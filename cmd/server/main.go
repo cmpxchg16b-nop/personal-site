@@ -1,15 +1,19 @@
 package main
 
 import (
-	"encoding/json"
+	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
+	"time"
 
 	personalsite "personal-site"
 	pkgapidyn "personal-site/pkg/api/dyn"
+	pkgapiprofile "personal-site/pkg/api/profile"
 	pkglog "personal-site/pkg/log"
 	pkgmodelsdyn "personal-site/pkg/models/dyn"
+	pkgsession "personal-site/pkg/session"
 
 	"github.com/alecthomas/kong"
 )
@@ -21,17 +25,30 @@ var logger = slog.Default()
 type CLI struct {
 	Addr      string `name:"addr" help:"Listening address." env:"ADDR" default:":8080"`
 	ConfigXML string `name:"config-xml" help:"Path to the server configuration XML document (see serverConfig.xsd)." env:"CONFIG_XML" type:"existingfile"`
+	// HealthzProbe makes the process a health probe instead of a server: it
+	// GETs the running server's /api/healthz on the loopback address and
+	// exits 0 on success, non-zero otherwise. The container image's
+	// HEALTHCHECK uses it, because the scratch-based image has no shell or
+	// curl to probe with.
+	HealthzProbe bool `name:"healthz-probe" help:"Probe the server's /api/healthz endpoint and exit."`
 }
 
 func (cli *CLI) Run() error {
+	if cli.HealthzProbe {
+		return runHealthzProbe(cli.Addr)
+	}
+
 	mux := http.NewServeMux()
 
 	// API routes. The site is a purely client-rendered static export today;
 	// these endpoints are the seed of the dynamic features served by this Go
-	// backend (profile, contact, …).
-	mux.HandleFunc("GET /api/healthz", handleHealthz)
-	mux.HandleFunc("GET /api/profile", handleProfile)
-	mux.HandleFunc("GET /api/contact", handleContact)
+	// backend (profile, dynamic blog data, …).
+	mux.Handle("GET /api/healthz", pkgapidyn.NewHealthzHandler())
+	// The profile endpoint reports the caller's identity. There is no login
+	// or account system yet, so the session manager supplies the same
+	// hard-coded visitor session for every request; once sign-in exists,
+	// swap it for the JWT-backed session middleware chain.
+	mux.Handle("GET /api/profile", pkgapiprofile.NewProfileHandler(pkgsession.NewStaticVisitorSessionManager()))
 
 	// The dynamic blog data endpoints serve the <dynBlogData/> section of the
 	// server configuration document (projects, author contacts). The provider
@@ -53,48 +70,25 @@ func (cli *CLI) Run() error {
 	return http.ListenAndServe(cli.Addr, handler)
 }
 
-func handleHealthz(w http.ResponseWriter, _ *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
-}
-
-// ProfileResponse mirrors the profile shape the frontend's account area
-// (ProfileMenu via useProfile) consumes.
-type ProfileResponse struct {
-	SessionID string `json:"session_id"`
-	SubjectID string `json:"subject_id"`
-	Username  string `json:"username"`
-	Email     string `json:"email"`
-}
-
-// handleProfile serves the caller's profile. There is no login or account
-// system yet, so everyone gets the same hard-coded visitor identity; once
-// sign-in exists, resolve the request's session here instead.
-func handleProfile(w http.ResponseWriter, _ *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(ProfileResponse{
-		SessionID: "visitor",
-		SubjectID: "visitor",
-		Username:  "Visitor",
-	})
-}
-
-// Contact is one way to reach the site owner: an iconizable kind ("email",
-// "github", …) plus a human-readable label and the URL to open.
-type Contact struct {
-	Kind  string `json:"kind"`
-	Label string `json:"label"`
-	URL   string `json:"url"`
-}
-
-// handleContact serves the site owner's contact entries. Placeholder values;
-// load them from a config file or database once real data is available.
-func handleContact(w http.ResponseWriter, _ *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode([]Contact{
-		{Kind: "email", Label: "you@example.com", URL: "mailto:you@example.com"},
-		{Kind: "github", Label: "github.com/your-handle", URL: "https://github.com/your-handle"},
-	})
+// runHealthzProbe GETs the server's health endpoint over the loopback
+// interface and reports the outcome via the process exit code. addr is the
+// server's listening address (same value as --addr); only its port is used.
+func runHealthzProbe(addr string) error {
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("health probe: invalid listening address %q: %w", addr, err)
+	}
+	url := "http://127.0.0.1:" + port + "/api/healthz"
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		return fmt.Errorf("health probe: %s: %w", url, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("health probe: %s returned %s", url, resp.Status)
+	}
+	return nil
 }
 
 func main() {

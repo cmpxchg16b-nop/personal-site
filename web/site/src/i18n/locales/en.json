@@ -64,49 +64,14 @@
   },
   "projects": {
     "title": "Projects",
-    "subtitle": "A few things I have built or am working on. Placeholder entries for now.",
-    "source": "Source",
-    "items": [
-      {
-        "name": "Project One",
-        "description": "A short description of what this project does and why it is interesting.",
-        "tech": ["Go", "Next.js"],
-        "url": "https://github.com/your-handle/project-one"
-      },
-      {
-        "name": "Project Two",
-        "description": "Another placeholder project. Mention the problem it solves or what you learned building it.",
-        "tech": ["TypeScript", "React"],
-        "url": "https://github.com/your-handle/project-two"
-      },
-      {
-        "name": "Project Three",
-        "description": "One more placeholder. Three cards show the list layout nicely; add or remove as you like.",
-        "tech": ["Rust"],
-        "url": "https://github.com/your-handle/project-three"
-      }
-    ]
+    "subtitle": "A few things I have built or am working on.",
+    "loadFailed": "Failed to load the projects.",
+    "source": "Source"
   },
   "contact": {
     "title": "Contact",
     "subtitle": "Feel free to reach out through any of these.",
-    "items": [
-      {
-        "kind": "email",
-        "label": "you@example.com",
-        "url": "mailto:you@example.com"
-      },
-      {
-        "kind": "github",
-        "label": "github.com/your-handle",
-        "url": "https://github.com/your-handle"
-      },
-      {
-        "kind": "website",
-        "label": "example.com",
-        "url": "https://example.com"
-      }
-    ]
+    "loadFailed": "Failed to load the contact entries."
   },
   "footer": {
     "copyright": "© {{year}} My Name",

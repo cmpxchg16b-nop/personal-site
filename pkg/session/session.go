@@ -55,6 +55,34 @@ func (m *OnMemorySessionManager) WithSession(ctx context.Context, sess *Session)
 	return context.WithValue(ctx, pkgutils.CtxKeySessionObject, sess)
 }
 
+// StaticVisitorSessionManager is a SessionManager that answers every
+// GetSessionFromContext with the same hard-coded visitor session, ignoring
+// the context. It exists because the site has no login or account system
+// yet: handlers that need a session (e.g. pkg/api/profile's ProfileHandler)
+// are supplied this placeholder identity instead.
+type StaticVisitorSessionManager struct {
+	sess *Session
+}
+
+func NewStaticVisitorSessionManager() *StaticVisitorSessionManager {
+	return &StaticVisitorSessionManager{sess: &Session{
+		id:        "visitor",
+		subjectId: "visitor",
+		username:  "Visitor",
+	}}
+}
+
+// GetSessionFromContext returns the static visitor session, unconditionally.
+func (m *StaticVisitorSessionManager) GetSessionFromContext(_ context.Context) (*Session, bool) {
+	return m.sess, true
+}
+
+// WithSession returns ctx unchanged: the static visitor identity is
+// unconditional, so there is nothing to attach.
+func (m *StaticVisitorSessionManager) WithSession(ctx context.Context, _ *Session) context.Context {
+	return ctx
+}
+
 // This middleware is expected the be chained before jwt middleware, in another word,
 // it is expected that the request is flowed through the jwt middleware before it hits this.
 func WithSessionId(h http.Handler, sm *OnMemorySessionManager) http.Handler {

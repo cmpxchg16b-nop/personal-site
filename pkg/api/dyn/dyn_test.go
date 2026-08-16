@@ -126,3 +126,27 @@ func TestDynamicBlogDataHandler_UnknownSubPath(t *testing.T) {
 		t.Fatalf("status: got %d, want %d", rec.Code, http.StatusNotFound)
 	}
 }
+
+func TestHealthzHandler(t *testing.T) {
+	h := NewHealthzHandler()
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/healthz", nil))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status: got %d, want %d", rec.Code, http.StatusOK)
+	}
+	var got map[string]string
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("response is not a JSON object: %v", err)
+	}
+	if got["status"] != "ok" {
+		t.Fatalf("unexpected payload: %+v", got)
+	}
+
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/healthz", nil))
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("POST status: got %d, want %d", rec.Code, http.StatusMethodNotAllowed)
+	}
+}

@@ -14,9 +14,10 @@ My personal site and blog, built with simplicity and brevity in mind.
   the top bar; all site copy lives in the two translation bundles.
 - **A small Go backend.** One self-contained binary that embeds and serves
   the static export, and answers the site's API endpoints: `GET
-/api/profile` (currently a hard-coded "Visitor" identity, until a login and
-  account system exists), `GET /api/contact`, `GET /api/healthz`, and the
-  dynamic blog data under `/api/dyn/` (see below).
+/api/profile` (the caller's identity — currently the hard-coded visitor
+  session supplied by `StaticVisitorSessionManager`, until a login and
+  account system exists), `GET /api/healthz`, and the dynamic blog data
+  under `/api/dyn/` (see below).
 
 ## Dynamic blog data
 
@@ -40,21 +41,24 @@ be edited without rebuilding the frontend:
 - **Wired unconditionally.** `main.go` mounts the handler at `/api/dyn/`
   even without `--config-xml`; the endpoints then serve empty lists.
 
-The frontend does not consume these endpoints yet — its projects and contact
-sections still render the placeholder copy from the translation bundles.
-Wiring them up is the natural next step.
+The frontend's Projects and Contact sections fetch these endpoints at
+runtime, so editing `serverConfig.xml` updates the rendered page with no
+frontend rebuild and no server restart.
 
 ## Layout
 
 - `cmd/server/` — the Go server entrypoint (`main.go`): static export,
-  `/api/profile`, `/api/contact`, `/api/healthz`, and the `/api/dyn/` mount.
+  `/api/profile`, `/api/healthz`, and the `/api/dyn/` mount.
 - `pkg/` — Go packages kept from the project's previous incarnation (HTTP
   logging middleware, session/auth helpers, and more), plus the ones added
   for this site. They are mostly not wired into `main.go` yet, but are
   available for future dynamic features. Notable:
   - `pkg/models/dyn/` — `DynBlogData`, the `DynBlogDataProvider` interface,
     and `FSBasedDynBlogData`.
-  - `pkg/api/dyn/` — `DynamicBlogDataHandler`.
+  - `pkg/api/dyn/` — `DynamicBlogDataHandler` and `HealthzHandler`.
+  - `pkg/api/profile/` — `ProfileHandler`, wired at `GET /api/profile`.
+  - `pkg/session/` — the session model; hosts `StaticVisitorSessionManager`,
+    the stand-in identity provider until sign-in exists.
   - `pkg/models/serverconfig/` — the parser for `serverConfig.xml`.
 - `web/site/` — the Next.js frontend (see its README).
 - `webfs.go` — embeds the frontend's static export (`web/site/out`) into the
@@ -92,17 +96,21 @@ docker build -t personal-site .
 docker run --rm -p 8080:8080 personal-site
 ```
 
+The image defines a `HEALTHCHECK` probing `GET /api/healthz`. Because the
+runtime stage is `FROM scratch` (no shell, no curl), the probe is the server
+binary itself: `--healthz-probe` GETs the endpoint over the loopback
+interface and exits non-zero on failure.
+
 Mount a configuration document to serve your dynamic blog data from the
 container, e.g. `-v "$PWD/serverConfig.xml:/app/serverConfig.xml"` and
 `--config-xml=serverConfig.xml` appended to the entrypoint arguments.
 
 ## Making it yours
 
-- Site copy (name, tagline, about, posts, and — until the frontend consumes
-  `/api/dyn/` — projects and contacts):
+- Site copy (name, tagline, about, posts):
   `web/site/src/i18n/locales/en.json` and `zh.json`.
-- Projects and author contacts served by the API: the `<dynBlogData/>`
-  section of `serverConfig.xml`.
-- The hard-coded visitor identity and the legacy `/api/contact` placeholder
-  entries: `cmd/server/main.go`.
+- Projects and author contacts: the `<dynBlogData/>` section of
+  `serverConfig.xml`, served live under `/api/dyn/`.
+- The hard-coded visitor identity: `pkg/session`
+  (`StaticVisitorSessionManager`).
 - The favicons: `web/site/public/logo-light.png` and `logo-dark.png`.

@@ -64,49 +64,14 @@
   },
   "projects": {
     "title": "项目",
-    "subtitle": "一些我做过或正在做的东西。目前是占位条目。",
-    "source": "源码",
-    "items": [
-      {
-        "name": "项目一",
-        "description": "一句话介绍这个项目是做什么的，以及它有趣在哪里。",
-        "tech": ["Go", "Next.js"],
-        "url": "https://github.com/your-handle/project-one"
-      },
-      {
-        "name": "项目二",
-        "description": "另一个占位项目。可以写它解决了什么问题，或者你在做它的过程中学到了什么。",
-        "tech": ["TypeScript", "React"],
-        "url": "https://github.com/your-handle/project-two"
-      },
-      {
-        "name": "项目三",
-        "description": "再来一个占位条目。三张卡片能很好地展示列表布局，可随意增减。",
-        "tech": ["Rust"],
-        "url": "https://github.com/your-handle/project-three"
-      }
-    ]
+    "subtitle": "一些我做过或正在做的东西。",
+    "loadFailed": "加载项目列表失败。",
+    "source": "源码"
   },
   "contact": {
     "title": "联系方式",
     "subtitle": "欢迎通过以下任意方式联系我。",
-    "items": [
-      {
-        "kind": "email",
-        "label": "you@example.com",
-        "url": "mailto:you@example.com"
-      },
-      {
-        "kind": "github",
-        "label": "github.com/your-handle",
-        "url": "https://github.com/your-handle"
-      },
-      {
-        "kind": "website",
-        "label": "example.com",
-        "url": "https://example.com"
-      }
-    ]
+    "loadFailed": "加载联系方式失败。"
   },
   "footer": {
     "copyright": "© {{year}} 我的名字",

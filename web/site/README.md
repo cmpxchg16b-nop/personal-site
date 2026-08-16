@@ -17,10 +17,12 @@ so run `go run ./cmd/server` from the repository root alongside it.
 
 ## Site content
 
-All copy is placeholder text living in the translation bundles
-(`src/i18n/locales/en.json`, `src/i18n/locales/zh.json`): the owner's name,
-tagline, about paragraphs, post and project cards, and contact entries.
-Edit those two files to make the site yours.
+Static copy lives in the translation bundles (`src/i18n/locales/en.json`,
+`src/i18n/locales/zh.json`): the owner's name, tagline, about paragraphs,
+and post cards. The projects and contact sections are dynamic — they fetch
+`GET /api/dyn/projects` and `GET /api/dyn/authorcontacts` from the Go
+backend, which re-reads the `<dynBlogData/>` section of `serverConfig.xml`
+on every request.
 
 ## Building
 
