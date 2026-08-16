@@ -39,7 +39,7 @@ export default function ContactSection() {
           <Stack
             direction="row"
             spacing={2}
-            sx={{ flexWrap: "wrap" }}
+            sx={{ flexWrap: "wrap", mt: 2 }}
             useFlexGap
           >
             {contacts.map((contact) => (
