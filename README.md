@@ -117,3 +117,9 @@ container, e.g. `-v "$PWD/serverConfig.xml:/app/serverConfig.xml"` and
 - The hard-coded visitor identity: `pkg/session`
   (`StaticVisitorSessionManager`).
 - The favicons: `web/site/public/logo-light.png` and `logo-dark.png`.
+
+## Todos
+
+1. Commenting subsystem
+2. Icons (for dark and bright variant)
+3. Math rendering (example MathML post)
