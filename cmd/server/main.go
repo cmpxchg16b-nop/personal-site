@@ -7,7 +7,9 @@ import (
 	"os"
 
 	personalsite "personal-site"
+	pkgapidyn "personal-site/pkg/api/dyn"
 	pkglog "personal-site/pkg/log"
+	pkgmodelsdyn "personal-site/pkg/models/dyn"
 
 	"github.com/alecthomas/kong"
 )
@@ -17,7 +19,8 @@ import (
 var logger = slog.Default()
 
 type CLI struct {
-	Addr string `name:"addr" help:"Listening address." env:"ADDR" default:":8080"`
+	Addr      string `name:"addr" help:"Listening address." env:"ADDR" default:":8080"`
+	ConfigXML string `name:"config-xml" help:"Path to the server configuration XML document (see serverConfig.xsd)." env:"CONFIG_XML" type:"existingfile"`
 }
 
 func (cli *CLI) Run() error {
@@ -29,6 +32,17 @@ func (cli *CLI) Run() error {
 	mux.HandleFunc("GET /api/healthz", handleHealthz)
 	mux.HandleFunc("GET /api/profile", handleProfile)
 	mux.HandleFunc("GET /api/contact", handleContact)
+
+	// The dynamic blog data endpoints serve the <dynBlogData/> section of the
+	// server configuration document (projects, author contacts). The provider
+	// re-reads the document on every request, so edits apply without a
+	// restart. Registered unconditionally — with no --config-xml the handler
+	// serves empty lists — so the frontend can always rely on it.
+	var dynProvider pkgmodelsdyn.DynBlogDataProvider
+	if cli.ConfigXML != "" {
+		dynProvider = pkgmodelsdyn.NewFSBasedDynBlogData(cli.ConfigXML)
+	}
+	mux.Handle("/api/dyn/", pkgapidyn.NewDynamicBlogDataHandler(dynProvider))
 
 	// Everything else is the embedded Next.js static export.
 	mux.Handle("/", personalsite.Handler())

@@ -30,6 +30,12 @@
           type="loginOptionsType"
           minOccurs="0"
         />
+        <!-- The site's dynamic blog data: the project and author-contact
+             lists served to the frontend as JSON under /api/dyn/ (see
+             pkg/api/dyn). The server re-reads this section from the document
+             on every request (FSBasedDynBlogData in pkg/models/dyn), so
+             edits apply without a server restart. -->
+        <xsd:element name="dynBlogData" type="dynBlogDataType" minOccurs="0" />
         <!-- An origin ("scheme://host") the OAuth2/OIDC login handlers trust
              when their configured redirect URL is relative (starts with
              "/"): the origin of the incoming login request is prepended to
@@ -165,6 +171,48 @@
       use="optional"
       default=""
     />
+  </xsd:complexType>
+
+  <!-- The <dynBlogData/> section; holds zero or more <project/> entries
+       followed by zero or more <authorContact/> entries. -->
+  <xsd:complexType name="dynBlogDataType">
+    <xsd:sequence>
+      <xsd:element
+        name="project"
+        type="projectType"
+        minOccurs="0"
+        maxOccurs="unbounded"
+      />
+      <xsd:element
+        name="authorContact"
+        type="authorContactType"
+        minOccurs="0"
+        maxOccurs="unbounded"
+      />
+    </xsd:sequence>
+  </xsd:complexType>
+
+  <!-- A single project entry of <dynBlogData/>. id uniquely identifies the
+       entry; name, description, and url are shown on the project's card.
+       tech is an optional comma-separated list of technologies (e.g.
+       "Go,Next.js"), rendered as chips; surrounding whitespace is ignored. -->
+  <xsd:complexType name="projectType">
+    <xsd:attribute name="id" type="xsd:string" use="required" />
+    <xsd:attribute name="name" type="xsd:string" use="required" />
+    <xsd:attribute name="description" type="xsd:string" use="required" />
+    <xsd:attribute name="url" type="xsd:string" use="required" />
+    <xsd:attribute name="tech" type="xsd:string" use="optional" default="" />
+  </xsd:complexType>
+
+  <!-- A single author contact entry of <dynBlogData/>. id uniquely
+       identifies the entry; kind picks the icon on the frontend ("email",
+       "github", …); label is the button caption and url where it navigates
+       (e.g. "mailto:you@example.com"). -->
+  <xsd:complexType name="authorContactType">
+    <xsd:attribute name="id" type="xsd:string" use="required" />
+    <xsd:attribute name="kind" type="xsd:string" use="required" />
+    <xsd:attribute name="label" type="xsd:string" use="required" />
+    <xsd:attribute name="url" type="xsd:string" use="required" />
   </xsd:complexType>
 
 </xsd:schema>

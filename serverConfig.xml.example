@@ -57,4 +57,31 @@
       loginURL="/api/login/visitor"
     />
   </loginOptions>
+
+  <!-- The site's dynamic blog data (optional): projects and author contacts
+       served to the frontend as JSON under /api/dyn/ (see pkg/api/dyn).
+       Re-read from this document on every request, so edits apply without a
+       server restart. A project's tech attribute is a comma-separated list.
+       Every entry carries a unique id. -->
+  <dynBlogData>
+    <project
+      id="project-one"
+      name="Project One"
+      description="A short description of what this project does."
+      url="https://github.com/your-handle/project-one"
+      tech="Go,Next.js"
+    />
+    <authorContact
+      id="email"
+      kind="email"
+      label="you@example.com"
+      url="mailto:you@example.com"
+    />
+    <authorContact
+      id="github"
+      kind="github"
+      label="github.com/your-handle"
+      url="https://github.com/your-handle"
+    />
+  </dynBlogData>
 </serverConfig>
