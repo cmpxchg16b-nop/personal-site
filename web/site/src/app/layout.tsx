@@ -74,7 +74,7 @@ export default function RootLayout({
               body so short pages don't collapse. */}
           <Box
             component="main"
-            sx={{ p: { xs: 2, sm: 3, md: 4 }, flexGrow: 1 }}
+            sx={{ p: { xs: 2, sm: 3, md: 3 }, flexGrow: 1 }}
           >
             <Suspense fallback={<div>Loading...</div>}>{children}</Suspense>
           </Box>

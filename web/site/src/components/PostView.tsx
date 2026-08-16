@@ -52,7 +52,12 @@ export default function PostView({ postId, children }: PostViewProps) {
         </Alert>
       ) : post ? (
         <Box component="header" sx={{ mb: 4 }}>
-          <Typography variant="h4" component="h1" fontWeight={700} gutterBottom>
+          <Typography
+            variant="h4"
+            component="h1"
+            sx={{ fontWeight: 500 }}
+            gutterBottom
+          >
             {post.title}
           </Typography>
           <Box sx={{ display: "flex", flexWrap: "wrap", gap: 0.5, mb: 2 }}>

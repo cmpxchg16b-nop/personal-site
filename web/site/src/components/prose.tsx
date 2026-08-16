@@ -26,8 +26,7 @@ export function H2({ children }: ChildrenProp) {
     <Typography
       variant="h5"
       component="h2"
-      fontWeight={600}
-      sx={{ mt: 5, mb: 2, scrollMarginTop: 8 }}
+      sx={{ fontWeight: 500, mt: 5, mb: 2, scrollMarginTop: 8 }}
     >
       {children}
     </Typography>
@@ -39,8 +38,7 @@ export function H3({ children }: ChildrenProp) {
     <Typography
       variant="h6"
       component="h3"
-      fontWeight={600}
-      sx={{ mt: 4, mb: 1.5, scrollMarginTop: 8 }}
+      sx={{ fontWeight: 500, mt: 4, mb: 1.5, scrollMarginTop: 8 }}
     >
       {children}
     </Typography>
@@ -52,8 +50,7 @@ export function H4({ children }: ChildrenProp) {
     <Typography
       variant="subtitle1"
       component="h4"
-      fontWeight={600}
-      sx={{ mt: 3, mb: 1 }}
+      sx={{ fontWeight: 500, mt: 3, mb: 1 }}
     >
       {children}
     </Typography>

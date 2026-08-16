@@ -73,14 +73,31 @@ export default function ProjectsSection() {
                           {project.description}
                         </Typography>
                       </Box>
+                      {/* Icon-only on phones: the label drops below sm and
+                          the startIcon's text-gap margins are neutralized so
+                          the icon stays centered. aria-label keeps the button
+                          named when the visible text is hidden. */}
                       <Button
                         variant="contained"
                         href={project.url}
                         target="_blank"
                         rel="noreferrer"
                         startIcon={<GitHubIcon />}
+                        aria-label={t("projects.source")}
+                        sx={{
+                          minWidth: { xs: 0, sm: 8 },
+                          "& .MuiButton-startIcon": {
+                            ml: { xs: 0, sm: "-4px" },
+                            mr: { xs: 0, sm: 1 },
+                          },
+                        }}
                       >
-                        {t("projects.source")}
+                        <Box
+                          component="span"
+                          sx={{ display: { xs: "none", sm: "inline" } }}
+                        >
+                          {t("projects.source")}
+                        </Box>
                       </Button>
                     </Box>
                   </CardContent>
