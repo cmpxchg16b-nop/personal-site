@@ -3,7 +3,7 @@ package cookie
 import (
 	"net/http"
 
-	pkgapicommon "dcna-questions/pkg/api/common"
+	pkgapicommon "personal-site/pkg/api/common"
 )
 
 // CookieBuilder builds the HTTP cookies used by the login handlers.

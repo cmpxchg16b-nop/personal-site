@@ -10,11 +10,11 @@ import (
 	"sync"
 	"time"
 
-	"dcna-questions/pkg/auth"
-	"dcna-questions/pkg/models/msgnotify"
-	pkgmodelquestions "dcna-questions/pkg/models/question"
+	"personal-site/pkg/auth"
+	"personal-site/pkg/models/msgnotify"
+	pkgmodelquestions "personal-site/pkg/models/question"
 
-	"dcna-questions/pkg/models/examreport"
+	"personal-site/pkg/models/examreport"
 
 	"github.com/google/uuid"
 )

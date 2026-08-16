@@ -1,0 +1,115 @@
+{
+  "app": {
+    "title": "我的名字"
+  },
+  "nav": {
+    "breadcrumb": "面包屑",
+    "home": "首页",
+    "examSessions": "考试会话"
+  },
+  "profile": {
+    "visitor": "访客",
+    "account": "账号：{{name}}"
+  },
+  "language": {
+    "label": "语言"
+  },
+  "colorMode": {
+    "label": "主题：{{mode}}",
+    "switch": "切换颜色主题",
+    "switchWithCurrent": "切换颜色主题，当前：{{mode}}",
+    "system": "跟随系统",
+    "light": "浅色",
+    "dark": "深色"
+  },
+  "hero": {
+    "greeting": "你好，我是{{name}}。",
+    "name": "我的名字",
+    "tagline": "这里写一句简短的标语。",
+    "intro": "这是一段占位简介。把它替换成一两句关于你自己的话——比如你在做什么、在学什么、关心什么。",
+    "ctaPosts": "阅读我的文章",
+    "ctaContact": "联系我"
+  },
+  "about": {
+    "title": "关于",
+    "paragraphs": [
+      "把这一段替换成简短的自我介绍：你的背景、你喜欢做的东西，以及目前专注的方向。",
+      "第二段可以写任何其他内容——工作之外的爱好、兴趣，或者一件有趣的事。这些都是占位文字，随你发挥。"
+    ]
+  },
+  "posts": {
+    "title": "文章",
+    "subtitle": "不定期更新，关于软件和其他话题。目前是占位条目。",
+    "read": "阅读",
+    "items": [
+      {
+        "title": "第一篇文章的标题",
+        "date": "2026-03-01",
+        "excerpt": "这里写一两句文章摘要。在卡片上最多显示两行，和真实摘要的效果一致。",
+        "tags": ["随笔", "示例"]
+      },
+      {
+        "title": "另一篇文章的标题",
+        "date": "2026-02-14",
+        "excerpt": "另一段占位摘要。等博客接入后，把这些条目换成你真正的文章。",
+        "tags": ["笔记"]
+      },
+      {
+        "title": "第三篇文章的标题",
+        "date": "2026-01-20",
+        "excerpt": "再来一段占位摘要，展示文章列表更长时的页面效果。",
+        "tags": ["示例"]
+      }
+    ]
+  },
+  "projects": {
+    "title": "项目",
+    "subtitle": "一些我做过或正在做的东西。目前是占位条目。",
+    "source": "源码",
+    "items": [
+      {
+        "name": "项目一",
+        "description": "一句话介绍这个项目是做什么的，以及它有趣在哪里。",
+        "tech": ["Go", "Next.js"],
+        "url": "https://github.com/your-handle/project-one"
+      },
+      {
+        "name": "项目二",
+        "description": "另一个占位项目。可以写它解决了什么问题，或者你在做它的过程中学到了什么。",
+        "tech": ["TypeScript", "React"],
+        "url": "https://github.com/your-handle/project-two"
+      },
+      {
+        "name": "项目三",
+        "description": "再来一个占位条目。三张卡片能很好地展示列表布局，可随意增减。",
+        "tech": ["Rust"],
+        "url": "https://github.com/your-handle/project-three"
+      }
+    ]
+  },
+  "contact": {
+    "title": "联系方式",
+    "subtitle": "欢迎通过以下任意方式联系我。",
+    "items": [
+      {
+        "kind": "email",
+        "label": "you@example.com",
+        "url": "mailto:you@example.com"
+      },
+      {
+        "kind": "github",
+        "label": "github.com/your-handle",
+        "url": "https://github.com/your-handle"
+      },
+      {
+        "kind": "website",
+        "label": "example.com",
+        "url": "https://example.com"
+      }
+    ]
+  },
+  "footer": {
+    "copyright": "© {{year}} 我的名字",
+    "builtWith": "使用 Next.js 与 MUI 构建。"
+  }
+}

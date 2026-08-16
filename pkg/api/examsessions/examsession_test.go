@@ -10,12 +10,12 @@ import (
 	"strings"
 	"testing"
 
-	"dcna-questions/pkg/api/examsessions"
-	"dcna-questions/pkg/models/examreport"
-	"dcna-questions/pkg/models/examserver"
-	"dcna-questions/pkg/models/question"
-	"dcna-questions/pkg/session"
-	pkgutils "dcna-questions/pkg/utils"
+	"personal-site/pkg/api/examsessions"
+	"personal-site/pkg/models/examreport"
+	"personal-site/pkg/models/examserver"
+	"personal-site/pkg/models/question"
+	"personal-site/pkg/session"
+	pkgutils "personal-site/pkg/utils"
 )
 
 // fakeExamLoader is an ExamLoader that serves a fixed set of exams keyed by URL.

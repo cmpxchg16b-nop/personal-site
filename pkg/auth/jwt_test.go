@@ -7,7 +7,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	pkgutils "dcna-questions/pkg/utils"
+	pkgutils "personal-site/pkg/utils"
 
 	"github.com/golang-jwt/jwt/v5"
 )

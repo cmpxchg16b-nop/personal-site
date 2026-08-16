@@ -10,7 +10,7 @@ import (
 	"slices"
 	"strings"
 
-	pkgapicommon "dcna-questions/pkg/api/common"
+	pkgapicommon "personal-site/pkg/api/common"
 )
 
 // LoginOption is one entry of the login options list: kind identifies the

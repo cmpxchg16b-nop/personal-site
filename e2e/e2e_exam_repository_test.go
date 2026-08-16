@@ -1,4 +1,4 @@
-package dcnaquestions
+package personalsite
 
 import (
 	"archive/tar"
@@ -10,10 +10,10 @@ import (
 	"strings"
 	"testing"
 
-	pkgmodelsquestion "dcna-questions/pkg/models/question"
-	pkgmodelsuserexamdocsfsbasedassociation "dcna-questions/pkg/models/userexamdocs/fsbasedassociation"
-	pkgmodelsuserupload "dcna-questions/pkg/models/userupload"
-	pkgsession "dcna-questions/pkg/session"
+	pkgmodelsquestion "personal-site/pkg/models/question"
+	pkgmodelsuserexamdocsfsbasedassociation "personal-site/pkg/models/userexamdocs/fsbasedassociation"
+	pkgmodelsuserupload "personal-site/pkg/models/userupload"
+	pkgsession "personal-site/pkg/session"
 )
 
 // ---------------------------------------------------------------------------

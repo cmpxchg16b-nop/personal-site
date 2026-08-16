@@ -15,8 +15,8 @@ import (
 	"net/http"
 	"strings"
 
-	"dcna-questions/pkg/models/examreport"
-	"dcna-questions/pkg/session"
+	"personal-site/pkg/models/examreport"
+	"personal-site/pkg/session"
 )
 
 // apiPrefix is the path the handler is mounted under.

@@ -11,12 +11,12 @@ import (
 	"strings"
 	"testing"
 
-	"dcna-questions/pkg/api/examassociations"
-	pkgmodelsquestion "dcna-questions/pkg/models/question"
-	pkgmodelsuserexamdocs "dcna-questions/pkg/models/userexamdocs"
-	pkgmodelsuserupload "dcna-questions/pkg/models/userupload"
-	"dcna-questions/pkg/session"
-	pkgutils "dcna-questions/pkg/utils"
+	"personal-site/pkg/api/examassociations"
+	pkgmodelsquestion "personal-site/pkg/models/question"
+	pkgmodelsuserexamdocs "personal-site/pkg/models/userexamdocs"
+	pkgmodelsuserupload "personal-site/pkg/models/userupload"
+	"personal-site/pkg/session"
+	pkgutils "personal-site/pkg/utils"
 )
 
 // fakeAssociationManager is a UserExamDocsAssociationManager that records the

@@ -11,9 +11,9 @@ import (
 	"strings"
 	"testing"
 
-	pkglog "dcna-questions/pkg/log"
-	"dcna-questions/pkg/session"
-	pkgutils "dcna-questions/pkg/utils"
+	pkglog "personal-site/pkg/log"
+	"personal-site/pkg/session"
+	pkgutils "personal-site/pkg/utils"
 )
 
 // newRecordLogger returns a logger that writes JSON records to the returned

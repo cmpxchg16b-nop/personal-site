@@ -10,10 +10,10 @@ import (
 	"testing"
 	"time"
 
-	pkgapicommon "dcna-questions/pkg/api/common"
-	"dcna-questions/pkg/api/login/visitor"
-	pkgauth "dcna-questions/pkg/auth"
-	pkgcookie "dcna-questions/pkg/cookie"
+	pkgapicommon "personal-site/pkg/api/common"
+	"personal-site/pkg/api/login/visitor"
+	pkgauth "personal-site/pkg/auth"
+	pkgcookie "personal-site/pkg/cookie"
 )
 
 // stubTicketGenerator is a test double for pkgauth.TicketGenerator returning

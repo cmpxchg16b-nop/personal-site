@@ -4,9 +4,9 @@ import (
 	"context"
 	"testing"
 
-	pkgmodelquestions "dcna-questions/pkg/models/question"
+	pkgmodelquestions "personal-site/pkg/models/question"
 
-	"dcna-questions/pkg/models/examreport"
+	"personal-site/pkg/models/examreport"
 )
 
 // float32Ptr returns a pointer to v; used to build optional passing scores.

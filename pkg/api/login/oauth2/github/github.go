@@ -12,11 +12,11 @@ import (
 	"strings"
 	"time"
 
-	pkgapicommon "dcna-questions/pkg/api/common"
-	pkgauth "dcna-questions/pkg/auth"
-	pkgcookie "dcna-questions/pkg/cookie"
-	pkggithub "dcna-questions/pkg/github"
-	pkgutils "dcna-questions/pkg/utils"
+	pkgapicommon "personal-site/pkg/api/common"
+	pkgauth "personal-site/pkg/auth"
+	pkgcookie "personal-site/pkg/cookie"
+	pkggithub "personal-site/pkg/github"
+	pkgutils "personal-site/pkg/utils"
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"

@@ -1,6 +1,6 @@
-// Package dcnaquestions embeds and serves the static web assets shipped with
+// Package personalsite embeds and serves the static web assets shipped with
 // the binary.
-package dcnaquestions
+package personalsite
 
 import (
 	"embed"
@@ -9,18 +9,18 @@ import (
 	"strings"
 )
 
-// web holds the contents of the Next.js static export (web/exam-lab/out) at
+// web holds the contents of the Next.js static export (web/site/out) at
 // compile time. The "all:" prefix is required so that directories such as
 // _next/ and _not-found/ are included; without it, embed skips any file or
 // directory whose name begins with "_" or ".".
 //
-//go:embed all:web/exam-lab/out
+//go:embed all:web/site/out
 var web embed.FS
 
 // WebFS returns the embedded Next.js export as a read-only filesystem rooted
-// at web/exam-lab/out (so paths carry no "web/exam-lab/out/" prefix).
+// at web/site/out (so paths carry no "web/site/out/" prefix).
 func WebFS() fs.FS {
-	fsys, err := fs.Sub(web, "web/exam-lab/out")
+	fsys, err := fs.Sub(web, "web/site/out")
 	if err != nil {
 		// fs.Sub only fails for an invalid or absent name; the path above is
 		// embedded, so this is unreachable.

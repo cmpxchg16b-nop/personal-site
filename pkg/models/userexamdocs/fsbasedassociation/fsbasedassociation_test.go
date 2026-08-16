@@ -14,9 +14,9 @@ import (
 	"testing"
 	"time"
 
-	pkgmodelsuserupload "dcna-questions/pkg/models/userupload"
-	pkgsession "dcna-questions/pkg/session"
-	pkgutils "dcna-questions/pkg/utils"
+	pkgmodelsuserupload "personal-site/pkg/models/userupload"
+	pkgsession "personal-site/pkg/session"
+	pkgutils "personal-site/pkg/utils"
 )
 
 // ---------------------------------------------------------------------------

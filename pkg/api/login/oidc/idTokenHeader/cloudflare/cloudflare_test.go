@@ -13,8 +13,8 @@ import (
 	"testing"
 	"time"
 
-	"dcna-questions/pkg/api/login/oidc/idTokenHeader/cloudflare"
-	pkgutils "dcna-questions/pkg/utils"
+	"personal-site/pkg/api/login/oidc/idTokenHeader/cloudflare"
+	pkgutils "personal-site/pkg/utils"
 
 	"github.com/coreos/go-oidc/v3/oidc"
 	"github.com/golang-jwt/jwt/v5"

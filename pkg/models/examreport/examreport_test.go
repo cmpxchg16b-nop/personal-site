@@ -15,9 +15,9 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"dcna-questions/pkg/models/msgnotify"
-	pkgmodelsquestion "dcna-questions/pkg/models/question"
-	pkgmodelssigner "dcna-questions/pkg/models/signer"
+	"personal-site/pkg/models/msgnotify"
+	pkgmodelsquestion "personal-site/pkg/models/question"
+	pkgmodelssigner "personal-site/pkg/models/signer"
 
 	"github.com/beevik/etree"
 	dsig "github.com/russellhaering/goxmldsig"

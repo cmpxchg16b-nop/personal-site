@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 
-	pkgsession "dcna-questions/pkg/session"
+	pkgsession "personal-site/pkg/session"
 )
 
 // ProfileHandler is an http.Handler that serves the caller's profile (session

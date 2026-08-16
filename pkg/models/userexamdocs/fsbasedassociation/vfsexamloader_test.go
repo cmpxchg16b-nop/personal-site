@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	pkgmodelsquestion "dcna-questions/pkg/models/question"
+	pkgmodelsquestion "personal-site/pkg/models/question"
 
 	"github.com/spf13/afero"
 )

@@ -12,10 +12,10 @@ import (
 	"testing"
 	"time"
 
-	pkgapicommon "dcna-questions/pkg/api/common"
-	"dcna-questions/pkg/api/login/oauth2/google"
-	pkgauth "dcna-questions/pkg/auth"
-	pkgcookie "dcna-questions/pkg/cookie"
+	pkgapicommon "personal-site/pkg/api/common"
+	"personal-site/pkg/api/login/oauth2/google"
+	pkgauth "personal-site/pkg/auth"
+	pkgcookie "personal-site/pkg/cookie"
 )
 
 // stubNonceIssuer is a test double for pkgauth.NonceIssuer returning scripted

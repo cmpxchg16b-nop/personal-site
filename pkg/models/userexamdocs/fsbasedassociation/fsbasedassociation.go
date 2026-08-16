@@ -19,10 +19,10 @@ import (
 	"github.com/google/uuid"
 	"github.com/spf13/afero"
 
-	pkgmodelsquestion "dcna-questions/pkg/models/question"
-	pkgmodelsuserexamdocs "dcna-questions/pkg/models/userexamdocs"
-	pkgmodelsuserupload "dcna-questions/pkg/models/userupload"
-	pkgsession "dcna-questions/pkg/session"
+	pkgmodelsquestion "personal-site/pkg/models/question"
+	pkgmodelsuserexamdocs "personal-site/pkg/models/userexamdocs"
+	pkgmodelsuserupload "personal-site/pkg/models/userupload"
+	pkgsession "personal-site/pkg/session"
 )
 
 // FsAssociation is one association persisted as an in-process handle to an

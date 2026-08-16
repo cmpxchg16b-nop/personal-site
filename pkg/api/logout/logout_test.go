@@ -7,9 +7,9 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	pkgapicommon "dcna-questions/pkg/api/common"
-	"dcna-questions/pkg/api/logout"
-	pkgutils "dcna-questions/pkg/utils"
+	pkgapicommon "personal-site/pkg/api/common"
+	"personal-site/pkg/api/logout"
+	pkgutils "personal-site/pkg/utils"
 )
 
 // findCookie returns the named response cookie, or nil when absent.

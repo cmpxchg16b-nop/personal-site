@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"dcna-questions/pkg/session"
-	pkgutils "dcna-questions/pkg/utils"
+	"personal-site/pkg/session"
+	pkgutils "personal-site/pkg/utils"
 )
 
 // interface conformance: the on-memory manager must satisfy SessionManager.

@@ -22,9 +22,9 @@ import (
 	"strconv"
 	"strings"
 
-	"dcna-questions/pkg/models/userupload"
-	"dcna-questions/pkg/session"
-	pkgutils "dcna-questions/pkg/utils"
+	"personal-site/pkg/models/userupload"
+	"personal-site/pkg/session"
+	pkgutils "personal-site/pkg/utils"
 )
 
 // apiPrefix is the path the handler is mounted under.

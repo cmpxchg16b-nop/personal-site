@@ -6,7 +6,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	pkgapicommon "dcna-questions/pkg/api/common"
+	pkgapicommon "personal-site/pkg/api/common"
 )
 
 func TestRequestOrigin(t *testing.T) {

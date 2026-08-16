@@ -9,8 +9,8 @@ import (
 	"net/http"
 	"time"
 
-	"dcna-questions/pkg/session"
-	"dcna-questions/pkg/utils"
+	"personal-site/pkg/session"
+	"personal-site/pkg/utils"
 )
 
 // responseWriter wraps an http.ResponseWriter to capture the response status

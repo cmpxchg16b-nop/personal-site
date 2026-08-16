@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"net/http"
 
-	pkgapicommon "dcna-questions/pkg/api/common"
-	pkgutils "dcna-questions/pkg/utils"
+	pkgapicommon "personal-site/pkg/api/common"
+	pkgutils "personal-site/pkg/utils"
 )
 
 type LogoutHandler struct {

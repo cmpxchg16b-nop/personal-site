@@ -10,8 +10,8 @@ import (
 	"net/http"
 	"strings"
 
-	pkgapicommon "dcna-questions/pkg/api/common"
-	pkgutils "dcna-questions/pkg/utils"
+	pkgapicommon "personal-site/pkg/api/common"
+	pkgutils "personal-site/pkg/utils"
 
 	"github.com/golang-jwt/jwt/v5"
 )

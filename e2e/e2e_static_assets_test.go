@@ -1,4 +1,4 @@
-package dcnaquestions
+package personalsite
 
 import (
 	"context"
@@ -11,10 +11,10 @@ import (
 	"testing"
 	"time"
 
-	pkgapiloginvisitor "dcna-questions/pkg/api/login/visitor"
-	pkgauth "dcna-questions/pkg/auth"
-	pkgcookie "dcna-questions/pkg/cookie"
-	pkgsession "dcna-questions/pkg/session"
+	pkgapiloginvisitor "personal-site/pkg/api/login/visitor"
+	pkgauth "personal-site/pkg/auth"
+	pkgcookie "personal-site/pkg/cookie"
+	pkgsession "personal-site/pkg/session"
 )
 
 // TestE2E_StaticAssetsPathTraversal guards the /assets/ static file handler —

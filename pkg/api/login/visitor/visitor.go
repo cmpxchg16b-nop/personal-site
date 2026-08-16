@@ -8,9 +8,9 @@ import (
 	"net/http"
 	"time"
 
-	pkgauth "dcna-questions/pkg/auth"
-	pkgcookie "dcna-questions/pkg/cookie"
-	pkgutils "dcna-questions/pkg/utils"
+	pkgauth "personal-site/pkg/auth"
+	pkgcookie "personal-site/pkg/cookie"
+	pkgutils "personal-site/pkg/utils"
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"

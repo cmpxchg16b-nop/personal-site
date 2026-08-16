@@ -23,10 +23,10 @@ import (
 	"errors"
 	"net/http"
 
-	pkgmodelsuserexamdocs "dcna-questions/pkg/models/userexamdocs"
-	pkgmodelsuserupload "dcna-questions/pkg/models/userupload"
-	pkgsession "dcna-questions/pkg/session"
-	pkgutils "dcna-questions/pkg/utils"
+	pkgmodelsuserexamdocs "personal-site/pkg/models/userexamdocs"
+	pkgmodelsuserupload "personal-site/pkg/models/userupload"
+	pkgsession "personal-site/pkg/session"
+	pkgutils "personal-site/pkg/utils"
 )
 
 // associationDTO is the JSON shape of an ExamDocAssociation. The model struct

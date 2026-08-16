@@ -11,7 +11,7 @@ import (
 	"os"
 	"strconv"
 
-	"dcna-questions/pkg/models/question"
+	"personal-site/pkg/models/question"
 )
 
 // rawOpt is a single answer option in the legacy NDJSON format.

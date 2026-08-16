@@ -1,4 +1,4 @@
-package dcnaquestions
+package personalsite
 
 import (
 	"archive/tar"
@@ -18,14 +18,14 @@ import (
 
 	"github.com/spf13/afero"
 
-	pkgapiexamassociations "dcna-questions/pkg/api/examassociations"
-	pkgapiloginvisitor "dcna-questions/pkg/api/login/visitor"
-	pkgapiuseruploads "dcna-questions/pkg/api/useruploads"
-	pkgauth "dcna-questions/pkg/auth"
-	pkgcookie "dcna-questions/pkg/cookie"
-	pkgmodelsuserexamdocsfsbasedassociation "dcna-questions/pkg/models/userexamdocs/fsbasedassociation"
-	pkgmodelsuserupload "dcna-questions/pkg/models/userupload"
-	pkgsession "dcna-questions/pkg/session"
+	pkgapiexamassociations "personal-site/pkg/api/examassociations"
+	pkgapiloginvisitor "personal-site/pkg/api/login/visitor"
+	pkgapiuseruploads "personal-site/pkg/api/useruploads"
+	pkgauth "personal-site/pkg/auth"
+	pkgcookie "personal-site/pkg/cookie"
+	pkgmodelsuserexamdocsfsbasedassociation "personal-site/pkg/models/userexamdocs/fsbasedassociation"
+	pkgmodelsuserupload "personal-site/pkg/models/userupload"
+	pkgsession "personal-site/pkg/session"
 )
 
 // TestE2E_DynAssetsAndAssociations exercises the full upload → associate →

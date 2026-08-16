@@ -17,10 +17,10 @@ import (
 	"testing"
 	"time"
 
-	pkgapicommon "dcna-questions/pkg/api/common"
-	"dcna-questions/pkg/api/login/oidc/general"
-	pkgauth "dcna-questions/pkg/auth"
-	pkgcookie "dcna-questions/pkg/cookie"
+	pkgapicommon "personal-site/pkg/api/common"
+	"personal-site/pkg/api/login/oidc/general"
+	pkgauth "personal-site/pkg/auth"
+	pkgcookie "personal-site/pkg/cookie"
 
 	"github.com/golang-jwt/jwt/v5"
 )

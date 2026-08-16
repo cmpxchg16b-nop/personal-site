@@ -1,4 +1,4 @@
-package dcnaquestions
+package personalsite
 
 import (
 	"context"
@@ -10,13 +10,13 @@ import (
 	"testing"
 	"time"
 
-	pkgapiexamdocs "dcna-questions/pkg/api/examdocs"
-	pkgapiexamsessions "dcna-questions/pkg/api/examsessions"
-	pkgauth "dcna-questions/pkg/auth"
-	pkgmodelsexamreport "dcna-questions/pkg/models/examreport"
-	pkgmodelsexamserver "dcna-questions/pkg/models/examserver"
-	pkgmodelsquestion "dcna-questions/pkg/models/question"
-	pkgsession "dcna-questions/pkg/session"
+	pkgapiexamdocs "personal-site/pkg/api/examdocs"
+	pkgapiexamsessions "personal-site/pkg/api/examsessions"
+	pkgauth "personal-site/pkg/auth"
+	pkgmodelsexamreport "personal-site/pkg/models/examreport"
+	pkgmodelsexamserver "personal-site/pkg/models/examserver"
+	pkgmodelsquestion "personal-site/pkg/models/question"
+	pkgsession "personal-site/pkg/session"
 
 	"github.com/google/uuid"
 )

@@ -1,4 +1,4 @@
-package dcnaquestions
+package personalsite
 
 import (
 	"io/fs"

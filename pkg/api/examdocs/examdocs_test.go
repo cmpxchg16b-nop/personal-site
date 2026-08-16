@@ -11,10 +11,10 @@ import (
 	"testing"
 	"time"
 
-	examdocs "dcna-questions/pkg/api/examdocs"
-	"dcna-questions/pkg/models/question"
-	"dcna-questions/pkg/session"
-	pkgutils "dcna-questions/pkg/utils"
+	examdocs "personal-site/pkg/api/examdocs"
+	"personal-site/pkg/models/question"
+	"personal-site/pkg/session"
+	pkgutils "personal-site/pkg/utils"
 )
 
 // fakeLoader is an ExamLoader that serves canned exams by URL and can be wired

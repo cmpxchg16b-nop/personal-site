@@ -4,8 +4,8 @@ package userexamdocs
 import (
 	"context"
 
-	pkgmodelsquestion "dcna-questions/pkg/models/question"
-	pkgmodelsuserupload "dcna-questions/pkg/models/userupload"
+	pkgmodelsquestion "personal-site/pkg/models/question"
+	pkgmodelsuserupload "personal-site/pkg/models/userupload"
 )
 
 // ExamDocAssociation is a data-only record of a binding between a user's

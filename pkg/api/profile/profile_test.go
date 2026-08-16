@@ -8,9 +8,9 @@ import (
 	"strings"
 	"testing"
 
-	"dcna-questions/pkg/api/profile"
-	"dcna-questions/pkg/session"
-	pkgutils "dcna-questions/pkg/utils"
+	"personal-site/pkg/api/profile"
+	"personal-site/pkg/session"
+	pkgutils "personal-site/pkg/utils"
 )
 
 // profileResponse mirrors the handler's on-the-wire ProfileResponse so tests can

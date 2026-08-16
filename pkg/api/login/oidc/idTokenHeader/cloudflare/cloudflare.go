@@ -7,8 +7,8 @@ import (
 	"log"
 	"net/http"
 
-	pkgoidc "dcna-questions/pkg/oidc"
-	pkgutils "dcna-questions/pkg/utils"
+	pkgoidc "personal-site/pkg/oidc"
+	pkgutils "personal-site/pkg/utils"
 
 	"github.com/coreos/go-oidc/v3/oidc"
 )

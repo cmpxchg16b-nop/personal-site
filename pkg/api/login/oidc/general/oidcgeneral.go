@@ -11,11 +11,11 @@ import (
 	"sync"
 	"time"
 
-	pkgapicommon "dcna-questions/pkg/api/common"
-	pkgauth "dcna-questions/pkg/auth"
-	pkgcookie "dcna-questions/pkg/cookie"
-	pkgoidc "dcna-questions/pkg/oidc"
-	pkgutils "dcna-questions/pkg/utils"
+	pkgapicommon "personal-site/pkg/api/common"
+	pkgauth "personal-site/pkg/auth"
+	pkgcookie "personal-site/pkg/cookie"
+	pkgoidc "personal-site/pkg/oidc"
+	pkgutils "personal-site/pkg/utils"
 
 	"github.com/coreos/go-oidc/v3/oidc"
 	"github.com/golang-jwt/jwt/v5"

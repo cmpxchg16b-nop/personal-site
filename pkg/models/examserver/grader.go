@@ -1,7 +1,7 @@
 package examserver
 
 import (
-	pkgmodelquestions "dcna-questions/pkg/models/question"
+	pkgmodelquestions "personal-site/pkg/models/question"
 )
 
 // SimpleGrader grades an exam submission and returns an assessment of the

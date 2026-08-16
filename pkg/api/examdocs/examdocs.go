@@ -5,8 +5,8 @@ import (
 	"encoding/json"
 	"net/http"
 
-	"dcna-questions/pkg/models/question"
-	"dcna-questions/pkg/session"
+	"personal-site/pkg/models/question"
+	"personal-site/pkg/session"
 )
 
 // ExamHandler is an http.Handler that lists exam documents. It streams the

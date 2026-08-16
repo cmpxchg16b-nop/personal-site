@@ -14,10 +14,10 @@ import (
 	"strings"
 	"testing"
 
-	"dcna-questions/pkg/api/useruploads"
-	"dcna-questions/pkg/models/userupload"
-	"dcna-questions/pkg/session"
-	pkgutils "dcna-questions/pkg/utils"
+	"personal-site/pkg/api/useruploads"
+	"personal-site/pkg/models/userupload"
+	"personal-site/pkg/session"
+	pkgutils "personal-site/pkg/utils"
 )
 
 // --- fakes / helpers -------------------------------------------------------

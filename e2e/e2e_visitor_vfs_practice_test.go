@@ -1,4 +1,4 @@
-package dcnaquestions
+package personalsite
 
 import (
 	"archive/tar"
@@ -19,20 +19,20 @@ import (
 
 	"github.com/spf13/afero"
 
-	pkgapiexamassociations "dcna-questions/pkg/api/examassociations"
-	pkgapiexamdocs "dcna-questions/pkg/api/examdocs"
-	pkgapiexamsessions "dcna-questions/pkg/api/examsessions"
-	pkgapiexamtrackings "dcna-questions/pkg/api/examtrackings"
-	pkgapiloginvisitor "dcna-questions/pkg/api/login/visitor"
-	pkgapiuseruploads "dcna-questions/pkg/api/useruploads"
-	pkgauth "dcna-questions/pkg/auth"
-	pkgcookie "dcna-questions/pkg/cookie"
-	pkgmodelsexamreport "dcna-questions/pkg/models/examreport"
-	pkgmodelsexamserver "dcna-questions/pkg/models/examserver"
-	pkgmodelsquestion "dcna-questions/pkg/models/question"
-	pkgmodelsuserexamdocsfsbasedassociation "dcna-questions/pkg/models/userexamdocs/fsbasedassociation"
-	pkgmodelsuserupload "dcna-questions/pkg/models/userupload"
-	pkgsession "dcna-questions/pkg/session"
+	pkgapiexamassociations "personal-site/pkg/api/examassociations"
+	pkgapiexamdocs "personal-site/pkg/api/examdocs"
+	pkgapiexamsessions "personal-site/pkg/api/examsessions"
+	pkgapiexamtrackings "personal-site/pkg/api/examtrackings"
+	pkgapiloginvisitor "personal-site/pkg/api/login/visitor"
+	pkgapiuseruploads "personal-site/pkg/api/useruploads"
+	pkgauth "personal-site/pkg/auth"
+	pkgcookie "personal-site/pkg/cookie"
+	pkgmodelsexamreport "personal-site/pkg/models/examreport"
+	pkgmodelsexamserver "personal-site/pkg/models/examserver"
+	pkgmodelsquestion "personal-site/pkg/models/question"
+	pkgmodelsuserexamdocsfsbasedassociation "personal-site/pkg/models/userexamdocs/fsbasedassociation"
+	pkgmodelsuserupload "personal-site/pkg/models/userupload"
+	pkgsession "personal-site/pkg/session"
 )
 
 // vfsPracticeExamXML is a valid exam document designed for VFS testing.

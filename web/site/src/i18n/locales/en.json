@@ -1,0 +1,115 @@
+{
+  "app": {
+    "title": "My Name"
+  },
+  "nav": {
+    "breadcrumb": "breadcrumb",
+    "home": "Home",
+    "examSessions": "Exam Sessions"
+  },
+  "profile": {
+    "visitor": "Visitor",
+    "account": "Account: {{name}}"
+  },
+  "language": {
+    "label": "Language"
+  },
+  "colorMode": {
+    "label": "Theme: {{mode}}",
+    "switch": "Switch color theme",
+    "switchWithCurrent": "Switch color theme, current: {{mode}}",
+    "system": "System",
+    "light": "Light",
+    "dark": "Dark"
+  },
+  "hero": {
+    "greeting": "Hi, I'm {{name}}.",
+    "name": "My Name",
+    "tagline": "A short tagline goes here.",
+    "intro": "This is a placeholder introduction. Replace it with a sentence or two about who you are and what you do — for example, what you work on, what you are learning, and what you care about.",
+    "ctaPosts": "Read my posts",
+    "ctaContact": "Get in touch"
+  },
+  "about": {
+    "title": "About",
+    "paragraphs": [
+      "Replace this paragraph with a short bio: your background, the things you like to build, and what you are currently focused on.",
+      "Use this second paragraph for anything else — hobbies, interests outside of work, or a fun fact. It is all placeholder text, so make it yours."
+    ]
+  },
+  "posts": {
+    "title": "Posts",
+    "subtitle": "Occasional writing about software and other things. These are placeholder entries.",
+    "read": "Read",
+    "items": [
+      {
+        "title": "Your first post title",
+        "date": "2026-03-01",
+        "excerpt": "A one- or two-sentence summary of the post goes here. It is clamped to two lines on the card, just like a real excerpt would be.",
+        "tags": ["meta", "example"]
+      },
+      {
+        "title": "Another post title",
+        "date": "2026-02-14",
+        "excerpt": "Another placeholder excerpt. Swap these entries for your real posts once the blog is wired up.",
+        "tags": ["notes"]
+      },
+      {
+        "title": "A third post title",
+        "date": "2026-01-20",
+        "excerpt": "One more placeholder excerpt to show how a longer list of posts looks on the page.",
+        "tags": ["example"]
+      }
+    ]
+  },
+  "projects": {
+    "title": "Projects",
+    "subtitle": "A few things I have built or am working on. Placeholder entries for now.",
+    "source": "Source",
+    "items": [
+      {
+        "name": "Project One",
+        "description": "A short description of what this project does and why it is interesting.",
+        "tech": ["Go", "Next.js"],
+        "url": "https://github.com/your-handle/project-one"
+      },
+      {
+        "name": "Project Two",
+        "description": "Another placeholder project. Mention the problem it solves or what you learned building it.",
+        "tech": ["TypeScript", "React"],
+        "url": "https://github.com/your-handle/project-two"
+      },
+      {
+        "name": "Project Three",
+        "description": "One more placeholder. Three cards show the list layout nicely; add or remove as you like.",
+        "tech": ["Rust"],
+        "url": "https://github.com/your-handle/project-three"
+      }
+    ]
+  },
+  "contact": {
+    "title": "Contact",
+    "subtitle": "Feel free to reach out through any of these.",
+    "items": [
+      {
+        "kind": "email",
+        "label": "you@example.com",
+        "url": "mailto:you@example.com"
+      },
+      {
+        "kind": "github",
+        "label": "github.com/your-handle",
+        "url": "https://github.com/your-handle"
+      },
+      {
+        "kind": "website",
+        "label": "example.com",
+        "url": "https://example.com"
+      }
+    ]
+  },
+  "footer": {
+    "copyright": "© {{year}} My Name",
+    "builtWith": "Built with Next.js and MUI."
+  }
+}

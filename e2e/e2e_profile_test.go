@@ -1,4 +1,4 @@
-package dcnaquestions
+package personalsite
 
 import (
 	"context"
@@ -10,11 +10,11 @@ import (
 	"testing"
 	"time"
 
-	pkgapiloginvisitor "dcna-questions/pkg/api/login/visitor"
-	pkgapiprofile "dcna-questions/pkg/api/profile"
-	pkgauth "dcna-questions/pkg/auth"
-	pkgcookie "dcna-questions/pkg/cookie"
-	pkgsession "dcna-questions/pkg/session"
+	pkgapiloginvisitor "personal-site/pkg/api/login/visitor"
+	pkgapiprofile "personal-site/pkg/api/profile"
+	pkgauth "personal-site/pkg/auth"
+	pkgcookie "personal-site/pkg/cookie"
+	pkgsession "personal-site/pkg/session"
 )
 
 // TestE2E_VisitorProfile exercises the /api/profile endpoint through the full

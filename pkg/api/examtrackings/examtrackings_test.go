@@ -9,10 +9,10 @@ import (
 	"strings"
 	"testing"
 
-	"dcna-questions/pkg/api/examtrackings"
-	"dcna-questions/pkg/models/examreport"
-	"dcna-questions/pkg/session"
-	pkgutils "dcna-questions/pkg/utils"
+	"personal-site/pkg/api/examtrackings"
+	"personal-site/pkg/models/examreport"
+	"personal-site/pkg/session"
+	pkgutils "personal-site/pkg/utils"
 )
 
 // fakeTrackingServer is an ExamTrackingServer that records the operations it

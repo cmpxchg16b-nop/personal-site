@@ -29,9 +29,9 @@ import (
 	"strings"
 	"time"
 
-	"dcna-questions/pkg/models/examreport"
-	pkgmodelssigner "dcna-questions/pkg/models/signer"
-	pkgutils "dcna-questions/pkg/utils"
+	"personal-site/pkg/models/examreport"
+	pkgmodelssigner "personal-site/pkg/models/signer"
+	pkgutils "personal-site/pkg/utils"
 
 	"github.com/beevik/etree"
 	dsig "github.com/russellhaering/goxmldsig"

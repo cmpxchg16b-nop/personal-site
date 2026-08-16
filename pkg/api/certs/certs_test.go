@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	pkgutils "dcna-questions/pkg/utils"
+	pkgutils "personal-site/pkg/utils"
 
 	"github.com/beevik/etree"
 	dsig "github.com/russellhaering/goxmldsig"

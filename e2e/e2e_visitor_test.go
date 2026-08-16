@@ -1,4 +1,4 @@
-package dcnaquestions
+package personalsite
 
 import (
 	"bytes"
@@ -12,16 +12,16 @@ import (
 	"testing"
 	"time"
 
-	pkgapiexamdocs "dcna-questions/pkg/api/examdocs"
-	pkgapiexamsessions "dcna-questions/pkg/api/examsessions"
-	pkgapiexamtrackings "dcna-questions/pkg/api/examtrackings"
-	pkgapiloginvisitor "dcna-questions/pkg/api/login/visitor"
-	pkgauth "dcna-questions/pkg/auth"
-	pkgcookie "dcna-questions/pkg/cookie"
-	pkgmodelsexamreport "dcna-questions/pkg/models/examreport"
-	pkgmodelsexamserver "dcna-questions/pkg/models/examserver"
-	pkgmodelsquestion "dcna-questions/pkg/models/question"
-	pkgsession "dcna-questions/pkg/session"
+	pkgapiexamdocs "personal-site/pkg/api/examdocs"
+	pkgapiexamsessions "personal-site/pkg/api/examsessions"
+	pkgapiexamtrackings "personal-site/pkg/api/examtrackings"
+	pkgapiloginvisitor "personal-site/pkg/api/login/visitor"
+	pkgauth "personal-site/pkg/auth"
+	pkgcookie "personal-site/pkg/cookie"
+	pkgmodelsexamreport "personal-site/pkg/models/examreport"
+	pkgmodelsexamserver "personal-site/pkg/models/examserver"
+	pkgmodelsquestion "personal-site/pkg/models/question"
+	pkgsession "personal-site/pkg/session"
 )
 
 // TestE2E_VisitorPracticeAndCertification exercises the full HTTP stack as a

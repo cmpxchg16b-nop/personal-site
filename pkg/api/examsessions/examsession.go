@@ -46,10 +46,10 @@ import (
 	"strconv"
 	"strings"
 
-	"dcna-questions/pkg/models/examreport"
-	"dcna-questions/pkg/models/examserver"
-	"dcna-questions/pkg/models/question"
-	"dcna-questions/pkg/session"
+	"personal-site/pkg/models/examreport"
+	"personal-site/pkg/models/examserver"
+	"personal-site/pkg/models/question"
+	"personal-site/pkg/session"
 )
 
 // maxBodyBytes bounds the size of a POST body. A session-creation request is a

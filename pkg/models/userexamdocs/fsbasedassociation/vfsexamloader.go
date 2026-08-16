@@ -2,7 +2,7 @@ package fsbasedassociation
 
 import (
 	"context"
-	pkgmodelsquestion "dcna-questions/pkg/models/question"
+	pkgmodelsquestion "personal-site/pkg/models/question"
 	"fmt"
 	"strings"
 
