@@ -37,6 +37,17 @@ function crumbsFor(
       { label: examSessionId ?? "…" },
     ];
   }
+  if (pathname.startsWith("/posts/")) {
+    return [
+      { label: t("nav.home"), href: "/" },
+      // The posts list lives on Home; link straight to its anchor.
+      { label: t("posts.title"), href: "/#posts" },
+      // The post's title is not available here (it lives in the server
+      // configuration, fetched by the page itself), so the last crumb shows
+      // the post's URL slug.
+      { label: pathname.slice("/posts/".length) },
+    ];
+  }
   // Unknown route: fall back to Home plus the raw path.
   return [{ label: t("nav.home"), href: "/" }, { label: pathname }];
 }
