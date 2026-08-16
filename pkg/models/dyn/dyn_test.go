@@ -25,6 +25,8 @@ func writeConfig(t *testing.T, inner string) string {
 
 func TestFSBasedDynBlogData_GetDynBlogData(t *testing.T) {
 	path := writeConfig(t, `
+    <postMetadata id="post-1" href="/posts/post-1" title="First Post" description="The first post." lastModified="2026-03-08" creation="2026-03-01" tags="meta, example ,"/>
+    <postMetadata id="post-2" href="/posts/post-2" title="Second Post" description="The second post." creation="2026-02-14"/>
     <project id="p1" name="Project One" description="First." url="https://example.com/one" tech="Go, Next.js ,"/>
     <project id="p2" name="Project Two" description="Second." url="https://example.com/two"/>
     <authorContact id="c1" kind="email" label="you@example.com" url="mailto:you@example.com"/>
@@ -33,6 +35,27 @@ func TestFSBasedDynBlogData_GetDynBlogData(t *testing.T) {
 	data, err := NewFSBasedDynBlogData(path).GetDynBlogData()
 	if err != nil {
 		t.Fatalf("GetDynBlogData: %v", err)
+	}
+
+	if len(data.Posts) != 2 {
+		t.Fatalf("posts count: got %d, want 2", len(data.Posts))
+	}
+	post1 := data.Posts[0]
+	if post1.Id != "post-1" || post1.Href != "/posts/post-1" || post1.Title != "First Post" || post1.Description != "The first post." {
+		t.Fatalf("unexpected post payload: %+v", post1)
+	}
+	if post1.Creation != "2026-03-01" || post1.LastModified != "2026-03-08" {
+		t.Fatalf("dates: got creation %q lastModified %q, want 2026-03-01 and 2026-03-08", post1.Creation, post1.LastModified)
+	}
+	if !slices.Equal(post1.Tags, []string{"meta", "example"}) {
+		t.Fatalf("tags: got %v, want [meta example]", post1.Tags)
+	}
+	// lastModified is optional: absent means empty; tags absent means an empty list.
+	if data.Posts[1].LastModified != "" {
+		t.Fatalf("lastModified without attribute: got %q, want empty", data.Posts[1].LastModified)
+	}
+	if len(data.Posts[1].Tags) != 0 {
+		t.Fatalf("tags without attribute: got %v, want empty", data.Posts[1].Tags)
 	}
 
 	if len(data.Projects) != 2 {
@@ -103,7 +126,7 @@ func TestFSBasedDynBlogData_MissingFile(t *testing.T) {
 	}
 }
 
-func TestParseTech(t *testing.T) {
+func TestParseCommaSeparated(t *testing.T) {
 	for _, tc := range []struct {
 		in   string
 		want []string
@@ -113,8 +136,8 @@ func TestParseTech(t *testing.T) {
 		{"Go,Next.js", []string{"Go", "Next.js"}},
 		{" Go , Next.js ,", []string{"Go", "Next.js"}},
 	} {
-		if got := parseTech(tc.in); !slices.Equal(got, tc.want) {
-			t.Errorf("parseTech(%q) = %v, want %v", tc.in, got, tc.want)
+		if got := parseCommaSeparated(tc.in); !slices.Equal(got, tc.want) {
+			t.Errorf("parseCommaSeparated(%q) = %v, want %v", tc.in, got, tc.want)
 		}
 	}
 }

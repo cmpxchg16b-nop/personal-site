@@ -22,12 +22,37 @@ func (s stubProvider) GetDynBlogData() (*pkgmodelsdyn.DynBlogData, error) {
 }
 
 var testData = &pkgmodelsdyn.DynBlogData{
+	Posts: []pkgmodelsdyn.PostMetadata{
+		{Id: "post-1", Href: "/posts/post-1", Title: "First Post", Description: "The first post.", LastModified: "2026-03-08", Creation: "2026-03-01", Tags: []string{"meta", "example"}},
+	},
 	Projects: []pkgmodelsdyn.Project{
 		{Id: "p1", Name: "Project One", Description: "First.", URL: "https://example.com/one", Tech: []string{"Go", "Next.js"}},
 	},
 	AuthorContacts: []pkgmodelsdyn.AuthorContact{
 		{Id: "c1", Kind: "email", Label: "you@example.com", URL: "mailto:you@example.com"},
 	},
+}
+
+func TestDynamicBlogDataHandler_ServesPosts(t *testing.T) {
+	h := NewDynamicBlogDataHandler(stubProvider{data: testData})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/dyn/posts", nil))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status: got %d, want %d", rec.Code, http.StatusOK)
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
+		t.Fatalf("Content-Type: got %q, want application/json", ct)
+	}
+
+	var got []pkgmodelsdyn.PostMetadata
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("response is not a JSON array: %v", err)
+	}
+	if len(got) != 1 || got[0].Id != "post-1" || got[0].Creation != "2026-03-01" || got[0].Tags[1] != "example" {
+		t.Fatalf("unexpected posts payload: %+v", got)
+	}
 }
 
 func TestDynamicBlogDataHandler_ServesProjects(t *testing.T) {
@@ -74,7 +99,7 @@ func TestDynamicBlogDataHandler_ServesAuthorContacts(t *testing.T) {
 func TestDynamicBlogDataHandler_NilProviderServesEmptyArrays(t *testing.T) {
 	h := NewDynamicBlogDataHandler(nil)
 
-	for _, path := range []string{"/api/dyn/projects", "/api/dyn/authorcontacts"} {
+	for _, path := range []string{"/api/dyn/posts", "/api/dyn/projects", "/api/dyn/authorcontacts"} {
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
 

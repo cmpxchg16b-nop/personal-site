@@ -39,28 +39,10 @@
   },
   "posts": {
     "title": "Posts",
-    "subtitle": "Occasional writing about software and other things. These are placeholder entries.",
+    "subtitle": "Occasional writing about software and other things.",
+    "loadFailed": "Failed to load the posts.",
     "read": "Read",
-    "items": [
-      {
-        "title": "Your first post title",
-        "date": "2026-03-01",
-        "excerpt": "A one- or two-sentence summary of the post goes here. It is clamped to two lines on the card, just like a real excerpt would be.",
-        "tags": ["meta", "example"]
-      },
-      {
-        "title": "Another post title",
-        "date": "2026-02-14",
-        "excerpt": "Another placeholder excerpt. Swap these entries for your real posts once the blog is wired up.",
-        "tags": ["notes"]
-      },
-      {
-        "title": "A third post title",
-        "date": "2026-01-20",
-        "excerpt": "One more placeholder excerpt to show how a longer list of posts looks on the page.",
-        "tags": ["example"]
-      }
-    ]
+    "updated": "Updated {{date}}"
   },
   "projects": {
     "title": "Projects",

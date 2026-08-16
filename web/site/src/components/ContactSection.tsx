@@ -1,6 +1,6 @@
 "use client";
 
-import { Button, Stack, Typography } from "@mui/material";
+import { Button, LinearProgress, Stack } from "@mui/material";
 import EmailOutlinedIcon from "@mui/icons-material/EmailOutlined";
 import GitHubIcon from "@mui/icons-material/GitHub";
 import PublicIcon from "@mui/icons-material/Public";
@@ -32,7 +32,7 @@ export default function ContactSection() {
       subtitle={isError ? t("contact.loadFailed") : t("contact.subtitle")}
     >
       {isPending ? (
-        <Typography>…</Typography>
+        <LinearProgress sx={{ mt: 2 }} />
       ) : (
         !isError &&
         contacts.length > 0 && (

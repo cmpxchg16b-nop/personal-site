@@ -58,12 +58,21 @@
     />
   </loginOptions>
 
-  <!-- The site's dynamic blog data (optional): projects and author contacts
-       served to the frontend as JSON under /api/dyn/ (see pkg/api/dyn).
-       Re-read from this document on every request, so edits apply without a
-       server restart. A project's tech attribute is a comma-separated list.
-       Every entry carries a unique id. -->
+  <!-- The site's dynamic blog data (optional): post metadata, projects, and
+       author contacts served to the frontend as JSON under /api/dyn/ (see
+       pkg/api/dyn). Re-read from this document on every request, so edits
+       apply without a server restart. A project's tech attribute and a
+       post's tags attribute are comma-separated lists. Every entry carries
+       a unique id. -->
   <dynBlogData>
+    <postMetadata
+      id="your-first-post"
+      href="/posts/your-first-post"
+      title="Your first post title"
+      description="A one- or two-sentence summary of the post goes here."
+      creation="2026-03-01"
+      tags="meta,example"
+    />
     <project
       id="project-one"
       name="Project One"

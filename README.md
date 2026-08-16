@@ -21,18 +21,21 @@ My personal site and blog, built with simplicity and brevity in mind.
 
 ## Dynamic blog data
 
-The lists a blog-style site changes often — projects, author contacts — are
-served by the Go backend from the global configuration document, so they can
-be edited without rebuilding the frontend:
+The lists a blog-style site changes often — post metadata, projects, author
+contacts — are served by the Go backend from the global configuration
+document, so they can be edited without rebuilding the frontend:
 
 - **Authored in XML.** The `<dynBlogData/>` section of `serverConfig.xml`
-  (validated against `serverConfig.xsd`) holds zero or more `<project/>`
-  entries (`id`, `name`, `description`, `url`, optional comma-separated
-  `tech`) and zero or more `<authorContact/>` entries (`id`, `kind`, `label`,
-  `url`). Every entry carries a unique `id`.
+  (validated against `serverConfig.xsd`) holds zero or more of each entry
+  kind: `<postMetadata/>` (`id`, `href`, `title`, `description`, `creation`,
+  optional `lastModified` — all dates ISO `YYYY-MM-DD` — and optional
+  comma-separated `tags`), `<project/>` (`id`, `name`, `description`, `url`,
+  optional comma-separated `tech`), and `<authorContact/>` (`id`, `kind`,
+  `label`, `url`). Every entry carries a unique `id`.
 - **Served under `/api/dyn/`.** `DynamicBlogDataHandler` in `pkg/api/dyn`
-  routes the subtree internally: `GET /api/dyn/projects` and `GET
-/api/dyn/authorcontacts`, each returning a JSON array.
+  routes the subtree internally: `GET /api/dyn/posts`, `GET
+/api/dyn/projects`, and `GET /api/dyn/authorcontacts`, each returning a
+  JSON array.
 - **Read on the fly.** The handler asks a `DynBlogDataProvider`
   (`pkg/models/dyn`) for the data on every request. The shipped
   implementation, `FSBasedDynBlogData`, keeps only the configuration file's
@@ -41,8 +44,8 @@ be edited without rebuilding the frontend:
 - **Wired unconditionally.** `main.go` mounts the handler at `/api/dyn/`
   even without `--config-xml`; the endpoints then serve empty lists.
 
-The frontend's Projects and Contact sections fetch these endpoints at
-runtime, so editing `serverConfig.xml` updates the rendered page with no
+The frontend's Posts, Projects, and Contact sections fetch these endpoints
+at runtime, so editing `serverConfig.xml` updates the rendered page with no
 frontend rebuild and no server restart.
 
 ## Layout
@@ -107,9 +110,9 @@ container, e.g. `-v "$PWD/serverConfig.xml:/app/serverConfig.xml"` and
 
 ## Making it yours
 
-- Site copy (name, tagline, about, posts):
+- Site copy (name, tagline, about paragraphs):
   `web/site/src/i18n/locales/en.json` and `zh.json`.
-- Projects and author contacts: the `<dynBlogData/>` section of
+- Posts, projects, and author contacts: the `<dynBlogData/>` section of
   `serverConfig.xml`, served live under `/api/dyn/`.
 - The hard-coded visitor identity: `pkg/session`
   (`StaticVisitorSessionManager`).

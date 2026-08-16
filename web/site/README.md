@@ -18,11 +18,11 @@ so run `go run ./cmd/server` from the repository root alongside it.
 ## Site content
 
 Static copy lives in the translation bundles (`src/i18n/locales/en.json`,
-`src/i18n/locales/zh.json`): the owner's name, tagline, about paragraphs,
-and post cards. The projects and contact sections are dynamic — they fetch
-`GET /api/dyn/projects` and `GET /api/dyn/authorcontacts` from the Go
-backend, which re-reads the `<dynBlogData/>` section of `serverConfig.xml`
-on every request.
+`src/i18n/locales/zh.json`): the owner's name, tagline, and about
+paragraphs. The posts, projects, and contact sections are dynamic — they
+fetch `GET /api/dyn/posts`, `GET /api/dyn/projects`, and `GET
+/api/dyn/authorcontacts` from the Go backend, which re-reads the
+`<dynBlogData/>` section of `serverConfig.xml` on every request.
 
 ## Building
 

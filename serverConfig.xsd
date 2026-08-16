@@ -173,10 +173,17 @@
     />
   </xsd:complexType>
 
-  <!-- The <dynBlogData/> section; holds zero or more <project/> entries
-       followed by zero or more <authorContact/> entries. -->
+  <!-- The <dynBlogData/> section; holds zero or more <postMetadata/>
+       entries followed by zero or more <project/> entries, followed by zero
+       or more <authorContact/> entries. -->
   <xsd:complexType name="dynBlogDataType">
     <xsd:sequence>
+      <xsd:element
+        name="postMetadata"
+        type="postMetadataType"
+        minOccurs="0"
+        maxOccurs="unbounded"
+      />
       <xsd:element
         name="project"
         type="projectType"
@@ -190,6 +197,24 @@
         maxOccurs="unbounded"
       />
     </xsd:sequence>
+  </xsd:complexType>
+
+  <!-- A single post entry of <dynBlogData/>: the metadata of one blog post.
+       id uniquely identifies the post; href is where the card's Read button
+       navigates (a site-relative path like "/posts/hello-world" or an
+       external URL); title and description are shown on the card. creation
+       is the publication date, lastModified the date of the last edit (both
+       ISO dates, e.g. "2026-03-01"); lastModified is optional. tags is an
+       optional comma-separated list rendered as chips (e.g. "go,notes");
+       surrounding whitespace is ignored. -->
+  <xsd:complexType name="postMetadataType">
+    <xsd:attribute name="id" type="xsd:string" use="required" />
+    <xsd:attribute name="href" type="xsd:string" use="required" />
+    <xsd:attribute name="title" type="xsd:string" use="required" />
+    <xsd:attribute name="description" type="xsd:string" use="required" />
+    <xsd:attribute name="lastModified" type="xsd:date" use="optional" />
+    <xsd:attribute name="creation" type="xsd:date" use="required" />
+    <xsd:attribute name="tags" type="xsd:string" use="optional" default="" />
   </xsd:complexType>
 
   <!-- A single project entry of <dynBlogData/>. id uniquely identifies the

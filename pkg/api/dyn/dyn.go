@@ -16,6 +16,7 @@ import (
 // DynamicBlogDataHandler is an http.Handler that serves the site's dynamic
 // blog data, routing the /api/dyn/ subtree internally:
 //
+//	GET /api/dyn/posts           the blog post metadata list
 //	GET /api/dyn/projects        the project list
 //	GET /api/dyn/authorcontacts  the author-contact list
 //
@@ -32,6 +33,7 @@ type DynamicBlogDataHandler struct {
 func NewDynamicBlogDataHandler(provider pkgmodelsdyn.DynBlogDataProvider) *DynamicBlogDataHandler {
 	h := &DynamicBlogDataHandler{provider: provider}
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/dyn/posts", h.handlePosts)
 	mux.HandleFunc("GET /api/dyn/projects", h.handleProjects)
 	mux.HandleFunc("GET /api/dyn/authorcontacts", h.handleAuthorContacts)
 	h.mux = mux
@@ -49,6 +51,20 @@ func (h *DynamicBlogDataHandler) getDynBlogData() (*pkgmodelsdyn.DynBlogData, er
 		return &pkgmodelsdyn.DynBlogData{}, nil
 	}
 	return h.provider.GetDynBlogData()
+}
+
+func (h *DynamicBlogDataHandler) handlePosts(w http.ResponseWriter, r *http.Request) {
+	data, err := h.getDynBlogData()
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	// Never serialize a nil slice: the response stays a JSON array.
+	posts := data.Posts
+	if posts == nil {
+		posts = []pkgmodelsdyn.PostMetadata{}
+	}
+	writeJSON(w, posts)
 }
 
 func (h *DynamicBlogDataHandler) handleProjects(w http.ResponseWriter, r *http.Request) {

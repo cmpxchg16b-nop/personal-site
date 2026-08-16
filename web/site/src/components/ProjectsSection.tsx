@@ -6,6 +6,7 @@ import {
   Card,
   CardContent,
   Chip,
+  LinearProgress,
   List,
   ListItem,
   Typography,
@@ -31,7 +32,7 @@ export default function ProjectsSection() {
       subtitle={isError ? t("projects.loadFailed") : t("projects.subtitle")}
     >
       {isPending ? (
-        <Typography>…</Typography>
+        <LinearProgress sx={{ mt: 2 }} />
       ) : (
         !isError &&
         projects.length > 0 && (

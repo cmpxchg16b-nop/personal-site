@@ -14,9 +14,22 @@ import (
 	"strings"
 )
 
+// PostMetadata is the metadata of one blog post: what its card shows and
+// where the card links. Dates are ISO date strings (e.g. "2026-03-01");
+// LastModified is empty when the post was never edited after publication.
+type PostMetadata struct {
+	Id           string   `json:"id"`
+	Href         string   `json:"href"`
+	Title        string   `json:"title"`
+	Description  string   `json:"description"`
+	LastModified string   `json:"lastModified,omitempty"`
+	Creation     string   `json:"creation"`
+	Tags         []string `json:"tags"`
+}
+
 // Project is one entry of the site's project list. Tech holds the
 // comma-separated technologies of the entry's tech attribute, split and
-// trimmed (see parseTech).
+// trimmed (see parseCommaSeparated).
 type Project struct {
 	Id          string   `json:"id"`
 	Name        string   `json:"name"`
@@ -37,6 +50,7 @@ type AuthorContact struct {
 // DynBlogData is the whole of the site's dynamic blog data: everything the
 // <dynBlogData/> section of the server configuration document carries.
 type DynBlogData struct {
+	Posts          []PostMetadata  `json:"posts"`
 	Projects       []Project       `json:"projects"`
 	AuthorContacts []AuthorContact `json:"authorContacts"`
 }
@@ -81,8 +95,23 @@ func (p *FSBasedDynBlogData) GetDynBlogData() (*DynBlogData, error) {
 
 // dynBlogDataXML mirrors the <dynBlogData/> section of serverConfig.xml.
 type dynBlogDataXML struct {
+	Posts          []postMetadataXML  `xml:"postMetadata"`
 	Projects       []projectXML       `xml:"project"`
 	AuthorContacts []authorContactXML `xml:"authorContact"`
+}
+
+// postMetadataXML mirrors a single <postMetadata/> entry of the
+// <dynBlogData/> section of serverConfig.xml.
+type postMetadataXML struct {
+	Id           string `xml:"id,attr"`
+	Href         string `xml:"href,attr"`
+	Title        string `xml:"title,attr"`
+	Description  string `xml:"description,attr"`
+	LastModified string `xml:"lastModified,attr"`
+	Creation     string `xml:"creation,attr"`
+	// Tags is the raw comma-separated tags attribute; an empty string means
+	// no tags.
+	Tags string `xml:"tags,attr"`
 }
 
 // projectXML mirrors a single <project/> entry of the <dynBlogData/>
@@ -108,8 +137,20 @@ type authorContactXML struct {
 
 func (x dynBlogDataXML) toDynBlogData() *DynBlogData {
 	data := &DynBlogData{
+		Posts:          make([]PostMetadata, 0, len(x.Posts)),
 		Projects:       make([]Project, 0, len(x.Projects)),
 		AuthorContacts: make([]AuthorContact, 0, len(x.AuthorContacts)),
+	}
+	for _, p := range x.Posts {
+		data.Posts = append(data.Posts, PostMetadata{
+			Id:           p.Id,
+			Href:         p.Href,
+			Title:        p.Title,
+			Description:  p.Description,
+			LastModified: p.LastModified,
+			Creation:     p.Creation,
+			Tags:         parseCommaSeparated(p.Tags),
+		})
 	}
 	for _, p := range x.Projects {
 		data.Projects = append(data.Projects, Project{
@@ -117,7 +158,7 @@ func (x dynBlogDataXML) toDynBlogData() *DynBlogData {
 			Name:        p.Name,
 			Description: p.Description,
 			URL:         p.URL,
-			Tech:        parseTech(p.Tech),
+			Tech:        parseCommaSeparated(p.Tech),
 		})
 	}
 	for _, c := range x.AuthorContacts {
@@ -131,15 +172,15 @@ func (x dynBlogDataXML) toDynBlogData() *DynBlogData {
 	return data
 }
 
-// parseTech parses the comma-separated tech attribute of a <project/> entry
-// into a list of technologies. An empty string yields a nil (empty) list;
+// parseCommaSeparated parses a comma-separated attribute (a project's tech,
+// a post's tags) into a list. An empty string yields a nil (empty) list;
 // surrounding whitespace is ignored.
-func parseTech(s string) []string {
-	var tech []string
+func parseCommaSeparated(s string) []string {
+	var list []string
 	for part := range strings.SplitSeq(s, ",") {
 		if t := strings.TrimSpace(part); t != "" {
-			tech = append(tech, t)
+			list = append(list, t)
 		}
 	}
-	return tech
+	return list
 }
