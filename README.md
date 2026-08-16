@@ -123,3 +123,5 @@ container, e.g. `-v "$PWD/serverConfig.xml:/app/serverConfig.xml"` and
 1. Commenting subsystem
 2. Icons (for dark and bright variant)
 3. Math rendering (example MathML post)
+4. Support listing updates from MCP, RSS
+5. Short-link feature (server-side)
