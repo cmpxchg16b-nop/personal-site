@@ -1,6 +1,6 @@
 name: build
 
-# Builds the single-binary exam-server (4 platforms) and a single multi-arch
+# Builds the single-binary personal-site (4 platforms) and a single multi-arch
 # OCI image (linux/amd64 + linux/arm64) whenever code lands on main.
 #
 # The web assets (Next.js static export) are embedded into the Go binary at
@@ -26,7 +26,7 @@ env:
   NODE_VERSION: "22"
 
 jobs:
-  # Build the Next.js static export (web/exam-lab/out) once. This directory is
+  # Build the Next.js static export (web/site/out) once. This directory is
   # gitignored and therefore absent from a fresh checkout, but the Go binary's
   # //go:embed directive requires it to exist at compile time.
   build-web:
@@ -39,10 +39,10 @@ jobs:
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: npm
-          cache-dependency-path: web/exam-lab/package-lock.json
+          cache-dependency-path: web/site/package-lock.json
 
       - name: Build Next.js static export
-        working-directory: web/exam-lab
+        working-directory: web/site
         run: |
           npm ci
           npm run build
@@ -53,7 +53,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: web-out
-          path: web/exam-lab/out
+          path: web/site/out
           retention-days: 1
 
   # Run the whole test suite (unit + e2e) with coverage, then publish the
@@ -77,7 +77,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: web-out
-          path: web/exam-lab/out
+          path: web/site/out
 
       - uses: actions/setup-go@v5
         with:
@@ -141,7 +141,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: web-out
-          path: web/exam-lab/out
+          path: web/site/out
 
       - uses: actions/setup-go@v5
         with:
@@ -155,14 +155,14 @@ jobs:
           CGO_ENABLED: "0"
         run: |
           mkdir -p bin
-          go build -trimpath -ldflags="-s -w" -o bin/exam-server ./cmd/server
-          file bin/exam-server
+          go build -trimpath -ldflags="-s -w" -o bin/personal-site ./cmd/server
+          file bin/personal-site
 
       - name: Upload binary
         uses: actions/upload-artifact@v4
         with:
-          name: exam-server-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: bin/exam-server
+          name: personal-site-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: bin/personal-site
 
   # Build a single multi-arch OCI image (linux/amd64 + linux/arm64) and push it
   # to GHCR under one tag. The Dockerfile uses $BUILDPLATFORM + Go cross-
@@ -178,7 +178,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: web-out
-          path: web/exam-lab/out
+          path: web/site/out
 
       - name: Login to GHCR
         uses: docker/login-action@v3

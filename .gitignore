@@ -1,13 +1,7 @@
 .DS_Store
-pkg/.DS_Store
-assets/9b44f37d-60b7-4b05-82db-2effb6aa58d6.jpg
-assets/37ba164c-5f4d-4d0f-9a2a-6f2a46d200e5.png
-exams/cisco1.xml
-exams/cisco2.xml
-bin/server
+bin/
 .env
 .env.local
 serverConfig.xml
 signing/key.pem
-getquestion.js
-getquestions1.js
+coverage.out

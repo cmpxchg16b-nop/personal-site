@@ -14,8 +14,7 @@ export default function AboutSection() {
       {paragraphs.map((paragraph, i) => (
         <Typography
           key={i}
-          paragraph={i < paragraphs.length - 1}
-          sx={{ maxWidth: 720 }}
+          sx={{ maxWidth: 720, mb: i < paragraphs.length - 1 ? 2 : 0 }}
         >
           {paragraph}
         </Typography>

@@ -1,11 +1,11 @@
 # The multi-stage Dockerfile needs the Go source and the pre-built web export
-# (web/exam-lab/out) for //go:embed. Exclude everything else to shrink context.
+# (web/site/out) for //go:embed. Exclude everything else to shrink context.
 .git
 .github
 **/node_modules
-web/exam-lab/.next
-web/exam-lab/src
-web/exam-lab/public
-web/exam-lab/tsconfig.tsbuildinfo
+web/site/.next
+web/site/src
+web/site/public
+web/site/tsconfig.tsbuildinfo
 bin/
 **/.DS_Store
