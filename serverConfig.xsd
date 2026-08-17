@@ -1,4 +1,4 @@
-<?xml version="1.0" encoding="UTF-8" ?>
+<?xml version="1.0" encoding="UTF-8"?>
 <!-- Schema for serverConfig.xml, the global server configuration document.
      The XML instance references this schema via
      xsi:noNamespaceSchemaLocation="serverConfig.xsd". -->
@@ -68,8 +68,8 @@
     <xsd:attribute name="href" type="xsd:string" use="required" />
     <xsd:attribute name="title" type="xsd:string" use="required" />
     <xsd:attribute name="description" type="xsd:string" use="required" />
-    <xsd:attribute name="lastModified" type="xsd:date" use="optional" />
-    <xsd:attribute name="creation" type="xsd:date" use="required" />
+    <xsd:attribute name="lastModified" type="xsd:string" use="optional" />
+    <xsd:attribute name="creation" type="xsd:string" use="required" />
     <xsd:attribute name="tags" type="xsd:string" use="optional" default="" />
   </xsd:complexType>
 

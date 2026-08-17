@@ -24,6 +24,10 @@ const nextConfig = (phase: string): NextConfig => {
         source: "/assets/:path*",
         destination: "http://localhost:8080/assets/:path*",
       },
+      {
+        source: "/links/:path*",
+        destination: "http://localhost:8080/links/:path*",
+      },
     ];
   }
 
