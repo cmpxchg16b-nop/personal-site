@@ -1,9 +1,9 @@
-name: dn42-examserver
+name: dn42-personal-site
 volumes:
   caddydata:
 services:
   web:
-    container_name: dn42-examserver-caddy
+    container_name: dn42-personal-site
     image: docker.io/library/caddy:latest
     environment:
       - "ACME_CONTACT_EMAIL=i@exploro.one"
