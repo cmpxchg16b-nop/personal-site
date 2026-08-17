@@ -205,6 +205,32 @@ func TestWithOverallLog(t *testing.T) {
 		})
 	}
 
+	t.Run("referer is recorded when the header is present", func(t *testing.T) {
+		logger, buf := newRecordLogger()
+		h := pkglog.WithOverallLog(logger, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+
+		r := httptest.NewRequest(http.MethodGet, "/landing", nil)
+		r.Header.Set("Referer", "https://example.com/source")
+		h.ServeHTTP(httptest.NewRecorder(), r)
+
+		rec := decodeRecord(t, buf)
+		if got := rec["referer"]; got != "https://example.com/source" {
+			t.Errorf("referer = %v, want https://example.com/source", got)
+		}
+	})
+
+	t.Run("referer is an empty string when the header is absent", func(t *testing.T) {
+		logger, buf := newRecordLogger()
+		h := pkglog.WithOverallLog(logger, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+
+		h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/direct", nil))
+
+		rec := decodeRecord(t, buf)
+		if got := rec["referer"]; got != "" {
+			t.Errorf("referer = %v, want the empty string (key always present)", got)
+		}
+	})
+
 	t.Run("record is written only after the handler completes", func(t *testing.T) {
 		logger, buf := newRecordLogger()
 		h := pkglog.WithOverallLog(logger, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

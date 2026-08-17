@@ -108,10 +108,11 @@ func WithHTTPLog(logger *slog.Logger, h http.Handler) http.Handler {
 
 // WithOverallLog wraps h so that an access record is emitted after the handler
 // completes. Unlike WithHTTPLog (which logs on request entry), this records the
-// request's outcome, appending the response status, bytes written, and duration
-// as extra attributes. Because it runs after h.ServeHTTP, the status-based log
-// level reflects the actual response: Error for 5xx, Warn for 4xx, Info
-// otherwise. A nil logger falls back to slog.Default().
+// request's outcome, appending the request's Referer (an empty string when the
+// header is absent), the response status, bytes written, and duration as extra
+// attributes. Because it runs after h.ServeHTTP, the status-based log level
+// reflects the actual response: Error for 5xx, Warn for 4xx, Info otherwise. A
+// nil logger falls back to slog.Default().
 func WithOverallLog(logger *slog.Logger, h http.Handler) http.Handler {
 	if logger == nil {
 		logger = slog.Default()
@@ -120,11 +121,15 @@ func WithOverallLog(logger *slog.Logger, h http.Handler) http.Handler {
 		start := time.Now()
 		rw := &responseWriter{ResponseWriter: w, status: http.StatusOK}
 		h.ServeHTTP(rw, r)
-		accessLog(logger, r, rw,
+		extra := []slog.Attr{
+			slog.String("referer", r.Referer()),
+		}
+		extra = append(extra,
 			slog.Int("status", rw.status),
 			slog.Int("bytes", rw.bytes),
 			slog.Duration("duration", time.Since(start)),
 		)
+		accessLog(logger, r, rw, extra...)
 	})
 }
 
