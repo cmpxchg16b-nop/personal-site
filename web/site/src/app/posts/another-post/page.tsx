@@ -1,3 +1,5 @@
+"use client";
+
 import PostView from "@/components/PostView";
 import { CodeBlock, H2, Li, Ol, P, Quote } from "@/components/prose";
 

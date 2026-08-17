@@ -35,8 +35,10 @@ document, so they can be edited without rebuilding the frontend:
   `label`, `url`). Every entry carries a unique `id`.
 - **Served under `/api/dyn/`.** `DynamicBlogDataHandler` in `pkg/api/dyn`
   routes the subtree internally: `GET /api/dyn/posts`, `GET
-/api/dyn/projects`, and `GET /api/dyn/authorcontacts`, each returning a
-  JSON array.
+/api/dyn/posts/{id}` (a single post's metadata, 404 when the id is
+  unknown — post pages query it instead of downloading the whole list),
+  `GET /api/dyn/projects`, and `GET /api/dyn/authorcontacts`. The list
+  endpoints return JSON arrays.
 - **Read on the fly.** The handler asks a `DynBlogDataProvider`
   (`pkg/models/dyn`) for the data on every request. The shipped
   implementation, `FSBasedDynBlogData`, keeps only the configuration file's

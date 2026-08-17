@@ -1,3 +1,5 @@
+"use client";
+
 import PostView from "@/components/PostView";
 import {
   Code,

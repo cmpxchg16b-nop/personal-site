@@ -3,9 +3,10 @@
 import { useQuery } from "@tanstack/react-query";
 
 // Wire types mirroring the JSON served by the Go backend's pkg/api/dyn:
-// GET /api/dyn/posts, GET /api/dyn/projects, and GET
-// /api/dyn/authorcontacts, sourced from the <dynBlogData/> section of the
-// server configuration document and re-read on every request server-side.
+// GET /api/dyn/posts, GET /api/dyn/posts/{id}, GET /api/dyn/projects, and
+// GET /api/dyn/authorcontacts, sourced from the <dynBlogData/> section of
+// the server configuration document and re-read on every request
+// server-side.
 export type DynPost = {
   id: string;
   href: string;
@@ -46,6 +47,28 @@ export function useDynPosts() {
   return useQuery({
     queryKey: ["dyn", "posts"],
     queryFn: () => fetchJson<DynPost[]>("/api/dyn/posts"),
+  });
+}
+
+// useDynPost fetches GET /api/dyn/posts/{id}: a single post's metadata —
+// the bandwidth-efficient query for post pages, which need one entry, not
+// the whole list. A 404 (no entry for the id) resolves to null rather than
+// throwing, so a post without a metadata entry renders its body alone,
+// without an error alert; other failures still throw.
+export function useDynPost(postId: string) {
+  const path = `/api/dyn/posts/${postId}`;
+  return useQuery({
+    queryKey: ["dyn", "posts", postId],
+    queryFn: async (): Promise<DynPost | null> => {
+      const res = await fetch(path);
+      if (res.status === 404) {
+        return null;
+      }
+      if (!res.ok) {
+        throw new Error(`GET ${path} failed: ${res.status}`);
+      }
+      return res.json();
+    },
   });
 }
 

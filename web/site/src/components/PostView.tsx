@@ -1,93 +1,52 @@
 "use client";
 
-import {
-  Alert,
-  Box,
-  Chip,
-  Divider,
-  LinearProgress,
-  Typography,
-} from "@mui/material";
-import { useTranslation } from "react-i18next";
-import { localeTagFor } from "@/i18n";
-import { useDynPosts } from "@/hooks/useDynBlogData";
+import { Children, isValidElement } from "react";
+import { Box } from "@mui/material";
+import PostDivider from "./PostDivider";
+import PostDynHeader from "./PostDynHeader";
+import PostHeader from "./PostHeader";
 
 type PostViewProps = {
-  // The post's id in the <dynBlogData/> section of serverConfig.xml — the
-  // single source of truth for the title, dates, and tags rendered here.
+  // The post's id in the <dynBlogData/> section of serverConfig.xml —
+  // forwarded to PostDynHeader, which fetches and renders the post's
+  // server-configured metadata.
   postId: string;
   // The post's body, authored with the building blocks from
-  // src/components/prose.tsx.
+  // src/components/prose.tsx. May include one PostHeader element (see
+  // below) to replace the server-driven header.
   children: React.ReactNode;
 };
 
-// PostView is the shared shell of every post page: a header built from the
-// post's server-configured metadata (title, the same date/tag chips as the
-// Posts cards, and the description as a lead paragraph), a divider, then the
-// page's authored body. The header fills in once /api/dyn/posts answers —
-// the same pattern the home sections use. If the metadata request fails (or
-// has no entry for this id), the body still renders on its own.
+// PostView is the shared shell of every post page: the header, a divider,
+// then the page's authored body.
+//
+// The header is the server-driven PostDynHeader unless the page authors its
+// own: when a PostHeader element appears among the direct children, it is
+// lifted out of the body into the header slot (identified by element type
+// at render time, so it must be a direct child — not wrapped in a fragment
+// or another component) and PostDynHeader, including its
+// /api/dyn/posts/{id} request, is skipped entirely. PostDivider always sits
+// between header and body, so an authored header needs no manual <Hr/>.
+//
+// Element type identity only holds when the page is itself a client module:
+// a server component's children cross the RSC boundary as client references
+// that no longer === PostHeader. Post pages must therefore start with
+// "use client" (the site is fully client-rendered anyway).
 export default function PostView({ postId, children }: PostViewProps) {
-  const { t, i18n } = useTranslation();
-  const { data: posts, isPending, isError } = useDynPosts();
-  const post = posts?.find((p) => p.id === postId);
-  const dateFmt = new Intl.DateTimeFormat(localeTagFor(i18n.language), {
-    dateStyle: "medium",
-  });
-
-  // Same rule as the post cards: an edited post shows only when it was last
-  // updated; the creation date adds noise.
-  const updated =
-    post !== undefined &&
-    post.lastModified !== undefined &&
-    post.lastModified !== post.creation;
+  const kids = Children.toArray(children);
+  const authoredHeader = kids.find(
+    (child) => isValidElement(child) && child.type === PostHeader,
+  );
+  const body =
+    authoredHeader === undefined
+      ? kids
+      : kids.filter((child) => child !== authoredHeader);
 
   return (
     <Box component="article">
-      {isPending ? (
-        <LinearProgress sx={{ mb: 4 }} />
-      ) : isError ? (
-        <Alert severity="warning" sx={{ mb: 4 }}>
-          {t("posts.loadFailed")}
-        </Alert>
-      ) : post ? (
-        <Box component="header" sx={{ mb: 4 }}>
-          <Typography
-            variant="h4"
-            component="h1"
-            sx={{ fontWeight: 500 }}
-            gutterBottom
-          >
-            {post.title}
-          </Typography>
-          <Box sx={{ display: "flex", flexWrap: "wrap", gap: 0.5, mb: 2 }}>
-            {updated ? (
-              <Chip
-                label={t("posts.updated", {
-                  date: dateFmt.format(new Date(post.lastModified!)),
-                })}
-                size="small"
-                variant="outlined"
-              />
-            ) : (
-              <Chip
-                label={dateFmt.format(new Date(post.creation))}
-                size="small"
-              />
-            )}
-            {post.tags.map((tag) => (
-              <Chip key={tag} label={tag} size="small" />
-            ))}
-          </Box>
-          <Typography color="text.secondary">{post.description}</Typography>
-        </Box>
-      ) : null}
-      {/* Separate the header (or its error stand-in) from the body; when the
-          post has no metadata entry the body stands alone. */}
-      {(post !== undefined || isError) && !isPending && (
-        <Divider sx={{ mb: 4 }} />
-      )}
-      {children}
+      {authoredHeader ?? <PostDynHeader postId={postId} />}
+      <PostDivider />
+      {body}
     </Box>
   );
 }

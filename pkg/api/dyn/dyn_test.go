@@ -55,6 +55,39 @@ func TestDynamicBlogDataHandler_ServesPosts(t *testing.T) {
 	}
 }
 
+func TestDynamicBlogDataHandler_ServesPostById(t *testing.T) {
+	h := NewDynamicBlogDataHandler(stubProvider{data: testData})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/dyn/posts/post-1", nil))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status: got %d, want %d", rec.Code, http.StatusOK)
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
+		t.Fatalf("Content-Type: got %q, want application/json", ct)
+	}
+
+	var got pkgmodelsdyn.PostMetadata
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("response is not a JSON object: %v", err)
+	}
+	if got.Id != "post-1" || got.Title != "First Post" || got.Creation != "2026-03-01" || len(got.Tags) != 2 {
+		t.Fatalf("unexpected post payload: %+v", got)
+	}
+}
+
+func TestDynamicBlogDataHandler_PostByIdUnknownId(t *testing.T) {
+	h := NewDynamicBlogDataHandler(stubProvider{data: testData})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/dyn/posts/nope", nil))
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status: got %d, want %d", rec.Code, http.StatusNotFound)
+	}
+}
+
 func TestDynamicBlogDataHandler_ServesProjects(t *testing.T) {
 	h := NewDynamicBlogDataHandler(stubProvider{data: testData})
 
@@ -110,23 +143,32 @@ func TestDynamicBlogDataHandler_NilProviderServesEmptyArrays(t *testing.T) {
 			t.Fatalf("GET %s: body: got %q, want %q", path, body, "[]\n")
 		}
 	}
+
+	// With no provider configured, every post id answers 404.
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/dyn/posts/post-1", nil))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("GET /api/dyn/posts/post-1: status: got %d, want %d", rec.Code, http.StatusNotFound)
+	}
 }
 
 func TestDynamicBlogDataHandler_ProviderError(t *testing.T) {
 	h := NewDynamicBlogDataHandler(stubProvider{err: errors.New("boom")})
 
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/dyn/projects", nil))
+	for _, path := range []string{"/api/dyn/projects", "/api/dyn/posts/post-1"} {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
 
-	if rec.Code != http.StatusInternalServerError {
-		t.Fatalf("status: got %d, want %d", rec.Code, http.StatusInternalServerError)
-	}
-	var got pkgutils.ErrorResponse
-	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
-		t.Fatalf("response is not an error object: %v", err)
-	}
-	if got.Error != "boom" {
-		t.Fatalf("unexpected error payload: %+v", got)
+		if rec.Code != http.StatusInternalServerError {
+			t.Fatalf("GET %s: status: got %d, want %d", path, rec.Code, http.StatusInternalServerError)
+		}
+		var got pkgutils.ErrorResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+			t.Fatalf("GET %s: response is not an error object: %v", path, err)
+		}
+		if got.Error != "boom" {
+			t.Fatalf("GET %s: unexpected error payload: %+v", path, got)
+		}
 	}
 }
 

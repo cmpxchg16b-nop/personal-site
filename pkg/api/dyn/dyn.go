@@ -17,6 +17,9 @@ import (
 // blog data, routing the /api/dyn/ subtree internally:
 //
 //	GET /api/dyn/posts           the blog post metadata list
+//	GET /api/dyn/posts/{id}      a single post's metadata (404 when the id is
+//	                             unknown) — lets post pages query one post
+//	                             without downloading the whole list
 //	GET /api/dyn/projects        the project list
 //	GET /api/dyn/authorcontacts  the author-contact list
 //
@@ -29,11 +32,13 @@ type DynamicBlogDataHandler struct {
 }
 
 // NewDynamicBlogDataHandler constructs a DynamicBlogDataHandler serving the
-// data from provider. A nil provider serves empty JSON arrays.
+// data from provider. A nil provider serves empty JSON arrays, and 404 for
+// every post id.
 func NewDynamicBlogDataHandler(provider pkgmodelsdyn.DynBlogDataProvider) *DynamicBlogDataHandler {
 	h := &DynamicBlogDataHandler{provider: provider}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/dyn/posts", h.handlePosts)
+	mux.HandleFunc("GET /api/dyn/posts/{id}", h.handlePostById)
 	mux.HandleFunc("GET /api/dyn/projects", h.handleProjects)
 	mux.HandleFunc("GET /api/dyn/authorcontacts", h.handleAuthorContacts)
 	h.mux = mux
@@ -65,6 +70,24 @@ func (h *DynamicBlogDataHandler) handlePosts(w http.ResponseWriter, r *http.Requ
 		posts = []pkgmodelsdyn.PostMetadata{}
 	}
 	writeJSON(w, posts)
+}
+
+// handlePostById serves the single post whose id matches the {id} path
+// segment, or 404 when no such post exists.
+func (h *DynamicBlogDataHandler) handlePostById(w http.ResponseWriter, r *http.Request) {
+	data, err := h.getDynBlogData()
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	id := r.PathValue("id")
+	for _, p := range data.Posts {
+		if p.Id == id {
+			writeJSON(w, p)
+			return
+		}
+	}
+	http.NotFound(w, r)
 }
 
 func (h *DynamicBlogDataHandler) handleProjects(w http.ResponseWriter, r *http.Request) {
