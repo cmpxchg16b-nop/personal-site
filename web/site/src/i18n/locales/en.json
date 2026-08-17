@@ -50,6 +50,17 @@
     "subtitle": "Feel free to reach out through any of these.",
     "loadFailed": "Failed to load the contact entries."
   },
+  "comments": {
+    "title": "Comments",
+    "loadFailed": "Failed to load the comments.",
+    "empty": "No comments yet — be the first.",
+    "name": "Name",
+    "nameRequired": "Please enter a name.",
+    "content": "Your comment",
+    "submit": "Send",
+    "postFailed": "Failed to post the comment. Please try again.",
+    "conflict": "Someone else commented while you were writing. Your comment was not posted — please try again."
+  },
   "footer": {
     "copyright": "© {{year}} {{name}}",
     "builtWith": "Built with Next.js and MUI."

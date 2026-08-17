@@ -9,10 +9,12 @@ import (
 	"time"
 
 	personalsite "personal-site"
+	pkgapicomments "personal-site/pkg/api/comments"
 	pkgapidyn "personal-site/pkg/api/dyn"
 	pkgapilinks "personal-site/pkg/api/links"
 	pkgapiprofile "personal-site/pkg/api/profile"
 	pkglog "personal-site/pkg/log"
+	pkgmodelscomment "personal-site/pkg/models/comment"
 	pkgmodelsdyn "personal-site/pkg/models/dyn"
 	pkgmodelsshortlink "personal-site/pkg/models/shortlink"
 	pkgsession "personal-site/pkg/session"
@@ -74,6 +76,12 @@ func (cli *CLI) Run() error {
 		shortLinkProvider = pkgmodelsshortlink.NewFsShortLinkDataProvider(cli.ConfigXML)
 	}
 	mux.Handle("/links/", pkgapilinks.NewShortLinkHandler(shortLinkProvider))
+
+	// The comments endpoints store and serve channel comments. There is no
+	// authentication yet — the API trusts the client-supplied user id, so
+	// anyone can comment in the name of anyone else — and comments live in
+	// process memory only, so they are lost on restart.
+	mux.Handle("/api/comments/", pkgapicomments.NewCommentsHandler(pkgmodelscomment.NewOnMemoryCommentProvider()))
 
 	// Everything else is the embedded Next.js static export.
 	mux.Handle("/", personalsite.Handler())

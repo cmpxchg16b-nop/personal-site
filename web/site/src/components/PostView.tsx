@@ -1,7 +1,8 @@
 "use client";
 
 import { Children, isValidElement } from "react";
-import { Box } from "@mui/material";
+import { Box, Divider } from "@mui/material";
+import CommentZone from "./CommentZone";
 import PostDivider from "./PostDivider";
 import PostDynHeader from "./PostDynHeader";
 import PostHeader from "./PostHeader";
@@ -18,7 +19,8 @@ type PostViewProps = {
 };
 
 // PostView is the shared shell of every post page: the header, a divider,
-// then the page's authored body.
+// then the page's authored body, and finally a CommentZone — its comment
+// channel defaults to "pathname:<the page's pathname>".
 //
 // The header is the server-driven PostDynHeader unless the page authors its
 // own: when a PostHeader element appears among the direct children, it is
@@ -47,6 +49,7 @@ export default function PostView({ postId, children }: PostViewProps) {
       {authoredHeader ?? <PostDynHeader postId={postId} />}
       <PostDivider />
       {body}
+      <CommentZone />
     </Box>
   );
 }
