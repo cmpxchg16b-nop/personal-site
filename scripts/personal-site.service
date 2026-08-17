@@ -1,0 +1,26 @@
+# systemd unit for personal-site.
+# Generated from scripts/personal-site.service by
+# scripts/install-systemd-service.sh; edit the template, then re-run the
+# installer instead of modifying the installed copy.
+
+[Unit]
+Description=personal-site - personal blog site
+Documentation=https://github.com/cmpxchg16b-nop/personal-site
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@SERVICE_USER@
+WorkingDirectory=@PROJECT_DIR@
+ExecStart=@PROJECT_DIR@/server --addr=:18972 --config-xml=serverConfig.xml
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+
+# --config-xml is relative to WorkingDirectory. The providers re-read the
+# document on every request, so editing serverConfig.xml applies without a
+# restart - no systemctl reload needed.
+
+[Install]
+WantedBy=multi-user.target
