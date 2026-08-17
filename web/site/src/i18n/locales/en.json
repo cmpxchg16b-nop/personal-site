@@ -4,8 +4,7 @@
   },
   "nav": {
     "breadcrumb": "breadcrumb",
-    "home": "Home",
-    "examSessions": "Exam Sessions"
+    "home": "Home"
   },
   "profile": {
     "visitor": "Visitor",

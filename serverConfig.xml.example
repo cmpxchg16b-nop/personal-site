@@ -1,69 +1,18 @@
 <?xml version="1.0" encoding="UTF-8" ?>
 <!-- Global server configuration, validated against serverConfig.xsd (project
-     root).
-
-     The <oidcLoginOptions/> section is consumed by the server's generic OIDC
-     login handler (pkg/api/login/oidc/general/oidcgeneral.go). Each
-     <oidcLoginOption/> configures one OIDC provider. Entries with empty
-     issuerURL are ignored by the server.
-
-     sessionLifespan is a Go time.Duration string (e.g. "168h"); when omitted
-     the handler's code-side default applies. -->
+     root). The <dynBlogData/> section is served live by the site's
+     /api/dyn/ and /links/ endpoints; the server re-reads this document on
+     every request, so edits apply without a restart. -->
 <serverConfig
   xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
   xsi:noNamespaceSchemaLocation="serverConfig.xsd"
 >
-  <oidcLoginOptions>
-    <oidcLoginOption
-      providerName="iedon"
-      issuerURL="https://auth.iedon.net"
-      clientId=""
-      clientSecret=""
-      redirectURL="http://localhost:8080/api/login/oidc/iedon/auth"
-      scope="openid profile email"
-      sessionLifespan="168h"
-      loginSuccessRedirectURL="/"
-    />
-  </oidcLoginOptions>
-
-  <!-- Outbound SMTP service for notification delivery (optional; consumed by
-       the EmailBasedMsgSvc in pkg/models/msgnotify). startTLS and tls are
-       mutually exclusive; omit both for plaintext, and omit username to skip
-       authentication.
-  <smtpServer
-    host="smtp.example.net"
-    port="587"
-    username="noreply@example.net"
-    password=""
-    startTLS="true"
-  />
-  -->
-
-  <!-- The login page's configurable IdP list (optional), served to the
-       frontend as JSON by GET /api/login/loginoptions. Options with an empty
-       loginURL are hidden by the login page. -->
-  <loginOptions>
-    <loginOption
-      kind="github"
-      name="github"
-      displayName="Github"
-      loginURL="/api/login/oauth2/github/start"
-    />
-    <loginOption
-      kind="visitor"
-      name="visitor"
-      displayName=""
-      label="Sign in as Visitor"
-      loginURL="/api/login/visitor"
-    />
-  </loginOptions>
-
   <!-- The site's dynamic blog data (optional): post metadata, projects, and
        author contacts served to the frontend as JSON under /api/dyn/ (see
-       pkg/api/dyn). Re-read from this document on every request, so edits
-       apply without a server restart. A project's tech attribute and a
-       post's tags attribute are comma-separated lists. Every entry carries
-       a unique id. -->
+       pkg/api/dyn), plus short links served as 302 redirects under /links/
+       (see pkg/api/links). A project's tech attribute and a post's tags
+       attribute are comma-separated lists. Every entry carries a unique
+       id. -->
   <dynBlogData>
     <postMetadata
       id="your-first-post"
@@ -92,9 +41,6 @@
       label="github.com/your-handle"
       url="https://github.com/your-handle"
     />
-    <!-- Short links (optional): stable short paths served as 302 redirects
-         under /links/ (see pkg/api/links): GET /links/{id} redirects to
-         href. Re-read on every request, so edits apply without a restart. -->
     <shortlink id="gh" href="https://github.com/your-handle" />
     <shortlink id="first-post" href="/posts/your-first-post" />
   </dynBlogData>

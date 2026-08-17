@@ -16,8 +16,9 @@ My personal site and blog, built with simplicity and brevity in mind.
   the static export, and answers the site's API endpoints: `GET
 /api/profile` (the caller's identity — currently the hard-coded visitor
   session supplied by `StaticVisitorSessionManager`, until a login and
-  account system exists), `GET /api/healthz`, and the dynamic blog data
-  under `/api/dyn/` (see below).
+  account system exists), `GET /api/healthz`, the dynamic blog data
+  under `/api/dyn/` (see below), and short-link redirects under `/links/`
+  (see below).
 
 ## Dynamic blog data
 
@@ -48,29 +49,48 @@ The frontend's Posts, Projects, and Contact sections fetch these endpoints
 at runtime, so editing `serverConfig.xml` updates the rendered page with no
 frontend rebuild and no server restart.
 
+## Short links
+
+Stable short paths that redirect to longer or changing destinations —
+meant for sharing, so they are served without the `/api` prefix:
+
+- **Authored in XML.** `<shortlink/>` entries of the `<dynBlogData/>`
+  section of `serverConfig.xml`, each with an `id` (the path segment) and
+  an `href` (the destination: a site-relative path like
+  `/posts/hello-world` or an absolute URL).
+- **Served under `/links/`.** `ShortLinkHandler` in `pkg/api/links`
+  answers `GET /links/{id}` with a 302 redirect to the entry's `href`, and
+  404 when the id is unknown. 302, not 301: the mapping can be edited at
+  any time, and browsers cache permanent redirects beyond such edits.
+- **Read on the fly.** The handler asks a `ShortLinkDataProvider`
+  (`pkg/models/shortlink`) on every request. The shipped implementation,
+  `FsShortLinkDataProvider`, keeps only the configuration file's path and
+  re-reads and re-parses the document per request, so edits apply without
+  a restart.
+- **Wired unconditionally.** `main.go` mounts the handler at `/links/`
+  even without `--config-xml`; every id then answers 404.
+
 ## Layout
 
 - `cmd/server/` — the Go server entrypoint (`main.go`): static export,
-  `/api/profile`, `/api/healthz`, and the `/api/dyn/` mount.
-- `pkg/` — Go packages kept from the project's previous incarnation (HTTP
-  logging middleware, session/auth helpers, and more), plus the ones added
-  for this site. They are mostly not wired into `main.go` yet, but are
-  available for future dynamic features. Notable:
+  `/api/profile`, `/api/healthz`, the `/api/dyn/` mount, and the `/links/`
+  mount.
+- `pkg/` — the Go packages behind the server's endpoints:
   - `pkg/models/dyn/` — `DynBlogData`, the `DynBlogDataProvider` interface,
     and `FSBasedDynBlogData`.
+  - `pkg/models/shortlink/` — the `ShortLinkDataProvider` interface and
+    `FsShortLinkDataProvider`.
   - `pkg/api/dyn/` — `DynamicBlogDataHandler` and `HealthzHandler`.
+  - `pkg/api/links/` — `ShortLinkHandler`, wired at `/links/`.
   - `pkg/api/profile/` — `ProfileHandler`, wired at `GET /api/profile`.
   - `pkg/session/` — the session model; hosts `StaticVisitorSessionManager`,
     the stand-in identity provider until sign-in exists.
-  - `pkg/models/serverconfig/` — the parser for `serverConfig.xml`.
+  - `pkg/log/` — the HTTP logging middleware wrapping the mux.
 - `web/site/` — the Next.js frontend (see its README).
 - `webfs.go` — embeds the frontend's static export (`web/site/out`) into the
   Go binary.
 - `serverConfig.xml` / `serverConfig.xsd` / `serverConfig.xml.example` — the
-  global configuration document, its schema, and a sample. The document also
-  still carries sections consumed by the not-yet-wired legacy packages
-  (`oidcLoginOptions`, `smtpServer`, `tlsCertKeyStore`, `loginOptions`,
-  `allowedOrigin`).
+  global configuration document, its schema, and a sample.
 
 ## Running it
 
@@ -114,6 +134,8 @@ container, e.g. `-v "$PWD/serverConfig.xml:/app/serverConfig.xml"` and
   `web/site/src/i18n/locales/en.json` and `zh.json`.
 - Posts, projects, and author contacts: the `<dynBlogData/>` section of
   `serverConfig.xml`, served live under `/api/dyn/`.
+- Short links: the `<shortlink/>` entries of that same section, served live
+  under `/links/`.
 - The hard-coded visitor identity: `pkg/session`
   (`StaticVisitorSessionManager`).
 - The favicons: `web/site/public/logo-light.png` and `logo-dark.png`.
@@ -124,4 +146,3 @@ container, e.g. `-v "$PWD/serverConfig.xml:/app/serverConfig.xml"` and
 2. Icons (for dark and bright variant)
 3. Math rendering (example MathML post)
 4. Support listing updates from MCP, RSS
-5. Short-link feature (server-side)

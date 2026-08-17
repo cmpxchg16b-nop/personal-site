@@ -9,169 +9,18 @@
   <xsd:element name="serverConfig">
     <xsd:complexType>
       <xsd:sequence>
-        <xsd:element
-          name="oidcLoginOptions"
-          type="oidcLoginOptionsType"
-          minOccurs="0"
-        />
-        <xsd:element name="smtpServer" type="smtpServerType" minOccurs="0" />
-        <!-- The X.509 certificate and private key the exam tracking server
-             uses to envelop XMLDSIG signatures into the exam report XML
-             documents attached to notification messages (see
-             OnMemoryExamTrackingServer in pkg/models/examreport). When the
-             element is absent, report attachments are sent unsigned. -->
-        <xsd:element
-          name="tlsCertKeyStore"
-          type="tlsCertKeyStoreType"
-          minOccurs="0"
-        />
-        <xsd:element
-          name="loginOptions"
-          type="loginOptionsType"
-          minOccurs="0"
-        />
-        <!-- The site's dynamic blog data: the project and author-contact
-             lists served to the frontend as JSON under /api/dyn/ (see
-             pkg/api/dyn). The server re-reads this section from the document
-             on every request (FSBasedDynBlogData in pkg/models/dyn), so
-             edits apply without a server restart. -->
+        <!-- The site's dynamic blog data: the post metadata, project, and
+             author-contact lists served to the frontend as JSON under
+             /api/dyn/ (see pkg/api/dyn), and the short links served as
+             redirects under /links/ (see pkg/api/links). The server re-reads
+             this section from the document on every request
+             (FSBasedDynBlogData in pkg/models/dyn, FsShortLinkDataProvider
+             in pkg/models/shortlink), so edits apply without a server
+             restart. -->
         <xsd:element name="dynBlogData" type="dynBlogDataType" minOccurs="0" />
-        <!-- An origin ("scheme://host") the OAuth2/OIDC login handlers trust
-             when their configured redirect URL is relative (starts with
-             "/"): the origin of the incoming login request is prepended to
-             the redirect URL only when it matches one of these entries.
-             Specify the element multiple times to allow several origins,
-             e.g. one per deployment environment alias. When no entry is
-             present, relative redirect URLs are rejected. -->
-        <xsd:element
-          name="allowedOrigin"
-          type="xsd:string"
-          minOccurs="0"
-          maxOccurs="unbounded"
-        />
       </xsd:sequence>
     </xsd:complexType>
   </xsd:element>
-
-  <!-- The configurable list of generic OIDC login providers; holds zero or
-       more oidcLoginOption entries. -->
-  <xsd:complexType name="oidcLoginOptionsType">
-    <xsd:sequence>
-      <xsd:element
-        name="oidcLoginOption"
-        type="oidcLoginOptionType"
-        minOccurs="0"
-        maxOccurs="unbounded"
-      />
-    </xsd:sequence>
-  </xsd:complexType>
-
-  <!-- A single OIDC provider configuration. Attribute names mirror the Go
-       struct fields of GenericOIDCLoginHandler (with a lowercased first
-       letter), and map directly onto the constructor parameters of
-       NewGenericOIDCLoginHandler.
-
-       Attributes with sensible code-side defaults are optional here:
-         * providerName      defaults to "oidc"
-         * scope             defaults to "openid profile email"
-         * sessionLifespan   a Go time.Duration string (e.g. "168h")
-         * loginSuccessRedirectURL  defaults to "/"
-
-       Attributes without defaults are required:
-         * issuerURL, clientId, clientSecret, redirectURL
-
-       redirectURL may be relative (start with "/"), in which case the
-       origin of the incoming request is prepended dynamically; the origin
-       must match one of the <allowedOrigin/> entries of the document. -->
-  <xsd:complexType name="oidcLoginOptionType">
-    <xsd:attribute name="issuerURL" type="xsd:string" use="required" />
-    <xsd:attribute name="clientId" type="xsd:string" use="required" />
-    <xsd:attribute name="clientSecret" type="xsd:string" use="required" />
-    <xsd:attribute name="redirectURL" type="xsd:string" use="required" />
-    <xsd:attribute name="providerName" type="xsd:string" use="optional" />
-    <xsd:attribute name="scope" type="xsd:string" use="optional" />
-    <xsd:attribute name="sessionLifespan" type="xsd:string" use="optional" />
-    <xsd:attribute
-      name="loginSuccessRedirectURL"
-      type="xsd:string"
-      use="optional"
-    />
-  </xsd:complexType>
-
-  <!-- The outbound SMTP service used to deliver notification messages,
-       consumed by EmailBasedMsgSvc in pkg/models/msgnotify.
-
-       Attributes:
-         * host, port          required; the SMTP server to connect to
-         * username, password  optional; when username is omitted the server
-                               is used without authentication
-         * startTLS            optional boolean (default false); connect in
-                               plaintext, then upgrade via a mandatory
-                               STARTTLS command
-         * tls                 optional boolean (default false); implicit TLS
-                               from the first byte ("smtps", typically
-                               port 465)
-
-       startTLS and tls are mutually exclusive; when both are false the
-       connection is plaintext. The mutual exclusion is enforced by the Go
-       wiring (XSD 1.0 cannot express it for attributes). -->
-  <xsd:complexType name="smtpServerType">
-    <xsd:attribute name="host" type="xsd:string" use="required" />
-    <xsd:attribute name="port" type="xsd:int" use="required" />
-    <xsd:attribute name="username" type="xsd:string" use="optional" />
-    <xsd:attribute name="password" type="xsd:string" use="optional" />
-    <xsd:attribute name="startTLS" type="xsd:boolean" use="optional" />
-    <xsd:attribute name="tls" type="xsd:boolean" use="optional" />
-  </xsd:complexType>
-
-  <!-- The key pair referenced by <tlsCertKeyStore/>. Both attributes are
-       required filesystem paths to PEM-encoded files, loaded with
-       tls.LoadX509KeyPair at configuration load time:
-         * certPath  the certificate (or certificate chain) file
-         * keyPath   the private key file; only RSA keys are usable for
-                     XMLDSIG signing -->
-  <xsd:complexType name="tlsCertKeyStoreType">
-    <xsd:attribute name="certPath" type="xsd:string" use="required" />
-    <xsd:attribute name="keyPath" type="xsd:string" use="required" />
-  </xsd:complexType>
-
-  <!-- The login page's configurable IdP list; holds zero or more loginOption
-       entries. Served to the frontend as JSON by the login options API
-       handler (pkg/api/loginoptions, GET /api/login/loginoptions). -->
-  <xsd:complexType name="loginOptionsType">
-    <xsd:sequence>
-      <xsd:element
-        name="loginOption"
-        type="loginOptionType"
-        minOccurs="0"
-        maxOccurs="unbounded"
-      />
-    </xsd:sequence>
-  </xsd:complexType>
-
-  <!-- A single login option. kind identifies the IdP type and selects the
-       login icon on the frontend; name is the option's unique key. Several
-       options may share a kind under different names (e.g. "entra-public"
-       and "entra-corporation", both with kind "entra"). Options with an
-       empty loginURL are hidden by the login page.
-
-       allowedOrigins is an optional comma-separated list of origins
-       ("scheme://host"); empty (the default) means no restriction. When
-       non-empty, GET /api/login/loginoptions serves the option only to
-       requests whose origin appears in the list. -->
-  <xsd:complexType name="loginOptionType">
-    <xsd:attribute name="kind" type="xsd:string" use="required" />
-    <xsd:attribute name="name" type="xsd:string" use="required" />
-    <xsd:attribute name="displayName" type="xsd:string" use="required" />
-    <xsd:attribute name="loginURL" type="xsd:string" use="required" />
-    <xsd:attribute name="label" type="xsd:string" use="optional" />
-    <xsd:attribute
-      name="allowedOrigins"
-      type="xsd:string"
-      use="optional"
-      default=""
-    />
-  </xsd:complexType>
 
   <!-- The <dynBlogData/> section; holds zero or more <postMetadata/>
        entries followed by zero or more <project/> entries, followed by zero
