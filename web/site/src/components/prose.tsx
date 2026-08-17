@@ -3,7 +3,8 @@
 import NextLink from "next/link";
 import { Box, Divider, Link as MuiLink, Typography } from "@mui/material";
 
-// The building blocks for post bodies. Posts are .tsx files: their content is
+// The building blocks for post bodies and other prose surfaces (e.g. the
+// About section's paragraphs). Posts are .tsx files: their content is
 // composed from these components (plus PostView for the header) instead of
 // bare HTML tags, so every post gets the same typography, spacing rhythm, and
 // theme-aware surfaces without repeating sx boilerplate.
@@ -62,6 +63,18 @@ export function H4({ children }: ChildrenProp) {
 export function P({ children }: ChildrenProp) {
   return (
     <Typography variant="body1" sx={{ lineHeight: 1.8, my: 2 }}>
+      {children}
+    </Typography>
+  );
+}
+
+// Narrow body paragraph clamped to a reading measure (720px), for prose
+// that would otherwise sprawl across a section's full width (e.g. the About
+// section on the home page). Consecutive NarrowPs space themselves: every
+// one carries a bottom margin except the last child of its container.
+export function NarrowP({ children }: ChildrenProp) {
+  return (
+    <Typography sx={{ maxWidth: 720, mb: 2, "&:last-child": { mb: 0 } }}>
       {children}
     </Typography>
   );

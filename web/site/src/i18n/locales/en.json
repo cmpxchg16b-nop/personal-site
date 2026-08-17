@@ -30,11 +30,7 @@
     "ctaContact": "Get in touch"
   },
   "about": {
-    "title": "About",
-    "paragraphs": [
-      "Replace this paragraph with a short bio: your background, the things you like to build, and what you are currently focused on.",
-      "Use this second paragraph for anything else — hobbies, interests outside of work, or a fun fact. It is all placeholder text, so make it yours."
-    ]
+    "title": "About"
   },
   "posts": {
     "title": "Posts",
