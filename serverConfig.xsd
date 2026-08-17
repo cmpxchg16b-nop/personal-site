@@ -175,7 +175,8 @@
 
   <!-- The <dynBlogData/> section; holds zero or more <postMetadata/>
        entries followed by zero or more <project/> entries, followed by zero
-       or more <authorContact/> entries. -->
+       or more <authorContact/> entries, followed by zero or more
+       <shortlink/> entries. -->
   <xsd:complexType name="dynBlogDataType">
     <xsd:sequence>
       <xsd:element
@@ -193,6 +194,12 @@
       <xsd:element
         name="authorContact"
         type="authorContactType"
+        minOccurs="0"
+        maxOccurs="unbounded"
+      />
+      <xsd:element
+        name="shortlink"
+        type="shortlinkType"
         minOccurs="0"
         maxOccurs="unbounded"
       />
@@ -238,6 +245,18 @@
     <xsd:attribute name="kind" type="xsd:string" use="required" />
     <xsd:attribute name="label" type="xsd:string" use="required" />
     <xsd:attribute name="url" type="xsd:string" use="required" />
+  </xsd:complexType>
+
+  <!-- A single short link entry of <dynBlogData/>, served by
+       ShortLinkHandler (pkg/api/links) under /links/. id uniquely identifies
+       the entry and is the link's path segment (GET /links/{id} redirects to
+       href); href is the destination — a site-relative path like
+       "/posts/hello-world" or an absolute URL. The server re-reads the
+       entries on every request (FsShortLinkDataProvider in
+       pkg/models/shortlink), so edits apply without a server restart. -->
+  <xsd:complexType name="shortlinkType">
+    <xsd:attribute name="id" type="xsd:string" use="required" />
+    <xsd:attribute name="href" type="xsd:string" use="required" />
   </xsd:complexType>
 
 </xsd:schema>

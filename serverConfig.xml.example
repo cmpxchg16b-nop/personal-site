@@ -92,5 +92,10 @@
       label="github.com/your-handle"
       url="https://github.com/your-handle"
     />
+    <!-- Short links (optional): stable short paths served as 302 redirects
+         under /links/ (see pkg/api/links): GET /links/{id} redirects to
+         href. Re-read on every request, so edits apply without a restart. -->
+    <shortlink id="gh" href="https://github.com/your-handle" />
+    <shortlink id="first-post" href="/posts/your-first-post" />
   </dynBlogData>
 </serverConfig>

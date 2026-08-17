@@ -10,9 +10,11 @@ import (
 
 	personalsite "personal-site"
 	pkgapidyn "personal-site/pkg/api/dyn"
+	pkgapilinks "personal-site/pkg/api/links"
 	pkgapiprofile "personal-site/pkg/api/profile"
 	pkglog "personal-site/pkg/log"
 	pkgmodelsdyn "personal-site/pkg/models/dyn"
+	pkgmodelsshortlink "personal-site/pkg/models/shortlink"
 	pkgsession "personal-site/pkg/session"
 
 	"github.com/alecthomas/kong"
@@ -60,6 +62,18 @@ func (cli *CLI) Run() error {
 		dynProvider = pkgmodelsdyn.NewFSBasedDynBlogData(cli.ConfigXML)
 	}
 	mux.Handle("/api/dyn/", pkgapidyn.NewDynamicBlogDataHandler(dynProvider))
+
+	// The short link endpoints redirect /links/{id} to the destinations of
+	// the <shortlink/> entries of the server configuration document. Like the
+	// dynamic blog data provider, the provider re-reads the document on every
+	// request, so edits apply without a restart. Mounted without the /api
+	// prefix — the paths are meant to be shared — and unconditionally: with
+	// no --config-xml every id answers 404.
+	var shortLinkProvider pkgmodelsshortlink.ShortLinkDataProvider
+	if cli.ConfigXML != "" {
+		shortLinkProvider = pkgmodelsshortlink.NewFsShortLinkDataProvider(cli.ConfigXML)
+	}
+	mux.Handle("/links/", pkgapilinks.NewShortLinkHandler(shortLinkProvider))
 
 	// Everything else is the embedded Next.js static export.
 	mux.Handle("/", personalsite.Handler())
