@@ -37,19 +37,19 @@
     <authorContact
       id="email"
       kind="email"
-      label="i@exploro.one"
+      label="Email"
       url="mailto:i@exploro.one"
     />
     <authorContact
       id="github"
       kind="github"
-      label="github.com/cmpxchg16b-nop"
+      label="Github"
       url="/links/gh"
     />
     <authorContact
       id="website"
       kind="website"
-      label="exploro.one"
+      label="Website"
       url="/links/home"
     />
     <!-- Short links, served as 302 redirects under /links/ (see

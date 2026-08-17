@@ -11,7 +11,7 @@ export default function AboutSection() {
   return (
     <Section id="about" title={t("about.title")}>
       <NarrowP>
-        关于我自己：INTP、软件开发工程师、开源项目参与者、业余计算机网络爱好者、业余无线电爱好者、CCNA、CCNP
+        关于我自己：INTP、软件开发工程师、开源项目参与者、计算机网络爱好者、业余无线电爱好者、CCNA、CCNP
         Data Center 持证者。
       </NarrowP>
       <NarrowP>
@@ -27,6 +27,16 @@ export default function AboutSection() {
       </NarrowP>
       <NarrowP>
         在工作和个人项目中，重度使用AI，力求AI参与度趋近100%，开发理念是：AI的重度参与能提升项目开发的速度和效率，减少人为引入错误的机会，AI化就是工程化。
+      </NarrowP>
+      <NarrowP>我相信，在未来，一切工作流程都会由基于AI的自动化驱动。</NarrowP>
+      <NarrowP>——手动分割线——</NarrowP>
+      <NarrowP>
+        关于站名和网名：网站的域名是 exploro.one
+        意为「探索」。网站的站名我还没想好，也许就是 exploro
+        吧？「秋信」是我随意起的一个网名，如果重复了请告诉我，我再想一个。关于头像？还没有，我也不会画画。我的
+        LDAP DN 是什么？可以是 cn=i,ou=person,dc=exploro,dc=one 也可以是
+        cn=qiuxin,ou=person,dc=exploro.one,dc=one. Never mind.
+        我的真实资料会在我的简历上。
       </NarrowP>
     </Section>
   );

@@ -23,9 +23,9 @@
   },
   "hero": {
     "greeting": "Hi, I'm {{name}}.",
-    "name": "My Name",
-    "tagline": "A short tagline goes here.",
-    "intro": "This is a placeholder introduction. Replace it with a sentence or two about who you are and what you do — for example, what you work on, what you are learning, and what you care about.",
+    "name": "qiuxin",
+    "tagline": "The Future Is AI.",
+    "intro": "Hereby keep an note of what I am thinking about that is subjected to change over time, please don't take it seriously.",
     "ctaPosts": "Read my posts",
     "ctaContact": "Get in touch"
   },
