@@ -51,7 +51,7 @@
     "loadFailed": "Failed to load the contact entries."
   },
   "footer": {
-    "copyright": "© {{year}} My Name",
+    "copyright": "© {{year}} {{name}}",
     "builtWith": "Built with Next.js and MUI."
   }
 }

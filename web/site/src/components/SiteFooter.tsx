@@ -16,7 +16,10 @@ export default function SiteFooter() {
       align="center"
       sx={{ mt: 4, mb: 2 }}
     >
-      {t("footer.copyright", { year: new Date().getFullYear() })}
+      {t("footer.copyright", {
+        year: new Date().getFullYear(),
+        name: t("hero.name"),
+      })}
       {" · "}
       {t("footer.builtWith")}
     </Typography>

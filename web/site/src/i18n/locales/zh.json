@@ -25,7 +25,7 @@
     "greeting": "你好，我是{{name}}。",
     "name": "秋信",
     "tagline": "未来属于 AI。",
-    "intro": "谨在此记录个人不成熟的、可能随着时间变化的动态观点，不建议认真的看待。",
+    "intro": "谨在此记录个人不成熟的、可能随着时间变化的动态观点，不建议认真地看待。",
     "ctaPosts": "阅读我的文章",
     "ctaContact": "联系我"
   },
@@ -51,7 +51,7 @@
     "loadFailed": "加载联系方式失败。"
   },
   "footer": {
-    "copyright": "© {{year}} 我的名字",
+    "copyright": "© {{year}} {{name}}",
     "builtWith": "使用 Next.js 与 MUI 构建。"
   }
 }
