@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"net"
@@ -13,10 +14,12 @@ import (
 	pkgapidyn "personal-site/pkg/api/dyn"
 	pkgapilinks "personal-site/pkg/api/links"
 	pkgapiprofile "personal-site/pkg/api/profile"
+	pkgapiwebsocketss "personal-site/pkg/api/websocket_ss"
 	pkglog "personal-site/pkg/log"
 	pkgmodelscomment "personal-site/pkg/models/comment"
 	pkgmodelsdyn "personal-site/pkg/models/dyn"
 	pkgmodelsshortlink "personal-site/pkg/models/shortlink"
+	pkgmodelsss "personal-site/pkg/models/ss"
 	pkgsession "personal-site/pkg/session"
 
 	"github.com/alecthomas/kong"
@@ -29,6 +32,10 @@ var logger = slog.Default()
 type CLI struct {
 	Addr      string `name:"addr" help:"Listening address." env:"ADDR" default:":8080"`
 	ConfigXML string `name:"config-xml" help:"Path to the server configuration XML document (see serverConfig.xsd)." env:"CONFIG_XML" type:"existingfile"`
+	// SSAging is the subscriber aging interval of the in-memory signalling
+	// provider: a registration expires when the subscriber is idle longer
+	// than this.
+	SSAging time.Duration `name:"ss-aging" help:"Signalling subscriber aging interval." env:"SS_AGING" default:"10s"`
 	// HealthzProbe makes the process a health probe instead of a server: it
 	// GETs the running server's /api/healthz on the loopback address and
 	// exits 0 on success, non-zero otherwise. The container image's
@@ -82,6 +89,16 @@ func (cli *CLI) Run() error {
 	// anyone can comment in the name of anyone else — and comments live in
 	// process memory only, so they are lost on restart.
 	mux.Handle("/api/comments/", pkgapicomments.NewCommentsHandler(pkgmodelscomment.NewOnMemoryCommentProvider()))
+
+	// The signalling endpoint upgrades client connections to WebSocket and
+	// bridges them to the signalling service: visitors discover each other
+	// and broker WebRTC sessions through it. Client identity comes from the
+	// experimental X-Exp-UserId / X-Exp-UserSessionId headers for now, and
+	// registrations live in process memory only, so they are lost on
+	// restart. The provider and hub goroutines run for the process
+	// lifetime.
+	mux.Handle("/api/ss/ws", pkgapiwebsocketss.NewWebSocketSSHandler(
+		context.Background(), pkgmodelsss.NewSimpleOnMemorySSProviderWithAging(cli.SSAging)))
 
 	// Everything else is the embedded Next.js static export.
 	mux.Handle("/", personalsite.Handler())

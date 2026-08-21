@@ -41,11 +41,18 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
-// startServer launches the server binary on a free loopback port, waits for
-// its health endpoint to answer, and returns the base URL. The process is
-// killed when the test ends; on failure its output is dumped to the test
-// log.
+// startServer launches the server binary with default arguments; see
+// startServerWithArgs.
 func startServer(t *testing.T) string {
+	t.Helper()
+	return startServerWithArgs(t)
+}
+
+// startServerWithArgs launches the server binary on a free loopback port
+// with extra command-line arguments, waits for its health endpoint to
+// answer, and returns the base URL. The process is killed when the test
+// ends; on failure its output is dumped to the test log.
+func startServerWithArgs(t *testing.T, args ...string) string {
 	t.Helper()
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -58,7 +65,7 @@ func startServer(t *testing.T) string {
 	}
 
 	var output bytes.Buffer
-	cmd := exec.Command(serverBin, "--addr", addr)
+	cmd := exec.Command(serverBin, append([]string{"--addr", addr}, args...)...)
 	cmd.Stdout = &output
 	cmd.Stderr = &output
 	if err := cmd.Start(); err != nil {

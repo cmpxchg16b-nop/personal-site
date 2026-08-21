@@ -1,11 +1,13 @@
 package log_test
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/hex"
 	"encoding/json"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -392,5 +394,40 @@ func TestNilLoggerFallsBackToDefault(t *testing.T) {
 	}
 	if !strings.Contains(buf.String(), "http request") {
 		t.Errorf("no access record written to the default logger, got %q", buf.String())
+	}
+}
+
+// hijackableResponseWriter is a ResponseRecorder that also implements
+// http.Hijacker, standing in for the server's real connection-backed
+// writer.
+type hijackableResponseWriter struct {
+	*httptest.ResponseRecorder
+	hijacked bool
+}
+
+func (w *hijackableResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	w.hijacked = true
+	return nil, nil, nil
+}
+
+// TestHijackDelegatesThroughWrapper checks that the logging wrapper passes
+// http.Hijacker through to the underlying writer: websocket upgrades (e.g.
+// github.com/gorilla/websocket, which type-asserts Hijacker directly) must
+// survive the middleware chain.
+func TestHijackDelegatesThroughWrapper(t *testing.T) {
+	h := pkglog.WithHTTPLog(nil, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hj, ok := w.(http.Hijacker)
+		if !ok {
+			t.Error("wrapped writer does not implement http.Hijacker")
+			return
+		}
+		if _, _, err := hj.Hijack(); err != nil {
+			t.Errorf("Hijack: %v", err)
+		}
+	}))
+	inner := &hijackableResponseWriter{ResponseRecorder: httptest.NewRecorder()}
+	h.ServeHTTP(inner, httptest.NewRequest(http.MethodGet, "/ws", nil))
+	if !inner.hijacked {
+		t.Error("Hijack did not reach the underlying writer")
 	}
 }

@@ -2,10 +2,13 @@
 package log
 
 import (
+	"bufio"
 	"context"
 	cryptoRand "crypto/rand"
 	"encoding/hex"
+	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"time"
 
@@ -36,6 +39,18 @@ func (rw *responseWriter) Flush() {
 	if f, ok := rw.ResponseWriter.(http.Flusher); ok {
 		f.Flush()
 	}
+}
+
+// Hijack delegates to the underlying Hijacker, so websocket upgrades and
+// similar protocol switches survive the wrapper. It complements Flush and
+// Unwrap: github.com/gorilla/websocket's upgrader type-asserts
+// http.Hijacker directly instead of going through http.ResponseController.
+func (rw *responseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	h, ok := rw.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, fmt.Errorf("response writer does not implement http.Hijacker")
+	}
+	return h.Hijack()
 }
 
 // WriteHeader records the first status code reported and forwards it. Repeated
