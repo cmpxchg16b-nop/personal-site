@@ -1,0 +1,153 @@
+"use client";
+
+import { Fragment } from "react";
+import {
+  Box,
+  Collapse,
+  List,
+  ListItem,
+  ListItemButton,
+  ListItemText,
+} from "@mui/material";
+import TagIcon from "@mui/icons-material/Tag";
+import ExpandMoreIcon from "@mui/icons-material/ExpandMore";
+import ChevronRightIcon from "@mui/icons-material/ChevronRight";
+import UserAvatar from "./UserAvatar";
+import {
+  conversationKey,
+  type ChatChannel,
+  type ConversationRef,
+} from "./types";
+
+type ConversationTreeProps = {
+  channels: ChatChannel[];
+  // Which channel rows are expanded, keyed by channel id. Rows missing from
+  // the record count as expanded.
+  openChannels: Record<string, boolean>;
+  onToggleChannel: (channelId: string) => void;
+  // Key of the selected conversation (see conversationKey); compared by key
+  // so a DM opened from any channel highlights everywhere it appears.
+  selectedKey: string;
+  onSelect: (ref: ConversationRef) => void;
+  // Unread counts by conversation key; zero/undefined renders nothing.
+  unread: Record<string, number>;
+};
+
+// UnreadBadge is the small pill showing a conversation's unseen count.
+function UnreadBadge({ count }: { count: number }) {
+  return (
+    <Box
+      component="span"
+      sx={{
+        ml: 1,
+        px: 0.75,
+        height: 18,
+        minWidth: 18,
+        borderRadius: "9999px",
+        bgcolor: "primary.main",
+        color: "primary.contrastText",
+        fontSize: 11,
+        fontWeight: 600,
+        display: "inline-flex",
+        alignItems: "center",
+        justifyContent: "center",
+        flexShrink: 0,
+      }}
+    >
+      {count}
+    </Box>
+  );
+}
+
+// ConversationTree renders the two-level navigation: channel rooms first,
+// each expandable to reveal its members as direct-message entries. It is
+// purely presentational — expansion state and selection live with the
+// parent.
+export default function ConversationTree({
+  channels,
+  openChannels,
+  onToggleChannel,
+  selectedKey,
+  onSelect,
+  unread,
+}: ConversationTreeProps) {
+  return (
+    // Full-bleed rows: no horizontal padding on the list, no rounding on
+    // the buttons — selection/hover paint edge to edge.
+    <List disablePadding sx={{ pb: 1 }}>
+      {channels.map((channel) => {
+        const open = openChannels[channel.id] ?? true;
+        return (
+          <Fragment key={channel.id}>
+            <ListItem disableGutters disablePadding>
+              {/* Channels only group people — there is no channel-level chat
+                  at this moment, so the row's only job is toggling the
+                  member list. The chevron is a passive state indicator. */}
+              <ListItemButton
+                onClick={() => onToggleChannel(channel.id)}
+                aria-expanded={open}
+                sx={{ px: 2, py: 0.75 }}
+              >
+                <TagIcon
+                  fontSize="small"
+                  sx={{ color: "text.secondary", mr: 1, flexShrink: 0 }}
+                />
+                <ListItemText
+                  primary={channel.name}
+                  slotProps={{
+                    primary: {
+                      variant: "body2",
+                      noWrap: true,
+                      sx: { fontWeight: 500 },
+                    },
+                  }}
+                />
+                {open ? (
+                  <ExpandMoreIcon
+                    fontSize="small"
+                    sx={{ ml: 1, color: "text.secondary", flexShrink: 0 }}
+                  />
+                ) : (
+                  <ChevronRightIcon
+                    fontSize="small"
+                    sx={{ ml: 1, color: "text.secondary", flexShrink: 0 }}
+                  />
+                )}
+              </ListItemButton>
+            </ListItem>
+            <Collapse in={open} timeout="auto">
+              <List disablePadding>
+                {channel.members.map((member) => {
+                  const dmRef: ConversationRef = {
+                    kind: "dm",
+                    userId: member.id,
+                  };
+                  const dmUnread = unread[conversationKey(dmRef)] ?? 0;
+                  return (
+                    <ListItem key={member.id} disableGutters disablePadding>
+                      <ListItemButton
+                        selected={conversationKey(dmRef) === selectedKey}
+                        onClick={() => onSelect(dmRef)}
+                        sx={{ py: 0.5, pl: 3, pr: 2 }}
+                      >
+                        <UserAvatar user={member} size={22} showPresence />
+                        <ListItemText
+                          primary={member.name}
+                          sx={{ ml: 1.25 }}
+                          slotProps={{
+                            primary: { variant: "body2", noWrap: true },
+                          }}
+                        />
+                        {dmUnread > 0 && <UnreadBadge count={dmUnread} />}
+                      </ListItemButton>
+                    </ListItem>
+                  );
+                })}
+              </List>
+            </Collapse>
+          </Fragment>
+        );
+      })}
+    </List>
+  );
+}

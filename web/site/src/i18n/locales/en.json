@@ -61,6 +61,20 @@
     "postFailed": "Failed to post the comment. Please try again.",
     "conflict": "Someone else commented while you were writing. Your comment was not posted — please try again."
   },
+  "chat": {
+    "title": "Chat",
+    "search": "Search",
+    "noMatch": "No matching channels or people.",
+    "message": "Message {{target}}",
+    "send": "Send",
+    "empty": "No messages yet — say hi.",
+    "you": "You",
+    "online": "Online",
+    "offline": "Offline",
+    "back": "Back to the channel list",
+    "today": "Today",
+    "yesterday": "Yesterday"
+  },
   "footer": {
     "copyright": "© {{year}} {{name}}",
     "builtWith": "Built with Next.js and MUI."

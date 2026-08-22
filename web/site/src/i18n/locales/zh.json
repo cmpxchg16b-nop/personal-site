@@ -61,6 +61,20 @@
     "postFailed": "发表评论失败，请重试。",
     "conflict": "在你编辑期间有人发表了新评论，你的评论未能提交——请重试。"
   },
+  "chat": {
+    "title": "聊天",
+    "search": "搜索",
+    "noMatch": "没有匹配的频道或联系人。",
+    "message": "发消息给 {{target}}",
+    "send": "发送",
+    "empty": "还没有消息，来打个招呼吧。",
+    "you": "我",
+    "online": "在线",
+    "offline": "离线",
+    "back": "返回频道列表",
+    "today": "今天",
+    "yesterday": "昨天"
+  },
   "footer": {
     "copyright": "© {{year}} {{name}}",
     "builtWith": "使用 Next.js 与 MUI 构建。"

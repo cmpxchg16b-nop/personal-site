@@ -19,6 +19,9 @@ function crumbsFor(pathname: string, t: TFunction): Crumb[] {
   if (pathname === "/") {
     return [{ label: t("nav.home") }];
   }
+  if (pathname === "/chat") {
+    return [{ label: t("nav.home"), href: "/" }, { label: t("chat.title") }];
+  }
   if (pathname.startsWith("/posts/")) {
     return [
       { label: t("nav.home"), href: "/" },
