@@ -27,10 +27,11 @@ const (
 
 // The well-known signalling error codes.
 const (
-	ssErrSubscriberIdIsRegistered = 1
-	ssErrSubscriberNotFound       = 2
-	ssErrChannelNotFound          = 3
-	ssErrUsernameTaken            = 4
+	ssErrSubscriberIdIsRegistered  = 1
+	ssErrSubscriberNotFound        = 2
+	ssErrChannelNotFound           = 3
+	ssErrUsernameTaken             = 4
+	ssErrNoSubscriberIdAvailable   = 5
 )
 
 type epAddrView struct {
@@ -54,11 +55,19 @@ type listChannelMembersView struct {
 	ChannelId string `json:"channelId"`
 }
 
+type listChannelsView struct{}
+
+type channelProfileQueryView struct {
+	ChannelId string `json:"channelId"`
+}
+
 type clientToSSEvView struct {
-	Register           *registerEvView         `json:"register,omitempty"`
-	UserProfileQuery   *userProfileQueryView   `json:"userProfileQuery,omitempty"`
-	Ping               *pingPongView           `json:"ping,omitempty"`
-	ListChannelMembers *listChannelMembersView `json:"listChannelMembers,omitempty"`
+	Register            *registerEvView          `json:"register,omitempty"`
+	UserProfileQuery    *userProfileQueryView    `json:"userProfileQuery,omitempty"`
+	ChannelProfileQuery *channelProfileQueryView `json:"channelProfileQuery,omitempty"`
+	Ping                *pingPongView            `json:"ping,omitempty"`
+	ListChannelMembers  *listChannelMembersView  `json:"listChannelMembers,omitempty"`
+	ListChannels        *listChannelsView        `json:"listChannels,omitempty"`
 }
 
 type ssErrView struct {
@@ -72,17 +81,35 @@ type userProfileView struct {
 	Username     string `json:"username"`
 }
 
+type registerResultView struct {
+	ChannelId    string `json:"channelId"`
+	SubscriberId string `json:"subscriberId"`
+}
+
 type channelMbsListResultView struct {
 	ChannelId string   `json:"channelId"`
 	Members   []string `json:"members"`
 	HasMore   bool     `json:"hasMore"`
 }
 
+type channelProfileView struct {
+	ChannelId   string `json:"channelId"`
+	ChannelName string `json:"channelName"`
+}
+
+type channelListResultView struct {
+	Channels []string `json:"channels"`
+	HasMore  bool     `json:"hasMore"`
+}
+
 type ssToClientEvView struct {
 	Err                  *ssErrView                `json:"err,omitempty"`
+	RegisterResult       *registerResultView       `json:"registerResult,omitempty"`
 	Profile              *userProfileView          `json:"profile,omitempty"`
+	ChannelProfile       *channelProfileView       `json:"channelProfile,omitempty"`
 	Pong                 *pingPongView             `json:"pong,omitempty"`
 	ChannelMbsListResult *channelMbsListResultView `json:"channelMbsListResult,omitempty"`
+	ChannelListResult    *channelListResultView    `json:"channelListResult,omitempty"`
 }
 
 type pingPongView struct {
@@ -106,6 +133,7 @@ type iceCandidateView struct {
 type clientToClientEvView struct {
 	FromSubscriber  string            `json:"fromSubscriber"`
 	ToSubscriber    string            `json:"toSubscriber"`
+	ChannelId       string            `json:"channelId"`
 	SessionDesc     *sessionDescView  `json:"sessionDesc,omitempty"`
 	RTCICECandidate *iceCandidateView `json:"rtcICECandidate,omitempty"`
 	Ping            *pingPongView     `json:"ping,omitempty"`
@@ -123,26 +151,49 @@ type signallingEventView struct {
 }
 
 // ssWSClient is a websocket client of the signalling endpoint, speaking
-// the view types above.
+// the view types above. Its connection identity (userId, sessionId) is the
+// visitor session's (subject id, session id), assigned by the server — the
+// jwtCookie is what the connection authenticates with.
 type ssWSClient struct {
-	t    *testing.T
-	conn *websocket.Conn
+	t         *testing.T
+	conn      *websocket.Conn
+	baseURL   string
+	jwtCookie string
+	userId    string
+	sessionId string
 }
 
-// dialSS connects to the signalling endpoint of the server at baseURL
-// with the given experimental identity headers.
-func dialSS(t *testing.T, baseURL, userId, sessionId string) *ssWSClient {
+// dialSS logs in as a fresh visitor and connects to the signalling
+// endpoint of the server at baseURL with the session cookie. Each call
+// produces a distinct identity (a fresh visitor session).
+func dialSS(t *testing.T, baseURL string) *ssWSClient {
 	t.Helper()
+	jwtCookie := loginAsVisitor(t, baseURL+"/api/login/visitor")
+	if jwtCookie == "" {
+		t.Fatal("visitor login did not set a jwt cookie")
+	}
+	c := &ssWSClient{t: t, baseURL: baseURL, jwtCookie: jwtCookie}
+	c.userId, c.sessionId, _ = profileIdentity(t, baseURL, jwtCookie)
+	c.redial()
+	t.Cleanup(func() { c.conn.Close() })
+	return c
+}
+
+// redial (re)connects the client with its session cookie: the new
+// connection carries the same identity as the old one.
+func (c *ssWSClient) redial() {
+	c.t.Helper()
 	header := http.Header{}
-	header.Set("X-Exp-UserId", userId)
-	header.Set("X-Exp-UserSessionId", sessionId)
-	url := "ws" + strings.TrimPrefix(baseURL, "http") + "/api/ss/ws"
+	header.Set("Cookie", "jwt="+c.jwtCookie)
+	url := "ws" + strings.TrimPrefix(c.baseURL, "http") + "/api/ss/ws"
 	conn, _, err := websocket.DefaultDialer.Dial(url, header)
 	if err != nil {
-		t.Fatalf("dial %s as (%s, %s): %v", url, userId, sessionId, err)
+		c.t.Fatalf("dial %s as (%s, %s): %v", url, c.userId, c.sessionId, err)
 	}
-	t.Cleanup(func() { conn.Close() })
-	return &ssWSClient{t: t, conn: conn}
+	if c.conn != nil {
+		c.conn.Close()
+	}
+	c.conn = conn
 }
 
 func (c *ssWSClient) send(ev *signallingEventView) {
@@ -182,7 +233,9 @@ func (c *ssWSClient) expectSilent() {
 }
 
 // register registers sub with username and consumes the ack, which must
-// be error-free and correlated with the request.
+// be error-free, correlated with the request, and carry the matching
+// registerResult. An empty sub asks the server to assign a subscriber id
+// from the automatic assignment range; the assigned id is returned.
 func (c *ssWSClient) register(msgId, sub, username string) *signallingEventView {
 	c.t.Helper()
 	c.send(&signallingEventView{
@@ -202,6 +255,15 @@ func (c *ssWSClient) register(msgId, sub, username string) *signallingEventView 
 	}
 	if ack.InReplyTo != msgId {
 		c.t.Fatalf("register ack inReplyTo = %q, want %q", ack.InReplyTo, msgId)
+	}
+	if ack.S2CEv.RegisterResult == nil {
+		c.t.Fatalf("register ack carries no registerResult: %+v", ack.S2CEv)
+	}
+	if ack.S2CEv.RegisterResult.ChannelId != ssMainChannelId {
+		c.t.Fatalf("registerResult channelId = %q, want %q", ack.S2CEv.RegisterResult.ChannelId, ssMainChannelId)
+	}
+	if sub != "" && ack.S2CEv.RegisterResult.SubscriberId != sub {
+		c.t.Fatalf("registerResult subscriberId = %q, want %q", ack.S2CEv.RegisterResult.SubscriberId, sub)
 	}
 	return ack
 }
@@ -236,16 +298,16 @@ func (c *ssWSClient) registerExpectingError(msgId, sub, channelId, username stri
 func TestSSRegisterAndProfile(t *testing.T) {
 	baseURL := startServer(t)
 
-	alice := dialSS(t, baseURL, "u-alice", "s-alice")
+	alice := dialSS(t, baseURL)
 
 	// A successful registration is acknowledged by the SS service, To the
-	// address the handler populated from the identity headers.
+	// address the handler populated from the caller's session.
 	ack := alice.register("e2e-reg-1", "alice", "alice")
 	if ack.From.ServiceId != ssServiceId {
 		t.Errorf("ack from.serviceId = %q, want %q", ack.From.ServiceId, ssServiceId)
 	}
-	if ack.To.UserId != "u-alice" || ack.To.UserSessionId != "s-alice" {
-		t.Errorf("ack to = %+v, want u-alice/s-alice", ack.To)
+	if ack.To.UserId != alice.userId || ack.To.UserSessionId != alice.sessionId {
+		t.Errorf("ack to = %+v, want alice's session identity %s/%s", ack.To, alice.userId, alice.sessionId)
 	}
 	if ack.MsgId == "" || ack.MsgId == "e2e-reg-1" {
 		t.Errorf("ack msgId = %q, want a fresh, distinct id", ack.MsgId)
@@ -291,13 +353,46 @@ func TestSSRegisterAndProfile(t *testing.T) {
 	// ...while another identity cannot take the id over, a taken username
 	// is rejected, and an unknown channel is rejected — each with its
 	// well-known code.
-	bob := dialSS(t, baseURL, "u-bob", "s-bob")
+	bob := dialSS(t, baseURL)
 	bob.registerExpectingError("e2e-reg-3", "alice", ssMainChannelId, "bob", ssErrSubscriberIdIsRegistered)
 	bob.registerExpectingError("e2e-reg-4", "bob", ssMainChannelId, "alice", ssErrUsernameTaken)
 	bob.registerExpectingError("e2e-reg-5", "bob", "no-such-channel", "bob", ssErrChannelNotFound)
 
 	alice.expectSilent()
 	bob.expectSilent()
+}
+
+// TestSSRegisterAutoAssign covers automatic subscriber id assignment: a
+// registration with an empty subscriber id is assigned the next free id
+// from the 1000-1999 range, echoed in the registerResult, and the
+// assigned id is a working registration.
+func TestSSRegisterAutoAssign(t *testing.T) {
+	baseURL := startServer(t)
+
+	alice := dialSS(t, baseURL)
+	bob := dialSS(t, baseURL)
+
+	ack := alice.register("e2e-auto-1", "", "auto-alice")
+	if got := ack.S2CEv.RegisterResult.SubscriberId; got != "1000" {
+		t.Fatalf("first auto-assigned subscriber id = %q, want %q", got, "1000")
+	}
+	ack = bob.register("e2e-auto-2", "", "auto-bob")
+	if got := ack.S2CEv.RegisterResult.SubscriberId; got != "1001" {
+		t.Fatalf("second auto-assigned subscriber id = %q, want %q", got, "1001")
+	}
+
+	// The assigned id is a working, queryable registration.
+	alice.send(&signallingEventView{
+		MsgId: "e2e-auto-query",
+		C2SEv: &clientToSSEvView{UserProfileQuery: &userProfileQueryView{
+			SubscriberId: "1000",
+			ChannelId:    ssMainChannelId,
+		}},
+	})
+	reply := alice.recv()
+	if reply.S2CEv == nil || reply.S2CEv.Profile == nil || reply.S2CEv.Profile.Username != "auto-alice" {
+		t.Fatalf("profile of auto-assigned id = %+v, want username auto-alice", reply)
+	}
 }
 
 // TestSSPingPongRelay drives an out-of-band ping session between two
@@ -307,9 +402,9 @@ func TestSSRegisterAndProfile(t *testing.T) {
 func TestSSPingPongRelay(t *testing.T) {
 	baseURL := startServer(t)
 
-	alice := dialSS(t, baseURL, "u-alice", "s-alice")
-	bob := dialSS(t, baseURL, "u-bob", "s-bob")
-	carol := dialSS(t, baseURL, "u-carol", "s-carol")
+	alice := dialSS(t, baseURL)
+	bob := dialSS(t, baseURL)
+	carol := dialSS(t, baseURL)
 	alice.register("e2e-reg-alice", "alice", "alice")
 	bob.register("e2e-reg-bob", "bob", "bob")
 	carol.register("e2e-reg-carol", "carol", "carol")
@@ -321,18 +416,18 @@ func TestSSPingPongRelay(t *testing.T) {
 		// alice pings bob, addressing the SS; the SS translates
 		// (channel, subscriber) into bob's endpoint address.
 		alice.send(&signallingEventView{
-			From:  epAddrView{UserId: "u-alice", UserSessionId: "s-alice"},
 			To:    epAddrView{ServiceId: ssServiceId},
 			MsgId: "e2e-ping-" + string(rune('0'+round)),
 			C2CEv: &clientToClientEvView{
 				FromSubscriber: "alice",
 				ToSubscriber:   "bob",
+				ChannelId:      ssMainChannelId,
 				Ping:           &pingPongView{PingId: pingId, SequenceNumber: seq},
 			},
 		})
 
 		// bob receives the ping unchanged, with From carrying alice's
-		// header-derived identity and To translated to bob's address.
+		// session identity and To translated to bob's address.
 		ping := bob.recv()
 		if ping.C2CEv == nil || ping.C2CEv.Ping == nil {
 			t.Fatalf("round %d: bob got %+v, want a ping", round, ping)
@@ -343,22 +438,22 @@ func TestSSPingPongRelay(t *testing.T) {
 		if ping.C2CEv.Ping.PingId != pingId {
 			t.Errorf("round %d: ping id = %q, want %q", round, ping.C2CEv.Ping.PingId, pingId)
 		}
-		if ping.From.UserId != "u-alice" || ping.From.UserSessionId != "s-alice" {
-			t.Errorf("round %d: ping from = %+v, want u-alice/s-alice", round, ping.From)
+		if ping.From.UserId != alice.userId || ping.From.UserSessionId != alice.sessionId {
+			t.Errorf("round %d: ping from = %+v, want alice's session identity", round, ping.From)
 		}
-		if ping.To.UserId != "u-bob" || ping.To.UserSessionId != "s-bob" {
-			t.Errorf("round %d: ping to = %+v, want u-bob/s-bob", round, ping.To)
+		if ping.To.UserId != bob.userId || ping.To.UserSessionId != bob.sessionId {
+			t.Errorf("round %d: ping to = %+v, want bob's session identity", round, ping.To)
 		}
 
 		// bob pongs: keep the ping id, ack = seq + 1.
 		bobSeq++
 		bob.send(&signallingEventView{
-			From:  epAddrView{UserId: "u-bob", UserSessionId: "s-bob"},
 			To:    epAddrView{ServiceId: ssServiceId},
 			MsgId: "e2e-pong-" + string(rune('0'+round)),
 			C2CEv: &clientToClientEvView{
 				FromSubscriber: "bob",
 				ToSubscriber:   "alice",
+				ChannelId:      ssMainChannelId,
 				Pong: &pingPongView{
 					PingId:            pingId,
 					SequenceNumber:    bobSeq,
@@ -379,8 +474,8 @@ func TestSSPingPongRelay(t *testing.T) {
 		if pong.C2CEv.Pong.PingId != pingId {
 			t.Errorf("round %d: pong ping id = %q, want %q", round, pong.C2CEv.Pong.PingId, pingId)
 		}
-		if pong.To.UserId != "u-alice" || pong.To.UserSessionId != "s-alice" {
-			t.Errorf("round %d: pong to = %+v, want u-alice/s-alice", round, pong.To)
+		if pong.To.UserId != alice.userId || pong.To.UserSessionId != alice.sessionId {
+			t.Errorf("round %d: pong to = %+v, want alice's session identity", round, pong.To)
 		}
 		seq = pong.C2CEv.Pong.AckSequenceNumber
 	}
@@ -400,8 +495,8 @@ func TestSSPingPongRelay(t *testing.T) {
 func TestSSRelayRTCData(t *testing.T) {
 	baseURL := startServer(t)
 
-	alice := dialSS(t, baseURL, "u-alice", "s-alice")
-	bob := dialSS(t, baseURL, "u-bob", "s-bob")
+	alice := dialSS(t, baseURL)
+	bob := dialSS(t, baseURL)
 	alice.register("e2e-reg-alice", "alice", "alice")
 	bob.register("e2e-reg-bob", "bob", "bob")
 
@@ -412,6 +507,7 @@ func TestSSRelayRTCData(t *testing.T) {
 		C2CEv: &clientToClientEvView{
 			FromSubscriber: "alice",
 			ToSubscriber:   "bob",
+			ChannelId:      ssMainChannelId,
 			SessionDesc:    &sessionDescView{Type: "offer", SDP: sdp},
 		},
 	})
@@ -432,6 +528,7 @@ func TestSSRelayRTCData(t *testing.T) {
 		C2CEv: &clientToClientEvView{
 			FromSubscriber: "bob",
 			ToSubscriber:   "alice",
+			ChannelId:      ssMainChannelId,
 			RTCICECandidate: &iceCandidateView{
 				Candidate:     candidate,
 				SDPMid:        &sdpMid,
@@ -459,9 +556,9 @@ func TestSSRelayRTCData(t *testing.T) {
 func TestSSListChannelMembers(t *testing.T) {
 	baseURL := startServer(t)
 
-	alice := dialSS(t, baseURL, "u-alice", "s-alice")
-	bob := dialSS(t, baseURL, "u-bob", "s-bob")
-	carol := dialSS(t, baseURL, "u-carol", "s-carol")
+	alice := dialSS(t, baseURL)
+	bob := dialSS(t, baseURL)
+	carol := dialSS(t, baseURL)
 	alice.register("e2e-reg-alice", "alice", "alice")
 	bob.register("e2e-reg-bob", "bob", "bob")
 	carol.register("e2e-reg-carol", "carol", "carol")
@@ -491,8 +588,8 @@ func TestSSListChannelMembers(t *testing.T) {
 		if reply.From.ServiceId != ssServiceId {
 			t.Errorf("page from.serviceId = %q, want %q", reply.From.ServiceId, ssServiceId)
 		}
-		if reply.To.UserId != "u-alice" || reply.To.UserSessionId != "s-alice" {
-			t.Errorf("page to = %+v, want u-alice/s-alice", reply.To)
+		if reply.To.UserId != alice.userId || reply.To.UserSessionId != alice.sessionId {
+			t.Errorf("page to = %+v, want alice's session identity", reply.To)
 		}
 		page := reply.S2CEv.ChannelMbsListResult
 		if page.ChannelId != ssMainChannelId {
@@ -527,6 +624,62 @@ func TestSSListChannelMembers(t *testing.T) {
 	carol.expectSilent()
 }
 
+// TestSSListChannelsAndProfile covers dynamic channel discovery: the
+// channel list comes back as one final page (only the main channel
+// exists) and a channel profile query resolves its display name. No
+// registration is needed.
+func TestSSListChannelsAndProfile(t *testing.T) {
+	baseURL := startServer(t)
+
+	alice := dialSS(t, baseURL)
+
+	// Deliberately before any registration: discovery needs none.
+	alice.send(&signallingEventView{
+		To:    epAddrView{ServiceId: ssServiceId},
+		MsgId: "e2e-list-channels",
+		C2SEv: &clientToSSEvView{ListChannels: &listChannelsView{}},
+	})
+	list := alice.recv()
+	if list.S2CEv == nil || list.S2CEv.ChannelListResult == nil {
+		t.Fatalf("list reply = %+v, want a channelListResult", list)
+	}
+	if list.S2CEv.Err != nil {
+		t.Fatalf("list reply carries an error: %+v", list.S2CEv.Err)
+	}
+	if list.InReplyTo != "e2e-list-channels" {
+		t.Errorf("list inReplyTo = %q, want %q", list.InReplyTo, "e2e-list-channels")
+	}
+	page := list.S2CEv.ChannelListResult
+	if page.HasMore || len(page.Channels) != 1 || page.Channels[0] != ssMainChannelId {
+		t.Fatalf("channel list page = %+v, want a single final page holding the main channel", page)
+	}
+
+	alice.send(&signallingEventView{
+		To:    epAddrView{ServiceId: ssServiceId},
+		MsgId: "e2e-ch-profile",
+		C2SEv: &clientToSSEvView{ChannelProfileQuery: &channelProfileQueryView{ChannelId: ssMainChannelId}},
+	})
+	profile := alice.recv()
+	if profile.S2CEv == nil || profile.S2CEv.ChannelProfile == nil {
+		t.Fatalf("profile reply = %+v, want a channelProfile", profile)
+	}
+	if got := profile.S2CEv.ChannelProfile; got.ChannelId != ssMainChannelId || got.ChannelName != "main" {
+		t.Errorf("channel profile = %+v, want the main channel named %q", got, "main")
+	}
+
+	alice.send(&signallingEventView{
+		To:    epAddrView{ServiceId: ssServiceId},
+		MsgId: "e2e-ch-profile-unknown",
+		C2SEv: &clientToSSEvView{ChannelProfileQuery: &channelProfileQueryView{ChannelId: "no-such-channel"}},
+	})
+	errReply := alice.recv()
+	if errReply.S2CEv == nil || errReply.S2CEv.Err == nil || errReply.S2CEv.Err.ErrorCode != ssErrChannelNotFound {
+		t.Fatalf("unknown channel reply = %+v, want error code %d", errReply, ssErrChannelNotFound)
+	}
+
+	alice.expectSilent()
+}
+
 // TestSSClientServerPing covers the c2s ping / s2c pong liveness
 // exchange with the SS itself: it works before any registration, the
 // pong keeps the ping id and answers ack = seq + 1, and the next ping's
@@ -534,7 +687,7 @@ func TestSSListChannelMembers(t *testing.T) {
 func TestSSClientServerPing(t *testing.T) {
 	baseURL := startServer(t)
 
-	alice := dialSS(t, baseURL, "u-alice", "s-alice")
+	alice := dialSS(t, baseURL)
 
 	// Deliberately before any registration.
 	seq := uint64(1)
@@ -561,8 +714,8 @@ func TestSSClientServerPing(t *testing.T) {
 		if pong.From.ServiceId != ssServiceId {
 			t.Errorf("round %d: pong from.serviceId = %q, want %q", round, pong.From.ServiceId, ssServiceId)
 		}
-		if pong.To.UserId != "u-alice" || pong.To.UserSessionId != "s-alice" {
-			t.Errorf("round %d: pong to = %+v, want u-alice/s-alice", round, pong.To)
+		if pong.To.UserId != alice.userId || pong.To.UserSessionId != alice.sessionId {
+			t.Errorf("round %d: pong to = %+v, want alice's session identity", round, pong.To)
 		}
 		if pong.InReplyTo != msgId {
 			t.Errorf("round %d: pong inReplyTo = %q, want %q", round, pong.InReplyTo, msgId)
@@ -583,9 +736,9 @@ func TestSSClientServerPing(t *testing.T) {
 func TestSSDisconnectAndReconnect(t *testing.T) {
 	baseURL := startServer(t)
 
-	alice1 := dialSS(t, baseURL, "u-alice", "s-alice")
-	bob := dialSS(t, baseURL, "u-bob", "s-bob")
-	alice1.register("e2e-reg-alice", "alice", "alice")
+	alice := dialSS(t, baseURL)
+	bob := dialSS(t, baseURL)
+	alice.register("e2e-reg-alice", "alice", "alice")
 	bob.register("e2e-reg-bob", "bob", "bob")
 
 	ping := func(to, msgId string) *signallingEventView {
@@ -595,6 +748,7 @@ func TestSSDisconnectAndReconnect(t *testing.T) {
 			C2CEv: &clientToClientEvView{
 				FromSubscriber: "bob",
 				ToSubscriber:   to,
+				ChannelId:      ssMainChannelId,
 				Ping:           &pingPongView{PingId: "e2e-reconnect", SequenceNumber: 1},
 			},
 		}
@@ -602,37 +756,37 @@ func TestSSDisconnectAndReconnect(t *testing.T) {
 
 	// Baseline: bob's ping to alice reaches her first connection.
 	bob.send(ping("alice", "e2e-ping-1"))
-	if ev := alice1.recv(); ev.C2CEv == nil || ev.C2CEv.Ping == nil {
-		t.Fatalf("alice1 got %+v, want the relayed ping", ev)
+	if ev := alice.recv(); ev.C2CEv == nil || ev.C2CEv.Ping == nil {
+		t.Fatalf("alice got %+v, want the relayed ping", ev)
 	}
 
 	// alice disconnects; the address she was learned under is purged with
 	// the connection.
-	alice1.conn.Close()
+	alice.conn.Close()
 
-	// On reconnect with the same identity, the address is re-learned onto
-	// the new connection: the provider still knows "alice", bound to this
-	// same (user, session, channel) tuple, so the re-registration is a
-	// refresh — its ack arriving here proves the re-learn. (The prototype
-	// has no unregister message, so the registration survived the
-	// disconnect.)
-	alice2 := dialSS(t, baseURL, "u-alice", "s-alice")
-	alice2.register("e2e-reg-alice-again", "alice", "alice")
+	// On reconnect with the same session cookie — the same identity — the
+	// address is re-learned onto the new connection: the provider still
+	// knows "alice", bound to this same (user, session, channel) tuple, so
+	// the re-registration is a refresh — its ack arriving here proves the
+	// re-learn. (The prototype has no unregister message, so the
+	// registration survived the disconnect.)
+	alice.redial()
+	alice.register("e2e-reg-alice-again", "alice", "alice")
 
 	// Relays addressed to the re-registered subscriber reach the new
 	// connection.
 	bob.send(ping("alice", "e2e-ping-2"))
-	ev := alice2.recv()
+	ev := alice.recv()
 	if ev.C2CEv == nil || ev.C2CEv.Ping == nil || ev.C2CEv.Ping.PingId != "e2e-reconnect" {
-		t.Fatalf("alice2 got %+v, want the relayed ping", ev)
+		t.Fatalf("alice got %+v, want the relayed ping", ev)
 	}
-	if ev.To.UserId != "u-alice" || ev.To.UserSessionId != "s-alice" {
-		t.Errorf("relayed to = %+v, want u-alice/s-alice", ev.To)
+	if ev.To.UserId != alice.userId || ev.To.UserSessionId != alice.sessionId {
+		t.Errorf("relayed to = %+v, want alice's session identity", ev.To)
 	}
 
 	// Silence checks last: a read timeout corrupts a gorilla connection.
 	bob.expectSilent()
-	alice2.expectSilent()
+	alice.expectSilent()
 }
 
 // TestSSQuickReconnectRoaming is the quick-disconnect-and-reconnect
@@ -647,8 +801,8 @@ func TestSSDisconnectAndReconnect(t *testing.T) {
 func TestSSQuickReconnectRoaming(t *testing.T) {
 	baseURL := startServer(t)
 
-	alice := dialSS(t, baseURL, "u-alice", "s-alice")
-	bob := dialSS(t, baseURL, "u-bob", "s-bob")
+	alice := dialSS(t, baseURL)
+	bob := dialSS(t, baseURL)
 	alice.register("e2e-reg-alice", "alice", "alice")
 	bob.register("e2e-reg-bob", "bob", "bob")
 
@@ -665,6 +819,7 @@ func TestSSQuickReconnectRoaming(t *testing.T) {
 			C2CEv: &clientToClientEvView{
 				FromSubscriber: "alice",
 				ToSubscriber:   "bob",
+				ChannelId:      ssMainChannelId,
 				Ping:           &pingPongView{PingId: pingId, SequenceNumber: seq},
 			},
 		})
@@ -678,8 +833,8 @@ func TestSSQuickReconnectRoaming(t *testing.T) {
 		if ping.C2CEv.Ping.PingId != pingId {
 			t.Fatalf("round %s: ping id = %q, want the same session %q", tag, ping.C2CEv.Ping.PingId, pingId)
 		}
-		if ping.To.UserId != "u-bob" || ping.To.UserSessionId != "s-bob" {
-			t.Errorf("round %s: ping to = %+v, want u-bob/s-bob", tag, ping.To)
+		if ping.To.UserId != bob.userId || ping.To.UserSessionId != bob.sessionId {
+			t.Errorf("round %s: ping to = %+v, want bob's session identity", tag, ping.To)
 		}
 
 		bobSeq++
@@ -689,6 +844,7 @@ func TestSSQuickReconnectRoaming(t *testing.T) {
 			C2CEv: &clientToClientEvView{
 				FromSubscriber: "bob",
 				ToSubscriber:   "alice",
+				ChannelId:      ssMainChannelId,
 				Pong: &pingPongView{
 					PingId:            pingId,
 					SequenceNumber:    bobSeq,
@@ -732,23 +888,23 @@ func TestSSQuickReconnectRoaming(t *testing.T) {
 	bob.conn.Close()
 	queryBob("e2e-query-offline")
 
-	// bob quickly reconnects with the same identity and announces himself
-	// with a liveness ping to the SS, re-learning his address onto the new
-	// connection.
-	bob2 := dialSS(t, baseURL, "u-bob", "s-bob")
-	bob2.send(&signallingEventView{
+	// bob quickly reconnects with the same session cookie — the same
+	// identity — and announces himself with a liveness ping to the SS,
+	// re-learning his address onto the new connection.
+	bob.redial()
+	bob.send(&signallingEventView{
 		To:    epAddrView{ServiceId: ssServiceId},
 		MsgId: "e2e-bob-alive",
 		C2SEv: &clientToSSEvView{Ping: &pingPongView{PingId: "e2e-bob-liveness", SequenceNumber: 1}},
 	})
-	if pong := bob2.recv(); pong.S2CEv == nil || pong.S2CEv.Pong == nil {
-		t.Fatalf("bob2 liveness reply = %+v, want a pong", pong)
+	if pong := bob.recv(); pong.S2CEv == nil || pong.S2CEv.Pong == nil {
+		t.Fatalf("bob liveness reply = %+v, want a pong", pong)
 	}
 
 	// Rounds 2 and 3 run on the new connection, same ping session, seq/ack
 	// chain unbroken — alice never noticed the transient offline.
-	round("2", bob2)
-	round("3", bob2)
+	round("2", bob)
+	round("3", bob)
 	if seq != 4 {
 		t.Errorf("seq after 3 rounds = %d, want 4", seq)
 	}
@@ -757,7 +913,7 @@ func TestSSQuickReconnectRoaming(t *testing.T) {
 	queryBob("e2e-query-after")
 
 	// Silence checks last: a read timeout corrupts a gorilla connection.
-	bob2.expectSilent()
+	bob.expectSilent()
 	alice.expectSilent()
 }
 
@@ -767,8 +923,8 @@ func TestSSQuickReconnectRoaming(t *testing.T) {
 func TestSSSubscriberAging(t *testing.T) {
 	baseURL := startServerWithArgs(t, "--ss-aging", "500ms")
 
-	alice := dialSS(t, baseURL, "u-alice", "s-alice")
-	bob := dialSS(t, baseURL, "u-bob", "s-bob")
+	alice := dialSS(t, baseURL)
+	bob := dialSS(t, baseURL)
 	alice.register("e2e-reg-alice", "alice", "alice")
 	bob.register("e2e-reg-bob", "bob", "bob")
 
@@ -800,7 +956,7 @@ func TestSSSubscriberAging(t *testing.T) {
 
 	// The expired subscriber id and username are free again: dave takes
 	// them over.
-	dave := dialSS(t, baseURL, "u-dave", "s-dave")
+	dave := dialSS(t, baseURL)
 	dave.register("e2e-reg-dave", "bob", "bob")
 
 	// Silence checks last: a read timeout corrupts a gorilla connection.
@@ -809,17 +965,18 @@ func TestSSSubscriberAging(t *testing.T) {
 	alice.expectSilent()
 }
 
-// TestSSRejectsMissingIdentityHeaders checks that the handshake fails
-// cleanly without the experimental identity headers.
-func TestSSRejectsMissingIdentityHeaders(t *testing.T) {
+// TestSSRejectsMissingSession checks that the handshake fails cleanly
+// without a session cookie: the endpoint is not on the JWT whitelist, so
+// the request never reaches the handler.
+func TestSSRejectsMissingSession(t *testing.T) {
 	baseURL := startServer(t)
 	url := "ws" + strings.TrimPrefix(baseURL, "http") + "/api/ss/ws"
 
 	_, resp, err := websocket.DefaultDialer.Dial(url, nil)
 	if !errors.Is(err, websocket.ErrBadHandshake) {
-		t.Fatalf("dial without identity headers: got %v, want ErrBadHandshake", err)
+		t.Fatalf("dial without a session cookie: got %v, want ErrBadHandshake", err)
 	}
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusBadRequest)
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusUnauthorized)
 	}
 }

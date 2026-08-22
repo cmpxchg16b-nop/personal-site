@@ -24,8 +24,7 @@ The backend carries a JWT-based login system: a login endpoint issues a
 signed session token into an HttpOnly cookie, and a whitelist middleware
 (`pkg/auth`) requires a valid token for every `/api/` path except the
 public ones (`/api/login/...`, `/api/logout`, `/api/healthz`, `/api/dyn/`,
-`GET /api/comments/` — reads are open, appends need a session — and
-`/api/ss/ws`).
+and `GET /api/comments/` — reads are open, appends need a session).
 
 - **Visitor login.** `GET /api/login/visitor` (`pkg/api/login/visitor`)
   signs an anonymous `visitor:`-prefixed session, paced by a shared ticket

@@ -1,21 +1,7 @@
 "use client";
 
-import PostDescription from "@/components/PostDescription";
-import PostHeader from "@/components/PostHeader";
-import PostTags from "@/components/PostTags";
-import PostTitle from "@/components/PostTitle";
 import PostView from "@/components/PostView";
-import {
-  Code,
-  CodeBlock,
-  H2,
-  Hr,
-  Li,
-  Link,
-  P,
-  Quote,
-  Ul,
-} from "@/components/prose";
+import { H2, Li, P, Ul } from "@/components/prose";
 
 // The example posts double as a demo of the prose building blocks (see
 // src/components/prose.tsx) and as documentation for how the blog fits

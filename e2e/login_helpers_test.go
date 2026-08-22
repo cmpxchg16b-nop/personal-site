@@ -2,6 +2,7 @@ package e2e
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -41,6 +42,27 @@ func loginAsVisitor(t *testing.T, loginURL string) string {
 		}
 	}
 	return ""
+}
+
+// profileIdentity GETs /api/profile with the session cookie and returns
+// the session's subject id, session id and username — the identity the
+// JWT-backed endpoints (comments, signalling) stamp onto the caller's
+// actions.
+func profileIdentity(t *testing.T, baseURL, jwtCookie string) (subjectId, sessionId, username string) {
+	t.Helper()
+	body := cookieReq(t, http.DefaultClient, baseURL, http.MethodGet, "/api/profile", "", jwtCookie)
+	var profile struct {
+		SessionID string `json:"session_id"`
+		SubjectID string `json:"subject_id"`
+		Username  string `json:"username"`
+	}
+	if err := json.Unmarshal(body, &profile); err != nil {
+		t.Fatalf("GET /api/profile: decode response: %v", err)
+	}
+	if profile.SubjectID == "" || profile.SessionID == "" {
+		t.Fatalf("GET /api/profile: empty identity: %s", body)
+	}
+	return profile.SubjectID, profile.SessionID, profile.Username
 }
 
 // cookieReq performs an HTTP request carrying the visitor's JWT cookie.

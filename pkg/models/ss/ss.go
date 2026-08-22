@@ -20,6 +20,7 @@ package ss
 import (
 	"context"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
 
@@ -82,6 +83,12 @@ type EPAddr struct {
 // the username; registration of an id bound to another tuple is
 // rejected with ErrorCodeSubscriberIdIsRegistered.
 type ClientToSSRegEv struct {
+	// SubscriberId may be empty: the SS then assigns one sequentially
+	// from the automatic assignment range 1000-1999 and echoes it in the
+	// registerResult reply. An empty id always mints a fresh subscriber,
+	// even from an already-registered tuple. Clients picking their own
+	// subscriber ids are recommended to preserve that range for
+	// automatic registration.
 	SubscriberId SubscriberId `json:"subscriberId"`
 	ChannelId    ChannelId    `json:"channelId"`
 
@@ -97,6 +104,12 @@ type ClientToSSUserProfileQuery struct {
 	ChannelId    ChannelId    `json:"channelId"`
 }
 
+// ClientToSSChannelProfileQuery queries the profile of a channel. The SS
+// answers with a s2c channelProfile.
+type ClientToSSChannelProfileQuery struct {
+	ChannelId ChannelId `json:"channelId"`
+}
+
 // ClientToSSListChannelMembers lists the members of a channel. The SS
 // answers with one or more s2c channelMbsListResult messages, all
 // inReplyTo the request.
@@ -104,10 +117,19 @@ type ClientToSSListChannelMembers struct {
 	ChannelId ChannelId `json:"channelId"`
 }
 
+// ClientToSSListChannels lists the channels of the server. It carries no
+// fields. The SS answers with one or more s2c channelListResult
+// messages, all inReplyTo the request.
+type ClientToSSListChannels struct{}
+
 // ClientToSSEv is a client-to-signalling-server event.
 type ClientToSSEv struct {
 	Register         *ClientToSSRegEv            `json:"register,omitempty"`
 	UserProfileQuery *ClientToSSUserProfileQuery `json:"userProfileQuery,omitempty"`
+
+	// ChannelProfileQuery asks for the profile of a channel; the SS
+	// answers with a s2c channelProfile.
+	ChannelProfileQuery *ClientToSSChannelProfileQuery `json:"channelProfileQuery,omitempty"`
 
 	// Ping pings the signalling server itself (out of band
 	// liveness/keepalive, e.g. from browsers, which cannot send
@@ -117,6 +139,9 @@ type ClientToSSEv struct {
 
 	// ListChannelMembers asks for the members of a channel.
 	ListChannelMembers *ClientToSSListChannelMembers `json:"listChannelMembers,omitempty"`
+
+	// ListChannels asks for the channels of the server.
+	ListChannels *ClientToSSListChannels `json:"listChannels,omitempty"`
 }
 
 // ErrorCode is the well-defined code of an SSToClientErrEv.
@@ -138,6 +163,10 @@ const (
 	// ErrorCodeUsernameTaken: the requested username has already been
 	// taken by someone else.
 	ErrorCodeUsernameTaken
+
+	// ErrorCodeNoSubscriberIdAvailable: no subscriber id is free in the
+	// automatic assignment range 1000-1999 (all are registered).
+	ErrorCodeNoSubscriberIdAvailable
 )
 
 // SSToClientErrEv carries a well-defined error code plus a descriptive,
@@ -164,13 +193,35 @@ type SSToClientChannelMbsListResult struct {
 	HasMore bool `json:"hasMore"`
 }
 
+// SSToClientChannelListResult is one page of a channel list result.
+// Multiple result messages can be sent per one listChannels request, all
+// correlated via InReplyTo; the client might decide a timeout on its
+// own, or wait until HasMore is false.
+type SSToClientChannelListResult struct {
+	// Channels holds (a page of) the channel ids of the server; use
+	// ClientToSSChannelProfileQuery to resolve a channel's profile.
+	Channels []ChannelId `json:"channels"`
+
+	// HasMore is true when more result messages follow for the same
+	// request.
+	HasMore bool `json:"hasMore"`
+}
+
 // SSToClientEv is a signalling-server-to-client event.
 type SSToClientEv struct {
 	// Err is present only when an error occurred.
 	Err *SSToClientErrEv `json:"err,omitempty"`
 
+	// RegisterResult carries the reply payload of a successful
+	// registration.
+	RegisterResult *RegisterResult `json:"registerResult,omitempty"`
+
 	// Profile carries the reply payload of a user profile query.
 	Profile *UserProfile `json:"profile,omitempty"`
+
+	// ChannelProfile carries the reply payload of a channel profile
+	// query.
+	ChannelProfile *ChannelProfile `json:"channelProfile,omitempty"`
 
 	// Pong answers a c2s ping: it keeps the ping id and answers
 	// ack = ping's seq + 1.
@@ -179,6 +230,10 @@ type SSToClientEv struct {
 	// ChannelMbsListResult is one page of the answer to a
 	// listChannelMembers request.
 	ChannelMbsListResult *SSToClientChannelMbsListResult `json:"channelMbsListResult,omitempty"`
+
+	// ChannelListResult is one page of the answer to a listChannels
+	// request.
+	ChannelListResult *SSToClientChannelListResult `json:"channelListResult,omitempty"`
 }
 
 // UserProfile is the profile data the SS holds about a registered
@@ -187,6 +242,20 @@ type UserProfile struct {
 	SubscriberId SubscriberId `json:"subscriberId"`
 	ChannelId    ChannelId    `json:"channelId"`
 	Username     string       `json:"username"`
+}
+
+// ChannelProfile is the profile data the SS holds about a channel.
+type ChannelProfile struct {
+	ChannelId   ChannelId `json:"channelId"`
+	ChannelName string    `json:"channelName"`
+}
+
+// RegisterResult is the SS's answer to a successful registration: the
+// channel and the subscriber id the registration is bound to. The
+// subscriber id is assigned by the SS when the request left it empty.
+type RegisterResult struct {
+	ChannelId    ChannelId    `json:"channelId"`
+	SubscriberId SubscriberId `json:"subscriberId"`
 }
 
 // PingPongMsg is a ping or ping-reply message: between two clients
@@ -203,10 +272,18 @@ type PingPongMsg struct {
 
 // ClientToClientEv is a client-to-client signalling event; a signalling
 // server simply passes it, rewriting only the envelope's To EPAddr to
-// the address ToSubscriber resolves to.
+// the address (ChannelId, ToSubscriber) resolves to.
 type ClientToClientEv struct {
 	FromSubscriber SubscriberId `json:"fromSubscriber"`
 	ToSubscriber   SubscriberId `json:"toSubscriber"`
+
+	// ChannelId scopes the two subscriber ids — think of a subscriber id
+	// as an IP address and the channel as the VLAN it lives in: a
+	// subscriber id alone does not determine an endpoint, only
+	// (ChannelId, SubscriberId) does. There is deliberately a single
+	// channel id, no from/to pair: caller and callee are expected to be
+	// registered in the same channel.
+	ChannelId ChannelId `json:"channelId"`
 
 	// SessionDesc is a WebRTC/SIP-flavor session description, e.g.
 	// {type: "answer", sdp: "..."}. It marshals to the same JSON shape
@@ -282,6 +359,17 @@ type SimpleOnMemorySSProvider struct {
 // SimpleOnMemorySSProvider.
 const DefaultSubscriberAging = 10 * time.Second
 
+// mainChannelName is the profile name of the well-known main channel.
+const mainChannelName = "main"
+
+// The automatic subscriber id assignment range: a registration with an
+// empty subscriber id is assigned the next free id in
+// [autoSubscriberIdRangeStart, autoSubscriberIdRangeEnd).
+const (
+	autoSubscriberIdRangeStart = 1000
+	autoSubscriberIdRangeEnd   = 2000 // exclusive: ids run 1000-1999
+)
+
 // NewSimpleOnMemorySSProvider constructs a SimpleOnMemorySSProvider with
 // the default subscriber aging. Call Run to start processing events.
 func NewSimpleOnMemorySSProvider() *SimpleOnMemorySSProvider {
@@ -312,7 +400,7 @@ func (p *SimpleOnMemorySSProvider) Run(ctx context.Context, inMsg <-chan *Signal
 	// All provider state lives on this goroutine's stack and every event
 	// is handled sequentially, so no mutex is needed anywhere.
 	channels := map[ChannelId]*channelState{
-		WellKnownChIdMain: newChannelState(),
+		WellKnownChIdMain: newChannelState(mainChannelName),
 	}
 
 	for {
@@ -356,6 +444,10 @@ func (p *SimpleOnMemorySSProvider) handle(ctx context.Context, channels map[Chan
 		return p.handlePing(ctx, ev, outMsg)
 	case ev.C2SEv != nil && ev.C2SEv.ListChannelMembers != nil:
 		return p.handleListChannelMembers(ctx, channels, ev, outMsg)
+	case ev.C2SEv != nil && ev.C2SEv.ListChannels != nil:
+		return p.handleListChannels(ctx, channels, ev, outMsg)
+	case ev.C2SEv != nil && ev.C2SEv.ChannelProfileQuery != nil:
+		return p.handleQueryChannelProfile(ctx, channels, ev, outMsg)
 	case ev.C2CEv != nil:
 		return p.handleRelay(ctx, channels, ev, outMsg)
 	default:
@@ -373,6 +465,17 @@ func (p *SimpleOnMemorySSProvider) handleRegister(ctx context.Context, channels 
 			"channel not found; currently only the main channel is implemented, please specify the correct channel id"))
 	}
 	now := time.Now()
+	// An empty subscriber id asks the SS to assign one, sequentially,
+	// from the automatic assignment range; the assigned id is echoed in
+	// the registerResult reply. Empty always mints a fresh subscriber,
+	// even from an already-registered tuple.
+	if reg.SubscriberId == "" {
+		reg.SubscriberId = ch.assignSubscriberId(now, p.aging)
+		if reg.SubscriberId == "" {
+			return p.send(ctx, outMsg, replyErr(ev, ErrorCodeNoSubscriberIdAvailable,
+				"no subscriber id is available in the automatic assignment range 1000-1999"))
+		}
+	}
 	if existing := ch.live(reg.SubscriberId, now, p.aging); existing != nil {
 		if !sameRegistrationTuple(existing.addr, ev.From) {
 			return p.send(ctx, outMsg, replyErr(ev, ErrorCodeSubscriberIdIsRegistered,
@@ -391,7 +494,10 @@ func (p *SimpleOnMemorySSProvider) handleRegister(ctx context.Context, channels 
 			existing.username = reg.Username
 		}
 		existing.lastActive = now
-		return p.send(ctx, outMsg, reply(ev, &SSToClientEv{}))
+		return p.send(ctx, outMsg, reply(ev, &SSToClientEv{RegisterResult: &RegisterResult{
+			ChannelId:    reg.ChannelId,
+			SubscriberId: reg.SubscriberId,
+		}}))
 	}
 	if owner, taken := ch.idsByUsername[reg.Username]; taken &&
 		ch.live(owner, now, p.aging) != nil {
@@ -405,7 +511,10 @@ func (p *SimpleOnMemorySSProvider) handleRegister(ctx context.Context, channels 
 		lastActive: now,
 	}
 	ch.idsByUsername[reg.Username] = reg.SubscriberId
-	return p.send(ctx, outMsg, reply(ev, &SSToClientEv{}))
+	return p.send(ctx, outMsg, reply(ev, &SSToClientEv{RegisterResult: &RegisterResult{
+		ChannelId:    reg.ChannelId,
+		SubscriberId: reg.SubscriberId,
+	}}))
 }
 
 // sameRegistrationTuple reports whether from is the non-empty (user id,
@@ -432,6 +541,21 @@ func (p *SimpleOnMemorySSProvider) handleQueryProfile(ctx context.Context, chann
 		SubscriberId: sub.id,
 		ChannelId:    query.ChannelId,
 		Username:     sub.username,
+	}}))
+}
+
+// handleQueryChannelProfile answers a channel profile query with the
+// channel's profile; an unknown channel is rejected with
+// ErrorCodeChannelNotFound.
+func (p *SimpleOnMemorySSProvider) handleQueryChannelProfile(ctx context.Context, channels map[ChannelId]*channelState, ev *SignallingEvent, outMsg chan<- *SignallingEvent) bool {
+	query := ev.C2SEv.ChannelProfileQuery
+	ch, ok := channels[query.ChannelId]
+	if !ok {
+		return p.send(ctx, outMsg, replyErr(ev, ErrorCodeChannelNotFound, "channel not found"))
+	}
+	return p.send(ctx, outMsg, reply(ev, &SSToClientEv{ChannelProfile: &ChannelProfile{
+		ChannelId:   query.ChannelId,
+		ChannelName: ch.name,
 	}}))
 }
 
@@ -487,21 +611,56 @@ func (p *SimpleOnMemorySSProvider) handleListChannelMembers(ctx context.Context,
 	}
 }
 
+// channelListPageSize bounds the number of channel ids carried by one
+// channelListResult message; a larger channel list is paged over
+// multiple messages.
+const channelListPageSize = 64
+
+// handleListChannels answers a listChannels request with one or more
+// channelListResult messages, paged by channelListPageSize and each
+// carrying a fresh MsgId with InReplyTo pointing at the request. Even an
+// empty channel list yields one (empty, final) page, so the client
+// always observes hasMore=false. Channels are listed sorted by channel
+// id, so pages are stable. No registration is needed first.
+func (p *SimpleOnMemorySSProvider) handleListChannels(ctx context.Context, channels map[ChannelId]*channelState, ev *SignallingEvent, outMsg chan<- *SignallingEvent) bool {
+	ids := make([]ChannelId, 0, len(channels))
+	for id := range channels {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	for start := 0; ; start += channelListPageSize {
+		end := min(start+channelListPageSize, len(ids))
+		hasMore := end < len(ids)
+		if !p.send(ctx, outMsg, reply(ev, &SSToClientEv{ChannelListResult: &SSToClientChannelListResult{
+			Channels: ids[start:end],
+			HasMore:  hasMore,
+		}})) {
+			return false
+		}
+		if !hasMore {
+			return true
+		}
+	}
+}
+
 func (p *SimpleOnMemorySSProvider) handleRelay(ctx context.Context, channels map[ChannelId]*channelState, ev *SignallingEvent, outMsg chan<- *SignallingEvent) bool {
 	c2c := ev.C2CEv
-	// The c2c payload carries no channel id (see the TypeScript
-	// prototype), so with only the main channel implemented, both
-	// subscribers are resolved there.
-	ch := channels[WellKnownChIdMain]
+	// Both subscribers are resolved in the event's channel: a subscriber
+	// id is only meaningful within its channel.
+	ch, ok := channels[c2c.ChannelId]
+	if !ok {
+		return p.send(ctx, outMsg, replyErr(ev, ErrorCodeChannelNotFound,
+			"channel not found; currently only the main channel is implemented, please specify the correct channel id"))
+	}
 	now := time.Now()
 	if ch.live(c2c.FromSubscriber, now, p.aging) == nil {
 		return p.send(ctx, outMsg, replyErr(ev, ErrorCodeSubscriberNotFound,
-			"from subscriber not found in the main channel"))
+			"from subscriber not found in the given channel"))
 	}
 	to := ch.live(c2c.ToSubscriber, now, p.aging)
 	if to == nil {
 		return p.send(ctx, outMsg, replyErr(ev, ErrorCodeSubscriberNotFound,
-			"to subscriber not found in the main channel"))
+			"to subscriber not found in the given channel"))
 	}
 	// The SS translates (channel, subscriber) addressing into an EPAddr:
 	// rewrite the destination (addressed to the SS on the way in) to the
@@ -568,18 +727,44 @@ func (s *subscriberState) expired(now time.Time, aging time.Duration) bool {
 	return now.Sub(s.lastActive) > aging
 }
 
-// channelState holds the subscribers of one channel, indexed by id and
-// (uniquely) by username.
+// channelState holds what the provider knows about one channel: its
+// profile name and its subscribers, indexed by id and (uniquely) by
+// username.
 type channelState struct {
+	name          string
 	subscribers   map[SubscriberId]*subscriberState
 	idsByUsername map[string]SubscriberId
+
+	// nextAutoId is where the next automatic subscriber id assignment
+	// scan starts.
+	nextAutoId int
 }
 
-func newChannelState() *channelState {
+func newChannelState(name string) *channelState {
 	return &channelState{
+		name:          name,
 		subscribers:   make(map[SubscriberId]*subscriberState),
 		idsByUsername: make(map[string]SubscriberId),
+		nextAutoId:    autoSubscriberIdRangeStart,
 	}
+}
+
+// assignSubscriberId picks the next free subscriber id in the automatic
+// assignment range, scanning sequentially from where the last assignment
+// left off and wrapping around at most once; expired ids on the way are
+// freed by live. It returns "" when every id in the range is taken.
+func (ch *channelState) assignSubscriberId(now time.Time, aging time.Duration) SubscriberId {
+	for i := 0; i < autoSubscriberIdRangeEnd-autoSubscriberIdRangeStart; i++ {
+		id := SubscriberId(strconv.Itoa(ch.nextAutoId))
+		ch.nextAutoId++
+		if ch.nextAutoId >= autoSubscriberIdRangeEnd {
+			ch.nextAutoId = autoSubscriberIdRangeStart
+		}
+		if ch.live(id, now, aging) == nil {
+			return id
+		}
+	}
+	return ""
 }
 
 // sweep evicts every expired subscriber of the channel, freeing its
@@ -618,10 +803,10 @@ func (ch *channelState) evict(id SubscriberId) {
 
 // touch refreshes the lastActive timestamp of every subscriber whose
 // learned address matches the event's From, and of a c2c event's
-// FromSubscriber. Any activity counts — including c2s liveness pings —
-// so a subscriber that sends something at least every aging interval
-// keeps its registration valid. It is O(channels × subscribers) per
-// event, which is fine at prototype scale.
+// FromSubscriber in the event's own channel. Any activity counts —
+// including c2s liveness pings — so a subscriber that sends something at
+// least every aging interval keeps its registration valid. It is
+// O(channels × subscribers) per event, which is fine at prototype scale.
 func touch(channels map[ChannelId]*channelState, ev *SignallingEvent, now time.Time) {
 	for _, ch := range channels {
 		for _, sub := range ch.subscribers {
@@ -630,7 +815,9 @@ func touch(channels map[ChannelId]*channelState, ev *SignallingEvent, now time.T
 				sub.lastActive = now
 			}
 		}
-		if c2c := ev.C2CEv; c2c != nil {
+	}
+	if c2c := ev.C2CEv; c2c != nil {
+		if ch, ok := channels[c2c.ChannelId]; ok {
 			if sub, ok := ch.subscribers[c2c.FromSubscriber]; ok {
 				sub.lastActive = now
 			}

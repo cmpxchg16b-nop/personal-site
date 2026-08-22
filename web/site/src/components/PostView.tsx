@@ -1,7 +1,7 @@
 "use client";
 
 import { Children, isValidElement } from "react";
-import { Box, Divider } from "@mui/material";
+import { Box } from "@mui/material";
 import CommentZone from "./CommentZone";
 import PostDivider from "./PostDivider";
 import PostDynHeader from "./PostDynHeader";

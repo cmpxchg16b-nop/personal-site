@@ -202,17 +202,11 @@ func mustPutComment(t *testing.T, baseURL, channelId, jwtCookie, content, lastCo
 // appended comments.
 func profileUsername(t *testing.T, baseURL, jwtCookie string) string {
 	t.Helper()
-	body := cookieReq(t, http.DefaultClient, baseURL, http.MethodGet, "/api/profile", "", jwtCookie)
-	var profile struct {
-		Username string `json:"username"`
-	}
-	if err := json.Unmarshal(body, &profile); err != nil {
-		t.Fatalf("GET /api/profile: decode response: %v", err)
-	}
-	if profile.Username == "" {
+	_, _, username := profileIdentity(t, baseURL, jwtCookie)
+	if username == "" {
 		t.Fatal("GET /api/profile: empty username")
 	}
-	return profile.Username
+	return username
 }
 
 // TestCommentsAPI drives the comments API of a freshly started server

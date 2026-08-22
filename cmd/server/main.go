@@ -148,12 +148,17 @@ func (cli *CLI) Run() error {
 	// The signalling endpoint upgrades client connections to WebSocket and
 	// bridges them to the signalling service: visitors discover each other
 	// and broker WebRTC sessions through it. Client identity comes from the
-	// experimental X-Exp-UserId / X-Exp-UserSessionId headers for now, and
-	// registrations live in process memory only, so they are lost on
-	// restart. The provider and hub goroutines run for the process
-	// lifetime. The path is on the JWT whitelist below for now.
-	muxHandlerDyn.Handle("/api/ss/ws", pkgapiwebsocketss.NewWebSocketSSHandler(
-		context.Background(), pkgmodelsss.NewSimpleOnMemorySSProviderWithAging(cli.SSAging)))
+	// caller's session (the path is NOT on the JWT whitelist below —
+	// browsers reach it with the session cookie), and registrations live in
+	// process memory only, so they are lost on restart. The provider and
+	// hub goroutines run for the process lifetime. The upgrader trusts the
+	// configuration's allowed origins alongside same-origin requests: in
+	// development the browser's origin is the frontend dev server proxying
+	// /api/* here, which the default origin check would reject.
+	ssHandler := pkgapiwebsocketss.NewWebSocketSSHandler(
+		context.Background(), pkgmodelsss.NewSimpleOnMemorySSProviderWithAging(cli.SSAging), sm)
+	ssHandler.Upgrader.CheckOrigin = pkgapiwebsocketss.CheckOriginAllowing(allowedOrigins)
+	muxHandlerDyn.Handle("/api/ss/ws", ssHandler)
 
 	// /api/logout is on the JWT whitelist below, so the handler also runs for
 	// requests whose token is already expired or invalid — clearing cookies
@@ -275,9 +280,9 @@ func (cli *CLI) Run() error {
 
 	// The JWT whitelist: paths that must stay reachable without a session.
 	// The login endpoints and logout obviously so; healthz (the container
-	// probe carries no credentials); the public blog data and signalling
-	// endpoints keep their current unauthenticated behavior. Comments are
-	// whitelisted for reads only: appending one requires a session.
+	// probe carries no credentials); the public blog data keeps its current
+	// unauthenticated behavior. Comments are whitelisted for reads only:
+	// appending one requires a session.
 	whList := []string{
 		"/api/login",
 		"/api/login/",
@@ -287,7 +292,6 @@ func (cli *CLI) Run() error {
 		"/api/dyn/",
 		"GET /api/comments",
 		"GET /api/comments/",
-		"/api/ss/ws",
 	}
 
 	// Detailed per-request middleware applies only to dynamic (api) endpoints.

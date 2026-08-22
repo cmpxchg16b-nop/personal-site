@@ -10,8 +10,8 @@ import type {
 // relative-time labels ("2 hours ago") always look fresh.
 
 // CURRENT_USER_ID is the local chatter's identity. There is no login system
-// yet, so this is a fixed placeholder; the display name comes from the i18n
-// bundle ("chat.you"), not from this record.
+// yet, so this is a fixed placeholder; its display name comes from this
+// record, shown as-is.
 export const CURRENT_USER_ID = "me";
 
 // DEFAULT_CONVERSATION is what the page opens on. Channels have no chat of
@@ -93,7 +93,7 @@ export const mockUnread: Record<string, number> = {
 };
 
 // mockReplies is the canned pool the fake chat partner answers with, a few
-// seconds after you send something (see ChatApp).
+// seconds after you send something (see chat/page.tsx).
 export const mockReplies: string[] = [
   "哈哈哈哈哈",
   "+1",

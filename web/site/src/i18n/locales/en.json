@@ -75,7 +75,6 @@
     "message": "Message {{target}}",
     "send": "Send",
     "empty": "No messages yet — say hi.",
-    "you": "You",
     "online": "Online",
     "offline": "Offline",
     "back": "Back to the channel list",

@@ -13,13 +13,41 @@ import (
 	"github.com/gorilla/websocket"
 
 	"personal-site/pkg/models/ss"
+	pkgsession "personal-site/pkg/session"
+	pkgutils "personal-site/pkg/utils"
+)
+
+// Test-only identity headers. The handler resolves identity from the
+// session middleware, which is awkward to drive in-process, so the test
+// server below maps these headers onto the context values the session
+// middleware would produce from a JWT, keeping the dial() call sites
+// unchanged.
+const (
+	testUserIdHeader        = "X-Test-UserId"
+	testUserSessionIdHeader = "X-Test-UserSessionId"
 )
 
 func startTestServer(t *testing.T) *httptest.Server {
 	t.Helper()
 	provider := ss.NewSimpleOnMemorySSProvider()
-	h := NewWebSocketSSHandler(context.Background(), provider)
-	srv := httptest.NewServer(h)
+	sm := pkgsession.NewOnMemorySessionManager()
+	h := NewWebSocketSSHandler(context.Background(), provider, sm)
+	// The real session middleware builds the request-scoped session object
+	// from context values, exactly as in production.
+	sessionized := pkgsession.WithSessionId(h, sm)
+	// Adapter: seed the request context from the test-only identity
+	// headers before the session middleware runs.
+	adapter := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx := r.Context()
+		if v := r.Header.Get(testUserIdHeader); v != "" {
+			ctx = context.WithValue(ctx, pkgutils.CtxKeySubjectId, v)
+		}
+		if v := r.Header.Get(testUserSessionIdHeader); v != "" {
+			ctx = context.WithValue(ctx, pkgutils.CtxKeySessionId, v)
+		}
+		sessionized.ServeHTTP(w, r.WithContext(ctx))
+	})
+	srv := httptest.NewServer(adapter)
 	t.Cleanup(func() {
 		srv.Close()
 		provider.Shutdown()
@@ -27,16 +55,16 @@ func startTestServer(t *testing.T) *httptest.Server {
 	return srv
 }
 
-// dial opens a websocket connection with the experimental identity
-// headers; empty userId/sessionId omit the respective header.
+// dial opens a websocket connection with the test-only identity headers;
+// empty userId/sessionId omit the respective header.
 func dial(t *testing.T, srv *httptest.Server, userId, sessionId string) *websocket.Conn {
 	t.Helper()
 	header := http.Header{}
 	if userId != "" {
-		header.Set(HeaderExpUserId, userId)
+		header.Set(testUserIdHeader, userId)
 	}
 	if sessionId != "" {
-		header.Set(HeaderExpUserSessionId, sessionId)
+		header.Set(testUserSessionIdHeader, sessionId)
 	}
 	url := "ws" + strings.TrimPrefix(srv.URL, "http")
 	c, _, err := websocket.DefaultDialer.Dial(url, header)
@@ -105,6 +133,33 @@ func mustRegister(t *testing.T, c *websocket.Conn, sub ss.SubscriberId, username
 	return ack
 }
 
+func TestCheckOriginAllowing(t *testing.T) {
+	check := CheckOriginAllowing([]string{"http://localhost:3000"})
+	for _, tc := range []struct {
+		name   string
+		origin string
+		host   string
+		want   bool
+	}{
+		{"no Origin header", "", "localhost:8080", true},
+		{"same origin", "http://localhost:8080", "localhost:8080", true},
+		{"allowed cross-origin", "http://localhost:3000", "localhost:8080", true},
+		{"unlisted cross-origin", "http://evil.example", "localhost:8080", false},
+		{"malformed origin", "://nope", "localhost:8080", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := httptest.NewRequest(http.MethodGet, "/api/ss/ws", nil)
+			r.Host = tc.host
+			if tc.origin != "" {
+				r.Header.Set("Origin", tc.origin)
+			}
+			if got := check(r); got != tc.want {
+				t.Errorf("CheckOrigin(origin %q, host %q) = %v, want %v", tc.origin, tc.host, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestMissingIdentityHeadersRejected(t *testing.T) {
 	srv := startTestServer(t)
 	url := "ws" + strings.TrimPrefix(srv.URL, "http")
@@ -155,6 +210,7 @@ func TestRelayUnicastNoFlood(t *testing.T) {
 			C2CEv: &ss.ClientToClientEv{
 				FromSubscriber: "alice",
 				ToSubscriber:   to,
+				ChannelId:      ss.WellKnownChIdMain,
 				Ping:           &ss.PingPongMsg{PingId: "p1", SequenceNumber: 1},
 			},
 		}
@@ -190,6 +246,35 @@ func TestRelayUnicastNoFlood(t *testing.T) {
 	expectNoEvent(t, alice)
 	expectNoEvent(t, bob)
 	expectNoEvent(t, carol)
+}
+
+// TestForgedFromOverridden checks that a client-supplied From is never
+// trusted: the handler overrides it with the connection's session
+// identity before the event reaches anyone.
+func TestForgedFromOverridden(t *testing.T) {
+	srv := startTestServer(t)
+	alice := dial(t, srv, "u-alice", "s-alice")
+	bob := dial(t, srv, "u-bob", "s-bob")
+	mustRegister(t, alice, "alice", "alice")
+	mustRegister(t, bob, "bob", "bob")
+
+	// alice sends a ping to bob carrying a forged From.
+	writeEvent(t, alice, &ss.SignallingEvent{
+		From:  ss.EPAddr{UserId: "u-mallory", UserSessionId: "s-mallory"},
+		To:    ss.EPAddr{ServiceId: ss.WellKnownSvcIdSS},
+		MsgId: "m-forged",
+		C2CEv: &ss.ClientToClientEv{
+			FromSubscriber: "alice",
+			ToSubscriber:   "bob",
+			ChannelId:      ss.WellKnownChIdMain,
+			Ping:           &ss.PingPongMsg{PingId: "p-forged", SequenceNumber: 1},
+		},
+	})
+
+	got := readEvent(t, bob)
+	if got.From.UserId != "u-alice" || got.From.UserSessionId != "s-alice" {
+		t.Fatalf("relayed From = %+v, want alice's session identity, not the forged one", got.From)
+	}
 }
 
 func TestReconnectRelearnsAddress(t *testing.T) {

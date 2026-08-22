@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"slices"
+	"strconv"
 	"testing"
 	"time"
 
@@ -110,6 +111,13 @@ func TestRegisterAck(t *testing.T) {
 	if ack.S2CEv.Err != nil {
 		t.Fatalf("ack carries an error: %+v", ack.S2CEv.Err)
 	}
+	if ack.S2CEv.RegisterResult == nil {
+		t.Fatalf("ack carries no registerResult: %+v", ack.S2CEv)
+	}
+	if ack.S2CEv.RegisterResult.ChannelId != WellKnownChIdMain ||
+		ack.S2CEv.RegisterResult.SubscriberId != "alice" {
+		t.Fatalf("ack registerResult = %+v, want alice in the main channel", ack.S2CEv.RegisterResult)
+	}
 	if ack.From.ServiceId != WellKnownSvcIdSS {
 		t.Fatalf("ack.From.ServiceId = %q, want %q", ack.From.ServiceId, WellKnownSvcIdSS)
 	}
@@ -163,6 +171,71 @@ func TestReregisterSameTuple(t *testing.T) {
 		reply.S2CEv.Err.ErrorCode != ErrorCodeSubscriberIdIsRegistered {
 		t.Fatalf("other-tuple re-registration reply = %+v, want error code %d",
 			reply, ErrorCodeSubscriberIdIsRegistered)
+	}
+}
+
+// TestRegisterAutoAssignedSubscriberId checks that a registration with
+// an empty subscriber id is assigned the next free id from the automatic
+// assignment range, sequentially, skipping ids already taken.
+func TestRegisterAutoAssignedSubscriberId(t *testing.T) {
+	h := startProvider(t)
+
+	registerAuto := func(user, username string) *RegisterResult {
+		t.Helper()
+		h.in <- registerEventFrom(
+			EPAddr{UserId: UserId("u-" + user), UserSessionId: UserSessionId("s-" + user)},
+			"", WellKnownChIdMain, username)
+		ack := h.recvOut(t)
+		if ack.S2CEv == nil || ack.S2CEv.Err != nil || ack.S2CEv.RegisterResult == nil {
+			t.Fatalf("auto register(%q) ack: %+v, want a registerResult and no error", username, ack)
+		}
+		return ack.S2CEv.RegisterResult
+	}
+
+	// Ids are assigned sequentially from the start of the range.
+	if got := registerAuto("a", "auto-a"); got.SubscriberId != "1000" || got.ChannelId != WellKnownChIdMain {
+		t.Fatalf("first auto assignment = %+v, want subscriber 1000 in the main channel", got)
+	}
+	if got := registerAuto("b", "auto-b"); got.SubscriberId != "1001" {
+		t.Fatalf("second auto assignment = %+v, want subscriber 1001", got)
+	}
+
+	// Ids already taken are skipped.
+	h.mustRegister(t, "1002", "manual")
+	if got := registerAuto("c", "auto-c"); got.SubscriberId != "1003" {
+		t.Fatalf("auto assignment past a taken id = %+v, want subscriber 1003", got)
+	}
+
+	// The assigned id is a working registration.
+	h.in <- &SignallingEvent{
+		From:  EPAddr{UserId: "u-q", UserSessionId: "s-q"},
+		MsgId: "m-q-auto",
+		C2SEv: &ClientToSSEv{UserProfileQuery: &ClientToSSUserProfileQuery{
+			SubscriberId: "1000",
+			ChannelId:    WellKnownChIdMain,
+		}},
+	}
+	reply := h.recvOut(t)
+	if reply.S2CEv == nil || reply.S2CEv.Profile == nil || reply.S2CEv.Profile.Username != "auto-a" {
+		t.Fatalf("profile of an auto-assigned id = %+v, want username auto-a", reply)
+	}
+}
+
+// TestRegisterAutoAssignedExhaustion checks that when every id of the
+// automatic assignment range is taken, an empty-id registration is
+// rejected with ErrorCodeNoSubscriberIdAvailable.
+func TestRegisterAutoAssignedExhaustion(t *testing.T) {
+	h := startProvider(t)
+	for n := autoSubscriberIdRangeStart; n < autoSubscriberIdRangeEnd; n++ {
+		id := SubscriberId(strconv.Itoa(n))
+		h.mustRegister(t, id, string(id))
+	}
+	h.in <- registerEventFrom(EPAddr{UserId: "u-late", UserSessionId: "s-late"},
+		"", WellKnownChIdMain, "late")
+	reply := h.recvOut(t)
+	if reply.S2CEv == nil || reply.S2CEv.Err == nil ||
+		reply.S2CEv.Err.ErrorCode != ErrorCodeNoSubscriberIdAvailable {
+		t.Fatalf("exhausted range reply = %+v, want error code %d", reply, ErrorCodeNoSubscriberIdAvailable)
 	}
 }
 
@@ -245,13 +318,41 @@ func TestQueryProfile(t *testing.T) {
 	}
 }
 
+func TestQueryChannelProfile(t *testing.T) {
+	h := startProvider(t)
+
+	query := func(ch ChannelId) *SignallingEvent {
+		return &SignallingEvent{
+			From:  EPAddr{UserId: "u-bob"},
+			MsgId: MsgId("m-ch-query"),
+			C2SEv: &ClientToSSEv{ChannelProfileQuery: &ClientToSSChannelProfileQuery{ChannelId: ch}},
+		}
+	}
+
+	h.in <- query(WellKnownChIdMain)
+	reply := h.recvOut(t)
+	if reply.S2CEv == nil || reply.S2CEv.Err != nil || reply.S2CEv.ChannelProfile == nil {
+		t.Fatalf("reply = %+v, want a channel profile and no error", reply)
+	}
+	profile := reply.S2CEv.ChannelProfile
+	if profile.ChannelId != WellKnownChIdMain || profile.ChannelName != mainChannelName {
+		t.Fatalf("channel profile = %+v, want the main channel", profile)
+	}
+
+	h.in <- query("no-such-channel")
+	reply = h.recvOut(t)
+	if reply.S2CEv == nil || reply.S2CEv.Err == nil || reply.S2CEv.Err.ErrorCode != ErrorCodeChannelNotFound {
+		t.Fatalf("unknown channel reply = %+v, want error code %d", reply, ErrorCodeChannelNotFound)
+	}
+}
+
 func TestRelayPassesC2CThrough(t *testing.T) {
 	h := startProvider(t)
 	h.mustRegister(t, "alice", "alice")
 	h.mustRegister(t, "bob", "bob")
 
 	c2c := func() *ClientToClientEv {
-		return &ClientToClientEv{FromSubscriber: "alice", ToSubscriber: "bob"}
+		return &ClientToClientEv{FromSubscriber: "alice", ToSubscriber: "bob", ChannelId: WellKnownChIdMain}
 	}
 	for _, tc := range []struct {
 		name string
@@ -300,9 +401,11 @@ func TestRelayUnknownSubscriber(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		c2c  *ClientToClientEv
+		want ErrorCode
 	}{
-		{"from not registered", &ClientToClientEv{FromSubscriber: "ghost", ToSubscriber: "alice"}},
-		{"to not registered", &ClientToClientEv{FromSubscriber: "alice", ToSubscriber: "ghost"}},
+		{"from not registered", &ClientToClientEv{FromSubscriber: "ghost", ToSubscriber: "alice", ChannelId: WellKnownChIdMain}, ErrorCodeSubscriberNotFound},
+		{"to not registered", &ClientToClientEv{FromSubscriber: "alice", ToSubscriber: "ghost", ChannelId: WellKnownChIdMain}, ErrorCodeSubscriberNotFound},
+		{"channel not found", &ClientToClientEv{FromSubscriber: "alice", ToSubscriber: "alice", ChannelId: "no-such-channel"}, ErrorCodeChannelNotFound},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			tc.c2c.Ping = &PingPongMsg{PingId: "p1", SequenceNumber: 1}
@@ -311,8 +414,8 @@ func TestRelayUnknownSubscriber(t *testing.T) {
 			if reply.S2CEv == nil || reply.S2CEv.Err == nil {
 				t.Fatalf("reply = %+v, want an s2CEv error", reply)
 			}
-			if reply.S2CEv.Err.ErrorCode != ErrorCodeSubscriberNotFound {
-				t.Fatalf("error code = %d, want %d", reply.S2CEv.Err.ErrorCode, ErrorCodeSubscriberNotFound)
+			if reply.S2CEv.Err.ErrorCode != tc.want {
+				t.Fatalf("error code = %d, want %d", reply.S2CEv.Err.ErrorCode, tc.want)
 			}
 		})
 	}
@@ -325,15 +428,46 @@ func TestWireJSONShape(t *testing.T) {
 		C2CEv: &ClientToClientEv{
 			FromSubscriber: "alice",
 			ToSubscriber:   "bob",
+			ChannelId:      WellKnownChIdMain,
 			SessionDesc:    &webrtc.SessionDescription{Type: webrtc.SDPTypeOffer, SDP: "v=0\r\n"},
 		},
 	})
 	if err != nil {
 		t.Fatalf("Marshal: %v", err)
 	}
-	want := `{"from":{"userId":"u-alice","userSessionId":"s-1"},"to":{},"msgId":"m1","c2CEv":{"fromSubscriber":"alice","toSubscriber":"bob","sessionDesc":{"type":"offer","sdp":"v=0\r\n"}}}`
+	want := `{"from":{"userId":"u-alice","userSessionId":"s-1"},"to":{},"msgId":"m1","c2CEv":{"fromSubscriber":"alice","toSubscriber":"bob","channelId":"f887f5b0-7b78-4ceb-a051-f42879f9d98e","sessionDesc":{"type":"offer","sdp":"v=0\r\n"}}}`
 	if string(data) != want {
 		t.Fatalf("wire shape = %s, want %s", data, want)
+	}
+}
+
+func TestListChannels(t *testing.T) {
+	h := startProvider(t)
+
+	// No registration is needed: list the channels right away. Only the
+	// main channel exists, so the answer is exactly one final page
+	// holding it.
+	h.in <- &SignallingEvent{
+		From:  EPAddr{UserId: "u-q", UserSessionId: "s-q"},
+		MsgId: MsgId("m-list-channels"),
+		C2SEv: &ClientToSSEv{ListChannels: &ClientToSSListChannels{}},
+	}
+	res := h.recvOut(t)
+	if res.S2CEv == nil || res.S2CEv.ChannelListResult == nil {
+		t.Fatalf("reply = %+v, want a channelListResult", res)
+	}
+	if res.S2CEv.Err != nil {
+		t.Fatalf("reply carries an error: %+v", res.S2CEv.Err)
+	}
+	if res.InReplyTo == nil || *res.InReplyTo != "m-list-channels" {
+		t.Errorf("page InReplyTo = %v, want %q", res.InReplyTo, "m-list-channels")
+	}
+	page := res.S2CEv.ChannelListResult
+	if page.HasMore {
+		t.Error("page hasMore = true, want false")
+	}
+	if want := []ChannelId{WellKnownChIdMain}; !slices.Equal(page.Channels, want) {
+		t.Errorf("page channels = %v, want %v", page.Channels, want)
 	}
 }
 

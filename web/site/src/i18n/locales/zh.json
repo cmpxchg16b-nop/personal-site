@@ -75,7 +75,6 @@
     "message": "发消息给 {{target}}",
     "send": "发送",
     "empty": "还没有消息，来打个招呼吧。",
-    "you": "我",
     "online": "在线",
     "offline": "离线",
     "back": "返回频道列表",

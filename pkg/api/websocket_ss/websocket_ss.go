@@ -4,11 +4,12 @@
 // provider, and every event the provider emits is written to the
 // connection its To EPAddr resolves to.
 //
-// Client identity is experimental — taken, for now, from the
-// X-Exp-UserId and X-Exp-UserSessionId request headers. As the wire
-// prototype allows (see web/site/src/api/ss/types.ts), the handler
-// populates empty From EPAddr fields of inbound messages from these
-// headers.
+// Client identity comes from the caller's session (see
+// pkgsession.SessionManager): the session's subject id is the user id and
+// the session id is the user session id. The endpoint is not on the
+// server's JWT whitelist, so every connection belongs to an authenticated
+// session; the From EPAddr of every inbound message is overridden with it
+// — a client-supplied From is untrusted input and is discarded.
 //
 // Like a learning switch, the handler builds the association between a
 // connection's remote ip:port and the (user id, user session id) pair by
@@ -24,21 +25,15 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"net/url"
+	"slices"
+	"strings"
 	"time"
 
 	"github.com/gorilla/websocket"
 
 	"personal-site/pkg/models/ss"
-)
-
-const (
-	// HeaderExpUserId carries the experimental user id of the connecting
-	// client.
-	HeaderExpUserId = "X-Exp-UserId"
-
-	// HeaderExpUserSessionId carries the experimental user session id of
-	// the connecting client.
-	HeaderExpUserSessionId = "X-Exp-UserSessionId"
+	pkgsession "personal-site/pkg/session"
 )
 
 const (
@@ -64,6 +59,7 @@ type WebSocketSSHandler struct {
 	// CheckOrigin) before serving the first request.
 	Upgrader websocket.Upgrader
 
+	sm      pkgsession.SessionManager
 	ctx     context.Context
 	inMsg   chan *ss.SignallingEvent // events from all connections, to the provider
 	outMsg  chan *ss.SignallingEvent // events emitted by the provider
@@ -72,12 +68,15 @@ type WebSocketSSHandler struct {
 }
 
 // NewWebSocketSSHandler constructs a WebSocketSSHandler bridging to
-// provider, which must be non-nil. The provider's Run loop and the
-// handler's hub start immediately and live until ctx is done (or the
-// provider stops); connections still open then are closed.
-func NewWebSocketSSHandler(ctx context.Context, provider ss.SignallingServiceProvider) *WebSocketSSHandler {
+// provider, which must be non-nil, resolving each connection's identity
+// through sm (the request-scoped session populated by the session
+// middleware upstream). The provider's Run loop and the handler's hub
+// start immediately and live until ctx is done (or the provider stops);
+// connections still open then are closed.
+func NewWebSocketSSHandler(ctx context.Context, provider ss.SignallingServiceProvider, sm pkgsession.SessionManager) *WebSocketSSHandler {
 	h := &WebSocketSSHandler{
 		Upgrader: websocket.Upgrader{ReadBufferSize: 4096, WriteBufferSize: 4096},
+		sm:       sm,
 		ctx:      ctx,
 		inMsg:    make(chan *ss.SignallingEvent, inMsgBufferSize),
 		outMsg:   make(chan *ss.SignallingEvent, outMsgBufferSize),
@@ -89,14 +88,18 @@ func NewWebSocketSSHandler(ctx context.Context, provider ss.SignallingServicePro
 	return h
 }
 
-// ServeHTTP implements http.Handler. Requests without both experimental
-// identity headers are answered 400; all other requests are upgraded to
-// WebSocket.
+// ServeHTTP implements http.Handler. Requests whose session carries no
+// identity (no subject id or no session id) are answered 400; all other
+// requests are upgraded to WebSocket.
 func (h *WebSocketSSHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	userId := ss.UserId(r.Header.Get(HeaderExpUserId))
-	sessionId := ss.UserSessionId(r.Header.Get(HeaderExpUserSessionId))
+	var userId ss.UserId
+	var sessionId ss.UserSessionId
+	if sess, ok := h.sm.GetSessionFromContext(r.Context()); ok {
+		userId = ss.UserId(sess.SubjectId())
+		sessionId = ss.UserSessionId(sess.Id())
+	}
 	if userId == "" || sessionId == "" {
-		http.Error(w, "missing "+HeaderExpUserId+" or "+HeaderExpUserSessionId+" header", http.StatusBadRequest)
+		http.Error(w, "session carries no identity (subject id or session id is empty)", http.StatusBadRequest)
 		return
 	}
 	conn, err := h.Upgrader.Upgrade(w, r, nil)
@@ -203,9 +206,10 @@ func (h *WebSocketSSHandler) note(n hubNote) bool {
 	}
 }
 
-// readPump parses the text frames of c as SignallingEvents, populates
-// empty From fields from the connection's identity headers, and hands
-// the events to the hub. Binary and unparseable frames are skipped. It
+// readPump parses the text frames of c as SignallingEvents, overrides
+// their From fields with the connection's session identity (client-
+// supplied From values are not trusted), and hands the events to the hub.
+// Binary and unparseable frames are skipped. It
 // returns when the connection fails or the handler shuts down, and
 // reports the closure to the hub.
 func (h *WebSocketSSHandler) readPump(c *wsConn, userId ss.UserId, sessionId ss.UserSessionId) {
@@ -222,12 +226,8 @@ func (h *WebSocketSSHandler) readPump(c *wsConn, userId ss.UserId, sessionId ss.
 		if err := json.Unmarshal(data, &ev); err != nil {
 			continue
 		}
-		if ev.From.UserId == "" {
-			ev.From.UserId = userId
-		}
-		if ev.From.UserSessionId == "" {
-			ev.From.UserSessionId = sessionId
-		}
+		ev.From.UserId = userId
+		ev.From.UserSessionId = sessionId
 		if !h.note(hubNote{kind: noteMessage, conn: c, ev: &ev}) {
 			return
 		}
@@ -331,3 +331,26 @@ func (t *camTable) purge(c *wsConn) {
 }
 
 var _ http.Handler = (*WebSocketSSHandler)(nil)
+
+// CheckOriginAllowing returns a websocket.Upgrader CheckOrigin func that
+// applies gorilla's default policy — no Origin header, or an Origin whose
+// host matches the request's — and additionally trusts origins in
+// allowedOrigins (scheme://host), mirroring the login handlers. The extra
+// trust covers development, where the browser's origin is the frontend
+// dev server proxying /api/* to this server.
+func CheckOriginAllowing(allowedOrigins []string) func(r *http.Request) bool {
+	return func(r *http.Request) bool {
+		origin := r.Header.Get("Origin")
+		if origin == "" {
+			return true
+		}
+		u, err := url.Parse(origin)
+		if err != nil {
+			return false
+		}
+		if strings.EqualFold(u.Host, r.Host) {
+			return true
+		}
+		return slices.Contains(allowedOrigins, u.Scheme+"://"+u.Host)
+	}
+}

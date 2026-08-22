@@ -47,6 +47,12 @@ export interface EPAddr {
 // refresh (it may update the username); registration of an id bound to another
 // tuple is rejected with ErrorCode.SubscriberIdIsRegistered.
 export interface ClientToSSRegEv {
+  /** if empty, the SS assigns a subscriber id sequentially from the
+   * automatic assignment range 1000-1999 and echoes it in the
+   * registerResult reply; an empty id always mints a fresh subscriber,
+   * even from an already-registered tuple. Clients picking their own
+   * subscriber ids are recommended to preserve that range for automatic
+   * registration. */
   subscriberId: SubscriberId;
   channelId: ChannelId;
   // descriptive, lowercase, no-space, valid dns label for displaying the subscriber in UI
@@ -59,6 +65,12 @@ export interface ClientToSSUserProfileQuery {
   channelId: ChannelId;
 }
 
+// Message for querying the profile of a channel, send from client to SS.
+// The SS answers with a s2c channelProfile reply.
+export interface ClientToSSChannelProfileQuery {
+  channelId: ChannelId;
+}
+
 // Message for listing the members of a channel, send from client to SS.
 // The SS answers with one or more s2c channelMbsListResult messages, all
 // inReplyTo the request's msg id.
@@ -66,17 +78,28 @@ export interface ClientToSSListChannelMembers {
   channelId: ChannelId;
 }
 
+// Message for listing the channels of the signalling server, send from
+// client to SS. It carries no fields. The SS answers with one or more s2c
+// channelListResult messages, all inReplyTo the request's msg id.
+export type ClientToSSListChannels = Record<string, never>;
+
 // Client to signalling server event
 export interface ClientToSSEv {
   register?: ClientToSSRegEv;
 
   userProfileQuery?: ClientToSSUserProfileQuery;
 
+  /** query the profile of a channel; the SS answers with a s2c channelProfile */
+  channelProfileQuery?: ClientToSSChannelProfileQuery;
+
   /** ping the signalling server itself (out of band liveness/keepalive, e.g. from browsers, which cannot send protocol-level WebSocket pings); the SS answers with a s2c pong */
   ping?: PingPongMsg;
 
   /** list the members of a channel; the SS answers with one or more channelMbsListResult messages */
   listChannelMembers?: ClientToSSListChannelMembers;
+
+  /** list the channels of the server; the SS answers with one or more channelListResult messages */
+  listChannels?: ClientToSSListChannels;
 }
 
 export enum ErrorCode {
@@ -91,6 +114,9 @@ export enum ErrorCode {
 
   // the username you requested in the registration has already been taken by someone else.
   UsernameTaken,
+
+  // no subscriber id is free in the automatic assignment range 1000-1999 (all are registered)
+  NoSubscriberIdAvailable,
 }
 
 export interface SSToClientErrEv {
@@ -108,6 +134,12 @@ export interface UserProfile {
   username: string;
 }
 
+// The profile data the SS holds about a channel.
+export interface ChannelProfile {
+  channelId: ChannelId;
+  channelName: string;
+}
+
 // One page of a channel members list result. Multiple result messages can be
 // sent per one listChannelMembers request, all correlated via inReplyTo; the
 // client might decide a timeout on its own, or wait until hasMore is false.
@@ -120,19 +152,47 @@ export interface SSToClientChannelMbsListResult {
   hasMore: boolean;
 }
 
+// One page of a channel list result. Multiple result messages can be
+// sent per one listChannels request, all correlated via inReplyTo; the
+// client might decide a timeout on its own, or wait until hasMore is false.
+export interface SSToClientChannelListResult {
+  // (a page of) the channel ids of the server; use channelProfileQuery to
+  // resolve a channel's profile
+  channels: ChannelId[];
+  // true when more result messages follow for the same request
+  hasMore: boolean;
+}
+
+// The result of a successful registration, echoed back by the SS: the
+// channel and the subscriber id the registration is bound to. The
+// subscriber id is assigned by the SS when the request left it empty.
+export interface RegisterResult {
+  channelId: ChannelId;
+  subscriberId: SubscriberId;
+}
+
 // Signalling server to Client event
 export interface SSToClientEv {
   // err is present only when there IS an error occurred, null or undefined otherwise.
   err?: SSToClientErrEv;
 
+  // carries the reply payload of a successful registration.
+  registerResult?: RegisterResult;
+
   // carries the reply payload of a user profile query; present only on profile query replies.
   profile?: UserProfile;
+
+  // carries the reply payload of a channel profile query; present only on channel profile query replies.
+  channelProfile?: ChannelProfile;
 
   // pong answering a c2s ping: keeps the ping id, ack = ping's seq + 1
   pong?: PingPongMsg;
 
   // one page of the answer to a listChannelMembers request
   channelMbsListResult?: SSToClientChannelMbsListResult;
+
+  // one page of the answer to a listChannels request
+  channelListResult?: SSToClientChannelListResult;
 }
 
 // A ping or ping-reply message: between two clients (relayed by the SS), or
@@ -151,11 +211,32 @@ export interface ClientToClientEv {
 
   toSubscriber: SubscriberId;
 
-  /** A WebRTC/SIP-flavor session description object, for example { type: 'answer', sdp: SDP } */
-  sessionDesc?: RTCSessionDescription;
+  /**
+   * The channel scoping the two subscriber ids — think of a subscriber id as
+   * an IP address and the channel as the VLAN it lives in: a subscriber id
+   * alone does not determine an endpoint, only (channelId, subscriberId)
+   * does. There is deliberately a single channel id, no from/to pair: caller
+   * and callee are expected to be registered in the same channel.
+   */
+  channelId: ChannelId;
 
-  /** Trickle ICE candidate */
-  rtcICECandidate?: RTCIceCandidate;
+  /**
+   * A WebRTC/SIP-flavor session description object, for example
+   * { type: 'answer', sdp: SDP }. This is the JSON wire shape shared by the
+   * browser's RTCSessionDescription (what JSON.stringify produces from it via
+   * toJSON()) and pion's webrtc.SessionDescription on the server side; it can
+   * be passed straight to RTCPeerConnection.setRemoteDescription().
+   */
+  sessionDesc?: RTCSessionDescriptionInit;
+
+  /**
+   * Trickle ICE candidate, in the JSON wire shape shared by the browser's
+   * RTCIceCandidate (via toJSON()) and pion's webrtc.ICECandidateInit on the
+   * server side; it can be passed straight to
+   * RTCPeerConnection.addIceCandidate(). An empty candidate string signals
+   * end-of-candidates.
+   */
+  rtcICECandidate?: RTCIceCandidateInit;
 
   /** out of band ping message */
   ping?: PingPongMsg;
