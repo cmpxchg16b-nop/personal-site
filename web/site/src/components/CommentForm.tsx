@@ -20,45 +20,32 @@ type CommentFormProps = {
   error: Error | null;
   // onSubmit resolves to true when the comment was posted — only then is the
   // text area cleared, so a failed attempt never loses what was written.
-  onSubmit: (input: { userId: string; content: string }) => Promise<boolean>;
+  onSubmit: (input: { content: string }) => Promise<boolean>;
 };
 
-// CommentForm is the comment editor: a name field, then the comment box — a
-// rounded, outlined container holding a borderless multiline input with the
-// send icon button in its bottom-right corner. Both fields are required; the
-// name is typed fresh each time — there is no authentication, so a comment's
-// author is whatever name the commenter enters.
+// CommentForm is the comment editor: the comment box — a rounded, outlined
+// container holding a borderless multiline input with the send icon button
+// in its bottom-right corner. There is no name field: the comment's author
+// is the commenter's session identity, resolved server-side.
 export default function CommentForm({
   submitting,
   error,
   onSubmit,
 }: CommentFormProps) {
   const { t } = useTranslation();
-  const [name, setName] = useState("");
   const [content, setContent] = useState("");
-  // touched gates the name field's error state: an untouched form shows no
-  // error; once the commenter types into or leaves either field, a
-  // trimmed-empty name is flagged live.
-  const [touched, setTouched] = useState(false);
 
-  const userId = name.trim();
   const trimmedContent = content.trim();
-  const fieldsValid = userId !== "" && trimmedContent !== "";
-  const nameError = touched && userId === "";
+  const fieldsValid = trimmedContent !== "";
 
   const handleSubmit = async (event: React.FormEvent) => {
     event.preventDefault();
     // The send button blocks invalid and duplicate submissions already; this
-    // guards programmatic submits (e.g. pressing Enter in a field), flagging
-    // the name field when an invalid submit is attempted.
-    if (submitting) {
+    // guards programmatic submits (e.g. pressing Enter in the field).
+    if (submitting || !fieldsValid) {
       return;
     }
-    if (!fieldsValid) {
-      setTouched(true);
-      return;
-    }
-    if (await onSubmit({ userId, content: trimmedContent })) {
+    if (await onSubmit({ content: trimmedContent })) {
       setContent("");
     }
   };
@@ -82,11 +69,7 @@ export default function CommentForm({
         <TextField
           placeholder={t("comments.content")}
           value={content}
-          onChange={(e) => {
-            setContent(e.target.value);
-            setTouched(true);
-          }}
-          onBlur={() => setTouched(true)}
+          onChange={(e) => setContent(e.target.value)}
           multiline
           minRows={3}
           fullWidth
@@ -113,24 +96,6 @@ export default function CommentForm({
           </IconButton>
         </Box>
       </Box>
-      {/* The name field sits below the comment box: its error helper text
-          appearing pushes only whatever is below the form, so the box never
-          jumps. */}
-      <TextField
-        label={t("comments.name")}
-        value={name}
-        onChange={(e) => {
-          setName(e.target.value);
-          setTouched(true);
-        }}
-        onBlur={() => setTouched(true)}
-        error={nameError}
-        helperText={nameError ? t("comments.nameRequired") : undefined}
-        size="small"
-        sx={{ mt: 2, maxWidth: 320 }}
-        fullWidth
-        variant="standard"
-      />
       {error !== null && (
         <Alert severity="warning" sx={{ mt: 2 }}>
           {error instanceof ApiError && error.status === 409

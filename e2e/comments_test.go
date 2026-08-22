@@ -68,6 +68,9 @@ func startServerWithArgs(t *testing.T, args ...string) string {
 	cmd := exec.Command(serverBin, append([]string{"--addr", addr}, args...)...)
 	cmd.Stdout = &output
 	cmd.Stderr = &output
+	// The server requires a JWT secret at startup (it signs and validates the
+	// login session tokens); supply a throwaway one for the test process.
+	cmd.Env = append(os.Environ(), "JWT_SECRET=personal-site-e2e-secret")
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start the server: %v", err)
 	}
@@ -122,10 +125,18 @@ type commentView struct {
 }
 
 // getComments GETs the comments of channelId, returning the status code and
-// the decoded comments.
-func getComments(t *testing.T, baseURL, channelId string) (int, []commentView) {
+// the decoded comments. jwtCookie is the session cookie to carry ("" for an
+// anonymous read — GETs are open).
+func getComments(t *testing.T, baseURL, channelId, jwtCookie string) (int, []commentView) {
 	t.Helper()
-	resp, err := http.Get(baseURL + "/api/comments/channel/" + channelId)
+	req, err := http.NewRequest(http.MethodGet, baseURL+"/api/comments/channel/"+channelId, nil)
+	if err != nil {
+		t.Fatalf("GET channel %q: %v", channelId, err)
+	}
+	if jwtCookie != "" {
+		req.AddCookie(&http.Cookie{Name: "jwt", Value: jwtCookie})
+	}
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("GET channel %q: %v", channelId, err)
 	}
@@ -140,8 +151,9 @@ func getComments(t *testing.T, baseURL, channelId string) (int, []commentView) {
 }
 
 // putComment PUTs payload (any JSON-marshalable value) to channelId,
-// returning the status code and the raw response body.
-func putComment(t *testing.T, baseURL, channelId string, payload any) (int, []byte) {
+// returning the status code and the raw response body. jwtCookie is the
+// session cookie to carry ("" exercises the unauthenticated path).
+func putComment(t *testing.T, baseURL, channelId, jwtCookie string, payload any) (int, []byte) {
 	t.Helper()
 	b, err := json.Marshal(payload)
 	if err != nil {
@@ -153,6 +165,9 @@ func putComment(t *testing.T, baseURL, channelId string, payload any) (int, []by
 		t.Fatalf("build PUT request: %v", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if jwtCookie != "" {
+		req.AddCookie(&http.Cookie{Name: "jwt", Value: jwtCookie})
+	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("PUT channel %q: %v", channelId, err)
@@ -166,10 +181,9 @@ func putComment(t *testing.T, baseURL, channelId string, payload any) (int, []by
 }
 
 // mustPutComment PUTs a comment expecting success and returns it decoded.
-func mustPutComment(t *testing.T, baseURL, channelId, userId, content, lastCommentId string) commentView {
+func mustPutComment(t *testing.T, baseURL, channelId, jwtCookie, content, lastCommentId string) commentView {
 	t.Helper()
-	status, body := putComment(t, baseURL, channelId, map[string]string{
-		"user_id":         userId,
+	status, body := putComment(t, baseURL, channelId, jwtCookie, map[string]string{
 		"content":         content,
 		"last_comment_id": lastCommentId,
 	})
@@ -183,14 +197,34 @@ func mustPutComment(t *testing.T, baseURL, channelId, userId, content, lastComme
 	return c
 }
 
+// profileUsername GETs /api/profile with the session cookie and returns the
+// session's username — the identity the comments API is expected to stamp on
+// appended comments.
+func profileUsername(t *testing.T, baseURL, jwtCookie string) string {
+	t.Helper()
+	body := cookieReq(t, http.DefaultClient, baseURL, http.MethodGet, "/api/profile", "", jwtCookie)
+	var profile struct {
+		Username string `json:"username"`
+	}
+	if err := json.Unmarshal(body, &profile); err != nil {
+		t.Fatalf("GET /api/profile: decode response: %v", err)
+	}
+	if profile.Username == "" {
+		t.Fatal("GET /api/profile: empty username")
+	}
+	return profile.Username
+}
+
 // TestCommentsAPI drives the comments API of a freshly started server
-// through a full commenting scenario.
+// through a full commenting scenario: reads are anonymous, appends carry a
+// visitor session, and the server stamps each comment with the session's
+// identity.
 func TestCommentsAPI(t *testing.T) {
 	baseURL := startServer(t)
 	channel := "e2e-post"
 
-	// A fresh channel is an empty list.
-	status, comments := getComments(t, baseURL, channel)
+	// A fresh channel is an empty list — readable without any session.
+	status, comments := getComments(t, baseURL, channel, "")
 	if status != http.StatusOK {
 		t.Fatalf("GET fresh channel: status: got %d, want %d", status, http.StatusOK)
 	}
@@ -198,17 +232,35 @@ func TestCommentsAPI(t *testing.T) {
 		t.Fatalf("GET fresh channel: got %d comments, want 0", len(comments))
 	}
 
-	// The first comment: server-assigned id, serial 0, no parent. Anyone can
-	// post under any user id — there is no authentication.
-	first := mustPutComment(t, baseURL, channel, "alice", "first!", "")
+	// Appending without a session is rejected: the author comes from the
+	// caller's session, so an anonymous PUT has no identity to stamp.
+	status, _ = putComment(t, baseURL, channel, "", map[string]string{
+		"content":         "anonymous",
+		"last_comment_id": "",
+	})
+	if status != http.StatusUnauthorized {
+		t.Errorf("PUT without a session: status: got %d, want %d", status, http.StatusUnauthorized)
+	}
+
+	// Log in as a visitor; every append below carries this session's cookie.
+	jwtCookie := loginAsVisitor(t, baseURL+"/api/login/visitor")
+	if jwtCookie == "" {
+		t.Fatal("visitor login did not set a jwt cookie")
+	}
+	// The identity the server is expected to stamp on the session's comments.
+	author := profileUsername(t, baseURL, jwtCookie)
+
+	// The first comment: server-assigned id, serial 0, no parent, and the
+	// session's identity as its author.
+	first := mustPutComment(t, baseURL, channel, jwtCookie, "first!", "")
 	if first.ID == "" {
 		t.Error("first comment: id is empty")
 	}
 	if first.ChannelID != channel {
 		t.Errorf("first comment: channel_id = %q, want %q", first.ChannelID, channel)
 	}
-	if first.UserID != "alice" {
-		t.Errorf("first comment: user_id = %q, want %q", first.UserID, "alice")
+	if first.UserID != author {
+		t.Errorf("first comment: user_id = %q, want the session's identity %q", first.UserID, author)
 	}
 	if first.SerialNumber != 0 {
 		t.Errorf("first comment: serial_number = %d, want 0", first.SerialNumber)
@@ -226,8 +278,8 @@ func TestCommentsAPI(t *testing.T) {
 		t.Errorf("first comment: last_modified = %d, want creation_time %d", first.LastModified, first.CreationTime)
 	}
 
-	// A second comment chained on the first, in someone else's name.
-	second := mustPutComment(t, baseURL, channel, "bob", "second!", first.ID)
+	// A second comment chained on the first.
+	second := mustPutComment(t, baseURL, channel, jwtCookie, "second!", first.ID)
 	if second.SerialNumber != 1 {
 		t.Errorf("second comment: serial_number = %d, want 1", second.SerialNumber)
 	}
@@ -235,8 +287,8 @@ func TestCommentsAPI(t *testing.T) {
 		t.Errorf("second comment: last_comment_id = %q, want %q", second.LastCommentID, first.ID)
 	}
 
-	// The channel reads back oldest-first.
-	status, comments = getComments(t, baseURL, channel)
+	// The channel reads back oldest-first — still anonymously.
+	status, comments = getComments(t, baseURL, channel, "")
 	if status != http.StatusOK {
 		t.Fatalf("GET channel: status: got %d, want %d", status, http.StatusOK)
 	}
@@ -254,8 +306,7 @@ func TestCommentsAPI(t *testing.T) {
 
 	// Appending onto a last comment that is no longer the channel's last
 	// conflicts; the client is expected to re-read and retry.
-	status, _ = putComment(t, baseURL, channel, map[string]string{
-		"user_id":         "alice",
+	status, _ = putComment(t, baseURL, channel, jwtCookie, map[string]string{
 		"content":         "late reply",
 		"last_comment_id": first.ID,
 	})
@@ -264,8 +315,7 @@ func TestCommentsAPI(t *testing.T) {
 	}
 
 	// A last comment id that does not exist at all is a bad request.
-	status, _ = putComment(t, baseURL, channel, map[string]string{
-		"user_id":         "alice",
+	status, _ = putComment(t, baseURL, channel, jwtCookie, map[string]string{
 		"content":         "orphan",
 		"last_comment_id": "no-such-comment",
 	})
@@ -274,8 +324,7 @@ func TestCommentsAPI(t *testing.T) {
 	}
 
 	// Only text/plain is supported.
-	status, _ = putComment(t, baseURL, channel, map[string]string{
-		"user_id":         "alice",
+	status, _ = putComment(t, baseURL, channel, jwtCookie, map[string]string{
 		"content":         "<b>bold</b>",
 		"mime_type":       "text/html",
 		"last_comment_id": second.ID,
@@ -284,22 +333,25 @@ func TestCommentsAPI(t *testing.T) {
 		t.Errorf("PUT text/html: status: got %d, want %d", status, http.StatusUnsupportedMediaType)
 	}
 
-	// user_id and content are required; the body must be a JSON object.
-	status, _ = putComment(t, baseURL, channel, map[string]string{"content": "anonymous"})
-	if status != http.StatusBadRequest {
-		t.Errorf("PUT without user_id: status: got %d, want %d", status, http.StatusBadRequest)
-	}
-	status, _ = putComment(t, baseURL, channel, map[string]string{"user_id": "alice"})
+	// content is required; the body must be a JSON object.
+	status, _ = putComment(t, baseURL, channel, jwtCookie, map[string]string{"last_comment_id": second.ID})
 	if status != http.StatusBadRequest {
 		t.Errorf("PUT without content: status: got %d, want %d", status, http.StatusBadRequest)
 	}
-	status, _ = putComment(t, baseURL, channel, "not a json object")
+	status, _ = putComment(t, baseURL, channel, jwtCookie, "not a json object")
 	if status != http.StatusBadRequest {
 		t.Errorf("PUT with a non-object body: status: got %d, want %d", status, http.StatusBadRequest)
 	}
 
 	// Other methods on the channel path are not allowed.
-	resp, err := http.Post(baseURL+"/api/comments/channel/"+channel, "application/json", strings.NewReader("{}"))
+	req, err := http.NewRequest(http.MethodPost,
+		baseURL+"/api/comments/channel/"+channel, strings.NewReader("{}"))
+	if err != nil {
+		t.Fatalf("POST channel: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(&http.Cookie{Name: "jwt", Value: jwtCookie})
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("POST channel: %v", err)
 	}
@@ -309,16 +361,26 @@ func TestCommentsAPI(t *testing.T) {
 	}
 
 	// Channels are isolated: a comment elsewhere starts its own chain and
-	// does not leak into the first channel.
-	other := mustPutComment(t, baseURL, "e2e-other", "carol", "elsewhere", "")
+	// does not leak into the first channel. A second visitor session gets its
+	// own identity — the server stamps each comment with the session it came
+	// from, not with whatever the client claims.
+	jwtCookieB := loginAsVisitor(t, baseURL+"/api/login/visitor")
+	if jwtCookieB == "" {
+		t.Fatal("second visitor login did not set a jwt cookie")
+	}
+	authorB := profileUsername(t, baseURL, jwtCookieB)
+	other := mustPutComment(t, baseURL, "e2e-other", jwtCookieB, "elsewhere", "")
 	if other.SerialNumber != 0 {
 		t.Errorf("other channel's first comment: serial_number = %d, want 0", other.SerialNumber)
 	}
-	_, comments = getComments(t, baseURL, channel)
+	if other.UserID != authorB {
+		t.Errorf("other channel comment: user_id = %q, want its own session's identity %q", other.UserID, authorB)
+	}
+	_, comments = getComments(t, baseURL, channel, "")
 	if len(comments) != 2 {
 		t.Errorf("GET channel after posting elsewhere: got %d comments, want 2", len(comments))
 	}
-	_, comments = getComments(t, baseURL, "e2e-other")
+	_, comments = getComments(t, baseURL, "e2e-other", "")
 	if len(comments) != 1 {
 		t.Errorf("GET other channel: got %d comments, want 1", len(comments))
 	}

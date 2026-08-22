@@ -44,4 +44,71 @@
     <shortlink id="gh" href="https://github.com/your-handle" />
     <shortlink id="first-post" href="/posts/your-first-post" />
   </dynBlogData>
+
+  <!-- Generic OIDC login providers (optional), consumed by the generic OIDC
+       login handler (pkg/api/login/oidc/general). Each <oidcLoginOption/>
+       registers a handler at /api/login/oidc/{providerName}/; entries with
+       an empty issuerURL are ignored by the server.
+
+       sessionLifespan is a Go time.Duration string (e.g. "168h"); when
+       omitted the handler's code-side default applies. redirectURL may be
+       relative (start with "/"), in which case the origin of the incoming
+       request is prepended; the origin must match an <allowedOrigin/>
+       entry below.
+  <oidcLoginOptions>
+    <oidcLoginOption
+      providerName="myidp"
+      issuerURL="https://auth.example.com"
+      clientId=""
+      clientSecret=""
+      redirectURL="/api/login/oidc/myidp/auth"
+      scope="openid profile email"
+      sessionLifespan="168h"
+      loginSuccessRedirectURL="/"
+    />
+  </oidcLoginOptions>
+  -->
+
+  <!-- The Github OAuth login provider (optional), consumed by the Github
+       OAuth login handler (pkg/api/login/oauth2/github) at
+       /api/login/oauth2/github/. The handler is wired only when clientId is
+       non-empty. redirectURL may be relative (start with "/"), in which
+       case the origin of the incoming request is prepended; the origin must
+       match an <allowedOrigin/> entry below. loginPage, scope,
+       tokenEndpoint, sessionLifespan (a Go time.Duration string) and
+       loginSuccessRedirectURL have code-side defaults and may be omitted.
+  <githubOAuthLogin
+    clientId=""
+    appSecret=""
+    redirectURL="/api/login/oauth2/github/auth"
+    scope="read:user"
+    sessionLifespan="168h"
+    loginSuccessRedirectURL="/"
+  />
+  -->
+
+  <!-- The login page's configurable IdP list (optional), served to the
+       frontend as JSON by GET /api/login/loginoptions. Options with an empty
+       loginURL are hidden by the login page.
+  <loginOptions>
+    <loginOption
+      kind="github"
+      name="github"
+      displayName="Github"
+      loginURL="/api/login/oauth2/github/start"
+    />
+    <loginOption
+      kind="visitor"
+      name="visitor"
+      displayName=""
+      label="Sign in as Visitor"
+      loginURL="/api/login/visitor"
+    />
+  </loginOptions>
+  -->
+
+  <!-- Origins ("scheme://host") trusted by the OAuth2/OIDC login handlers
+       when their configured redirect URL is relative (optional).
+  <allowedOrigin>http://localhost:8080</allowedOrigin>
+  -->
 </serverConfig>

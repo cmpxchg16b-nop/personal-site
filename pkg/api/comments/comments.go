@@ -7,10 +7,11 @@
 // channel, take the last comment's id); the client-supplied last_comment_id
 // is passed to the provider unchanged.
 //
-// There is NO authentication for now: the API trusts the client-supplied
-// user_id of every PUT, so anyone can comment in the name of anyone else.
-// Once sign-in exists, the identity must come from the session middleware
-// instead of the request body.
+// Reading is open to everyone (the GET routes are on the server's JWT
+// whitelist); appending requires a session: the author of every PUT is the
+// caller's session identity (its username, falling back to the subject id),
+// never the request body, so no client can comment in the name of anyone
+// else.
 package comments
 
 import (
@@ -18,14 +19,15 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 
 	pkgmodelscomment "personal-site/pkg/models/comment"
+	pkgsession "personal-site/pkg/session"
 	pkgutils "personal-site/pkg/utils"
 )
 
-// maxPutCommentBody caps PUT request bodies at 1 MiB: the endpoint is
-// unauthenticated, so comment payloads must not become a memory-exhaustion
-// vector.
+// maxPutCommentBody caps PUT request bodies at 1 MiB, so comment payloads
+// cannot become a memory-exhaustion vector.
 const maxPutCommentBody = 1 << 20
 
 // CommentsHandler is an http.Handler serving the commenting API, routing
@@ -37,13 +39,16 @@ const maxPutCommentBody = 1 << 20
 // It is stateless and safe for concurrent use.
 type CommentsHandler struct {
 	provider pkgmodelscomment.CommentServiceProvider
+	sm       pkgsession.SessionManager
 	mux      *http.ServeMux
 }
 
 // NewCommentsHandler constructs a CommentsHandler storing and serving
-// comments through provider, which must be non-nil.
-func NewCommentsHandler(provider pkgmodelscomment.CommentServiceProvider) *CommentsHandler {
-	h := &CommentsHandler{provider: provider}
+// comments through provider, which must be non-nil, and resolving the author
+// of appended comments through sm (the request-scoped session populated by
+// the session middleware upstream).
+func NewCommentsHandler(provider pkgmodelscomment.CommentServiceProvider, sm pkgsession.SessionManager) *CommentsHandler {
+	h := &CommentsHandler{provider: provider, sm: sm}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/comments/channel/{channelId}", h.handleGetComments)
 	mux.HandleFunc("PUT /api/comments/channel/{channelId}", h.handlePutComment)
@@ -91,11 +96,9 @@ type getCommentsResponse struct {
 }
 
 // putCommentRequest is the request body of
-// PUT /api/comments/channel/{channelId}.
+// PUT /api/comments/channel/{channelId}. The comment's author is NOT part of
+// it: the server takes the identity from the caller's session.
 type putCommentRequest struct {
-	// UserID is who the comment is from. Trusted as given: there is no
-	// authentication yet.
-	UserID  string `json:"user_id"`
 	Content string `json:"content"`
 	// MIMEType defaults to text/plain when empty.
 	MIMEType string `json:"mime_type"`
@@ -108,8 +111,8 @@ type putCommentRequest struct {
 
 func (h *CommentsHandler) handleGetComments(w http.ResponseWriter, r *http.Request) {
 	channelId := r.PathValue("channelId")
-	// The empty requestingUser: there is no authentication yet and the
-	// provider has no per-user visibility rules.
+	// The empty requestingUser: reads are open to everyone and the provider
+	// has no per-user visibility rules.
 	resp := getCommentsResponse{Comments: []commentJSON{}}
 	for ev := range h.provider.GetCommentsByChannelId(r.Context(), "", channelId) {
 		if ev.Err != nil {
@@ -129,17 +132,32 @@ func (h *CommentsHandler) handlePutComment(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid request body: %w", err))
 		return
 	}
-	if req.UserID == "" {
-		writeError(w, http.StatusBadRequest, errors.New("user_id is required"))
-		return
-	}
 	if req.Content == "" {
 		writeError(w, http.StatusBadRequest, errors.New("content is required"))
 		return
 	}
 
+	// The comment's author comes from the caller's session: the
+	// human-friendly username when the JWT carries one, else the subject id.
+	// PUT is not on the JWT whitelist, so an authenticated session is always
+	// present; a missing or identity-less one means the upstream middleware
+	// chain is misconfigured.
+	sess, ok := h.sm.GetSessionFromContext(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, errors.New("no session on the request"))
+		return
+	}
+	userId := strings.TrimSpace(sess.Username())
+	if userId == "" {
+		userId = sess.SubjectId()
+	}
+	if userId == "" {
+		writeError(w, http.StatusUnauthorized, errors.New("session carries no identity"))
+		return
+	}
+
 	c := &pkgmodelscomment.Comment{Content: req.Content, MIMEType: req.MIMEType}
-	if err := h.provider.PutComment(r.Context(), c, req.LastCommentID, req.UserID, channelId); err != nil {
+	if err := h.provider.PutComment(r.Context(), c, req.LastCommentID, userId, channelId); err != nil {
 		switch {
 		case errors.Is(err, pkgmodelscomment.ErrUnsupportedMIMEType):
 			writeError(w, http.StatusUnsupportedMediaType, err)

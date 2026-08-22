@@ -9,3 +9,6 @@ web/site/public
 web/site/tsconfig.tsbuildinfo
 bin/
 **/.DS_Store
+.env
+.env.local
+serverConfig.xml

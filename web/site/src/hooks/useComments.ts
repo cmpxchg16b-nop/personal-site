@@ -65,18 +65,19 @@ export function useComments(channelId: string, enabled = true) {
 // PostCommentInput is one comment submission. lastCommentId is the id of the
 // channel's last comment as the submitter knew it ("" when the channel
 // looked empty); the server rejects the append with 409 when the channel has
-// moved past it.
+// moved past it. The comment's author is not part of the input: the server
+// takes it from the caller's session.
 export type PostCommentInput = {
-  userId: string;
   content: string;
   lastCommentId: string;
 };
 
 // usePostComment appends a comment to a channel (PUT
-// /api/comments/channel/{channelId}). There is no authentication yet: userId
-// is trusted as given. A successful append invalidates the channel's comment
-// list; a 409 conflict invalidates it too, so the retry the server expects
-// starts from the fresh list.
+// /api/comments/channel/{channelId}). The endpoint requires a session: the
+// server derives the author from it, so an anonymous caller gets a 401. A
+// successful append invalidates the channel's comment list; a 409 conflict
+// invalidates it too, so the retry the server expects starts from the fresh
+// list.
 export function usePostComment(channelId: string) {
   const queryClient = useQueryClient();
   return useMutation({
@@ -86,7 +87,6 @@ export function usePostComment(channelId: string) {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          user_id: input.userId,
           content: input.content,
           last_comment_id: input.lastCommentId,
         }),

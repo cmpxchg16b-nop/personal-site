@@ -8,7 +8,15 @@
   },
   "profile": {
     "visitor": "Visitor",
+    "login": "Login",
+    "logout": "Log Out",
     "account": "Account: {{name}}"
+  },
+  "login": {
+    "signInWith": "Sign in with {{name}}",
+    "signInAsVisitor": "Sign in as Visitor",
+    "loadFailed": "Failed to load login options.",
+    "empty": "No viable login options."
   },
   "language": {
     "label": "Language"
@@ -54,9 +62,8 @@
     "title": "Comments",
     "loadFailed": "Failed to load the comments.",
     "empty": "No comments yet — be the first.",
-    "name": "Name",
-    "nameRequired": "Please enter a name.",
     "content": "Your comment",
+    "loginRequired": "Log in to comment",
     "submit": "Send",
     "postFailed": "Failed to post the comment. Please try again.",
     "conflict": "Someone else commented while you were writing. Your comment was not posted — please try again."

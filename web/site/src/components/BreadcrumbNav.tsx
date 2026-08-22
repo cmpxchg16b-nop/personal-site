@@ -19,6 +19,11 @@ function crumbsFor(pathname: string, t: TFunction): Crumb[] {
   if (pathname === "/") {
     return [{ label: t("nav.home") }];
   }
+  // The login page is a modal dialog outside the app's page hierarchy, so it
+  // gets no breadcrumb trail at all.
+  if (pathname === "/login") {
+    return [];
+  }
   if (pathname === "/chat") {
     return [{ label: t("nav.home"), href: "/" }, { label: t("chat.title") }];
   }

@@ -1,4 +1,4 @@
-<?xml version="1.0" encoding="UTF-8"?>
+<?xml version="1.0" encoding="UTF-8" ?>
 <!-- Schema for serverConfig.xml, the global server configuration document.
      The XML instance references this schema via
      xsi:noNamespaceSchemaLocation="serverConfig.xsd". -->
@@ -18,9 +18,165 @@
              in pkg/models/shortlink), so edits apply without a server
              restart. -->
         <xsd:element name="dynBlogData" type="dynBlogDataType" minOccurs="0" />
+        <!-- The configurable list of generic OIDC login providers, consumed
+             by the generic OIDC login handler (see
+             pkg/api/login/oidc/general). -->
+        <xsd:element
+          name="oidcLoginOptions"
+          type="oidcLoginOptionsType"
+          minOccurs="0"
+        />
+        <!-- The single Github OAuth login provider, consumed by the Github
+             OAuth login handler (see pkg/api/login/oauth2/github). When the
+             element is absent, no Github login endpoint is wired. -->
+        <xsd:element
+          name="githubOAuthLogin"
+          type="githubOAuthLoginType"
+          minOccurs="0"
+        />
+        <!-- The login page's configurable IdP list, served to the frontend
+             as JSON by GET /api/login/loginoptions (see
+             pkg/api/loginoptions). -->
+        <xsd:element
+          name="loginOptions"
+          type="loginOptionsType"
+          minOccurs="0"
+        />
+        <!-- An origin ("scheme://host") the OAuth2/OIDC login handlers trust
+             when their configured redirect URL is relative (starts with
+             "/"): the origin of the incoming login request is prepended to
+             the redirect URL only when it matches one of these entries.
+             Specify the element multiple times to allow several origins,
+             e.g. one per deployment environment alias. When no entry is
+             present, relative redirect URLs are rejected. -->
+        <xsd:element
+          name="allowedOrigin"
+          type="xsd:string"
+          minOccurs="0"
+          maxOccurs="unbounded"
+        />
       </xsd:sequence>
     </xsd:complexType>
   </xsd:element>
+
+  <!-- The configurable list of generic OIDC login providers; holds zero or
+       more oidcLoginOption entries. -->
+  <xsd:complexType name="oidcLoginOptionsType">
+    <xsd:sequence>
+      <xsd:element
+        name="oidcLoginOption"
+        type="oidcLoginOptionType"
+        minOccurs="0"
+        maxOccurs="unbounded"
+      />
+    </xsd:sequence>
+  </xsd:complexType>
+
+  <!-- A single OIDC provider configuration. Attribute names mirror the Go
+       struct fields of GenericOIDCLoginHandler (with a lowercased first
+       letter), and map directly onto the constructor parameters of
+       NewGenericOIDCLoginHandler.
+
+       Attributes with sensible code-side defaults are optional here:
+         * providerName      defaults to "oidc"
+         * scope             defaults to "openid profile email"
+         * sessionLifespan   a Go time.Duration string (e.g. "168h")
+         * loginSuccessRedirectURL  defaults to "/"
+
+       Attributes without defaults are required:
+         * issuerURL, clientId, clientSecret, redirectURL
+
+       redirectURL may be relative (start with "/"), in which case the
+       origin of the incoming request is prepended dynamically; the origin
+       must match one of the <allowedOrigin/> entries of the document. -->
+  <xsd:complexType name="oidcLoginOptionType">
+    <xsd:attribute name="issuerURL" type="xsd:string" use="required" />
+    <xsd:attribute name="clientId" type="xsd:string" use="required" />
+    <xsd:attribute name="clientSecret" type="xsd:string" use="required" />
+    <xsd:attribute name="redirectURL" type="xsd:string" use="required" />
+    <xsd:attribute name="providerName" type="xsd:string" use="optional" />
+    <xsd:attribute name="scope" type="xsd:string" use="optional" />
+    <xsd:attribute name="sessionLifespan" type="xsd:string" use="optional" />
+    <xsd:attribute
+      name="loginSuccessRedirectURL"
+      type="xsd:string"
+      use="optional"
+    />
+  </xsd:complexType>
+
+  <!-- The Github OAuth login provider configuration. Attribute names
+       mirror the Go struct fields of GithubOAuthLoginHandler with the
+       redundant GithubOAuth prefix dropped, and map directly onto the
+       constructor parameters of NewGithubOAuthLoginHandler.
+
+       Attributes with sensible code-side defaults are optional here:
+         * loginPage        defaults to Github's authorize page
+         * scope            defaults to "read:user"
+         * tokenEndpoint    defaults to Github's token endpoint
+         * sessionLifespan  a Go time.Duration string (e.g. "168h")
+         * loginSuccessRedirectURL  defaults to "/"
+
+       Attributes without defaults are required:
+         * clientId, appSecret, redirectURL
+
+       The handler is wired only when clientId is non-empty, so a sample
+       element with empty values can ship in the configuration document
+       unused. redirectURL may be relative (start with "/"), in which case
+       the origin of the incoming request is prepended dynamically; the
+       origin must match one of the <allowedOrigin/> entries of the
+       document. -->
+  <xsd:complexType name="githubOAuthLoginType">
+    <xsd:attribute name="clientId" type="xsd:string" use="required" />
+    <xsd:attribute name="appSecret" type="xsd:string" use="required" />
+    <xsd:attribute name="redirectURL" type="xsd:string" use="required" />
+    <xsd:attribute name="loginPage" type="xsd:string" use="optional" />
+    <xsd:attribute name="scope" type="xsd:string" use="optional" />
+    <xsd:attribute name="tokenEndpoint" type="xsd:string" use="optional" />
+    <xsd:attribute name="sessionLifespan" type="xsd:string" use="optional" />
+    <xsd:attribute
+      name="loginSuccessRedirectURL"
+      type="xsd:string"
+      use="optional"
+    />
+  </xsd:complexType>
+
+  <!-- The login page's configurable IdP list; holds zero or more loginOption
+       entries. Served to the frontend as JSON by the login options API
+       handler (pkg/api/loginoptions, GET /api/login/loginoptions). -->
+  <xsd:complexType name="loginOptionsType">
+    <xsd:sequence>
+      <xsd:element
+        name="loginOption"
+        type="loginOptionType"
+        minOccurs="0"
+        maxOccurs="unbounded"
+      />
+    </xsd:sequence>
+  </xsd:complexType>
+
+  <!-- A single login option. kind identifies the IdP type and selects the
+       login icon on the frontend; name is the option's unique key. Several
+       options may share a kind under different names (e.g. "entra-public"
+       and "entra-corporation", both with kind "entra"). Options with an
+       empty loginURL are hidden by the login page.
+
+       allowedOrigins is an optional comma-separated list of origins
+       ("scheme://host"); empty (the default) means no restriction. When
+       non-empty, GET /api/login/loginoptions serves the option only to
+       requests whose origin appears in the list. -->
+  <xsd:complexType name="loginOptionType">
+    <xsd:attribute name="kind" type="xsd:string" use="required" />
+    <xsd:attribute name="name" type="xsd:string" use="required" />
+    <xsd:attribute name="displayName" type="xsd:string" use="required" />
+    <xsd:attribute name="loginURL" type="xsd:string" use="required" />
+    <xsd:attribute name="label" type="xsd:string" use="optional" />
+    <xsd:attribute
+      name="allowedOrigins"
+      type="xsd:string"
+      use="optional"
+      default=""
+    />
+  </xsd:complexType>
 
   <!-- The <dynBlogData/> section; holds zero or more <postMetadata/>
        entries followed by zero or more <project/> entries, followed by zero

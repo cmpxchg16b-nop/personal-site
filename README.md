@@ -14,11 +14,42 @@ My personal site and blog, built with simplicity and brevity in mind.
   the top bar; all site copy lives in the two translation bundles.
 - **A small Go backend.** One self-contained binary that embeds and serves
   the static export, and answers the site's API endpoints: `GET
-/api/profile` (the caller's identity — currently the hard-coded visitor
-  session supplied by `StaticVisitorSessionManager`, until a login and
-  account system exists), `GET /api/healthz`, the dynamic blog data
-  under `/api/dyn/` (see below), and short-link redirects under `/links/`
-  (see below).
+/api/profile` (the caller's identity, from its JWT session), `GET
+/api/healthz`, the dynamic blog data under `/api/dyn/` (see below), and
+  short-link redirects under `/links/` (see below).
+
+## Sign-in and sessions
+
+The backend carries a JWT-based login system: a login endpoint issues a
+signed session token into an HttpOnly cookie, and a whitelist middleware
+(`pkg/auth`) requires a valid token for every `/api/` path except the
+public ones (`/api/login/...`, `/api/logout`, `/api/healthz`, `/api/dyn/`,
+`GET /api/comments/` — reads are open, appends need a session — and
+`/api/ss/ws`).
+
+- **Visitor login.** `GET /api/login/visitor` (`pkg/api/login/visitor`)
+  signs an anonymous `visitor:`-prefixed session, paced by a shared ticket
+  generator so registrations are rate-limited.
+- **GitHub OAuth.** `/api/login/oauth2/github/` (`start` + `auth`) is wired
+  when the configuration document carries a `<githubOAuthLogin/>` element
+  with a non-empty `clientId`; the flow's `state` nonce is signed with the
+  same key as the session tokens.
+- **Generic OIDC.** Each `<oidcLoginOption/>` of the server configuration
+  document mounts a provider at `/api/login/oidc/{providerName}/`
+  (`pkg/api/login/oidc/general`). A relative `redirectURL` is resolved
+  against the request's origin when it matches an `<allowedOrigin/>`
+  entry.
+- **Login options.** `GET /api/login/loginoptions`
+  (`pkg/api/loginoptions`) serves the `<loginOptions/>` section of the
+  configuration document as JSON, so the login page can render its IdP
+  buttons; `POST /api/logout` (`pkg/api/logout`) clears the session
+  cookies.
+
+The JWT secret is required at startup: set the `JWT_SECRET` environment
+variable (or point `--jwt-auth-secret-from-file` at a file, or change the
+variable name with `--jwt-auth-secret-from-env`). Conventional `.env.local`
+/ `.env` files are loaded before flag parsing, so a gitignored `.env.local`
+is the place for local secrets.
 
 ## Dynamic blog data
 
@@ -75,18 +106,34 @@ meant for sharing, so they are served without the `/api` prefix:
 ## Layout
 
 - `cmd/server/` — the Go server entrypoint (`main.go`): static export,
-  `/api/profile`, `/api/healthz`, the `/api/dyn/` mount, and the `/links/`
-  mount.
+  the login/auth wiring, `/api/profile`, `/api/healthz`, the `/api/dyn/`
+  mount, and the `/links/` mount.
 - `pkg/` — the Go packages behind the server's endpoints:
   - `pkg/models/dyn/` — `DynBlogData`, the `DynBlogDataProvider` interface,
     and `FSBasedDynBlogData`.
   - `pkg/models/shortlink/` — the `ShortLinkDataProvider` interface and
     `FsShortLinkDataProvider`.
+  - `pkg/models/serverconfig/` — the parser of the global configuration
+    document's login sections (`<loginOptions/>`, `<oidcLoginOptions/>`,
+    `<allowedOrigin/>`).
   - `pkg/api/dyn/` — `DynamicBlogDataHandler` and `HealthzHandler`.
   - `pkg/api/links/` — `ShortLinkHandler`, wired at `/links/`.
-  - `pkg/api/profile/` — `ProfileHandler`, wired at `GET /api/profile`.
-  - `pkg/session/` — the session model; hosts `StaticVisitorSessionManager`,
-    the stand-in identity provider until sign-in exists.
+  - `pkg/api/profile/` — `ProfileHandler`, wired at `/api/profile`.
+  - `pkg/api/login/` — the login handlers: `visitor/`, `oauth2/github/`,
+    `oauth2/google/`, and `oidc/` (`general/` plus the Cloudflare Access
+    JWT validator under `idTokenHeader/cloudflare/`).
+  - `pkg/api/loginoptions/`, `pkg/api/logout/` — the login page's IdP list
+    and the logout handler.
+  - `pkg/api/common/` — the cookie names and the request-origin / redirect
+    URL resolution shared by the login handlers.
+  - `pkg/auth/` — the JWT issuer/validator, the whitelist auth middleware,
+    the subject blacklist, the OAuth nonce issuer and the visitor ticket
+    generator.
+  - `pkg/cookie/` — the session/nonce cookie builder.
+  - `pkg/github/`, `pkg/google/`, `pkg/oidc/` — the token/profile types and
+    OIDC helpers behind the OAuth2/OIDC login handlers.
+  - `pkg/session/` — the session model and the middleware that builds the
+    request-scoped session from the JWT middleware's context values.
   - `pkg/log/` — the HTTP logging middleware wrapping the mux.
 - `web/site/` — the Next.js frontend (see its README).
 - `webfs.go` — embeds the frontend's static export (`web/site/out`) into the
@@ -103,7 +150,10 @@ cd web/site && npm ci && npm run build && cd ../..
 go run ./cmd/server --config-xml=serverConfig.xml
 ```
 
-Then open <http://localhost:8080>. `--config-xml` is optional; without it the
+The server needs a JWT secret at startup (it signs the login session
+tokens): export `JWT_SECRET`, or keep it in a gitignored `.env.local` —
+conventional dotenv files are loaded before flag parsing. Then open
+<http://localhost:8080>. `--config-xml` is optional; without it the
 `/api/dyn/` endpoints serve empty lists.
 
 For frontend development with hot reload, run the two side by side:

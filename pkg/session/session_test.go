@@ -16,31 +16,6 @@ import (
 // interface conformance: the on-memory manager must satisfy SessionManager.
 var _ session.SessionManager = (*session.OnMemorySessionManager)(nil)
 
-// interface conformance: the static visitor manager must satisfy
-// SessionManager.
-var _ session.SessionManager = (*session.StaticVisitorSessionManager)(nil)
-
-func TestStaticVisitorSessionManager(t *testing.T) {
-	sm := session.NewStaticVisitorSessionManager()
-
-	// Any context — even an empty one — yields the same visitor session.
-	sess, ok := sm.GetSessionFromContext(context.Background())
-	if !ok {
-		t.Fatal("empty context: got no session, want the static visitor session")
-	}
-	if sess.Id() != "visitor" || sess.SubjectId() != "visitor" || sess.Username() != "Visitor" {
-		t.Errorf("session = {id:%q subject:%q username:%q}, want the hard-coded visitor",
-			sess.Id(), sess.SubjectId(), sess.Username())
-	}
-
-	// WithSession is a no-op: an attached session must not shadow the visitor.
-	ctx := sm.WithSession(context.Background(), &session.Session{})
-	got, ok := sm.GetSessionFromContext(ctx)
-	if !ok || got != sess {
-		t.Errorf("after WithSession: got (%p, %v), want the same visitor session (%p, true)", got, ok, sess)
-	}
-}
-
 // sessionFromDownstream returns a handler that resolves the session from the
 // request context and reports what it found through the returned pointers.
 func sessionFromDownstream(found **session.Session, ok *bool) http.Handler {

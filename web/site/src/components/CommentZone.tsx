@@ -1,11 +1,18 @@
 "use client";
 
+import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { Box, LinearProgress, Typography } from "@mui/material";
+import {
+  Box,
+  LinearProgress,
+  Link as MuiLink,
+  Typography,
+} from "@mui/material";
 import { useTranslation } from "react-i18next";
 import CommentForm from "./CommentForm";
 import CommentList from "./CommentList";
 import { useComments, usePostComment } from "@/hooks/useComments";
+import { useProfile } from "@/hooks/useProfile";
 
 type CommentZoneProps = {
   // The channel the zone reads and appends to. Optional: when unset or
@@ -26,6 +33,10 @@ type CommentZoneProps = {
 // Submitting appends onto the channel's last comment as currently loaded; a
 // 409 (someone else commented first) refreshes the list and shows a message
 // — the written text stays in the form so the commenter can retry.
+//
+// Reading comments is open to everyone; posting requires a session (the
+// server takes the author from it), so an anonymous visitor gets a link to
+// the login page instead of the form.
 export default function CommentZone({ channelId }: CommentZoneProps) {
   const { t } = useTranslation();
   // usePathname tracks client-side navigations, so the zone follows soft
@@ -46,12 +57,16 @@ export default function CommentZone({ channelId }: CommentZoneProps) {
     isPending: submitting,
     error,
   } = usePostComment(resolvedChannelId ?? "");
+  // Shares ProfileMenu's ["profile"] cache entry, so this check costs no
+  // extra request. While it is pending the editor area renders nothing, so
+  // it never flashes the wrong affordance (same rule as ProfileMenu).
+  const { isPending: profilePending, isError: anonymous } = useProfile();
 
   if (resolvedChannelId === null) {
     return null;
   }
 
-  const handleSubmit = async (input: { userId: string; content: string }) => {
+  const handleSubmit = async (input: { content: string }) => {
     const lastCommentId = comments?.[comments.length - 1]?.id ?? "";
     try {
       await mutateAsync({ ...input, lastCommentId });
@@ -78,11 +93,31 @@ export default function CommentZone({ channelId }: CommentZoneProps) {
           ) : (
             <CommentList comments={comments} />
           )}
-          <CommentForm
-            submitting={submitting}
-            error={error}
-            onSubmit={handleSubmit}
-          />
+          {profilePending ? null : anonymous ? (
+            <Typography sx={{ mt: 3 }}>
+              {/* Carry the current location so the login flow returns here
+                  after a successful sign-in. This branch only renders
+                  client-side (after the profile query has failed), so
+                  window is safe to read. */}
+              <MuiLink
+                component={Link}
+                href={`/login?redirect_if_succeed=${encodeURIComponent(
+                  window.location.pathname +
+                    window.location.search +
+                    window.location.hash,
+                )}`}
+                underline="hover"
+              >
+                {t("comments.loginRequired")}
+              </MuiLink>
+            </Typography>
+          ) : (
+            <CommentForm
+              submitting={submitting}
+              error={error}
+              onSubmit={handleSubmit}
+            />
+          )}
         </>
       )}
     </Box>

@@ -8,7 +8,15 @@
   },
   "profile": {
     "visitor": "访客",
+    "login": "登录",
+    "logout": "退出登录",
     "account": "账号：{{name}}"
+  },
+  "login": {
+    "signInWith": "使用 {{name}} 登录",
+    "signInAsVisitor": "以访客身份登录",
+    "loadFailed": "加载登录选项失败。",
+    "empty": "没有可用的登录方式。"
   },
   "language": {
     "label": "语言"
@@ -54,9 +62,8 @@
     "title": "评论",
     "loadFailed": "加载评论失败。",
     "empty": "还没有评论，来抢沙发吧。",
-    "name": "昵称",
-    "nameRequired": "请输入昵称。",
     "content": "你的评论",
+    "loginRequired": "登录后评论",
     "submit": "发送",
     "postFailed": "发表评论失败，请重试。",
     "conflict": "在你编辑期间有人发表了新评论，你的评论未能提交——请重试。"
