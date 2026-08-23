@@ -27,11 +27,11 @@ const (
 
 // The well-known signalling error codes.
 const (
-	ssErrSubscriberIdIsRegistered  = 1
-	ssErrSubscriberNotFound        = 2
-	ssErrChannelNotFound           = 3
-	ssErrUsernameTaken             = 4
-	ssErrNoSubscriberIdAvailable   = 5
+	ssErrSubscriberIdIsRegistered = 1
+	ssErrSubscriberNotFound       = 2
+	ssErrChannelNotFound          = 3
+	ssErrUsernameTaken            = 4
+	ssErrNoSubscriberIdAvailable  = 5
 )
 
 type epAddrView struct {
@@ -44,6 +44,11 @@ type registerEvView struct {
 	SubscriberId string `json:"subscriberId"`
 	ChannelId    string `json:"channelId"`
 	Username     string `json:"username"`
+}
+
+type channelKeepAliveView struct {
+	ChannelId    string `json:"channelId"`
+	SubscriberId string `json:"subscriberId"`
 }
 
 type userProfileQueryView struct {
@@ -63,6 +68,7 @@ type channelProfileQueryView struct {
 
 type clientToSSEvView struct {
 	Register            *registerEvView          `json:"register,omitempty"`
+	ChannelKeepAlive    *channelKeepAliveView    `json:"channelKeepAlive,omitempty"`
 	UserProfileQuery    *userProfileQueryView    `json:"userProfileQuery,omitempty"`
 	ChannelProfileQuery *channelProfileQueryView `json:"channelProfileQuery,omitempty"`
 	Ping                *pingPongView            `json:"ping,omitempty"`
@@ -727,6 +733,55 @@ func TestSSClientServerPing(t *testing.T) {
 	}
 
 	alice.expectSilent()
+}
+
+// TestSSChannelKeepAlive covers the channel keepalive, end to end: a
+// successful renewal is answered with nothing, while an unknown channel,
+// an unknown subscriber, and a subscriber bound to another identity are
+// each rejected with their well-known error code.
+func TestSSChannelKeepAlive(t *testing.T) {
+	baseURL := startServer(t)
+
+	alice := dialSS(t, baseURL)
+	bob := dialSS(t, baseURL)
+	alice.register("e2e-reg-alice", "alice", "alice")
+
+	keepAlive := func(msgId, channelId, sub string) *signallingEventView {
+		return &signallingEventView{
+			To:    epAddrView{ServiceId: ssServiceId},
+			MsgId: msgId,
+			C2SEv: &clientToSSEvView{ChannelKeepAlive: &channelKeepAliveView{
+				ChannelId:    channelId,
+				SubscriberId: sub,
+			}},
+		}
+	}
+	expectKeepAliveErr := func(c *ssWSClient, ev *signallingEventView, wantCode int) {
+		t.Helper()
+		c.send(ev)
+		reply := c.recv()
+		if reply.S2CEv == nil || reply.S2CEv.Err == nil {
+			t.Fatalf("keepalive reply = %+v, want an s2CEv error", reply)
+		}
+		if reply.S2CEv.Err.ErrorCode != wantCode {
+			t.Fatalf("keepalive error code = %d, want %d (%s)", reply.S2CEv.Err.ErrorCode, wantCode, reply.S2CEv.Err.ErrorMsg)
+		}
+		if reply.InReplyTo != ev.MsgId {
+			t.Fatalf("keepalive error reply inReplyTo = %q, want %q", reply.InReplyTo, ev.MsgId)
+		}
+	}
+
+	expectKeepAliveErr(alice, keepAlive("e2e-ka-ch", "no-such-channel", "alice"), ssErrChannelNotFound)
+	expectKeepAliveErr(alice, keepAlive("e2e-ka-sub", ssMainChannelId, "ghost"), ssErrSubscriberNotFound)
+	// A subscriber id is bound to its registering identity: bob may not
+	// renew alice's membership.
+	expectKeepAliveErr(bob, keepAlive("e2e-ka-eve", ssMainChannelId, "alice"), ssErrSubscriberNotFound)
+
+	// A successful renewal is silent. (Silence checks last: a read
+	// timeout corrupts a gorilla connection.)
+	alice.send(keepAlive("e2e-ka-ok", ssMainChannelId, "alice"))
+	alice.expectSilent()
+	bob.expectSilent()
 }
 
 // TestSSDisconnectAndReconnect covers the handler's source-address

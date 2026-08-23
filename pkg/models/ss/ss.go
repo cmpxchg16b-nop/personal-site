@@ -97,6 +97,18 @@ type ClientToSSRegEv struct {
 	Username string `json:"username"`
 }
 
+// ClientToSSChannelKeepAlive renews the subscriber's membership of a
+// channel — its lastActive — and is sent periodically once registered.
+// The SS answers nothing on success; an err reply
+// (ErrorCodeChannelNotFound, or ErrorCodeSubscriberNotFound when the
+// registration has expired or is bound to another (user id, user
+// session id) tuple) means the membership is gone and the client should
+// re-register.
+type ClientToSSChannelKeepAlive struct {
+	ChannelId    ChannelId    `json:"channelId"`
+	SubscriberId SubscriberId `json:"subscriberId"`
+}
+
 // ClientToSSUserProfileQuery queries the user profile of another
 // subscriber.
 type ClientToSSUserProfileQuery struct {
@@ -126,6 +138,10 @@ type ClientToSSListChannels struct{}
 type ClientToSSEv struct {
 	Register         *ClientToSSRegEv            `json:"register,omitempty"`
 	UserProfileQuery *ClientToSSUserProfileQuery `json:"userProfileQuery,omitempty"`
+
+	// ChannelKeepAlive renews the caller's membership of a channel; the
+	// SS answers nothing on success, an err otherwise.
+	ChannelKeepAlive *ClientToSSChannelKeepAlive `json:"channelKeepAlive,omitempty"`
 
 	// ChannelProfileQuery asks for the profile of a channel; the SS
 	// answers with a s2c channelProfile.
@@ -438,6 +454,8 @@ func (p *SimpleOnMemorySSProvider) handle(ctx context.Context, channels map[Chan
 		return true
 	case ev.C2SEv != nil && ev.C2SEv.Register != nil:
 		return p.handleRegister(ctx, channels, ev, outMsg)
+	case ev.C2SEv != nil && ev.C2SEv.ChannelKeepAlive != nil:
+		return p.handleChannelKeepAlive(ctx, channels, ev, outMsg)
 	case ev.C2SEv != nil && ev.C2SEv.UserProfileQuery != nil:
 		return p.handleQueryProfile(ctx, channels, ev, outMsg)
 	case ev.C2SEv != nil && ev.C2SEv.Ping != nil:
@@ -515,6 +533,32 @@ func (p *SimpleOnMemorySSProvider) handleRegister(ctx context.Context, channels 
 		ChannelId:    reg.ChannelId,
 		SubscriberId: reg.SubscriberId,
 	}}))
+}
+
+// handleChannelKeepAlive renews the caller's membership of the channel:
+// the named subscriber's lastActive is refreshed, silently — a success
+// is answered with nothing. Only the registration's own (user id, user
+// session id) tuple may renew it: a keepalive for an unknown channel,
+// an unknown or expired subscriber, or a mismatched identity is
+// rejected (ChannelNotFound / SubscriberNotFound), so the caller learns
+// its membership is gone and can re-register.
+func (p *SimpleOnMemorySSProvider) handleChannelKeepAlive(ctx context.Context, channels map[ChannelId]*channelState, ev *SignallingEvent, outMsg chan<- *SignallingEvent) bool {
+	ka := ev.C2SEv.ChannelKeepAlive
+	ch, ok := channels[ka.ChannelId]
+	if !ok {
+		return p.send(ctx, outMsg, replyErr(ev, ErrorCodeChannelNotFound, "channel not found"))
+	}
+	sub := ch.live(ka.SubscriberId, time.Now(), p.aging)
+	if sub == nil {
+		return p.send(ctx, outMsg, replyErr(ev, ErrorCodeSubscriberNotFound,
+			"subscriber not found in the given channel"))
+	}
+	if !sameRegistrationTuple(sub.addr, ev.From) {
+		return p.send(ctx, outMsg, replyErr(ev, ErrorCodeSubscriberNotFound,
+			"the subscriber's registration is bound to another (user id, user session id) tuple"))
+	}
+	sub.lastActive = time.Now()
+	return true
 }
 
 // sameRegistrationTuple reports whether from is the non-empty (user id,

@@ -612,6 +612,120 @@ func TestListChannelMembers(t *testing.T) {
 	}
 }
 
+func keepAliveEventFrom(from EPAddr, sub SubscriberId, ch ChannelId, msgId string) *SignallingEvent {
+	return &SignallingEvent{
+		From:  from,
+		To:    EPAddr{ServiceId: WellKnownSvcIdSS},
+		MsgId: MsgId(msgId),
+		C2SEv: &ClientToSSEv{ChannelKeepAlive: &ClientToSSChannelKeepAlive{
+			ChannelId:    ch,
+			SubscriberId: sub,
+		}},
+	}
+}
+
+// TestChannelKeepAlive checks that a channel keepalive is answered with
+// nothing on success, and rejected with the well-known error codes when
+// the channel is unknown, the subscriber is not registered, or the
+// caller's identity is not the registration's tuple.
+func TestChannelKeepAlive(t *testing.T) {
+	h := startProvider(t)
+	aliceAddr := EPAddr{UserId: "u-alice", UserSessionId: "s-alice"}
+	h.mustRegisterFrom(t, aliceAddr, "alice", "alice")
+
+	// A successful renewal is silent: nothing is answered.
+	h.in <- keepAliveEventFrom(aliceAddr, "alice", WellKnownChIdMain, "m-ka-ok")
+	h.expectNoOut(t)
+
+	for _, tc := range []struct {
+		name string
+		ev   *SignallingEvent
+		want ErrorCode
+	}{
+		{"unknown channel", keepAliveEventFrom(aliceAddr, "alice", "no-such-channel", "m-ka-ch"), ErrorCodeChannelNotFound},
+		{"unknown subscriber", keepAliveEventFrom(aliceAddr, "ghost", WellKnownChIdMain, "m-ka-sub"), ErrorCodeSubscriberNotFound},
+		// A subscriber id is bound to its registering (user id, user
+		// session id) tuple: nobody else may renew the membership.
+		{"another identity", keepAliveEventFrom(
+			EPAddr{UserId: "u-eve", UserSessionId: "s-eve"},
+			"alice", WellKnownChIdMain, "m-ka-eve"), ErrorCodeSubscriberNotFound},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h.in <- tc.ev
+			reply := h.recvOut(t)
+			if reply.S2CEv == nil || reply.S2CEv.Err == nil {
+				t.Fatalf("reply = %+v, want an s2CEv error", reply)
+			}
+			if reply.S2CEv.Err.ErrorCode != tc.want {
+				t.Fatalf("error code = %d, want %d", reply.S2CEv.Err.ErrorCode, tc.want)
+			}
+			if reply.InReplyTo == nil || *reply.InReplyTo != tc.ev.MsgId {
+				t.Fatalf("reply.InReplyTo = %v, want %q", reply.InReplyTo, tc.ev.MsgId)
+			}
+		})
+	}
+}
+
+// TestChannelKeepAliveRenewsMembership checks that channel keepalives
+// extend the registration — the subscriber stays live past the aging
+// interval — and that once they stop and the membership expires, a late
+// keepalive is rejected and renews nothing.
+func TestChannelKeepAliveRenewsMembership(t *testing.T) {
+	const aging = 200 * time.Millisecond
+	h := startProviderWithAging(t, aging)
+	aliceAddr := EPAddr{UserId: "u-alice", UserSessionId: "s-alice"}
+	h.mustRegisterFrom(t, aliceAddr, "alice", "alice")
+
+	profileErr := func(msgId string) *SSToClientEv {
+		t.Helper()
+		// From a third party, so the query itself does not refresh alice.
+		h.in <- &SignallingEvent{
+			From:  EPAddr{UserId: "u-q", UserSessionId: "s-q"},
+			MsgId: MsgId(msgId),
+			C2SEv: &ClientToSSEv{UserProfileQuery: &ClientToSSUserProfileQuery{
+				SubscriberId: "alice",
+				ChannelId:    WellKnownChIdMain,
+			}},
+		}
+		reply := h.recvOut(t)
+		if reply.S2CEv == nil {
+			t.Fatalf("query reply = %+v, want an s2CEv", reply)
+		}
+		return reply.S2CEv
+	}
+
+	// Keepalives every aging/4 keep the membership valid well past one
+	// aging interval.
+	for i := 1; i <= 5; i++ {
+		time.Sleep(aging / 4)
+		h.in <- keepAliveEventFrom(aliceAddr, "alice", WellKnownChIdMain,
+			fmt.Sprintf("m-ka-%d", i))
+	}
+	h.expectNoOut(t) // renewals are silent
+	if s2c := profileErr("m-q-alive"); s2c.Err != nil || s2c.Profile == nil {
+		t.Fatalf("profile after keepalives: err=%+v profile=%+v, want a live registration", s2c.Err, s2c.Profile)
+	}
+
+	// Once they stop, the membership expires: a third-party query finds
+	// alice gone (evicting the expired entry — expiration is lazy)...
+	time.Sleep(5 * aging / 2)
+	if s2c := profileErr("m-q-expired"); s2c.Err == nil || s2c.Err.ErrorCode != ErrorCodeSubscriberNotFound {
+		t.Fatalf("profile after expiry = %+v, want error code %d", s2c, ErrorCodeSubscriberNotFound)
+	}
+
+	// ...and a late keepalive is rejected — the registration is gone, not
+	// merely stale — and renews nothing.
+	h.in <- keepAliveEventFrom(aliceAddr, "alice", WellKnownChIdMain, "m-ka-late")
+	reply := h.recvOut(t)
+	if reply.S2CEv == nil || reply.S2CEv.Err == nil ||
+		reply.S2CEv.Err.ErrorCode != ErrorCodeSubscriberNotFound {
+		t.Fatalf("late keepalive reply = %+v, want error code %d", reply, ErrorCodeSubscriberNotFound)
+	}
+	if s2c := profileErr("m-q-still-expired"); s2c.Err == nil || s2c.Err.ErrorCode != ErrorCodeSubscriberNotFound {
+		t.Fatalf("profile after late keepalive = %+v, want error code %d", s2c, ErrorCodeSubscriberNotFound)
+	}
+}
+
 // TestSubscriberAging checks that a registration expires when the
 // subscriber is idle longer than the aging interval, that any activity —
 // here c2s liveness pings — keeps it valid, and that an expired

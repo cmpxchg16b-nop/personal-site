@@ -44,11 +44,11 @@ const (
 	outMsgBufferSize    = 64
 	ingressBufferSize   = 64
 	connQueueBufferSize = 32
-
-	// writeTimeout bounds a single websocket write so a stuck client
-	// cannot block its writer goroutine forever.
-	writeTimeout = 10 * time.Second
 )
+
+// DefaultWriteTimeout is the default bound on a single websocket write;
+// see WebSocketSSHandler.WriteTimeout.
+const DefaultWriteTimeout = 10 * time.Second
 
 // WebSocketSSHandler is an http.Handler that upgrades signalling client
 // connections to WebSocket and bridges them to a
@@ -61,6 +61,12 @@ type WebSocketSSHandler struct {
 	// Upgrader performs the HTTP→WebSocket upgrade. Customize it (e.g.
 	// CheckOrigin) before serving the first request.
 	Upgrader websocket.Upgrader
+
+	// WriteTimeout bounds a single websocket write, so a stuck client
+	// cannot block its writer goroutine forever. Zero (or negative)
+	// selects DefaultWriteTimeout. Set it before serving the first
+	// request.
+	WriteTimeout time.Duration
 
 	sm      pkgsession.SessionManager
 	ctx     context.Context
@@ -237,6 +243,15 @@ func (h *WebSocketSSHandler) readPump(c *wsConn, userId ss.UserId, sessionId ss.
 	}
 }
 
+// writeTimeout resolves the configured WriteTimeout; a non-positive
+// value selects DefaultWriteTimeout.
+func (h *WebSocketSSHandler) writeTimeout() time.Duration {
+	if h.WriteTimeout <= 0 {
+		return DefaultWriteTimeout
+	}
+	return h.WriteTimeout
+}
+
 // writePump writes the events queued for c until the queue is closed or
 // a write fails; it closes the websocket connection when it returns.
 func (h *WebSocketSSHandler) writePump(c *wsConn) {
@@ -253,7 +268,7 @@ func (h *WebSocketSSHandler) writePump(c *wsConn) {
 			if err != nil {
 				continue
 			}
-			c.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
+			c.conn.SetWriteDeadline(time.Now().Add(h.writeTimeout()))
 			if err := c.conn.WriteMessage(websocket.TextMessage, data); err != nil {
 				return
 			}

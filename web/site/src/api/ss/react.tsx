@@ -13,11 +13,13 @@
  * useSignalling() reads that context. At this first design stage it
  * registers the browser as a subscriber of the main channel (reusing the
  * subscriber id persisted in localStorage, or asking the SS to assign
- * one), renews the server's channel list every five seconds — resolving
- * each channel's profile and its members' profiles into ChatChannels —
- * and pings the SS once per second, reporting the latest round-trip
- * time. The activities read their own streams from the proxy — every
- * getReadStream() call returns a stream duplicating the SS messages.
+ * one), renews the membership with a channel keepalive every few
+ * seconds, renews the server's channel list every five seconds —
+ * resolving each channel's profile and its members' profiles into
+ * ChatChannels — and pings the SS once per second, reporting the latest
+ * round-trip time. The activities read their own streams from the proxy
+ * — every getReadStream() call returns a stream duplicating the SS
+ * messages.
  */
 
 import {
@@ -167,6 +169,11 @@ const CHANNEL_LIST_TIMEOUT_MS = 5000;
 // CHANNEL_LIST_INTERVAL_MS is how often the channel list is renewed while
 // connected.
 const CHANNEL_LIST_INTERVAL_MS = 5000;
+
+// CHANNEL_KEEPALIVE_INTERVAL_MS is how often the browser renews its
+// channel membership once registered — deliberately well below the
+// server's default subscriber aging (10s), like the pings.
+const CHANNEL_KEEPALIVE_INTERVAL_MS = 5000;
 
 // SUBSCRIBER_STORAGE_KEY is the localStorage key holding the subscriber id
 // the SS assigned to this browser, reused across reconnects and reloads.
@@ -489,8 +496,10 @@ function sameChannels(a: ChatChannel[], b: ChatChannel[]): boolean {
 /**
  * Reads the SSProxy from context. While connected it registers the browser
  * as a subscriber of the main channel (see registerSubscriber), renews the
- * server's channel list every CHANNEL_LIST_INTERVAL_MS (see listChannels),
- * and pings the SS every PING_INTERVAL_MS — one ping session per connection:
+ * membership with a channel keepalive every CHANNEL_KEEPALIVE_INTERVAL_MS,
+ * renews the server's channel list every CHANNEL_LIST_INTERVAL_MS (see
+ * listChannels), and pings the SS every PING_INTERVAL_MS — one ping session
+ * per connection:
  * a fixed ping id, the seq chaining rule from the prototype (the next ping's
  * seq is the ack of the last reply), at most one ping in flight — reporting
  * the latest round-trip time. A successful registration also exposes the
@@ -677,6 +686,52 @@ export function useSignalling(): SignallingState {
       }
     })();
 
+    // Renew the channel membership every CHANNEL_KEEPALIVE_INTERVAL_MS,
+    // starting once the registration resolves. Fire-and-forget: the SS
+    // answers nothing on success (an err reply — meaning the membership
+    // is gone — is only visible to stream readers, none of which listen
+    // for it at this design stage).
+    let keepAliveIntervalId: number | undefined;
+    void (async () => {
+      const reg = await registration;
+      if (!live || reg === null) {
+        return;
+      }
+      const keepAlive = () => {
+        const msgId = crypto.randomUUID();
+        writer
+          .write({
+            // `from` is populated server-side from the caller's session.
+            from: {},
+            to: { serviceId: WELLKNOWN_SVC_ID_SS },
+            msgId,
+            c2SEv: {
+              channelKeepAlive: {
+                channelId: WELLKNOWN_CH_ID_MAIN,
+                subscriberId: reg.subscriberId,
+              },
+            },
+          })
+          .then(() => {
+            if (live)
+              console.log(
+                `signalling: channel keepalive sent ` +
+                  `(channel_id=${WELLKNOWN_CH_ID_MAIN} ` +
+                  `subscriber=${reg.subscriberId} msg_id=${msgId})`,
+              );
+          })
+          .catch((err) => {
+            if (live)
+              console.error("signalling: channel keepalive write failed", err);
+          });
+      };
+      keepAlive();
+      keepAliveIntervalId = window.setInterval(
+        keepAlive,
+        CHANNEL_KEEPALIVE_INTERVAL_MS,
+      );
+    })();
+
     // Renew the channel listing every CHANNEL_LIST_INTERVAL_MS. Best-effort:
     // a failed round is logged and leaves the previous listing in place.
     let listing = false;
@@ -722,6 +777,9 @@ export function useSignalling(): SignallingState {
       abort.abort();
       window.clearInterval(intervalId);
       window.clearInterval(listIntervalId);
+      if (keepAliveIntervalId !== undefined) {
+        window.clearInterval(keepAliveIntervalId);
+      }
       // Cancelling the reader also unsubscribes its stream from the proxy.
       void reader.cancel();
       writer.releaseLock();

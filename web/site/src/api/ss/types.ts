@@ -59,6 +59,17 @@ export interface ClientToSSRegEv {
   username: string;
 }
 
+// Message for a subscriber to renew its membership of a channel — its
+// lastActive — sent from client to SS, periodically, once registered.
+// The SS answers nothing on success; an err reply (ChannelNotFound, or
+// SubscriberNotFound when the registration has expired or is bound to
+// another (user id, user session id) tuple) means the membership is
+// gone and the client should re-register.
+export interface ClientToSSChannelKeepAlive {
+  channelId: ChannelId;
+  subscriberId: SubscriberId;
+}
+
 // Message for a subscriber query the user profile of another subscriber, send from client to SS
 export interface ClientToSSUserProfileQuery {
   subscriberId: SubscriberId;
@@ -86,6 +97,9 @@ export type ClientToSSListChannels = Record<string, never>;
 // Client to signalling server event
 export interface ClientToSSEv {
   register?: ClientToSSRegEv;
+
+  /** renew the caller's membership of a channel (see ClientToSSChannelKeepAlive); the SS answers nothing on success, an err otherwise */
+  channelKeepAlive?: ClientToSSChannelKeepAlive;
 
   userProfileQuery?: ClientToSSUserProfileQuery;
 

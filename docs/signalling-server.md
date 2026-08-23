@@ -58,6 +58,13 @@ implementation must provide.
   live id by the same tuple is a refresh (renewing `lastActive`,
   optionally updating the username), while another tuple is rejected
   with `SubscriberIdIsRegistered`.
+- **`channelKeepAlive {channelId, subscriberId}`** — renews the caller's
+  membership of a channel: the SS refreshes the subscriber's
+  `lastActive`. Sent periodically once registered. **Nothing is answered
+  on success**; an `err` is answered otherwise — `ChannelNotFound`, or
+  `SubscriberNotFound` when the registration has expired or is bound to
+  another (user id, user session id) tuple — meaning the membership is
+  gone and the client should re-register.
 - **`userProfileQuery {subscriberId, channelId}`** — answered with a
   `profile {subscriberId, channelId, username}` reply.
 - **`listChannelMembers {channelId}`** — answered with **one or more**
@@ -151,8 +158,9 @@ re-learns its address onto the new connection, switch-style.
 ## Subscriber aging
 
 Every subscriber carries a `lastActive` timestamp, refreshed by any
-activity from its learned address — including c2s liveness pings, so a
-client that pings periodically keeps its registration alive. A
+activity from its learned address — including c2s liveness pings — and
+explicitly by `channelKeepAlive`, so a client that pings periodically
+keeps its registration alive. A
 registration whose `lastActive` is longer ago than the aging interval
 (the `--ss-aging` server flag, default `10s`) is considered invalid:
 profile queries answer `SubscriberNotFound`, relays fail, and the
@@ -176,8 +184,8 @@ path:
 - **Handler** (`WebSocketSSHandler`): one hub goroutine owns the
   connection set and the CAM table; each connection has a read pump
   (parse JSON, populate `from`, forward to the hub's ingress channel) and
-  a write pump (drain a per-connection queue to the socket, 10s write
-  deadline). A full queue makes a slow consumer get dropped rather than
+  a write pump (drain a per-connection queue to the socket, write
+  deadline configurable via `WriteTimeout`, default 10s). A full queue makes a slow consumer get dropped rather than
   stall the hub. The hub exits on context cancellation or provider
   shutdown, closing every queue, which cascades to connection closure.
 
@@ -210,9 +218,10 @@ cookie/JWT-based population described by the prototype.
 
 - `pkg/models/ss` and `pkg/api/websocket_ss` carry `-race`-clean unit
   suites: registration and its error codes, profile query, c2s ping/pong
-  session rules, relay pass-through with `to` rewriting, member-list
-  paging, shutdown/close semantics, header rejection, unicast routing,
-  and address re-learning across reconnects.
+  session rules, channel-keepalive renewal and its error codes, relay
+  pass-through with `to` rewriting, member-list paging, shutdown/close
+  semantics, header rejection, unicast routing, and address re-learning
+  across reconnects.
 - `e2e/websocket_ss_test.go` exercises the real built server binary:
   register + profile, a 3-round c2c ping/pong session (seq/ack chaining),
   RTC payload pass-through, the members list, c2s ping before
