@@ -72,6 +72,7 @@
     "title": "Chat",
     "search": "Search",
     "noMatch": "No matching channels or people.",
+    "selectConversation": "Select a chat to start messaging.",
     "message": "Message {{target}}",
     "send": "Send",
     "empty": "No messages yet — say hi.",

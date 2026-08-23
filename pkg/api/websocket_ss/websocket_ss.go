@@ -16,9 +16,12 @@
 // sniffing the From EPAddr field of inbound messages. It never learns —
 // and never needs — the association between a subscriber id and a
 // connection: the SS provider translates (channel, subscriber)
-// addressing into an EPAddr, so every outbound event is unicasted by its
-// To EPAddr. Events whose destination was never learned (or whose
-// connection is already gone) are dropped.
+// addressing into an EPAddr, so every outbound event is routed by its To
+// EPAddr alone. One EPAddr can map to several connections — two tabs
+// sharing one session, or a reconnect whose old connection has not been
+// noticed closed yet — so the event is delivered to every connection the
+// address was learned on. Events whose destination was never learned (or
+// whose connections are all gone) are dropped.
 package websocket_ss
 
 import (
@@ -153,7 +156,8 @@ func (h *WebSocketSSHandler) hub() {
 				}
 			case noteMessage:
 				// Source address learning, switch-style: remember
-				// which connection this From was seen on.
+				// this connection serves the From address (one address
+				// may be served by several connections).
 				table.learn(camKeyOf(n.ev.From), n.conn)
 				select {
 				case h.inMsg <- n.ev:
@@ -165,23 +169,22 @@ func (h *WebSocketSSHandler) hub() {
 	}
 }
 
-// forward routes an outbound event to the connection its To EPAddr was
-// learned on. Events with an empty or never-learned destination are
-// dropped.
+// forward routes an outbound event to every connection its To EPAddr
+// was learned on — one address may map to several connections (e.g. two
+// tabs sharing one session). Events with an empty or never-learned
+// destination are dropped.
 func (h *WebSocketSSHandler) forward(table *camTable, conns map[*wsConn]struct{}, ev *ss.SignallingEvent) {
 	key := camKeyOf(ev.To)
 	if key.empty() {
 		return
 	}
-	c, ok := table.byAddr[key]
-	if !ok {
-		return
-	}
-	select {
-	case c.queue <- ev:
-	default:
-		// Slow consumer: drop the connection rather than stall the hub.
-		dropConn(table, conns, c)
+	for c := range table.byAddr[key] {
+		select {
+		case c.queue <- ev:
+		default:
+			// Slow consumer: drop the connection rather than stall the hub.
+			dropConn(table, conns, c)
+		}
 	}
 }
 
@@ -296,35 +299,48 @@ func camKeyOf(addr ss.EPAddr) camKey {
 
 func (k camKey) empty() bool { return k.userId == "" || k.sessionId == "" }
 
-// camTable holds the learned (user id, user session id) → connection
-// associations, with a reverse index for fast aging on link-down. It is
-// owned by the hub goroutine and needs no locking.
+// camTable holds the learned (user id, user session id) → connections
+// associations — one address can map to several connections (e.g. two
+// tabs sharing one session, or a reconnect whose old connection has not
+// been noticed closed yet) — with a reverse index for fast aging on
+// link-down. It is owned by the hub goroutine and needs no locking.
 type camTable struct {
-	byAddr map[camKey]*wsConn
+	byAddr map[camKey]map[*wsConn]struct{}
 	byConn map[*wsConn][]camKey
 }
 
 func newCamTable() *camTable {
 	return &camTable{
-		byAddr: make(map[camKey]*wsConn),
+		byAddr: make(map[camKey]map[*wsConn]struct{}),
 		byConn: make(map[*wsConn][]camKey),
 	}
 }
 
-// learn records that addr was last seen on c.
+// learn records that addr is reachable via c, keeping any connections
+// the address was already learned on.
 func (t *camTable) learn(addr camKey, c *wsConn) {
-	if addr.empty() || t.byAddr[addr] == c {
+	if addr.empty() {
 		return
 	}
-	t.byAddr[addr] = c
+	set, ok := t.byAddr[addr]
+	if !ok {
+		set = make(map[*wsConn]struct{})
+		t.byAddr[addr] = set
+	} else if _, dup := set[c]; dup {
+		return
+	}
+	set[c] = struct{}{}
 	t.byConn[c] = append(t.byConn[c], addr)
 }
 
 // purge forgets every address learned on c.
 func (t *camTable) purge(c *wsConn) {
 	for _, addr := range t.byConn[c] {
-		if t.byAddr[addr] == c {
-			delete(t.byAddr, addr)
+		if set, ok := t.byAddr[addr]; ok {
+			delete(set, c)
+			if len(set) == 0 {
+				delete(t.byAddr, addr)
+			}
 		}
 	}
 	delete(t.byConn, c)

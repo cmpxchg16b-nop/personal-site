@@ -18,7 +18,7 @@ type MessageItemProps = {
 // then a header line (name + relative time) above the group's message lines.
 // Content keeps the author's line breaks (pre-wrap); long unbroken text
 // wraps instead of overflowing.
-export default function MessageItem({ group, isOwn }: MessageItemProps) {
+export function MessageItem({ group, isOwn }: MessageItemProps) {
   const { i18n } = useTranslation();
   const startedAt = new Date(group.startedAt * 1000);
   const relative = formatDistanceToNow(startedAt, {

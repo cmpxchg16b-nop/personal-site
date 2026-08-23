@@ -164,11 +164,13 @@ export class SSProxy {
 // an unparseable URL) — that is converted to a rejection, so callers only
 // ever deal with the promise.
 function connectWebSocket(url: string | URL): Promise<WebSocket> {
+  console.info(`SSProxy: connecting to ${url}`);
   return new Promise<WebSocket>((resolve, reject) => {
     let ws: WebSocket;
     try {
       ws = new WebSocket(url);
     } catch (err) {
+      console.error(`SSProxy: connecting to ${url} threw`, err);
       reject(err);
       return;
     }
@@ -176,10 +178,13 @@ function connectWebSocket(url: string | URL): Promise<WebSocket> {
       // Detach the connection-phase handlers before handing the socket
       // over; the SSProxy assigns its own.
       ws.onopen = ws.onerror = ws.onclose = null;
+      console.info(`SSProxy: connected to ${ws.url}`);
       resolve(ws);
     };
-    const fail = (what: string) =>
+    const fail = (what: string) => {
+      console.warn(`SSProxy: connecting to ${ws.url} failed: ${what}`);
       reject(new Error(`SSProxy: connecting to ${ws.url} failed: ${what}`));
+    };
     ws.onerror = () => fail("websocket error");
     ws.onclose = (e) => fail(`closed before open (code ${e.code})`);
   });

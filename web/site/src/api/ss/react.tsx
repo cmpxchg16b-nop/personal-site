@@ -13,8 +13,10 @@
  * useSignalling() reads that context. At this first design stage it
  * registers the browser as a subscriber of the main channel (reusing the
  * subscriber id persisted in localStorage, or asking the SS to assign
- * one) and pings the SS once per second, reporting the latest round-trip
- * time. The two activities read their own streams from the proxy — every
+ * one), renews the server's channel list every five seconds — resolving
+ * each channel's profile and its members' profiles into ChatChannels —
+ * and pings the SS once per second, reporting the latest round-trip
+ * time. The activities read their own streams from the proxy — every
  * getReadStream() call returns a stream duplicating the SS messages.
  */
 
@@ -32,7 +34,12 @@ import {
   ErrorCode,
   WELLKNOWN_CH_ID_MAIN,
   WELLKNOWN_SVC_ID_SS,
+  type ChannelId,
+  type ChatChannel,
+  type ChatUser,
   type SignallingEvent,
+  type SubscriberId,
+  type UserId,
 } from "./types";
 
 // SSProxyContext carries the current SSProxy singleton, or null while no
@@ -118,7 +125,27 @@ export interface SignallingState {
    * (no connection yet, or the latest ping went unanswered).
    */
   lastPing: PingStat | null;
+  /**
+   * The current user: `id` is the app-level user id the SS echoes in
+   * every reply's `to` (populated server-side from the caller's
+   * session), `name` the profile username, plus the signalling
+   * subscription (main channel, assigned subscriber id); null while not
+   * registered (no connection yet, or registration failed).
+   */
+  me: ChatUser | null;
+  /**
+   * The channels of the signalling server — id, name, and members with
+   * resolved profiles (excluding the current user) — renewed every
+   * CHANNEL_LIST_INTERVAL_MS while connected; empty while no listing is
+   * available (no connection yet, or no round has succeeded).
+   */
+  channels: ChatChannel[];
 }
+
+// NO_CHANNELS is the stable empty list SignallingState.channels falls
+// back to, so consumers can depend on it without re-running effects on
+// every render.
+const NO_CHANNELS: ChatChannel[] = [];
 
 // PING_INTERVAL_MS is how often the SS is pinged while connected —
 // deliberately well below the server's default subscriber aging (10s), so
@@ -132,6 +159,14 @@ const PONG_TIMEOUT_MS = 3000;
 // REGISTER_REPLY_TIMEOUT_MS bounds the wait for the SS's registration
 // reply.
 const REGISTER_REPLY_TIMEOUT_MS = 5000;
+
+// CHANNEL_LIST_TIMEOUT_MS bounds the wait for one listing round's page
+// reads (channel list, member list) and each of its profile replies.
+const CHANNEL_LIST_TIMEOUT_MS = 5000;
+
+// CHANNEL_LIST_INTERVAL_MS is how often the channel list is renewed while
+// connected.
+const CHANNEL_LIST_INTERVAL_MS = 5000;
 
 // SUBSCRIBER_STORAGE_KEY is the localStorage key holding the subscriber id
 // the SS assigned to this browser, reused across reconnects and reloads.
@@ -200,17 +235,60 @@ async function awaitReplyOn(
   }
 }
 
+// awaitRepliesOn is the paged-reply counterpart of awaitReplyOn: it
+// collects every event correlated (via inReplyTo) to msgId until `done`
+// accepts one of them or the timeout fires; the stream is cancelled —
+// i.e. unsubscribed from the proxy — either way.
+async function awaitRepliesOn(
+  stream: ReadableStream<SignallingEvent>,
+  msgId: string,
+  timeoutMs: number,
+  done: (ev: SignallingEvent) => boolean,
+): Promise<SignallingEvent[]> {
+  const reader = stream.getReader();
+  const collected: SignallingEvent[] = [];
+  let timeoutId: number | undefined;
+  try {
+    for (;;) {
+      const raced = await Promise.race([
+        reader.read(),
+        new Promise<null>((resolve) => {
+          timeoutId = window.setTimeout(() => resolve(null), timeoutMs);
+        }),
+      ]);
+      if (raced === null || raced.done) {
+        return collected;
+      }
+      if (raced.value.inReplyTo !== msgId) {
+        continue;
+      }
+      collected.push(raced.value);
+      if (done(raced.value)) {
+        return collected;
+      }
+    }
+  } finally {
+    if (timeoutId !== undefined) {
+      window.clearTimeout(timeoutId);
+    }
+    await reader.cancel();
+  }
+}
+
 // registerSubscriber registers this browser as a subscriber of the main
 // channel, reading the SS's reply on its own short-lived stream: the
 // stored subscriber id is reused when present, an empty id asks the SS to
 // assign one (from the 1000-1999 range) which is then persisted for
 // reuse. A stored id the SS rejects as bound to another session is
-// forgotten and retried once with an empty id.
+// forgotten and retried once with an empty id. It resolves to the
+// registered subscriber id and the caller's user id — which the SS
+// echoes in the reply's `to`, populated server-side from the session —
+// or null when registration failed.
 async function registerSubscriber(
   read: () => ReadableStream<SignallingEvent>,
   send: (ev: SignallingEvent) => Promise<void>,
   username: string,
-): Promise<void> {
+): Promise<{ subscriberId: SubscriberId; userId: UserId | null } | null> {
   let subscriberId = loadStoredSubscriberId() ?? "";
   for (let attempt = 0; attempt < 2; attempt++) {
     const msgId = crypto.randomUUID();
@@ -231,7 +309,7 @@ async function registerSubscriber(
     const reply = await replyPromise;
     if (!reply) {
       console.warn("signalling: registration timed out");
-      return;
+      return null;
     }
     const result = reply.s2CEv?.registerResult;
     if (result) {
@@ -241,7 +319,10 @@ async function registerSubscriber(
       console.info(
         `signalling: registered as subscriber ${result.subscriberId} (${username})`,
       );
-      return;
+      return {
+        subscriberId: result.subscriberId,
+        userId: reply.to.userId ?? null,
+      };
     }
     const err = reply.s2CEv?.err;
     if (
@@ -255,18 +336,167 @@ async function registerSubscriber(
       continue;
     }
     console.error("signalling: registration failed", err ?? reply);
-    return;
+    return null;
   }
+  return null;
+}
+
+// listChannels discovers the server's channels, resolving each into a
+// ChatChannel: one listChannels request, reading pages until hasMore is
+// false (an err page stops the read early), then listChannel per
+// discovered id, all in parallel. Channels whose resolution fails are
+// dropped from the result.
+async function listChannels(
+  read: () => ReadableStream<SignallingEvent>,
+  send: (ev: SignallingEvent) => Promise<void>,
+  selfSubscriberId: SubscriberId | null,
+): Promise<ChatChannel[]> {
+  const listMsgId = crypto.randomUUID();
+  const pagesPromise = awaitRepliesOn(
+    read(),
+    listMsgId,
+    CHANNEL_LIST_TIMEOUT_MS,
+    (ev) =>
+      ev.s2CEv?.err !== undefined ||
+      ev.s2CEv?.channelListResult?.hasMore === false,
+  );
+  await send({
+    // `from` is populated server-side from the caller's session.
+    from: {},
+    to: { serviceId: WELLKNOWN_SVC_ID_SS },
+    msgId: listMsgId,
+    c2SEv: { listChannels: {} },
+  });
+  const ids = (await pagesPromise).flatMap(
+    (p) => p.s2CEv?.channelListResult?.channels ?? [],
+  );
+  const channels = await Promise.all(
+    ids.map((channelId) =>
+      listChannel(read, send, channelId, selfSubscriberId),
+    ),
+  );
+  return channels.filter((c): c is ChatChannel => c !== null);
+}
+
+// listChannel resolves one channel id into a ChatChannel: a
+// channelProfileQuery for the name, a paged listChannelMembers for the
+// member ids (reading pages until hasMore is false, an err page stops
+// the read early), and one userProfileQuery per member for its username
+// — the member queries in parallel. The current user is filtered out of
+// the members: you don't open a direct message with yourself. Returns
+// null when the channel profile query fails or times out (e.g. the
+// channel went away between listing and querying); members whose profile
+// query fails are dropped.
+async function listChannel(
+  read: () => ReadableStream<SignallingEvent>,
+  send: (ev: SignallingEvent) => Promise<void>,
+  channelId: ChannelId,
+  selfSubscriberId: SubscriberId | null,
+): Promise<ChatChannel | null> {
+  const profileMsgId = crypto.randomUUID();
+  const profilePromise = awaitReplyOn(
+    read(),
+    profileMsgId,
+    CHANNEL_LIST_TIMEOUT_MS,
+  );
+  await send({
+    from: {},
+    to: { serviceId: WELLKNOWN_SVC_ID_SS },
+    msgId: profileMsgId,
+    c2SEv: { channelProfileQuery: { channelId } },
+  });
+  const profile = (await profilePromise)?.s2CEv?.channelProfile;
+  if (!profile) {
+    return null;
+  }
+
+  const mbsMsgId = crypto.randomUUID();
+  const mbsPromise = awaitRepliesOn(
+    read(),
+    mbsMsgId,
+    CHANNEL_LIST_TIMEOUT_MS,
+    (ev) =>
+      ev.s2CEv?.err !== undefined ||
+      ev.s2CEv?.channelMbsListResult?.hasMore === false,
+  );
+  await send({
+    from: {},
+    to: { serviceId: WELLKNOWN_SVC_ID_SS },
+    msgId: mbsMsgId,
+    c2SEv: { listChannelMembers: { channelId } },
+  });
+  const memberIds = (await mbsPromise)
+    .flatMap((p) => p.s2CEv?.channelMbsListResult?.members ?? [])
+    .filter((id) => id !== selfSubscriberId);
+
+  const members = await Promise.all(
+    memberIds.map(async (subscriberId) => {
+      const msgId = crypto.randomUUID();
+      const replyPromise = awaitReplyOn(read(), msgId, CHANNEL_LIST_TIMEOUT_MS);
+      await send({
+        from: {},
+        to: { serviceId: WELLKNOWN_SVC_ID_SS },
+        msgId,
+        c2SEv: { userProfileQuery: { subscriberId, channelId } },
+      });
+      const userProfile = (await replyPromise)?.s2CEv?.profile;
+      if (!userProfile) {
+        return null;
+      }
+      const user: ChatUser = {
+        // The wire carries no app-level user identity yet, so the
+        // subscriber id — all the SS knows — doubles as the chat user id.
+        id: userProfile.subscriberId,
+        name: userProfile.username,
+        // A listed member is online: the SS sweeps expired registrations
+        // before answering listChannelMembers.
+        online: true,
+        channelId: userProfile.channelId,
+        subscriberId: userProfile.subscriberId,
+      };
+      return user;
+    }),
+  );
+  return {
+    id: profile.channelId,
+    name: profile.channelName,
+    members: members.filter((m): m is ChatUser => m !== null),
+  };
+}
+
+// sameChannels reports whether two listings carry the same channels —
+// the same (id, name) pairs, each with the same members in the same
+// order. The server lists channels sorted by channel id and members
+// sorted by subscriber id, so the order is stable across rounds.
+function sameChannels(a: ChatChannel[], b: ChatChannel[]): boolean {
+  return (
+    a.length === b.length &&
+    a.every((c, i) => {
+      const o = b[i];
+      return (
+        o !== undefined &&
+        c.id === o.id &&
+        c.name === o.name &&
+        c.members.length === o.members.length &&
+        c.members.every(
+          (m, j) => m.id === o.members[j]?.id && m.name === o.members[j]?.name,
+        )
+      );
+    })
+  );
 }
 
 /**
  * Reads the SSProxy from context. While connected it registers the browser
- * as a subscriber of the main channel (see registerSubscriber) and pings
- * the SS every PING_INTERVAL_MS — one ping session per connection: a fixed
- * ping id, the seq chaining rule from the prototype (the next ping's seq
- * is the ack of the last reply), at most one ping in flight — reporting
- * the latest round-trip time. Registration and the ping loop each read
- * their own stream from the proxy.
+ * as a subscriber of the main channel (see registerSubscriber), renews the
+ * server's channel list every CHANNEL_LIST_INTERVAL_MS (see listChannels),
+ * and pings the SS every PING_INTERVAL_MS — one ping session per connection:
+ * a fixed ping id, the seq chaining rule from the prototype (the next ping's
+ * seq is the ack of the last reply), at most one ping in flight — reporting
+ * the latest round-trip time. A successful registration also exposes the
+ * current user (`me`): its id is the user id the SS echoes in the register
+ * reply's `to`. Registration, the channel listing, and the ping loop each
+ * read their own stream from the proxy.
  */
 export function useSignalling(): SignallingState {
   const proxy = useContext(SSProxyContext);
@@ -277,6 +507,20 @@ export function useSignalling(): SignallingState {
   const [measured, setMeasured] = useState<{
     proxy: SSProxy;
     ping: PingStat;
+  } | null>(null);
+  // The current user follows the same rule as lastPing: recorded together
+  // with the proxy the registration happened on, so a stale identity never
+  // outlives its connection.
+  const [registered, setRegistered] = useState<{
+    proxy: SSProxy;
+    me: ChatUser;
+  } | null>(null);
+  // The channel listing follows the same rule as lastPing: recorded
+  // together with the proxy it was discovered on, so a stale listing
+  // never outlives its connection.
+  const [listed, setListed] = useState<{
+    proxy: SSProxy;
+    channels: ChatChannel[];
   } | null>(null);
 
   useEffect(() => {
@@ -379,37 +623,96 @@ export function useSignalling(): SignallingState {
     })();
 
     // Register the subscriber, and keep measuring latency. Registration
-    // is best-effort: a failure is logged and never stops the pings.
-    void (async () => {
+    // is best-effort: a failure is logged and never stops the pings or
+    // the listing. The promise resolves to this browser's registration
+    // (null when registration failed); listing rounds await it so the
+    // current user is excluded from the members from the first round on.
+    const registration: Promise<{
+      subscriberId: SubscriberId;
+      userId: UserId | null;
+    } | null> = (async () => {
       let username = "";
       try {
         username = (await fetchProfile(abort.signal)).username.trim();
       } catch (err) {
-        if (err instanceof DOMException && err.name === "AbortError") return;
+        if (err instanceof DOMException && err.name === "AbortError")
+          return null;
         // The session is gone (e.g. expired or logged out elsewhere
         // mid-connection): bounce to the login page.
         if (err instanceof ProfileApiError && err.status === 401) {
           redirectToLogin();
-          return;
+          return null;
         }
         console.error(
           "signalling: cannot load /api/profile for registration",
           err,
         );
+        return null;
       }
       if (!live || username === "") {
-        return;
+        return null;
       }
       try {
-        await registerSubscriber(
+        const reg = await registerSubscriber(
           () => proxy.getReadStream(),
           (ev) => writer.write(ev),
           username,
         );
+        if (live && reg !== null && reg.userId !== null) {
+          setRegistered({
+            proxy,
+            me: {
+              id: reg.userId,
+              name: username,
+              online: true,
+              channelId: WELLKNOWN_CH_ID_MAIN,
+              subscriberId: reg.subscriberId,
+            },
+          });
+        }
+        return reg;
       } catch (err) {
         if (live) console.error("signalling: registration failed", err);
+        return null;
       }
     })();
+
+    // Renew the channel listing every CHANNEL_LIST_INTERVAL_MS. Best-effort:
+    // a failed round is logged and leaves the previous listing in place.
+    let listing = false;
+    const doListChannels = async () => {
+      if (!live || listing) {
+        return; // the previous round is still running
+      }
+      listing = true;
+      try {
+        const reg = await registration;
+        const channels = await listChannels(
+          () => proxy.getReadStream(),
+          (ev) => writer.write(ev),
+          reg?.subscriberId ?? null,
+        );
+        if (!live) return;
+        // Keep the previous listing's identity when nothing changed, so an
+        // unchanged round never re-renders consumers.
+        setListed((prev) =>
+          prev !== null &&
+          prev.proxy === proxy &&
+          sameChannels(prev.channels, channels)
+            ? prev
+            : { proxy, channels },
+        );
+      } catch (err) {
+        if (live) console.error("signalling: channel listing failed", err);
+      } finally {
+        listing = false;
+      }
+    };
+    void doListChannels();
+    const listIntervalId = window.setInterval(
+      doListChannels,
+      CHANNEL_LIST_INTERVAL_MS,
+    );
 
     void doPing();
     const intervalId = window.setInterval(doPing, PING_INTERVAL_MS);
@@ -418,6 +721,7 @@ export function useSignalling(): SignallingState {
       live = false;
       abort.abort();
       window.clearInterval(intervalId);
+      window.clearInterval(listIntervalId);
       // Cancelling the reader also unsubscribes its stream from the proxy.
       void reader.cancel();
       writer.releaseLock();
@@ -427,5 +731,8 @@ export function useSignalling(): SignallingState {
   return {
     lastPing:
       proxy !== null && measured?.proxy === proxy ? measured.ping : null,
+    me: proxy !== null && registered?.proxy === proxy ? registered.me : null,
+    channels:
+      proxy !== null && listed?.proxy === proxy ? listed.channels : NO_CHANNELS,
   };
 }

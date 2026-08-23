@@ -11,17 +11,15 @@ import {
 } from "@mui/material";
 import SearchIcon from "@mui/icons-material/Search";
 import { useTranslation } from "react-i18next";
+import type { ChatChannel } from "@/api/ss/types";
 import ConversationTree from "./ConversationTree";
-import {
-  conversationKey,
-  type ChatChannel,
-  type ConversationRef,
-} from "./types";
+import { conversationKey, type ConversationRef } from "./types";
 
 type ChatSidebarProps = {
   channels: ChatChannel[];
   unread: Record<string, number>;
-  selected: ConversationRef;
+  // The open conversation, or null when none is selected.
+  selected: ConversationRef | null;
   onSelect: (ref: ConversationRef) => void;
   // Responsive visibility is controlled by the parent (ChatApp) through sx.
   sx?: SxProps<Theme>;
@@ -119,7 +117,7 @@ export default function ChatSidebar({
           channels={visibleChannels}
           openChannels={openForRender}
           onToggleChannel={toggleChannel}
-          selectedKey={conversationKey(selected)}
+          selectedKey={selected === null ? null : conversationKey(selected)}
           onSelect={onSelect}
           unread={unread}
         />

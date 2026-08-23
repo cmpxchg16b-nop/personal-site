@@ -72,6 +72,7 @@
     "title": "聊天",
     "search": "搜索",
     "noMatch": "没有匹配的频道或联系人。",
+    "selectConversation": "选择一个对话开始聊天。",
     "message": "发消息给 {{target}}",
     "send": "发送",
     "empty": "还没有消息，来打个招呼吧。",

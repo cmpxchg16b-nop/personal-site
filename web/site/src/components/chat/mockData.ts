@@ -1,9 +1,5 @@
-import type {
-  ChatChannel,
-  ChatMessage,
-  ChatUser,
-  ConversationRef,
-} from "./types";
+import type { ChatChannel, ChatUser } from "@/api/ss/types";
+import type { ChatMessage } from "./types";
 
 // Stage 1 mock data: the entire chat "backend" lives in this file until a
 // real API exists. Timestamps are computed relative to module load so the
@@ -13,13 +9,6 @@ import type {
 // yet, so this is a fixed placeholder; its display name comes from this
 // record, shown as-is.
 export const CURRENT_USER_ID = "me";
-
-// DEFAULT_CONVERSATION is what the page opens on. Channels have no chat of
-// their own at this moment (they only group people), so it must be a DM.
-export const DEFAULT_CONVERSATION: ConversationRef = {
-  kind: "dm",
-  userId: "afu",
-};
 
 export const chatUsers: Record<string, ChatUser> = {
   [CURRENT_USER_ID]: { id: CURRENT_USER_ID, name: "visitor", online: true },
@@ -35,21 +24,8 @@ const user = (id: string): ChatUser => chatUsers[id];
 export const chatChannels: ChatChannel[] = [
   {
     id: "general",
-    name: "日常闲聊",
-    topic: "随便聊，什么都行。",
+    name: "main",
     members: [user("qiuxin"), user("afu"), user("mint")],
-  },
-  {
-    id: "tech",
-    name: "技术交流",
-    topic: "代码、网络，和其他有趣的东西。",
-    members: [user("qiuxin"), user("afu"), user("laobai")],
-  },
-  {
-    id: "sharing",
-    name: "好物分享",
-    topic: "最近发现了什么好东西？",
-    members: [user("mint"), user("qiyan")],
   },
 ];
 
@@ -61,7 +37,7 @@ const minutesAgo = (minutes: number): number =>
 // the conversation's messages, oldest first. Only DMs have messages —
 // channels are grouping-only at this moment.
 export const mockMessages: Record<string, ChatMessage[]> = {
-  "dm:afu": [
+  "dm:general:afu": [
     {
       id: "d1",
       authorId: "afu",
@@ -75,7 +51,7 @@ export const mockMessages: Record<string, ChatMessage[]> = {
       timestamp: minutesAgo(20),
     },
   ],
-  "dm:mint": [
+  "dm:general:mint": [
     {
       id: "d3",
       authorId: "mint",
@@ -89,7 +65,7 @@ export const mockMessages: Record<string, ChatMessage[]> = {
 // conversation clears its count; a mock reply landing while you look
 // elsewhere bumps it again.
 export const mockUnread: Record<string, number> = {
-  "dm:afu": 1,
+  "dm:general:afu": 1,
 };
 
 // mockReplies is the canned pool the fake chat partner answers with, a few

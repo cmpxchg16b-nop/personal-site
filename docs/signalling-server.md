@@ -129,11 +129,14 @@ next `ping`'s `sequenceNumber` is the ack of the last reply.
   switch, it builds the association between a connection's remote
   `ip:port` and the `(userId, userSessionId)` pair purely by sniffing the
   `from` field of inbound messages (after header population).
-- Outbound events are **unicast** by their `to` EPAddr — there is no
-  flooding. Events whose destination was never learned, or whose
-  connection is already gone, are dropped; disconnects purge all of a
-  connection's learned addresses (link-down aging), and a reconnect
-  re-learns onto the new connection.
+- Outbound events are routed by their `to` EPAddr to **every
+  connection the address was learned on** — one address can map to
+  several connections (two tabs sharing a session, or a reconnect whose
+  old connection has not been noticed closed yet); there is no flooding
+  beyond that. Events whose destination was never learned are dropped;
+  a disconnect purges the closed connection from all of its learned
+  addresses (link-down aging), and a reconnect re-learns onto the new
+  connection.
 
 **Roaming.** Registrations outlive connections (the prototype has no
 unregister message), and ping-session state (ping id, seq/ack chain) is

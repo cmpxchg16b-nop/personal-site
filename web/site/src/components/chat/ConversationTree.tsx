@@ -12,12 +12,9 @@ import {
 import TagIcon from "@mui/icons-material/Tag";
 import ExpandMoreIcon from "@mui/icons-material/ExpandMore";
 import ChevronRightIcon from "@mui/icons-material/ChevronRight";
+import type { ChatChannel } from "@/api/ss/types";
 import UserAvatar from "./UserAvatar";
-import {
-  conversationKey,
-  type ChatChannel,
-  type ConversationRef,
-} from "./types";
+import { conversationKey, type ConversationRef } from "./types";
 
 type ConversationTreeProps = {
   channels: ChatChannel[];
@@ -25,9 +22,10 @@ type ConversationTreeProps = {
   // the record count as expanded.
   openChannels: Record<string, boolean>;
   onToggleChannel: (channelId: string) => void;
-  // Key of the selected conversation (see conversationKey); compared by key
-  // so a DM opened from any channel highlights everywhere it appears.
-  selectedKey: string;
+  // Key of the selected conversation (see conversationKey), or null when
+  // none; compared by key, so the open DM highlights in the channel it
+  // was opened from.
+  selectedKey: string | null;
   onSelect: (ref: ConversationRef) => void;
   // Unread counts by conversation key; zero/undefined renders nothing.
   unread: Record<string, number>;
@@ -120,6 +118,7 @@ export default function ConversationTree({
                 {channel.members.map((member) => {
                   const dmRef: ConversationRef = {
                     kind: "dm",
+                    channelId: channel.id,
                     userId: member.id,
                   };
                   const dmUnread = unread[conversationKey(dmRef)] ?? 0;

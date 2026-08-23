@@ -259,3 +259,32 @@ export interface SignallingEvent {
   s2CEv?: SSToClientEv;
   c2CEv?: ClientToClientEv;
 }
+
+// ChatUser is the chat UI's view of a user: the app-level identity (id,
+// display name, presence) plus the user's signalling subscription
+// (channelId + subscriberId), when known.
+export type ChatUser = {
+  // The id is currently the user's signalling subscriber id: it is
+  // guaranteed unique within its channel (see channelId), but NOT
+  // globally — the same subscriber id can identify different users in
+  // different channels, so a ChatUser is only addressable as
+  // (channelId, id).
+  id: string;
+  name: string;
+  online: boolean;
+  // The signalling channel the user's subscription lives in — the scope
+  // of subscriberId — when known.
+  channelId?: ChannelId;
+  // The user's signalling subscriber id (channel-local, assigned by the
+  // SS on registration), when known.
+  subscriberId?: SubscriberId;
+};
+
+// ChatChannel is the chat UI's view of a channel: its members form the
+// sidebar tree's second level (excludes the current user — you don't
+// open a direct message with yourself).
+export type ChatChannel = {
+  id: string;
+  name: string;
+  members: ChatUser[];
+};

@@ -1,7 +1,7 @@
 "use client";
 
 import { Avatar, Box } from "@mui/material";
-import type { ChatUser } from "./types";
+import type { ChatUser } from "@/api/ss/types";
 
 // avatarHue hashes a user id to a stable hue (0–359), so each user gets a
 // consistent avatar color without the server assigning one. Same hashing as
@@ -31,7 +31,9 @@ export default function UserAvatar({
 }: UserAvatarProps) {
   const dotSize = Math.max(8, Math.round(size * 0.32));
   return (
-    <Box sx={{ position: "relative", flexShrink: 0, width: size, height: size }}>
+    <Box
+      sx={{ position: "relative", flexShrink: 0, width: size, height: size }}
+    >
       <Avatar
         sx={{
           width: size,

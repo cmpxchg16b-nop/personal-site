@@ -2,13 +2,12 @@
 
 import { useState } from "react";
 import { Paper } from "@mui/material";
+import type { ChatChannel, ChatUser } from "@/api/ss/types";
 import ChatSidebar from "./ChatSidebar";
 import ConversationView from "./ConversationView";
 import {
   conversationKey,
-  type ChatChannel,
   type ChatMessage,
-  type ChatUser,
   type Conversation,
   type ConversationRef,
 } from "./types";
@@ -37,8 +36,9 @@ type ChatAppProps = {
   users: Record<string, ChatUser>;
   // The local chatter's identity — the author of your sent messages.
   currentUserId: string;
-  // The open conversation.
-  selected: ConversationRef;
+  // The open conversation, or null when none is selected — the pane shows
+  // a placeholder then.
+  selected: ConversationRef | null;
   onSelect: (ref: ConversationRef) => void;
   // Messages per conversation, keyed by conversationKey (see types.ts),
   // oldest first.
@@ -62,20 +62,17 @@ export default function ChatApp({
 }: ChatAppProps) {
   const [mobileListOpen, setMobileListOpen] = useState(false);
 
-  const conversation: Conversation =
-    selected.kind === "channel"
-      ? {
-          kind: "channel",
-          channel:
-            channels.find((c) => c.id === selected.channelId) ?? channels[0],
-        }
+  const conversation: Conversation | null =
+    selected === null
+      ? null
       : {
           kind: "dm",
+          channelId: selected.channelId,
           user: users[selected.userId] ?? users[currentUserId],
         };
 
-  const activeKey = conversationKey(selected);
-  const activeMessages = messages[activeKey] ?? [];
+  const activeKey = selected === null ? null : conversationKey(selected);
+  const activeMessages = activeKey === null ? [] : (messages[activeKey] ?? []);
 
   const handleSelect = (ref: ConversationRef) => {
     onSelect(ref);

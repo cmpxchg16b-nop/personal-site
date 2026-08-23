@@ -6,9 +6,10 @@ import ForumOutlinedIcon from "@mui/icons-material/ForumOutlined";
 import { format, isSameDay, isToday, isYesterday } from "date-fns";
 import { useTranslation } from "react-i18next";
 import type { TFunction } from "i18next";
+import type { ChatUser } from "@/api/ss/types";
 import { dateFnsLocaleFor } from "@/i18n";
-import MessageItem from "./MessageItem";
-import type { ChatMessage, ChatUser, MessageGroup } from "./types";
+import { MessageItem } from "./MessageItem";
+import type { ChatMessage, MessageGroup } from "./types";
 
 // GROUP_WINDOW_MS: consecutive messages by the same author within this gap
 // collapse into one group (one avatar, one header line).
