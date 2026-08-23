@@ -26,6 +26,9 @@ type ServerConfigXML struct {
 	// configured redirect URL is relative (see pkg/api/common
 	// ResolveRedirectURL).
 	AllowedOrigins []string `xml:"allowedOrigin"`
+	// IceServers holds every <iceServer/> entry of the document: the ICE
+	// server sets served by GET /api/iceServers (see pkg/api/iceservers).
+	IceServers []IceServerXML `xml:"iceServer"`
 }
 
 // OIDCLoginOptionsXML mirrors the <oidcLoginOptions/> section of
@@ -83,6 +86,16 @@ type LoginOptionXML struct {
 	// an empty string means no origin restriction. Split it with
 	// loginoptions.ParseAllowedOrigins.
 	AllowedOrigins string `xml:"allowedOrigins,attr"`
+}
+
+// IceServerXML mirrors a single <iceServer/> entry of serverConfig.xml.
+// URLs is the raw comma-separated urls attribute; split it with
+// iceservers.ParseURLs. AllowedOrigin restricts the entry to requests
+// whose origin matches it exactly; an empty string applies the entry to
+// every origin.
+type IceServerXML struct {
+	URLs          string `xml:"urls,attr"`
+	AllowedOrigin string `xml:"allowedOrigin,attr"`
 }
 
 // LoadServerConfig parses the global server configuration XML document.

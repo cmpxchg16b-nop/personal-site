@@ -13,9 +13,9 @@
  * Signalling events flow through the native Streams API
  * (https://developer.mozilla.org/en-US/docs/Web/API/Streams_API): the
  * negotiator reads inbound events from a ReadableStream and writes
- * outbound ones to a WritableStream. A transport (e.g. a WebSocket
- * adapter) is expected to provide both. Nothing here is wired up to a
- * transport yet.
+ * outbound ones to a WritableStream. A transport (e.g. the SSProxy) is
+ * expected to provide both; useDataChannel (see datachannel.tsx) wires
+ * one negotiator per peer to it.
  */
 
 import {

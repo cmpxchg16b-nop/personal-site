@@ -1,15 +1,11 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo } from "react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
+import { newDCMsg, useDataChannel } from "@/api/ss/datachannel";
 import { useSignalling } from "@/api/ss/react";
 import type { ChatUser } from "@/api/ss/types";
 import ChatApp from "@/components/chat/ChatApp";
-import {
-  mockMessages,
-  mockReplies,
-  mockUnread,
-} from "@/components/chat/mockData";
 import {
   conversationKey,
   parseConversationKey,
@@ -17,12 +13,16 @@ import {
   type ConversationRef,
 } from "@/components/chat/types";
 
-// The chat page: it owns all chat state and plays backend. The sidebar's
-// channels and their members come live from the signalling server (see
-// useSignalling); messages are still mock — sending a message appends it
-// immediately with a canned reply from the DM partner following a second
-// or two later, until a real API takes over both sides of handleSend.
-// ChatApp under it is a pure controlled component.
+// The chat page: it owns all chat state. The sidebar's channels and
+// their members come live from the signalling server (useSignalling),
+// and messages travel over WebRTC data channels between the peers
+// (useDataChannel); our own messages come back as echoes over the same
+// channel. ChatApp under it is a pure controlled component.
+
+// NO_UNREAD is the stable empty unread-count record: the mock badge
+// source is gone and nothing computes unread counts yet.
+const NO_UNREAD: Record<string, number> = {};
+
 export default function ChatPage() {
   // Latency monitor: the latest answered ping of the signalling server
   // connection, re-measured once a second.
@@ -37,20 +37,46 @@ export default function ChatPage() {
     }
   }, [lastPing]);
 
+  const { dcMsgs, sendTo } = useDataChannel(me, channels);
+
   // All known users by id, including the current user: the live channel
-  // members plus ourselves once registered.
+  // members, plus ourselves once registered, plus every data-channel
+  // sender — a message must keep rendering even after its author drops
+  // out of the listing (MessageList skips messages by unknown authors).
   const users: Record<string, ChatUser> = useMemo(() => {
     const byId: Record<string, ChatUser> = {};
     if (me !== null) {
       byId[me.id] = me;
+      // Messages name their author by subscriber id
+      // (DCMsg.fromSubscriberId), which is not me's app-level user id:
+      // index ourselves under it too, so our own echoed messages
+      // resolve to our username (and to us for isOwn).
+      if (me.subscriberId !== undefined) {
+        byId[me.subscriberId] = me;
+      }
     }
     for (const channel of channels) {
       for (const member of channel.members) {
         byId[member.id] = member;
       }
     }
+    for (const bySender of Object.values(dcMsgs)) {
+      for (const [senderId, msgs] of Object.entries(bySender)) {
+        if (byId[senderId] === undefined && msgs.length > 0) {
+          // The sender is no longer in the listing; the id doubles as
+          // the display name (it is all that is known).
+          byId[senderId] = {
+            id: senderId,
+            name: senderId,
+            online: false,
+            channelId: msgs[0].channelId,
+            subscriberId: senderId,
+          };
+        }
+      }
+    }
     return byId;
-  }, [channels, me]);
+  }, [me, channels, dcMsgs]);
 
   // The open conversation lives in the ?conversation= query param (its
   // conversationKey), so every selection is a browser-history entry and
@@ -77,32 +103,40 @@ export default function ChatPage() {
     }
     return ref;
   }, [conversationParam, users, channels, me]);
-  const [messages, setMessages] =
-    useState<Record<string, ChatMessage[]>>(mockMessages);
-  const [unread, setUnread] = useState<Record<string, number>>(() => ({
-    ...mockUnread,
-  }));
 
-  // Mirror of `selected` for the reply timer callbacks, which close over
-  // stale state otherwise.
-  const selectedRef = useRef(selected);
-  useEffect(() => {
-    selectedRef.current = selected;
-  }, [selected]);
-
-  const idCounter = useRef(0);
-  const nextId = () => `local-${Date.now()}-${idCounter.current++}`;
-
-  const replyTimers = useRef<number[]>([]);
-  useEffect(
-    () => () => {
-      replyTimers.current.forEach((t) => window.clearTimeout(t));
-    },
-    [],
-  );
+  // The conversations' messages from the data channels, oldest first:
+  // the peers' messages plus the echoes of our own (echo set), keyed by
+  // conversation key. Derived from dcMsgs at render time — there is
+  // nothing to sync.
+  const messages: Record<string, ChatMessage[]> = useMemo(() => {
+    const merged: Record<string, ChatMessage[]> = {};
+    for (const bySender of Object.values(dcMsgs)) {
+      for (const senderMsgs of Object.values(bySender)) {
+        for (const m of senderMsgs) {
+          // The conversation's peer is the message's other end: its
+          // sender, or its recipient for an echo of our own message.
+          const key = conversationKey({
+            kind: "dm",
+            channelId: m.channelId,
+            userId: m.echo === true ? m.toSubscriberId : m.fromSubscriberId,
+          });
+          (merged[key] ??= []).push({
+            id: m.msgId,
+            authorId: m.fromSubscriberId,
+            content: m.plaintext,
+            timestamp: m.creationTimestamp,
+          });
+        }
+      }
+    }
+    // Each sender list is oldest-first, but the senders interleave.
+    for (const list of Object.values(merged)) {
+      list.sort((a, b) => a.timestamp - b.timestamp);
+    }
+    return merged;
+  }, [dcMsgs]);
 
   const handleSelect = (ref: ConversationRef) => {
-    setUnread((prev) => ({ ...prev, [conversationKey(ref)]: 0 }));
     const params = new URLSearchParams(searchParams.toString());
     if (conversationKey(ref) === conversationParam) {
       // Selecting the open conversation again deselects it.
@@ -118,55 +152,14 @@ export default function ChatPage() {
     });
   };
 
-  // Stands in for the backend: a canned reply from the DM partner, a second
-  // or two after you send something.
-  const scheduleMockReply = (ref: ConversationRef) => {
-    const key = conversationKey(ref);
-    const authorId = ref.userId;
-    const content = mockReplies[Math.floor(Math.random() * mockReplies.length)];
-    const timer = window.setTimeout(
-      () => {
-        setMessages((prev) => ({
-          ...prev,
-          [key]: [
-            ...(prev[key] ?? []),
-            { id: nextId(), authorId, content, timestamp: Date.now() / 1000 },
-          ],
-        }));
-        // A reply landing while you look at another conversation — or
-        // none — counts as unread there.
-        const openKey =
-          selectedRef.current === null
-            ? null
-            : conversationKey(selectedRef.current);
-        if (openKey !== key) {
-          setUnread((prev) => ({ ...prev, [key]: (prev[key] ?? 0) + 1 }));
-        }
-      },
-      900 + Math.random() * 1200,
-    );
-    replyTimers.current.push(timer);
-  };
-
   const handleSend = (content: string) => {
     // The composer only exists while a conversation is open, so a null
-    // selection (or a missing registration) here is unreachable.
+    // selection (or a missing registration) here is unreachable. The
+    // message shows up in the conversation when its echo comes back
+    // over the data channel.
     const ref = selected;
-    if (ref === null || me === null) return;
-    const key = conversationKey(ref);
-    setMessages((prev) => ({
-      ...prev,
-      [key]: [
-        ...(prev[key] ?? []),
-        {
-          id: nextId(),
-          authorId: me.id,
-          content,
-          timestamp: Date.now() / 1000,
-        },
-      ],
-    }));
-    scheduleMockReply(ref);
+    if (ref === null || me?.subscriberId === undefined) return;
+    sendTo(newDCMsg(ref.channelId, me.subscriberId, ref.userId, content));
   };
 
   return (
@@ -177,7 +170,7 @@ export default function ChatPage() {
       selected={selected}
       onSelect={handleSelect}
       messages={messages}
-      unread={unread}
+      unread={NO_UNREAD}
       onSend={handleSend}
     />
   );

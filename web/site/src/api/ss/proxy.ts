@@ -2,13 +2,15 @@
 
 /**
  * SSProxy is the browser-side transport to the signalling server: it
- * wraps one connected WebSocket and vends it as native streams — outbound
- * SignallingEvents on a single WritableStream, inbound ones fanned out to
- * per-consumer ReadableStreams: every getReadStream() call returns a brand
- * new stream that duplicates every SS message, so any number of consumers
- * (e.g. useSignalling and a PerfectNegotiator) can read concurrently and
- * never touch the socket themselves. It carries no protocol logic beyond
- * JSON framing.
+ * wraps one connected WebSocket and vends it as native streams — inbound
+ * SignallingEvents fanned out to per-consumer ReadableStreams: every
+ * getReadStream() call returns a brand new stream that duplicates every
+ * SS message, so any number of consumers (e.g. useSignalling and a
+ * PerfectNegotiator) can read concurrently and never touch the socket
+ * themselves; outbound ones fanned in from per-consumer WritableStreams:
+ * every getWriteStream() call returns a brand new stream whose writes all
+ * funnel into the socket, so any number of writers can hold a lock
+ * concurrently. It carries no protocol logic beyond JSON framing.
  *
  * A single module-level singleton is managed by getSSProxy(): the first
  * call connects and every later call shares the same instance until the
@@ -36,7 +38,6 @@ export class SSProxy {
   ondisconnect: (() => void) | null = null;
 
   private readonly ws: WebSocket;
-  private readonly writeStream: WritableStream<SignallingEvent>;
   // Every getReadStream() call registers one subscriber controller;
   // inbound events are duplicated to all of them.
   private readonly subscribers = new Set<
@@ -52,10 +53,6 @@ export class SSProxy {
    */
   constructor(ws: WebSocket) {
     this.ws = ws;
-
-    this.writeStream = new WritableStream<SignallingEvent>({
-      write: (ev) => this.send(ev),
-    });
 
     ws.onclose = () => this.destroy();
     ws.onmessage = (m) => {
@@ -106,11 +103,17 @@ export class SSProxy {
   }
 
   /**
-   * Outbound signalling events; writes reject once the socket is no
-   * longer open.
+   * Outbound signalling events: every call returns a brand new
+   * WritableStream whose writes all funnel into the socket — the fan-in
+   * counterpart of getReadStream's fan-out, so any number of writers
+   * (e.g. useSignalling and several PerfectNegotiators) can write
+   * concurrently. Writes reject once the socket is no longer open;
+   * closing a stream only retires that writer, never the socket.
    */
   getWriteStream(): WritableStream<SignallingEvent> {
-    return this.writeStream;
+    return new WritableStream<SignallingEvent>({
+      write: (ev) => this.send(ev),
+    });
   }
 
   /** True once the connection has dropped and this proxy is unusable. */

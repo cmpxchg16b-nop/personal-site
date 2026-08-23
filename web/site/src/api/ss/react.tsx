@@ -109,6 +109,13 @@ export function SSProxyProvider({
   );
 }
 
+// useSSProxy reads the SSProxy provided by SSProxyProvider: the current
+// singleton connection, or null while none is established (before the
+// first connect resolves, or between a disconnect and its reconnect).
+export function useSSProxy(): SSProxy | null {
+  return useContext(SSProxyContext);
+}
+
 // PingStat is one answered ping of the current connection's ping session.
 export interface PingStat {
   /** ping id of the ping session this measurement belongs to */
@@ -508,7 +515,7 @@ function sameChannels(a: ChatChannel[], b: ChatChannel[]): boolean {
  * read their own stream from the proxy.
  */
 export function useSignalling(): SignallingState {
-  const proxy = useContext(SSProxyContext);
+  const proxy = useSSProxy();
   // The last answered ping is recorded together with the proxy it was
   // measured on, so a stale value never outlives its connection: after a
   // disconnect or reconnect the pair no longer matches and lastPing

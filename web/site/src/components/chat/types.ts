@@ -1,7 +1,5 @@
-// Shared chat domain types. Stage 1 is frontend-only: all data comes from
-// mockData.ts, and these types mirror the shapes the chat API will
-// eventually serve. ChatUser and ChatChannel live with the signalling
-// types in @/api/ss/types.
+// Shared chat domain types. ChatUser and ChatChannel live with the
+// signalling types in @/api/ss/types.
 
 import type { ChatUser } from "@/api/ss/types";
 

@@ -55,9 +55,37 @@
           minOccurs="0"
           maxOccurs="unbounded"
         />
+        <!-- An ICE server set for the WebRTC sessions brokered by the
+             signalling server, served by GET /api/iceServers (see
+             pkg/api/iceservers). urls is a comma-separated list of ICE
+             server URLs (e.g. "stun:stun.example.com:3478"); surrounding
+             whitespace is ignored. allowedOrigin restricts the entry to
+             requests whose origin ("scheme://host") matches it exactly;
+             empty (the default) applies the entry to every origin.
+             Specify the element multiple times to bind different server
+             sets to different origins — the endpoint concatenates the
+             URLs of every entry matching the request's origin and
+             deduplicates them. -->
+        <xsd:element
+          name="iceServer"
+          type="iceServerType"
+          minOccurs="0"
+          maxOccurs="unbounded"
+        />
       </xsd:sequence>
     </xsd:complexType>
   </xsd:element>
+
+  <!-- A single ICE server set; see the iceServer element above. -->
+  <xsd:complexType name="iceServerType">
+    <xsd:attribute name="urls" type="xsd:string" use="required" />
+    <xsd:attribute
+      name="allowedOrigin"
+      type="xsd:string"
+      use="optional"
+      default=""
+    />
+  </xsd:complexType>
 
   <!-- The configurable list of generic OIDC login providers; holds zero or
        more oidcLoginOption entries. -->

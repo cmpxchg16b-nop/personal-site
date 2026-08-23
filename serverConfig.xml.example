@@ -111,4 +111,17 @@
        when their configured redirect URL is relative (optional).
   <allowedOrigin>http://localhost:8080</allowedOrigin>
   -->
+
+  <!-- ICE server sets for the WebRTC sessions brokered by the signalling
+       server (optional), served by GET /api/iceServers (see
+       pkg/api/iceservers). urls is a comma-separated list of ICE server
+       URLs; an entry without allowedOrigin applies to every request
+       origin, otherwise only to that origin; matching entries' URLs are
+       concatenated and deduplicated.
+  <iceServer urls="stun:stun.l.google.com:19302" />
+  <iceServer
+    urls="stun:stun.example.com:3478"
+    allowedOrigin="https://www.example.com"
+  />
+  -->
 </serverConfig>

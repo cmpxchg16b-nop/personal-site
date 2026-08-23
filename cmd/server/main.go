@@ -12,6 +12,7 @@ import (
 	personalsite "personal-site"
 	pkgapicomments "personal-site/pkg/api/comments"
 	pkgapidyn "personal-site/pkg/api/dyn"
+	pkgapiiceservers "personal-site/pkg/api/iceservers"
 	pkgapilinks "personal-site/pkg/api/links"
 	pkgapiloginoauth2github "personal-site/pkg/api/login/oauth2/github"
 	pkgapiloginoidcgeneral "personal-site/pkg/api/login/oidc/general"
@@ -160,6 +161,22 @@ func (cli *CLI) Run() error {
 	ssHandler.Upgrader.CheckOrigin = pkgapiwebsocketss.CheckOriginAllowing(allowedOrigins)
 	muxHandlerDyn.Handle("/api/ss/ws", ssHandler)
 
+	// The ICE servers endpoint serves the <iceServer/> entries of the
+	// configuration document: visitors need them to establish the WebRTC
+	// sessions the signalling endpoint above brokers. Registered
+	// unconditionally — an empty list when unconfigured — and reachable
+	// without a session (it is on the JWT whitelist below).
+	var iceServerEntries []pkgapiiceservers.IceServerEntry
+	if serverCfg != nil {
+		for _, e := range serverCfg.IceServers {
+			iceServerEntries = append(iceServerEntries, pkgapiiceservers.IceServerEntry{
+				URLs:          pkgapiiceservers.ParseURLs(e.URLs),
+				AllowedOrigin: e.AllowedOrigin,
+			})
+		}
+	}
+	muxHandlerDyn.Handle("GET /api/iceServers", pkgapiiceservers.NewIceServersHandler(iceServerEntries))
+
 	// /api/logout is on the JWT whitelist below, so the handler also runs for
 	// requests whose token is already expired or invalid — clearing cookies
 	// must never depend on a still-valid session.
@@ -280,7 +297,8 @@ func (cli *CLI) Run() error {
 
 	// The JWT whitelist: paths that must stay reachable without a session.
 	// The login endpoints and logout obviously so; healthz (the container
-	// probe carries no credentials); the public blog data keeps its current
+	// probe carries no credentials); the ICE server list is public WebRTC
+	// bootstrap data; the public blog data keeps its current
 	// unauthenticated behavior. Comments are whitelisted for reads only:
 	// appending one requires a session.
 	whList := []string{
@@ -288,6 +306,7 @@ func (cli *CLI) Run() error {
 		"/api/login/",
 		"/api/logout",
 		"/api/healthz",
+		"GET /api/iceServers",
 		"/api/dyn",
 		"/api/dyn/",
 		"GET /api/comments",
