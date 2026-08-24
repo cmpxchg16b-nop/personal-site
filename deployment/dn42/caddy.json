@@ -36,11 +36,36 @@
     },
     "http": {
       "servers": {
-        "main": {
-          "listen": [":443", ":80"],
+        "http": {
+          "listen": [":80"],
           "routes": [
             {
-              "group": "main",
+              "group": "http_redirect",
+              "match": [
+                {
+                  "host": ["nexus.dn42", "chat.dn42"]
+                }
+              ],
+              "handle": [
+                {
+                  "handler": "static_response",
+                  "status_code": 308,
+                  "headers": {
+                    "Location": [
+                      "https://{http.request.host}{http.request.uri}"
+                    ]
+                  }
+                }
+              ],
+              "terminal": true
+            }
+          ]
+        },
+        "https": {
+          "listen": [":443"],
+          "routes": [
+            {
+              "group": "nexus",
               "match": [
                 {
                   "host": ["nexus.dn42"]
@@ -54,6 +79,24 @@
                       "dial": "[fdda:8ca4:1556:3000::8376:bf72]:18972"
                     }
                   ]
+                }
+              ],
+              "terminal": true
+            },
+            {
+              "group": "chat",
+              "match": [
+                {
+                  "host": ["chat.dn42"]
+                }
+              ],
+              "handle": [
+                {
+                  "handler": "static_response",
+                  "status_code": 308,
+                  "headers": {
+                    "Location": ["https://nexus.dn42/chat"]
+                  }
                 }
               ],
               "terminal": true
