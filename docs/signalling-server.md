@@ -132,17 +132,19 @@ next `ping`'s `sequenceNumber` is the ack of the last reply.
 
 Discovery and session establishment go through the SS, but chat traffic
 itself never does: once the c2c relay has brokered the WebRTC handshake,
-the two browsers talk **directly and in-band** over a point-to-point data
-channel (label `dcmsg`). The browser-side codec and session management
-live in `web/site/src/api/ss/datachannel.tsx` (the source of truth for
-the frame format); `useDataChannel` owns the sessions and the message
-store.
+the two browsers talk **directly and in-band** over a point-to-point peer
+connection. The browser-side codecs and session management live in
+`web/site/src/api/ss/datachannel.tsx` (the source of truth for the
+messaging frame format); `useDataChannel` owns the sessions and the
+message store.
 
-- **One data channel per pair.** The polite peer (the smaller subscriber
-  id) creates it — which also starts perfect negotiation over the c2c
-  relay — the impolite peer receives it via `ondatachannel`. Sessions
-  track the channel membership: they appear as the listing discovers
-  members and are torn down when a member drops out.
+- **One peer connection, two data channels per pair.** The polite peer
+  (the smaller subscriber id) creates both — which also starts perfect
+  negotiation over the c2c relay — the impolite peer receives them via
+  `ondatachannel`, dispatched by label: `dcmsg` carries the JSON DCMsgs
+  below, `dcbin` carries compact binary frames (see _Binary file
+  transfer_). Sessions track the channel membership: they appear as the
+  listing discovers members and are torn down when a member drops out.
 - **ICE servers** come from `GET /api/iceServers` (the `<iceServer/>`
   entries of `serverConfig.xml`), so a deployment can steer peers at its
   own STUN/TURN instance.
@@ -171,6 +173,57 @@ message. Only the sender's own messages can be targeted; unknown targets
 and body-kind mismatches are no-ops. The receiver applies a control
 message on arrival, the sender when its echo comes back, so both
 histories stay identical; control messages themselves are never stored.
+
+### Binary file transfer (`dcbin`)
+
+The second data channel of every pair carries compact binary frames; the
+source of truth for the format is `web/site/src/api/ss/binaryframes.ts`
+(the codec), and the transfer engine is `useBinaryDataChannel` in
+`binarydatachannel.tsx`, built on the `BinaryTransport` `useDataChannel`
+exposes for the same sessions. All multi-byte integers are big-endian.
+Two frame kinds exist, selected by the 4-byte ASCII `frame_type`:
+
+`FILE` — one (possibly fragmented) block of a file, sender → receiver; a
+48-byte header followed by the payload:
+
+| Offset | Size | Field                                                                                          |
+| ------ | ---- | ---------------------------------------------------------------------------------------------- |
+| 0      | 4    | `frame_type` — ASCII `FILE`                                                                    |
+| 4      | 16   | `file_id` — the file's UUID, packed into 16 bytes                                              |
+| 20     | 4    | `seq` — uint32, per-`file_id` frame sequence from 0 (a `file_id` is a stream; files multiplex) |
+| 24     | 8    | `offset` — uint64 byte offset of the payload in the original file (the first frame's is 0)     |
+| 32     | 8    | `total` — uint64 size of the whole file in bytes                                               |
+| 40     | 8    | `payload_size` — uint64 size of the payload; must equal the remaining frame length             |
+| 48     | var  | `payload` — the (possibly fragmented) file content                                             |
+
+`FACK` — receiver → sender acknowledgement of the contiguous prefix of a
+file's stream received so far; 32 bytes, no payload:
+
+| Offset | Size | Field                                                                                   |
+| ------ | ---- | --------------------------------------------------------------------------------------- |
+| 0      | 4    | `frame_type` — ASCII `FACK`                                                             |
+| 4      | 16   | `file_id` — the file's UUID, packed into 16 bytes                                       |
+| 20     | 4    | `ack_seq` — uint32, cumulative: the next expected seq (one past the highest contiguous) |
+| 24     | 8    | `acked_bytes` — uint64, cumulative: the contiguously received byte count                |
+
+The sender streams a file in 16 KiB chunks with at most 64 frames
+(1 MiB) unacknowledged — a sliding window over the per-file frame
+sequence, which is also the send-side flow control — and the receiver
+acknowledges every accepted frame. SCTP delivery is ordered and
+reliable, so reassembly is strict concatenation: a gap, an overlap or a
+mismatched `total` marks the stream corrupt and the transfer is dropped.
+An empty file is one `FILE` frame with an empty payload.
+
+The transfer's status rides `dcmsg`, never `dcbin`: `sendFile` returns a
+reader yielding the transfer's status (`pending` → `running` → `done`)
+as the receiver's acknowledgements advance — throttled to a few updates
+per second — and the caller forwards every status as a chat-control
+amend of the original file-transfer-status message, whose echo updates
+the sender's own history; both UIs therefore render what the receiver
+actually holds, in real time. Completed files stay in memory on both
+ends: the receiver hands its reassembled Blob out by
+`getFileByFileId(fileId)`, the sender registers the original File under
+the same id, so a completed card downloads from whichever side clicks it.
 
 ### Magic commands
 
