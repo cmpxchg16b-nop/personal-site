@@ -48,6 +48,10 @@ export default function ConversationView({
     // No conversation selected: a centered placeholder fills the pane.
     // Same colors as MessageList's empty state (text.secondary on the
     // container, icon dimmed via opacity) so the two placeholders match.
+    // On phones the placeholder gets the conversation header's back
+    // button too — without it the channel list is unreachable when
+    // nothing is selected. The whole header is hidden on sm and up,
+    // where the sidebar is always visible.
     return (
       <Box
         sx={[
@@ -57,16 +61,42 @@ export default function ConversationView({
             minHeight: 0,
             display: "flex",
             flexDirection: "column",
-            alignItems: "center",
-            justifyContent: "center",
-            gap: 1,
-            color: "text.secondary",
           },
           ...(Array.isArray(sx) ? sx : [sx]),
         ]}
       >
-        <ForumOutlinedIcon sx={{ fontSize: 40, opacity: 0.6 }} />
-        <Typography variant="body2">{t("chat.selectConversation")}</Typography>
+        <Box
+          sx={{
+            display: { xs: "flex", sm: "none" },
+            alignItems: "center",
+            px: 2,
+            py: 1.25,
+            borderBottom: 1,
+            borderColor: "divider",
+            flexShrink: 0,
+          }}
+        >
+          <IconButton onClick={onBack} aria-label={t("chat.back")}>
+            <ArrowBackIcon />
+          </IconButton>
+        </Box>
+        <Box
+          sx={{
+            flexGrow: 1,
+            minHeight: 0,
+            display: "flex",
+            flexDirection: "column",
+            alignItems: "center",
+            justifyContent: "center",
+            gap: 1,
+            color: "text.secondary",
+          }}
+        >
+          <ForumOutlinedIcon sx={{ fontSize: 40, opacity: 0.6 }} />
+          <Typography variant="body2">
+            {t("chat.selectConversation")}
+          </Typography>
+        </Box>
       </Box>
     );
   }
