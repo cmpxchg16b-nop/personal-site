@@ -76,6 +76,12 @@
     "message": "发消息给 {{target}}",
     "send": "发送",
     "attach": "发送文件",
+    "attachMenu": {
+      "attachment": "附件",
+      "photo": "图片",
+      "video": "影片"
+    },
+    "preview": "预览",
     "empty": "还没有消息，来打个招呼吧。",
     "online": "在线",
     "offline": "离线",

@@ -10,9 +10,7 @@ import { conversationKey, type ChatMessage } from "./types";
 // (echo set), mapped onto the chat domain, keyed by conversation key,
 // oldest first. Chat-control effects are already applied to the store by
 // useDataChannel. Derived at render time — there is nothing to sync.
-export function useChatMessages(
-  dcMsgs: DCMsgs,
-): Record<string, ChatMessage[]> {
+export function useChatMessages(dcMsgs: DCMsgs): Record<string, ChatMessage[]> {
   return useMemo(() => {
     const merged: Record<string, ChatMessage[]> = {};
     for (const bySender of Object.values(dcMsgs)) {
@@ -25,28 +23,40 @@ export function useChatMessages(
             channelId: m.channelId,
             userId: m.echo === true ? m.toSubscriberId : m.fromSubscriberId,
           });
-          const msg: ChatMessage =
+          let msg: ChatMessage;
+          if (
             m.mimeType === DC_MSG_MIME_FILE_TRANSFER_STATUS &&
             m.fileTransfer !== undefined
-              ? {
-                  type: "file-transfer-status",
-                  id: m.msgId,
-                  authorId: m.fromSubscriberId,
-                  fileId: m.fileTransfer.fileId,
-                  filename: m.fileTransfer.filename,
-                  fileMIMEType: m.fileTransfer.fileMIMEType,
-                  fileSizeTotalBytes: m.fileTransfer.fileSizeTotalBytes,
-                  fileSizeTransferred: m.fileTransfer.fileSizeTransferred,
-                  fileTransferStatus: m.fileTransfer.fileTransferStatus,
-                  timestamp: m.creationTimestamp,
-                }
-              : {
-                  type: "text-chat",
-                  id: m.msgId,
-                  authorId: m.fromSubscriberId,
-                  content: m.plaintext,
-                  timestamp: m.creationTimestamp,
-                };
+          ) {
+            const transfer = {
+              id: m.msgId,
+              authorId: m.fromSubscriberId,
+              fileId: m.fileTransfer.fileId,
+              filename: m.fileTransfer.filename,
+              fileMIMEType: m.fileTransfer.fileMIMEType,
+              fileSizeTotalBytes: m.fileTransfer.fileSizeTotalBytes,
+              fileSizeTransferred: m.fileTransfer.fileSizeTransferred,
+              fileTransferStatus: m.fileTransfer.fileTransferStatus,
+              timestamp: m.creationTimestamp,
+            };
+            // The message kind is the sender's explicit choice, carried
+            // in the transfer's kind field — never derived from the
+            // file's MIME type.
+            msg =
+              m.fileTransfer.kind === "image"
+                ? { type: "image-chat", ...transfer }
+                : m.fileTransfer.kind === "video"
+                  ? { type: "video-chat", ...transfer }
+                  : { type: "file-transfer-status", ...transfer };
+          } else {
+            msg = {
+              type: "text-chat",
+              id: m.msgId,
+              authorId: m.fromSubscriberId,
+              content: m.plaintext,
+              timestamp: m.creationTimestamp,
+            };
+          }
           (merged[key] ??= []).push(msg);
         }
       }

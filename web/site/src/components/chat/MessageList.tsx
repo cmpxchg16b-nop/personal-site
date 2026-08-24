@@ -10,9 +10,11 @@ import type { ChatUser } from "@/api/ss/types";
 import { dateFnsLocaleFor } from "@/i18n";
 import { MessageItem } from "./MessageItem";
 import { FileTransferStatusItem } from "./FileTransferStatusItem";
+import { MediaMessageItem } from "./MediaMessageItem";
 import type {
   ChatMessage,
   FileTransferStatusMessage,
+  MediaChatMessage,
   MessageGroup,
 } from "./types";
 
@@ -30,18 +32,22 @@ type MessageListProps = {
   // onRequestFile asks for a completed transfer's bytes by fileId (see
   // FileTransferStatusItem).
   onRequestFile: (fileId: string) => void;
+  // getFileByFileId resolves a completed transfer's bytes locally for
+  // the media cards (see MediaMessageItem).
+  getFileByFileId: (fileId: string) => Blob | undefined;
 };
 
 // ListItem is one renderable row of the list: a group of text messages, or
-// a standalone file-transfer status card (status messages are never folded
-// into text groups; they break a run).
+// a standalone transfer card (transfers are never folded into text groups;
+// they break a run).
 type ListItem =
   | { kind: "group"; group: MessageGroup }
   | {
       kind: "fileTransfer";
       message: FileTransferStatusMessage;
       author: ChatUser;
-    };
+    }
+  | { kind: "media"; message: MediaChatMessage; author: ChatUser };
 
 // itemTimestamp returns the Unix-seconds timestamp an item carries for the
 // day-divider logic.
@@ -51,7 +57,7 @@ function itemTimestamp(item: ListItem): number {
 
 // foldMessages folds the flat oldest-first list into renderable items: runs
 // of consecutive text messages by the same author collapse into one
-// MessageGroup; file-transfer status messages stand alone.
+// MessageGroup; transfer messages stand alone.
 function foldMessages(
   messages: ChatMessage[],
   usersById: Record<string, ChatUser>,
@@ -62,6 +68,10 @@ function foldMessages(
     if (!author) continue;
     if (message.type === "file-transfer-status") {
       items.push({ kind: "fileTransfer", message, author });
+      continue;
+    }
+    if (message.type === "image-chat" || message.type === "video-chat") {
+      items.push({ kind: "media", message, author });
       continue;
     }
     const last = items[items.length - 1];
@@ -107,6 +117,7 @@ export default function MessageList({
   currentUserId,
   conversationKey,
   onRequestFile,
+  getFileByFileId,
 }: MessageListProps) {
   const { t, i18n } = useTranslation();
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -172,12 +183,19 @@ export default function MessageList({
                 group={item.group}
                 isOwn={item.group.author.id === currentUserId}
               />
-            ) : (
+            ) : item.kind === "fileTransfer" ? (
               <FileTransferStatusItem
                 message={item.message}
                 author={item.author}
                 isOwn={item.author.id === currentUserId}
                 onRequestFile={onRequestFile}
+              />
+            ) : (
+              <MediaMessageItem
+                message={item.message}
+                author={item.author}
+                isOwn={item.author.id === currentUserId}
+                getFileByFileId={getFileByFileId}
               />
             )}
           </Box>

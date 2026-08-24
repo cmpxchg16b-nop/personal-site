@@ -10,6 +10,7 @@ import {
   type ChatMessage,
   type Conversation,
   type ConversationRef,
+  type TransferKind,
 } from "./types";
 
 // ChatApp is the chat page's root: it lays out the sidebar next to the
@@ -48,12 +49,15 @@ type ChatAppProps = {
   // Reports a message the user sent; the parent owns appending it (and any
   // reply) to `messages`.
   onSend: (content: string) => void;
-  // Reports the files the user attached in the composer; the parent owns
-  // the resulting messages.
-  onAttachFile: (files: File[]) => void;
+  // Reports the files the user attached in the composer, with the
+  // picker's kind; the parent owns the resulting messages.
+  onAttachFile: (files: File[], kind: TransferKind) => void;
   // Reports a click on a completed file-transfer card: the user wants the
   // file's bytes.
   onRequestFile: (fileId: string) => void;
+  // Resolves a completed transfer's bytes locally by fileId (the media
+  // cards render from it — see MediaMessageItem).
+  getFileByFileId: (fileId: string) => Blob | undefined;
 };
 
 export default function ChatApp({
@@ -67,6 +71,7 @@ export default function ChatApp({
   onSend,
   onAttachFile,
   onRequestFile,
+  getFileByFileId,
 }: ChatAppProps) {
   const [mobileListOpen, setMobileListOpen] = useState(false);
 
@@ -118,6 +123,7 @@ export default function ChatApp({
         onSend={onSend}
         onAttachFile={onAttachFile}
         onRequestFile={onRequestFile}
+        getFileByFileId={getFileByFileId}
         onBack={() => setMobileListOpen(true)}
         sx={{ display: { xs: mobileListOpen ? "none" : "flex", sm: "flex" } }}
       />

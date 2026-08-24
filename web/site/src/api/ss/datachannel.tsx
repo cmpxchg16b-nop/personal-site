@@ -67,11 +67,19 @@ export const DC_FILE_TRANSFER_STATUSES = [
   "done",
 ] as const;
 
+// DCFileTransferKind is how a transfer is announced and rendered: a
+// plain file download card ("file") or an inline media card ("image",
+// "video"). It is the sender's explicit choice — the attach menu's
+// picker — never derived from the file's MIME type.
+export type DCFileTransferKind = "file" | "image" | "video";
+
 // DCFileTransfer is the body of a file-transfer-status DCMsg: the UI state
 // of one file transfer.
 export interface DCFileTransfer {
   /** opaque, globally unique identifier of the file */
   fileId: string;
+  /** how the transfer is announced and rendered (the sender's choice) */
+  kind: DCFileTransferKind;
   filename: string;
   fileMIMEType: string;
   fileSizeTotalBytes: number;
@@ -212,6 +220,7 @@ function encodeDCMsg(msg: DCMsg): string {
 function isWellFormedFileTransfer(ft: DCFileTransfer): boolean {
   return (
     typeof ft.fileId === "string" &&
+    (ft.kind === "file" || ft.kind === "image" || ft.kind === "video") &&
     typeof ft.filename === "string" &&
     typeof ft.fileMIMEType === "string" &&
     typeof ft.fileSizeTotalBytes === "number" &&

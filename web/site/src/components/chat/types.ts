@@ -2,6 +2,13 @@
 // signalling types in @/api/ss/types.
 
 import type { ChatUser } from "@/api/ss/types";
+import type { DCFileTransferKind } from "@/api/ss/datachannel";
+
+// TransferKind is how a transfer is announced and rendered: a plain file
+// download card ("file") or an inline media card ("image", "video"). The
+// attach menu's picker chooses it, and it travels in the DCFileTransfer
+// body — never derived from the file's MIME type.
+export type TransferKind = DCFileTransferKind;
 
 // TextChatMessage is one line of plain-text chat.
 export type TextChatMessage = {
@@ -13,27 +20,57 @@ export type TextChatMessage = {
   timestamp: number;
 };
 
-// FileTransferStatusMessage carries the UI state of a file transfer — the
-// file's bytes never travel in this message; it exists purely so both ends
-// can render the transfer's progress.
-export type FileTransferStatusMessage = {
-  type: "file-transfer-status";
-  id: string;
-  authorId: string;
-  // Opaque, globally unique identifier of the transferred file; the handle
-  // a recipient passes back (e.g. via onRequestFile) to fetch the bytes.
+// TransferMessageFields are the fields every transfer-backed message
+// carries: the UI state of one file transfer over the binary data
+// channel. The file's bytes never travel in the message — the opaque,
+// globally unique fileId is the handle getFileByFileId
+// (useBinaryDataChannel) resolves them with — the message exists purely
+// so both ends can render the transfer's progress.
+export type TransferMessageFields = {
   fileId: string;
   filename: string;
   fileMIMEType: string;
   fileSizeTotalBytes: number;
   fileSizeTransferred: number;
   fileTransferStatus: "pending" | "running" | "done";
+};
+
+// FileTransferStatusMessage is a generic file transfer, rendered as a
+// download card (see FileTransferStatusItem).
+export type FileTransferStatusMessage = TransferMessageFields & {
+  type: "file-transfer-status";
+  id: string;
+  authorId: string;
   // Unix seconds, matching TextChatMessage.timestamp.
   timestamp: number;
 };
 
+// ImageChatMessage is a file transfer whose payload is an image (its
+// fileMIMEType is image/*), rendered as an inline image card with a
+// preview dialog once the transfer completes (see MediaMessageItem).
+export type ImageChatMessage = TransferMessageFields & {
+  type: "image-chat";
+  id: string;
+  authorId: string;
+  timestamp: number;
+};
+
+// VideoChatMessage is a file transfer whose payload is a video (its
+// fileMIMEType is video/*), rendered as an inline video card with a
+// preview dialog once the transfer completes (see MediaMessageItem).
+export type VideoChatMessage = TransferMessageFields & {
+  type: "video-chat";
+  id: string;
+  authorId: string;
+  timestamp: number;
+};
+
+// MediaChatMessage is either transfer-backed media message.
+export type MediaChatMessage = ImageChatMessage | VideoChatMessage;
+
 // ChatMessage is any message renderable in a conversation.
-export type ChatMessage = TextChatMessage | FileTransferStatusMessage;
+export type ChatMessage =
+  TextChatMessage | FileTransferStatusMessage | MediaChatMessage;
 
 // ConversationRef identifies the selected conversation: a direct message
 // with one user, scoped to the channel the DM was opened from — opening

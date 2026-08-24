@@ -14,7 +14,12 @@ import type { ChatUser } from "@/api/ss/types";
 import MessageInput from "./MessageInput";
 import MessageList from "./MessageList";
 import UserAvatar from "./UserAvatar";
-import { conversationKey, type ChatMessage, type Conversation } from "./types";
+import {
+  conversationKey,
+  type ChatMessage,
+  type Conversation,
+  type TransferKind,
+} from "./types";
 
 type ConversationViewProps = {
   // The open conversation, or null when none is selected — a placeholder
@@ -24,10 +29,14 @@ type ConversationViewProps = {
   usersById: Record<string, ChatUser>;
   currentUserId: string;
   onSend: (content: string) => void;
-  // onAttachFile reports the files picked in the composer's attach button.
-  onAttachFile: (files: File[]) => void;
+  // onAttachFile reports the files picked in the composer's attach menu,
+  // with the picker's kind.
+  onAttachFile: (files: File[], kind: TransferKind) => void;
   // onRequestFile asks for a completed transfer's bytes by fileId.
   onRequestFile: (fileId: string) => void;
+  // getFileByFileId resolves a completed transfer's bytes locally; the
+  // media cards render from it (see MediaMessageItem).
+  getFileByFileId: (fileId: string) => Blob | undefined;
   // onBack returns to the channel list; only reachable on phone-sized
   // viewports where the sidebar and the conversation don't share the screen.
   onBack: () => void;
@@ -45,6 +54,7 @@ export default function ConversationView({
   onSend,
   onAttachFile,
   onRequestFile,
+  getFileByFileId,
   onBack,
   sx,
 }: ConversationViewProps) {
@@ -169,6 +179,7 @@ export default function ConversationView({
         currentUserId={currentUserId}
         conversationKey={conversationKey(ref)}
         onRequestFile={onRequestFile}
+        getFileByFileId={getFileByFileId}
       />
       <MessageInput
         target={target}

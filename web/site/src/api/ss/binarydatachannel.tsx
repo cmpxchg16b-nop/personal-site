@@ -35,7 +35,7 @@
  * original File under the same fileId.
  */
 
-import { useCallback, useEffect, useRef } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import {
   BINARY_FRAME_TYPE_FILE_ACK,
@@ -46,7 +46,11 @@ import {
   uuidToBytes,
   type FileAckFrame,
 } from "./binaryframes";
-import type { BinaryTransport, DCFileTransfer } from "./datachannel";
+import type {
+  BinaryTransport,
+  DCFileTransfer,
+  DCFileTransferKind,
+} from "./datachannel";
 import type { ChannelId, SubscriberId } from "./types";
 
 // FILE_CHUNK_SIZE is the payload size of one FILE frame.
@@ -85,22 +89,32 @@ export interface UseBinaryDataChannelResult {
    * transfer that breaks (the channel or the session goes away) rejects
    * the pending read. fileId must be a UUID string — the wire format's
    * file_id field is the packed UUID — and is also the key the peer's
-   * getFileByFileId hands the reassembled file out under.
+   * getFileByFileId hands the reassembled file out under. kind is the
+   * sender's render choice (see DCFileTransfer.kind); every status the
+   * reader yields carries it, so amends built from them stay complete.
    */
   sendFile: (
     channelId: ChannelId,
     toSubscriberId: SubscriberId,
     fileId: string,
     file: File,
+    kind: DCFileTransferKind,
   ) => ReadableStreamDefaultReader<DCFileTransfer>;
   /**
    * Returns a completed file by its fileId: a reassembled Blob for a
    * received file, the original File for a sent one. Undefined while
-   * the transfer is still running or unknown. Imperative and
-   * non-reactive by design — the UI calls it when a completed transfer
-   * card is clicked.
+   * the transfer is still running or unknown. Render-safe: filesVersion
+   * bumps whenever a file lands in the registry, re-rendering the
+   * hook's caller, so a component that reads getFileByFileId during
+   * render sees a file the moment its bytes arrive (memoized consumers
+   * can depend on filesVersion).
    */
   getFileByFileId: (fileId: string) => Blob | undefined;
+  /**
+   * Bumped whenever a completed file lands in the registry — the
+   * mechanism that keeps getFileByFileId reads reactive.
+   */
+  filesVersion: number;
 }
 
 /**
@@ -115,6 +129,9 @@ export function useBinaryDataChannel(
   // Completed files by fileId: reassembled received files and the
   // originals of sent ones.
   const filesRef = useRef(new Map<string, Blob>());
+  // Bumped whenever the registry gains a file — the re-render that
+  // keeps getFileByFileId reads reactive.
+  const [filesVersion, setFilesVersion] = useState(0);
   // Partial inbound transfers, keyed `${channelId}:${from}:${fileId}`.
   const inboundRef = useRef(new Map<string, InboundTransfer>());
   // The acknowledgement callbacks of in-flight sends, keyed
@@ -216,6 +233,7 @@ export function useBinaryDataChannel(
       if (transfer.received === transfer.total) {
         inboundRef.current.delete(key);
         filesRef.current.set(frame.fileId, new Blob(transfer.chunks));
+        setFilesVersion((v) => v + 1);
       }
     });
   }, [transport]);
@@ -252,6 +270,7 @@ export function useBinaryDataChannel(
       toSubscriberId: SubscriberId,
       fileId: string,
       file: File,
+      kind: DCFileTransferKind,
     ): ReadableStreamDefaultReader<DCFileTransfer> => {
       const fileIdBytes = uuidToBytes(fileId);
       if (fileIdBytes === null) {
@@ -263,8 +282,10 @@ export function useBinaryDataChannel(
       const normalizedFileId = bytesToUuid(fileIdBytes);
       // The sender's own completed card downloads the original file.
       filesRef.current.set(normalizedFileId, file);
+      setFilesVersion((v) => v + 1);
       const base = {
         fileId: normalizedFileId,
+        kind,
         filename: file.name,
         // The File API leaves type empty for unrecognized extensions.
         fileMIMEType: file.type || "application/octet-stream",
@@ -428,5 +449,5 @@ export function useBinaryDataChannel(
     [transport],
   );
 
-  return { sendFile, getFileByFileId };
+  return { sendFile, getFileByFileId, filesVersion };
 }

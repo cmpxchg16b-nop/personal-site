@@ -76,6 +76,12 @@
     "message": "Message {{target}}",
     "send": "Send",
     "attach": "Attach a file",
+    "attachMenu": {
+      "attachment": "Attachment",
+      "photo": "Photo",
+      "video": "Video"
+    },
+    "preview": "Preview",
     "empty": "No messages yet — say hi.",
     "online": "Online",
     "offline": "Offline",

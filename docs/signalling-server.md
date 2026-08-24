@@ -159,11 +159,11 @@ Every frame is one JSON `DCMsg`: `mimeVersion` (`1.0`), `channelId`,
 tag, and the body. Malformed frames are dropped silently, mirroring the
 SS's rule for malformed events.
 
-| `mimeType`                           | Body                                                                                                         | Meaning                                                                                                                                                                                                   |
-| ------------------------------------ | ------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `text/plain`                         | `plaintext`                                                                                                  | A plain-text chat line.                                                                                                                                                                                   |
-| `application/x-file-transfer-status` | `fileTransfer {fileId, filename, fileMIMEType, fileSizeTotalBytes, fileSizeTransferred, fileTransferStatus}` | The UI state of a file transfer (`pending` → `running` → `done`). The file's bytes never travel in the message; the opaque, globally unique `fileId` is the handle a recipient passes back to fetch them. |
-| `application/x-chat-control`         | `chatControl {subtype, targetMessageId, text?, fileTransfer?}`                                               | Mutates one of the sender's earlier messages instead of adding a line.                                                                                                                                    |
+| `mimeType`                           | Body                                                                                                               | Meaning                                                                                                                                                                                                   |
+| ------------------------------------ | ------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `text/plain`                         | `plaintext`                                                                                                        | A plain-text chat line.                                                                                                                                                                                   |
+| `application/x-file-transfer-status` | `fileTransfer {fileId, kind, filename, fileMIMEType, fileSizeTotalBytes, fileSizeTransferred, fileTransferStatus}` | The UI state of a file transfer (`pending` → `running` → `done`). The file's bytes never travel in the message; the opaque, globally unique `fileId` is the handle a recipient passes back to fetch them. |
+| `application/x-chat-control`         | `chatControl {subtype, targetMessageId, text?, fileTransfer?}`                                                     | Mutates one of the sender's earlier messages instead of adding a line.                                                                                                                                    |
 
 Chat-control semantics: `delete` drops the target message; `amend`
 rewrites the target's body — `text` for a text message, `fileTransfer`
@@ -224,6 +224,15 @@ actually holds, in real time. Completed files stay in memory on both
 ends: the receiver hands its reassembled Blob out by
 `getFileByFileId(fileId)`, the sender registers the original File under
 the same id, so a completed card downloads from whichever side clicks it.
+
+A transfer message's render kind is the sender's explicit choice,
+carried in the body's `kind` field — `file` renders the download card,
+`image` / `video` render inline media cards (a progress doughnut while
+transferring, a borderless card opening a preview dialog once done). It
+is chosen by the composer's attach menu (attachment / photo / video,
+whose only other effect is the file dialog's `accept` filter) and is
+never derived from the file's MIME type; the transfer path over `dcbin`
+is the same for all three.
 
 ### Magic commands
 
