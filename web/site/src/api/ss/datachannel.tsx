@@ -47,8 +47,50 @@ import type {
 // DC_MSG_MIME_VERSION is the DCMsg format version, MIME-Version style.
 export const DC_MSG_MIME_VERSION = "1.0";
 
-// DC_MSG_MIME_PLAINTEXT is the only supported body kind for now.
+// DC_MSG_MIME_PLAINTEXT: a plain-text chat line.
 export const DC_MSG_MIME_PLAINTEXT = "text/plain";
+
+// DC_MSG_MIME_FILE_TRANSFER_STATUS: a file-transfer status update (body in
+// the fileTransfer field). The file's bytes never travel in the message —
+// it exists so both ends can render the transfer's progress.
+export const DC_MSG_MIME_FILE_TRANSFER_STATUS =
+  "application/x-file-transfer-status";
+
+// DC_FILE_TRANSFER_STATUSES are the lifecycle states of a file transfer.
+export const DC_FILE_TRANSFER_STATUSES = [
+  "pending",
+  "running",
+  "done",
+] as const;
+
+// DCFileTransfer is the body of a file-transfer-status DCMsg: the UI state
+// of one file transfer.
+export interface DCFileTransfer {
+  /** opaque, globally unique identifier of the file */
+  fileId: string;
+  filename: string;
+  fileMIMEType: string;
+  fileSizeTotalBytes: number;
+  fileSizeTransferred: number;
+  fileTransferStatus: "pending" | "running" | "done";
+}
+
+// DC_MSG_MIME_CHAT_CONTROL: a chat control message (body in the
+// chatControl field): delete or amend an earlier message.
+export const DC_MSG_MIME_CHAT_CONTROL = "application/x-chat-control";
+
+// DCChatControl is the body of a chat-control DCMsg. For "delete" only
+// targetMessageId is set. For "amend" exactly one of text / fileTransfer
+// carries the target's new content; the amendment keeps the target's
+// original id and timestamp (see applyChatControlDCMsg below).
+export interface DCChatControl {
+  subtype: "delete" | "amend";
+  targetMessageId: MsgId;
+  /** amended content, when the target is a text message */
+  text?: string;
+  /** amended status, when the target is a file-transfer status message */
+  fileTransfer?: DCFileTransfer;
+}
 
 // DCMsg is a message carried over a WebRTC data channel.
 export interface DCMsg {
@@ -69,10 +111,15 @@ export interface DCMsg {
    * original send; echoes are never echoed again.
    */
   echo?: boolean;
-  /** the body kind; only DC_MSG_MIME_PLAINTEXT is supported for now */
+  /** the body kind; see DC_MSG_MIME_PLAINTEXT et al. */
   mimeType: string;
-  /** the message body, when mimeType is text/plain */
+  /** the message body when mimeType is text/plain; empty otherwise */
   plaintext: string;
+  /** the file-transfer status when mimeType is
+      DC_MSG_MIME_FILE_TRANSFER_STATUS */
+  fileTransfer?: DCFileTransfer;
+  /** the control operation when mimeType is DC_MSG_MIME_CHAT_CONTROL */
+  chatControl?: DCChatControl;
 }
 
 // DCMsgs maps channelId → sender subscriber id → the list of messages
@@ -103,11 +150,72 @@ export function newDCMsg(
   };
 }
 
+// newFileTransferDCMsg builds a file-transfer-status DCMsg to
+// toSubscriberId, minting a fresh msg id and stamping the creation time.
+export function newFileTransferDCMsg(
+  channelId: ChannelId,
+  fromSubscriberId: SubscriberId,
+  toSubscriberId: SubscriberId,
+  fileTransfer: DCFileTransfer,
+  inReplyTo?: MsgId,
+): DCMsg {
+  return {
+    mimeVersion: DC_MSG_MIME_VERSION,
+    channelId,
+    fromSubscriberId,
+    toSubscriberId,
+    creationTimestamp: Date.now() / 1000,
+    msgId: crypto.randomUUID(),
+    inReplyTo,
+    mimeType: DC_MSG_MIME_FILE_TRANSFER_STATUS,
+    plaintext: "",
+    fileTransfer,
+  };
+}
+
+// newChatControlDCMsg builds a chat-control DCMsg to toSubscriberId,
+// minting a fresh msg id and stamping the creation time.
+export function newChatControlDCMsg(
+  channelId: ChannelId,
+  fromSubscriberId: SubscriberId,
+  toSubscriberId: SubscriberId,
+  chatControl: DCChatControl,
+  inReplyTo?: MsgId,
+): DCMsg {
+  return {
+    mimeVersion: DC_MSG_MIME_VERSION,
+    channelId,
+    fromSubscriberId,
+    toSubscriberId,
+    creationTimestamp: Date.now() / 1000,
+    msgId: crypto.randomUUID(),
+    inReplyTo,
+    mimeType: DC_MSG_MIME_CHAT_CONTROL,
+    plaintext: "",
+    chatControl,
+  };
+}
+
 // encodeDCMsg serializes a DCMsg for the wire. The data channel's
 // on-the-wire format is a private detail of this codec — JSON today, but
 // it could be XML or anything else; DCMsg itself stays agnostic to it.
 function encodeDCMsg(msg: DCMsg): string {
   return JSON.stringify(msg);
+}
+
+// isWellFormedFileTransfer reports whether ft is a structurally valid
+// DCFileTransfer.
+function isWellFormedFileTransfer(ft: DCFileTransfer): boolean {
+  return (
+    typeof ft.fileId === "string" &&
+    typeof ft.filename === "string" &&
+    typeof ft.fileMIMEType === "string" &&
+    typeof ft.fileSizeTotalBytes === "number" &&
+    typeof ft.fileSizeTransferred === "number" &&
+    (ft.fileTransferStatus === "pending" ||
+      ft.fileTransferStatus === "running" ||
+      ft.fileTransferStatus === "done")
+  );
 }
 
 // decodeDCMsg parses one data-channel frame back into a DCMsg, returning
@@ -128,10 +236,31 @@ function decodeDCMsg(data: unknown): DCMsg | null {
     typeof msg.fromSubscriberId !== "string" ||
     typeof msg.toSubscriberId !== "string" ||
     typeof msg.msgId !== "string" ||
+    typeof msg.mimeType !== "string" ||
     typeof msg.plaintext !== "string" ||
     (msg.echo !== undefined && typeof msg.echo !== "boolean")
   ) {
     return null;
+  }
+  if (
+    msg.mimeType === DC_MSG_MIME_FILE_TRANSFER_STATUS &&
+    (msg.fileTransfer === undefined ||
+      !isWellFormedFileTransfer(msg.fileTransfer))
+  ) {
+    return null;
+  }
+  if (msg.mimeType === DC_MSG_MIME_CHAT_CONTROL) {
+    const cc = msg.chatControl;
+    if (
+      cc === undefined ||
+      (cc.subtype !== "delete" && cc.subtype !== "amend") ||
+      typeof cc.targetMessageId !== "string" ||
+      (cc.text !== undefined && typeof cc.text !== "string") ||
+      (cc.fileTransfer !== undefined &&
+        !isWellFormedFileTransfer(cc.fileTransfer))
+    ) {
+      return null;
+    }
   }
   return msg;
 }
@@ -239,12 +368,63 @@ function appendDCMsg(prev: DCMsgs, msg: DCMsg): DCMsgs {
   };
 }
 
+// applyChatControlDCMsg applies a chat-control message to the sender's own
+// stored messages: "delete" drops the target, "amend" rewrites its body
+// (plaintext for a text message, fileTransfer for a file-transfer status),
+// keeping the target's msgId and creationTimestamp — an amendment never
+// moves or reattributes a message. Controls targeting another sender's
+// message, an unknown message, or a mismatched body kind are no-ops.
+function applyChatControlDCMsg(
+  prev: DCMsgs,
+  channelId: ChannelId,
+  senderId: SubscriberId,
+  cc: DCChatControl,
+): DCMsgs {
+  const byPeer = prev[channelId];
+  const list = byPeer?.[senderId];
+  if (byPeer === undefined || list === undefined) return prev;
+  if (cc.subtype === "delete") {
+    const next = list.filter((m) => m.msgId !== cc.targetMessageId);
+    if (next.length === list.length) return prev;
+    return { ...prev, [channelId]: { ...byPeer, [senderId]: next } };
+  }
+  const index = list.findIndex((m) => m.msgId === cc.targetMessageId);
+  if (index === -1) return prev;
+  const target = list[index];
+  let amended: DCMsg | null = null;
+  if (cc.text !== undefined && target.mimeType === DC_MSG_MIME_PLAINTEXT) {
+    amended = { ...target, plaintext: cc.text };
+  } else if (
+    cc.fileTransfer !== undefined &&
+    target.mimeType === DC_MSG_MIME_FILE_TRANSFER_STATUS
+  ) {
+    amended = { ...target, fileTransfer: cc.fileTransfer };
+  }
+  if (amended === null) return prev;
+  const next = [...list];
+  next[index] = amended;
+  return { ...prev, [channelId]: { ...byPeer, [senderId]: next } };
+}
+
+// applyDCMsg folds one inbound DCMsg into the store: a chat-control
+// message mutates the sender's earlier message and is never stored;
+// anything else appends.
+function applyDCMsg(prev: DCMsgs, msg: DCMsg): DCMsgs {
+  const cc =
+    msg.mimeType === DC_MSG_MIME_CHAT_CONTROL ? msg.chatControl : undefined;
+  if (cc !== undefined) {
+    return applyChatControlDCMsg(prev, msg.channelId, msg.fromSubscriberId, cc);
+  }
+  return appendDCMsg(prev, msg);
+}
+
 export interface UseDataChannelResult {
   /**
    * Messages received from data channels so far: first key the channel
    * id, second key the sender's subscriber id, oldest first. Our own
    * messages come back as echoes (echo set) under our own subscriber
-   * id.
+   * id. Chat-control messages are applied on arrival — the target is
+   * deleted or amended in place — and never show up in the store.
    */
   dcMsgs: DCMsgs;
   /**
@@ -340,7 +520,7 @@ export function useDataChannel(
           sessions.set(
             key,
             startPeerSession(proxy, channel.id, self, peer, iceServers, (msg) =>
-              setDcMsgs((prev) => appendDCMsg(prev, msg)),
+              setDcMsgs((prev) => applyDCMsg(prev, msg)),
             ),
           );
         }

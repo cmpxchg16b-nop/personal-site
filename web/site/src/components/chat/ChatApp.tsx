@@ -48,6 +48,12 @@ type ChatAppProps = {
   // Reports a message the user sent; the parent owns appending it (and any
   // reply) to `messages`.
   onSend: (content: string) => void;
+  // Reports the files the user attached in the composer; the parent owns
+  // the resulting messages.
+  onAttachFile: (files: File[]) => void;
+  // Reports a click on a completed file-transfer card: the user wants the
+  // file's bytes.
+  onRequestFile: (fileId: string) => void;
 };
 
 export default function ChatApp({
@@ -59,6 +65,8 @@ export default function ChatApp({
   messages,
   unread,
   onSend,
+  onAttachFile,
+  onRequestFile,
 }: ChatAppProps) {
   const [mobileListOpen, setMobileListOpen] = useState(false);
 
@@ -108,6 +116,8 @@ export default function ChatApp({
         usersById={users}
         currentUserId={currentUserId}
         onSend={onSend}
+        onAttachFile={onAttachFile}
+        onRequestFile={onRequestFile}
         onBack={() => setMobileListOpen(true)}
         sx={{ display: { xs: mobileListOpen ? "none" : "flex", sm: "flex" } }}
       />

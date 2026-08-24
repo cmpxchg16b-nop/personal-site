@@ -1,7 +1,8 @@
 "use client";
 
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { Box, IconButton, TextField } from "@mui/material";
+import AttachFileIcon from "@mui/icons-material/AttachFile";
 import SendIcon from "@mui/icons-material/Send";
 import { useTranslation } from "react-i18next";
 
@@ -10,17 +11,25 @@ type MessageInputProps = {
   // the placeholder.
   target: string;
   onSend: (content: string) => void;
+  // onAttachFile reports the files picked through the attach button.
+  onAttachFile: (files: File[]) => void;
 };
 
 // MessageInput is the composer at the bottom of a conversation: a borderless
 // multiline input filling the whole bar, separated from the history by a
-// single hairline, with the send button docked at its end. Enter sends;
-// Shift+Enter inserts a newline. Enter is ignored while an IME composition
-// is in progress so CJK input isn't cut off mid-conversion.
-export default function MessageInput({ target, onSend }: MessageInputProps) {
+// single hairline, with the attach button docked at its start and the send
+// button at its end. Enter sends; Shift+Enter inserts a newline. Enter is
+// ignored while an IME composition is in progress so CJK input isn't cut
+// off mid-conversion.
+export default function MessageInput({
+  target,
+  onSend,
+  onAttachFile,
+}: MessageInputProps) {
   const { t } = useTranslation();
   const [content, setContent] = useState("");
   const sendable = content.trim() !== "";
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   const submit = () => {
     const trimmed = content.trim();
@@ -35,12 +44,32 @@ export default function MessageInput({ target, onSend }: MessageInputProps) {
         display: "flex",
         alignItems: "flex-end",
         gap: 1,
-        px: 2,
+        px: 1,
         py: 1,
         borderTop: 1,
         borderColor: "divider",
       }}
     >
+      <IconButton
+        onClick={() => fileInputRef.current?.click()}
+        aria-label={t("chat.attach")}
+      >
+        <AttachFileIcon fontSize="small" />
+      </IconButton>
+      {/* Hidden file input driven by the attach button; the value is
+          cleared after each pick so choosing the same file again still
+          fires onChange. */}
+      <input
+        type="file"
+        hidden
+        multiple
+        ref={fileInputRef}
+        onChange={(e) => {
+          const files = Array.from(e.target.files ?? []);
+          if (files.length > 0) onAttachFile(files);
+          e.target.value = "";
+        }}
+      />
       <TextField
         placeholder={t("chat.message", { target })}
         value={content}

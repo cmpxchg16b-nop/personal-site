@@ -75,12 +75,19 @@
     "selectConversation": "Select a chat to start messaging.",
     "message": "Message {{target}}",
     "send": "Send",
+    "attach": "Attach a file",
     "empty": "No messages yet — say hi.",
     "online": "Online",
     "offline": "Offline",
     "back": "Back to the channel list",
     "today": "Today",
-    "yesterday": "Yesterday"
+    "yesterday": "Yesterday",
+    "fileTransfer": {
+      "pending": "Waiting…",
+      "running": "Transferring",
+      "done": "Completed",
+      "download": "Download {{filename}}"
+    }
   },
   "footer": {
     "copyright": "© {{year}} {{name}}",

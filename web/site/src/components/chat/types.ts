@@ -3,13 +3,37 @@
 
 import type { ChatUser } from "@/api/ss/types";
 
-export type ChatMessage = {
+// TextChatMessage is one line of plain-text chat.
+export type TextChatMessage = {
+  type: "text-chat";
   id: string;
   authorId: string;
   content: string;
   // Unix seconds, matching Comment.creation_time elsewhere in the app.
   timestamp: number;
 };
+
+// FileTransferStatusMessage carries the UI state of a file transfer — the
+// file's bytes never travel in this message; it exists purely so both ends
+// can render the transfer's progress.
+export type FileTransferStatusMessage = {
+  type: "file-transfer-status";
+  id: string;
+  authorId: string;
+  // Opaque, globally unique identifier of the transferred file; the handle
+  // a recipient passes back (e.g. via onRequestFile) to fetch the bytes.
+  fileId: string;
+  filename: string;
+  fileMIMEType: string;
+  fileSizeTotalBytes: number;
+  fileSizeTransferred: number;
+  fileTransferStatus: "pending" | "running" | "done";
+  // Unix seconds, matching TextChatMessage.timestamp.
+  timestamp: number;
+};
+
+// ChatMessage is any message renderable in a conversation.
+export type ChatMessage = TextChatMessage | FileTransferStatusMessage;
 
 // ConversationRef identifies the selected conversation: a direct message
 // with one user, scoped to the channel the DM was opened from — opening
@@ -51,12 +75,13 @@ export function parseConversationKey(
 }
 
 // MessageGroup is the view model for MessageItem: a run of consecutive
-// messages by the same author rendered under one avatar and header line.
+// text messages by the same author rendered under one avatar and header
+// line.
 export type MessageGroup = {
   // Stable React key (the first message's id).
   key: string;
   author: ChatUser;
   // Unix seconds; when the group started (shown in the header line).
   startedAt: number;
-  messages: ChatMessage[];
+  messages: TextChatMessage[];
 };

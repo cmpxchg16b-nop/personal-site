@@ -128,6 +128,68 @@ Ping sessions between clients follow the sequence rules: a `pong` keeps
 the `pingId` and answers `ackSequenceNumber = sequenceNumber + 1`; the
 next `ping`'s `sequenceNumber` is the ack of the last reply.
 
+## In-band peer messaging (data channels)
+
+Discovery and session establishment go through the SS, but chat traffic
+itself never does: once the c2c relay has brokered the WebRTC handshake,
+the two browsers talk **directly and in-band** over a point-to-point data
+channel (label `dcmsg`). The browser-side codec and session management
+live in `web/site/src/api/ss/datachannel.tsx` (the source of truth for
+the frame format); `useDataChannel` owns the sessions and the message
+store.
+
+- **One data channel per pair.** The polite peer (the smaller subscriber
+  id) creates it — which also starts perfect negotiation over the c2c
+  relay — the impolite peer receives it via `ondatachannel`. Sessions
+  track the channel membership: they appear as the listing discovers
+  members and are torn down when a member drops out.
+- **ICE servers** come from `GET /api/iceServers` (the `<iceServer/>`
+  entries of `serverConfig.xml`), so a deployment can steer peers at its
+  own STUN/TURN instance.
+- **Echo.** A data channel does not echo; the recipient bounces every
+  message back with `echo: true` so the sender sees its own message.
+  Echoes are never echoed again. Both sides therefore build the same
+  history from the same frames.
+
+Every frame is one JSON `DCMsg`: `mimeVersion` (`1.0`), `channelId`,
+`fromSubscriberId`, `toSubscriberId`, `creationTimestamp` (Unix seconds),
+`msgId`, optional `inReplyTo`, optional `echo`, a `mimeType` body-kind
+tag, and the body. Malformed frames are dropped silently, mirroring the
+SS's rule for malformed events.
+
+| `mimeType`                           | Body                                                                                                         | Meaning                                                                                                                                                                                                   |
+| ------------------------------------ | ------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `text/plain`                         | `plaintext`                                                                                                  | A plain-text chat line.                                                                                                                                                                                   |
+| `application/x-file-transfer-status` | `fileTransfer {fileId, filename, fileMIMEType, fileSizeTotalBytes, fileSizeTransferred, fileTransferStatus}` | The UI state of a file transfer (`pending` → `running` → `done`). The file's bytes never travel in the message; the opaque, globally unique `fileId` is the handle a recipient passes back to fetch them. |
+| `application/x-chat-control`         | `chatControl {subtype, targetMessageId, text?, fileTransfer?}`                                               | Mutates one of the sender's earlier messages instead of adding a line.                                                                                                                                    |
+
+Chat-control semantics: `delete` drops the target message; `amend`
+rewrites the target's body — `text` for a text message, `fileTransfer`
+for a file-transfer status — while keeping its `msgId` and
+`creationTimestamp`, so an amendment never moves or reattributes a
+message. Only the sender's own messages can be targeted; unknown targets
+and body-kind mismatches are no-ops. The receiver applies a control
+message on arrival, the sender when its echo comes back, so both
+histories stay identical; control messages themselves are never stored.
+
+### Magic commands
+
+The composer intercepts three debugging commands on send — a message
+matching one is never sent as text but turned into the corresponding
+chat-control message (`web/site/src/components/chat/magic.ts`):
+
+- `/magic a90926e3-c768-45b7-ab93-4709c5f4aa91 <target_msg_id>` — delete
+  the target message.
+- `/magic 1f734b69-9c46-4629-9e73-0aed96166f7c <target_msg_id> <content>` —
+  amend a text chat message (`content` may contain spaces).
+- `/magic 7f8d9d4e-f41e-4e18-958e-ebc990690666 <target_msg_id> <status> <transferred> <total>` —
+  amend a file-transfer status message (`status` is `pending`, `running`
+  or `done`; the sizes are byte counts).
+
+Amendments copy the target's immutable fields (a file transfer's
+`fileId`, name and MIME type) from the local history, so an unknown
+target id or a kind mismatch makes the command a no-op.
+
 ## Addressing and routing
 
 - The provider is the **only** component that understands subscriber

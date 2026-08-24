@@ -24,6 +24,10 @@ type ConversationViewProps = {
   usersById: Record<string, ChatUser>;
   currentUserId: string;
   onSend: (content: string) => void;
+  // onAttachFile reports the files picked in the composer's attach button.
+  onAttachFile: (files: File[]) => void;
+  // onRequestFile asks for a completed transfer's bytes by fileId.
+  onRequestFile: (fileId: string) => void;
   // onBack returns to the channel list; only reachable on phone-sized
   // viewports where the sidebar and the conversation don't share the screen.
   onBack: () => void;
@@ -39,6 +43,8 @@ export default function ConversationView({
   usersById,
   currentUserId,
   onSend,
+  onAttachFile,
+  onRequestFile,
   onBack,
   sx,
 }: ConversationViewProps) {
@@ -162,8 +168,13 @@ export default function ConversationView({
         usersById={usersById}
         currentUserId={currentUserId}
         conversationKey={conversationKey(ref)}
+        onRequestFile={onRequestFile}
       />
-      <MessageInput target={target} onSend={onSend} />
+      <MessageInput
+        target={target}
+        onSend={onSend}
+        onAttachFile={onAttachFile}
+      />
     </Box>
   );
 }

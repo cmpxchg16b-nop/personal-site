@@ -9,7 +9,12 @@ import type { TFunction } from "i18next";
 import type { ChatUser } from "@/api/ss/types";
 import { dateFnsLocaleFor } from "@/i18n";
 import { MessageItem } from "./MessageItem";
-import type { ChatMessage, MessageGroup } from "./types";
+import { FileTransferStatusItem } from "./FileTransferStatusItem";
+import type {
+  ChatMessage,
+  FileTransferStatusMessage,
+  MessageGroup,
+} from "./types";
 
 // GROUP_WINDOW_MS: consecutive messages by the same author within this gap
 // collapse into one group (one avatar, one header line).
@@ -22,35 +27,65 @@ type MessageListProps = {
   // Key of the conversation being shown; a change resets the scroll position
   // instantly instead of animating.
   conversationKey: string;
+  // onRequestFile asks for a completed transfer's bytes by fileId (see
+  // FileTransferStatusItem).
+  onRequestFile: (fileId: string) => void;
 };
 
-// groupMessages folds the flat oldest-first list into per-author runs.
-function groupMessages(
+// ListItem is one renderable row of the list: a group of text messages, or
+// a standalone file-transfer status card (status messages are never folded
+// into text groups; they break a run).
+type ListItem =
+  | { kind: "group"; group: MessageGroup }
+  | {
+      kind: "fileTransfer";
+      message: FileTransferStatusMessage;
+      author: ChatUser;
+    };
+
+// itemTimestamp returns the Unix-seconds timestamp an item carries for the
+// day-divider logic.
+function itemTimestamp(item: ListItem): number {
+  return item.kind === "group" ? item.group.startedAt : item.message.timestamp;
+}
+
+// foldMessages folds the flat oldest-first list into renderable items: runs
+// of consecutive text messages by the same author collapse into one
+// MessageGroup; file-transfer status messages stand alone.
+function foldMessages(
   messages: ChatMessage[],
   usersById: Record<string, ChatUser>,
-): MessageGroup[] {
-  const groups: MessageGroup[] = [];
+): ListItem[] {
+  const items: ListItem[] = [];
   for (const message of messages) {
     const author = usersById[message.authorId];
     if (!author) continue;
-    const last = groups[groups.length - 1];
+    if (message.type === "file-transfer-status") {
+      items.push({ kind: "fileTransfer", message, author });
+      continue;
+    }
+    const last = items[items.length - 1];
     if (
-      last &&
-      last.author.id === author.id &&
-      message.timestamp * 1000 - last.startedAt * 1000 < GROUP_WINDOW_MS &&
-      isSameDay(message.timestamp * 1000, last.startedAt * 1000)
+      last?.kind === "group" &&
+      last.group.author.id === author.id &&
+      message.timestamp * 1000 - last.group.startedAt * 1000 <
+        GROUP_WINDOW_MS &&
+      isSameDay(message.timestamp * 1000, last.group.startedAt * 1000)
     ) {
-      last.messages.push(message);
+      last.group.messages.push(message);
     } else {
-      groups.push({
-        key: message.id,
-        author,
-        startedAt: message.timestamp,
-        messages: [message],
+      items.push({
+        kind: "group",
+        group: {
+          key: message.id,
+          author,
+          startedAt: message.timestamp,
+          messages: [message],
+        },
       });
     }
   }
-  return groups;
+  return items;
 }
 
 // dayLabel renders a divider's date: "Today"/"Yesterday" when applicable,
@@ -71,6 +106,7 @@ export default function MessageList({
   usersById,
   currentUserId,
   conversationKey,
+  onRequestFile,
 }: MessageListProps) {
   const { t, i18n } = useTranslation();
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -78,8 +114,8 @@ export default function MessageList({
   // (no smooth animation on page load).
   const lastKeyRef = useRef<string | null>(null);
 
-  const groups = useMemo(
-    () => groupMessages(messages, usersById),
+  const items = useMemo(
+    () => foldMessages(messages, usersById),
     [messages, usersById],
   );
 
@@ -92,7 +128,7 @@ export default function MessageList({
     });
   }, [conversationKey, messages.length]);
 
-  if (groups.length === 0) {
+  if (items.length === 0) {
     return (
       <Box
         sx={{
@@ -115,25 +151,35 @@ export default function MessageList({
 
   return (
     <Box sx={{ flexGrow: 1, minHeight: 0, overflowY: "auto", py: 1.5 }}>
-      {groups.map((group, i) => {
+      {items.map((item, i) => {
+        const timestamp = itemTimestamp(item);
         const showDivider =
           i === 0 ||
-          !isSameDay(group.startedAt * 1000, groups[i - 1].startedAt * 1000);
+          !isSameDay(timestamp * 1000, itemTimestamp(items[i - 1]) * 1000);
         return (
-          <Box key={group.key}>
+          <Box key={item.kind === "group" ? item.group.key : item.message.id}>
             {showDivider && (
               <Divider sx={{ my: 1.5, mx: 2 }}>
                 <Chip
-                  label={dayLabel(group.startedAt, t, i18n.language)}
+                  label={dayLabel(timestamp, t, i18n.language)}
                   size="small"
                   variant="outlined"
                 />
               </Divider>
             )}
-            <MessageItem
-              group={group}
-              isOwn={group.author.id === currentUserId}
-            />
+            {item.kind === "group" ? (
+              <MessageItem
+                group={item.group}
+                isOwn={item.group.author.id === currentUserId}
+              />
+            ) : (
+              <FileTransferStatusItem
+                message={item.message}
+                author={item.author}
+                isOwn={item.author.id === currentUserId}
+                onRequestFile={onRequestFile}
+              />
+            )}
           </Box>
         );
       })}
