@@ -18,6 +18,16 @@ services:
       - "caddy"
       - "run"
       - "--config=/caddy.json"
+  turn:
+    container_name: dn42-coturn
+    image: docker.io/coturn/coturn:latest
+    network_mode: "ns:/run/netns/svcs"
+    volumes:
+      - "./turnserver.conf:/etc/coturn/turnserver.conf:ro"
+    command:
+      - "turnserver"
+      - "-c"
+      - "/etc/coturn/turnserver.conf"
 # memo:
 # vie1 host interconnect:
 #   container (netns svcs): fdda:8ca4:1556:3000::8376:bf73/127
