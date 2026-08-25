@@ -4,20 +4,14 @@
  * Data-channel messaging between channel members, over the signalling
  * server.
  *
- * useDataChannel grabs the SSProxy from React context (like
- * useSignalling) and brings up one RTCPeerConnection per fellow member
- * of the current user's channel, driving each with a PerfectNegotiator
- * (see negotiate.ts): SDP offers/answers and trickled ICE candidates
- * ride the SS's client-to-client relay, so once the channel listing
- * shows a peer, negotiation — and with it the messaging data channel —
- * follows automatically. Two data channels exist per pair, both riding
- * the one peer connection, both created by the polite peer (the
- * lexicographically smaller subscriber id — the same rule
- * PerfectNegotiator derives the role from) and received via
- * ondatachannel on the other, dispatched by label: the messaging
- * channel (dcmsg) carries JSON DCMsgs, the binary channel (dcbin)
- * carries compact binary frames (see binaryframes.ts) and is handed to
- * consumers — useBinaryDataChannel — as a BinaryTransport.
+ * useDataChannel is one of the two consumers of the peer sessions
+ * usePeerSessions brings up (see peersessions.tsx) — one
+ * RTCPeerConnection per fellow member of the current user's channel,
+ * PerfectNegotiator-driven over the SS's client-to-client relay. It
+ * subscribes the messaging data channel (dcmsg) of every session and
+ * exchanges DCMsgs over it; the binary channel (dcbin) is
+ * useBinaryDataChannel's business — the two are siblings over the
+ * sessions primitive, decoupled from each other.
  *
  * Messages are DCMsgs. DCMsg is agnostic to the on-the-wire format the
  * data channel (SCTP) carries — the codec (encodeDCMsg/decodeDCMsg) is
@@ -26,27 +20,12 @@
  * so the recipient bounces every message it accepts back to the sender
  * with the echo flag set: the sender's own messages arrive as echoes
  * over the same channel.
- *
- * The ICE servers for the peer connections come from GET
- * /api/iceServers (the <iceServer/> entries of the server configuration
- * document, matched to this origin) via the useICEServers query; peer
- * sessions are not brought up before that query has settled, so every
- * connection negotiates with the configured servers.
  */
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 
-import { useICEServers } from "@/hooks/useICEServers";
-import { PerfectNegotiator } from "./negotiate";
-import type { SSProxy } from "./proxy";
-import { useSSProxy } from "./react";
-import type {
-  ChannelId,
-  ChatChannel,
-  ChatUser,
-  MsgId,
-  SubscriberId,
-} from "./types";
+import type { PeerSessions } from "./peersessions";
+import type { ChannelId, ChatUser, MsgId, SubscriberId } from "./types";
 
 // DC_MSG_MIME_VERSION is the DCMsg format version, MIME-Version style.
 export const DC_MSG_MIME_VERSION = "1.0";
@@ -282,195 +261,6 @@ function decodeDCMsg(data: unknown): DCMsg | null {
 // pair of peers brings up.
 const DATA_CHANNEL_LABEL = "dcmsg";
 
-// BINARY_DATA_CHANNEL_LABEL is the label of the binary data channel every
-// pair of peers brings up alongside the messaging one, on the same peer
-// connection; it carries compact binary frames (see binaryframes.ts).
-// This module only moves the bytes — frame semantics live with the
-// consumer (binarydatachannel.tsx).
-const BINARY_DATA_CHANNEL_LABEL = "dcbin";
-
-// peerKey indexes the session of one (channel, peer subscriber) pair.
-function peerKey(channelId: ChannelId, subscriberId: SubscriberId): string {
-  return `${channelId}:${subscriberId}`;
-}
-
-// BinaryFrameHandler receives one inbound binary frame from a peer's
-// binary data channel.
-export type BinaryFrameHandler = (
-  channelId: ChannelId,
-  from: SubscriberId,
-  data: ArrayBuffer,
-) => void;
-
-// SessionResetHandler is notified when peer sessions go away: `dropped`
-// names one closed session, or null when every session was torn down
-// (a proxy swap or an identity change).
-export type SessionResetHandler = (
-  dropped: { channelId: ChannelId; peer: SubscriberId } | null,
-) => void;
-
-// BinaryTransport is useDataChannel's binary-channel plumbing, consumed
-// by useBinaryDataChannel (binarydatachannel.tsx): it moves binary
-// frames between peers, nothing more — frame semantics live with the
-// consumer.
-export interface BinaryTransport {
-  /**
-   * Resolves with the open binary data channel to `peer`, waiting for
-   * the session to appear and the channel to open; resolves with null
-   * when the session goes away first (the peer dropped out, or every
-   * session was torn down). A peer that never appears at all leaves the
-   * promise pending until the next teardown.
-   */
-  whenOpenChannel(
-    channelId: ChannelId,
-    peer: SubscriberId,
-  ): Promise<RTCDataChannel | null>;
-  /**
-   * Subscribes to inbound binary frames from any peer; returns the
-   * unsubscribe function.
-   */
-  subscribeFrames(cb: BinaryFrameHandler): () => void;
-  /**
-   * Subscribes to session teardowns; returns the unsubscribe function.
-   */
-  subscribeReset(cb: SessionResetHandler): () => void;
-}
-
-// BinarySessionHooks is how a peer session reports its binary channel
-// (label dcbin) to useDataChannel's BinaryTransport: the channel opened,
-// a frame arrived, the session closed.
-interface BinarySessionHooks {
-  onBinaryOpen(
-    channelId: ChannelId,
-    peer: SubscriberId,
-    dc: RTCDataChannel,
-  ): void;
-  onBinaryFrame(
-    channelId: ChannelId,
-    peer: SubscriberId,
-    data: ArrayBuffer,
-  ): void;
-  onSessionClosed(channelId: ChannelId, peer: SubscriberId): void;
-}
-
-// PeerSession is one peer connection plus its messaging and binary data
-// channels and the negotiation task driving it.
-interface PeerSession {
-  pc: RTCPeerConnection;
-  // The messaging data channel — assigned as soon as it exists (created
-  // by the polite peer, received by the other), possibly still
-  // connecting.
-  dc: RTCDataChannel | null;
-  // The binary data channel — same lifecycle as dc.
-  bindc: RTCDataChannel | null;
-  close: () => void;
-}
-
-// startPeerSession brings up one peer connection to peer and starts its
-// perfect negotiation over the proxy's streams. Inbound DCMsgs that
-// decode cleanly and name this pair go to onMessage; the binary channel
-// is reported through binary.
-function startPeerSession(
-  proxy: SSProxy,
-  channelId: ChannelId,
-  self: SubscriberId,
-  peer: SubscriberId,
-  iceServers: RTCIceServer[],
-  onMessage: (msg: DCMsg) => void,
-  binary: BinarySessionHooks,
-): PeerSession {
-  const pc = new RTCPeerConnection({ iceServers });
-  const session: PeerSession = { pc, dc: null, bindc: null, close: () => {} };
-
-  const wire = (dc: RTCDataChannel) => {
-    session.dc = dc;
-    dc.onmessage = (e) => {
-      const msg = decodeDCMsg(e.data);
-      // The data channel is bound to this pair by construction; a
-      // message claiming otherwise is dropped.
-      if (msg === null || msg.channelId !== channelId) {
-        return;
-      }
-      if (msg.echo === true) {
-        // An echo is one of our own messages bounced back by the peer:
-        // it must name us as the sender and the peer as the recipient,
-        // and it is never echoed again.
-        if (msg.fromSubscriberId !== self || msg.toSubscriberId !== peer) {
-          return;
-        }
-        onMessage(msg);
-        return;
-      }
-      if (msg.fromSubscriberId !== peer) {
-        return;
-      }
-      onMessage(msg);
-      // Bounce the message back so the sender sees its own message.
-      dc.send(encodeDCMsg({ ...msg, echo: true }));
-    };
-  };
-  // wireBinary hooks up the binary channel (label dcbin): it carries
-  // ArrayBuffer frames only, which are reported to the consumer; its
-  // opening resolves the BinaryTransport's waiters.
-  const wireBinary = (dc: RTCDataChannel) => {
-    session.bindc = dc;
-    dc.binaryType = "arraybuffer";
-    dc.onmessage = (e) => {
-      // Anything but binary frames is dropped silently, mirroring
-      // decodeDCMsg's rule for malformed frames.
-      if (e.data instanceof ArrayBuffer) {
-        binary.onBinaryFrame(channelId, peer, e.data);
-      }
-    };
-    if (dc.readyState === "open") {
-      binary.onBinaryOpen(channelId, peer, dc);
-    } else {
-      dc.addEventListener(
-        "open",
-        () => binary.onBinaryOpen(channelId, peer, dc),
-        { once: true },
-      );
-    }
-  };
-  // Two data channels per pair on the one peer connection, both created
-  // by the polite peer (the messaging channel's creation also triggers
-  // the initial negotiation); the impolite peer receives them via
-  // ondatachannel, dispatched by label.
-  if (self < peer) {
-    wire(pc.createDataChannel(DATA_CHANNEL_LABEL));
-    wireBinary(pc.createDataChannel(BINARY_DATA_CHANNEL_LABEL));
-  } else {
-    pc.ondatachannel = (e) => {
-      if (e.channel.label === BINARY_DATA_CHANNEL_LABEL) {
-        wireBinary(e.channel);
-      } else {
-        wire(e.channel);
-      }
-    };
-  }
-
-  const negotiator = new PerfectNegotiator(pc, {
-    channelId,
-    selfSubscriber: self,
-    peerSubscriber: peer,
-  });
-  const inStream = proxy.getReadStream();
-  void negotiator
-    .negotiate(inStream, proxy.getWriteStream())
-    .catch((err) =>
-      console.error(`datachannel: negotiation with ${peer} failed`, err),
-    );
-
-  session.close = () => {
-    // Cancelling the inbound stream ends negotiate(), which releases its
-    // stream locks; closing the connection stops ICE and its events.
-    void inStream.cancel();
-    pc.close();
-    binary.onSessionClosed(channelId, peer);
-  };
-  return session;
-}
-
 function appendDCMsg(prev: DCMsgs, msg: DCMsg): DCMsgs {
   const byPeer = prev[msg.channelId] ?? {};
   const list = byPeer[msg.fromSubscriberId] ?? [];
@@ -548,210 +338,80 @@ export interface UseDataChannelResult {
    * gone — the message is dropped with a warning.
    */
   sendTo: (msg: DCMsg) => void;
-  /**
-   * The binary-channel plumbing of the same peer sessions: the transport
-   * useBinaryDataChannel builds file transfer on. The object is stable
-   * across renders.
-   */
-  binaryTransport: BinaryTransport;
 }
 
 /**
- * Brings up a WebRTC peer connection to every fellow member of the
- * current user's channel, each carrying two data channels — the
- * messaging channel (dcmsg) DCMsgs are exchanged over, and the binary
- * channel (dcbin) exposed as binaryTransport. `me` and `channels` are
- * the useSignalling state: sessions appear as the listing discovers
- * members and disappear when members drop out; a proxy swap (reconnect)
- * or an identity change tears every session down and rebuilds from the
- * current listing.
- *
- * The ICE servers are loaded via the useICEServers query; no session is
- * brought up before the query settles, so every peer connection is
- * created with the configured servers (with none when the query fails —
- * local-network peers still connect).
+ * Exchanges DCMsgs over the messaging data channel (dcmsg) of the peer
+ * sessions — one of the two consumers of the PeerSessions primitive
+ * (see peersessions.tsx), decoupled from the other
+ * (useBinaryDataChannel): both build on the same peer connections,
+ * neither knowing the other. `me` is the useSignalling identity; the
+ * echo check below needs it.
  */
 export function useDataChannel(
   me: ChatUser | null,
-  channels: ChatChannel[],
+  sessions: PeerSessions,
 ): UseDataChannelResult {
-  const proxy = useSSProxy();
   const [dcMsgs, setDcMsgs] = useState<DCMsgs>({});
-  const sessionsRef = useRef(new Map<string, PeerSession>());
-  // The BinaryTransport's plumbing: inbound-frame and session-teardown
-  // subscribers, and the waiters whenOpenChannel parks until a binary
-  // channel opens or its session goes away.
-  const frameHandlersRef = useRef(new Set<BinaryFrameHandler>());
-  const resetHandlersRef = useRef(new Set<SessionResetHandler>());
-  const channelWaitersRef = useRef(
-    new Map<string, Set<(dc: RTCDataChannel | null) => void>>(),
-  );
 
-  const binaryHooks = useMemo<BinarySessionHooks>(
-    () => ({
-      onBinaryOpen: (channelId, peer, dc) => {
-        const key = peerKey(channelId, peer);
-        const waiters = channelWaitersRef.current.get(key);
-        if (waiters === undefined) return;
-        channelWaitersRef.current.delete(key);
-        for (const resolve of waiters) resolve(dc);
-      },
-      onBinaryFrame: (channelId, peer, data) => {
-        for (const cb of frameHandlersRef.current) cb(channelId, peer, data);
-      },
-      onSessionClosed: (channelId, peer) => {
-        const key = peerKey(channelId, peer);
-        const waiters = channelWaitersRef.current.get(key);
-        if (waiters !== undefined) {
-          channelWaitersRef.current.delete(key);
-          for (const resolve of waiters) resolve(null);
-        }
-        for (const cb of resetHandlersRef.current) cb({ channelId, peer });
-      },
-    }),
-    [],
-  );
-
-  // The ICE servers of the peer connections, cached by react-query; null
-  // until the query settles, holding back every session until then.
-  const iceServersQuery = useICEServers();
+  // Wire the messaging channel of every session: inbound DCMsgs that
+  // decode cleanly and name the session's pair fold into the store, and
+  // every accepted message is bounced back to the sender with the echo
+  // flag set — a data channel does not echo on its own, so the sender's
+  // own messages arrive as echoes over the same channel.
   useEffect(() => {
-    if (iceServersQuery.isError) {
-      console.error(
-        "datachannel: cannot load /api/iceServers, using no ICE servers",
-        iceServersQuery.error,
-      );
-    }
-  }, [iceServersQuery.isError, iceServersQuery.error]);
-  const iceServers: RTCIceServer[] | null = useMemo(() => {
-    const urls = iceServersQuery.data;
-    if (urls !== undefined) {
-      return urls.length > 0 ? [{ urls }] : [];
-    }
-    return iceServersQuery.isError ? [] : null;
-  }, [iceServersQuery.data, iceServersQuery.isError]);
-
-  // Sessions are bound to their connection and to the own subscription:
-  // a proxy swap or an identity change tears every session down; the
-  // reconcile effect below then rebuilds from the current listing.
-  useEffect(() => {
-    const sessions = sessionsRef.current;
-    return () => {
-      for (const session of sessions.values()) {
-        session.close();
-      }
-      sessions.clear();
-      // Anything still waiting on a binary channel is released, and the
-      // BinaryTransport's consumers are told every session is gone.
-      for (const waiters of channelWaitersRef.current.values()) {
-        for (const resolve of waiters) resolve(null);
-      }
-      channelWaitersRef.current.clear();
-      for (const cb of resetHandlersRef.current) cb(null);
-    };
-  }, [proxy, me]);
-
-  // Reconcile the sessions with the current member listing: open one
-  // session per newly seen member of the own channel, close the ones
-  // whose peer dropped out. Kept sessions are never touched, so a
-  // membership change elsewhere never renegotiates an existing pair.
-  useEffect(() => {
-    const sessions = sessionsRef.current;
-    if (
-      proxy === null ||
-      me === null ||
-      me.channelId === undefined ||
-      me.subscriberId === undefined ||
-      iceServers === null
-    ) {
-      return;
-    }
-    const self = me.subscriberId;
-    const want = new Set<string>();
-    for (const channel of channels) {
-      if (channel.id !== me.channelId) {
-        continue;
-      }
-      for (const member of channel.members) {
-        const peer = member.subscriberId;
-        if (peer === undefined || peer === self) {
-          continue;
-        }
-        const key = peerKey(channel.id, peer);
-        want.add(key);
-        if (!sessions.has(key)) {
-          sessions.set(
-            key,
-            startPeerSession(
-              proxy,
-              channel.id,
-              self,
-              peer,
-              iceServers,
-              (msg) => setDcMsgs((prev) => applyDCMsg(prev, msg)),
-              binaryHooks,
-            ),
-          );
-        }
-      }
-    }
-    for (const [key, session] of sessions) {
-      if (!want.has(key)) {
-        session.close();
-        sessions.delete(key);
-      }
-    }
-  }, [proxy, me, channels, iceServers, binaryHooks]);
-
-  const sendTo = useCallback((msg: DCMsg) => {
-    const session = sessionsRef.current.get(
-      peerKey(msg.channelId, msg.toSubscriberId),
+    const self = me?.subscriberId;
+    if (self === undefined) return;
+    return sessions.subscribeChannel(
+      DATA_CHANNEL_LABEL,
+      (channelId, peer, dc) => {
+        dc.onmessage = (e) => {
+          const msg = decodeDCMsg(e.data);
+          // The data channel is bound to this pair by construction; a
+          // message claiming otherwise is dropped.
+          if (msg === null || msg.channelId !== channelId) {
+            return;
+          }
+          if (msg.echo === true) {
+            // An echo is one of our own messages bounced back by the peer:
+            // it must name us as the sender and the peer as the recipient,
+            // and it is never echoed again.
+            if (msg.fromSubscriberId !== self || msg.toSubscriberId !== peer) {
+              return;
+            }
+            setDcMsgs((prev) => applyDCMsg(prev, msg));
+            return;
+          }
+          if (msg.fromSubscriberId !== peer) {
+            return;
+          }
+          setDcMsgs((prev) => applyDCMsg(prev, msg));
+          // Bounce the message back so the sender sees its own message.
+          dc.send(encodeDCMsg({ ...msg, echo: true }));
+        };
+      },
     );
-    if (session?.dc?.readyState !== "open") {
-      console.warn(
-        `datachannel: no open data channel to subscriber ` +
-          `${msg.toSubscriberId} in channel ${msg.channelId}; ` +
-          `message ${msg.msgId} dropped`,
+  }, [sessions, me?.subscriberId]);
+
+  const sendTo = useCallback(
+    (msg: DCMsg) => {
+      const dc = sessions.getChannel(
+        DATA_CHANNEL_LABEL,
+        msg.channelId,
+        msg.toSubscriberId,
       );
-      return;
-    }
-    session.dc.send(encodeDCMsg(msg));
-  }, []);
-
-  const whenOpenChannel = useCallback(
-    (channelId: ChannelId, peer: SubscriberId) => {
-      const key = peerKey(channelId, peer);
-      const bindc = sessionsRef.current.get(key)?.bindc;
-      if (bindc?.readyState === "open") {
-        return Promise.resolve(bindc);
+      if (dc?.readyState !== "open") {
+        console.warn(
+          `datachannel: no open data channel to subscriber ` +
+            `${msg.toSubscriberId} in channel ${msg.channelId}; ` +
+            `message ${msg.msgId} dropped`,
+        );
+        return;
       }
-      // The waiter resolves when the channel opens (BinarySessionHooks),
-      // or with null when the session goes away first — a waiter whose
-      // session is never created is released by the teardown effect.
-      return new Promise<RTCDataChannel | null>((resolve) => {
-        const waiters = channelWaitersRef.current.get(key) ?? new Set();
-        waiters.add(resolve);
-        channelWaitersRef.current.set(key, waiters);
-      });
+      dc.send(encodeDCMsg(msg));
     },
-    [],
-  );
-  const subscribeFrames = useCallback((cb: BinaryFrameHandler) => {
-    frameHandlersRef.current.add(cb);
-    return () => {
-      frameHandlersRef.current.delete(cb);
-    };
-  }, []);
-  const subscribeReset = useCallback((cb: SessionResetHandler) => {
-    resetHandlersRef.current.add(cb);
-    return () => {
-      resetHandlersRef.current.delete(cb);
-    };
-  }, []);
-  const binaryTransport = useMemo<BinaryTransport>(
-    () => ({ whenOpenChannel, subscribeFrames, subscribeReset }),
-    [whenOpenChannel, subscribeFrames, subscribeReset],
+    [sessions],
   );
 
-  return { dcMsgs, sendTo, binaryTransport };
+  return { dcMsgs, sendTo };
 }

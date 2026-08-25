@@ -8,6 +8,7 @@ import {
   useDataChannel,
 } from "@/api/ss/datachannel";
 import { useBinaryDataChannel } from "@/api/ss/binarydatachannel";
+import { usePeerSessions } from "@/api/ss/peersessions";
 import { useSignalling } from "@/api/ss/react";
 import ChatApp from "@/components/chat/ChatApp";
 import { buildMagicControl, parseMagicCommand } from "@/components/chat/magic";
@@ -18,9 +19,11 @@ import { useConversationNavigation } from "@/components/chat/useConversationNavi
 
 // The chat page: it owns all chat state. The sidebar's channels and
 // their members come live from the signalling server (useSignalling),
-// and messages travel over WebRTC data channels between the peers
-// (useDataChannel); our own messages come back as echoes over the same
-// channel. ChatApp under it is a pure controlled component.
+// the peer connections to fellow members are usePeerSessions', and the
+// two data-channel consumers build on them — messages travel as DCMsgs
+// (useDataChannel), file bytes as binary frames (useBinaryDataChannel);
+// our own messages come back as echoes over the same channel. ChatApp
+// under it is a pure controlled component.
 
 // NO_UNREAD is the stable empty unread-count record: the mock badge
 // source is gone and nothing computes unread counts yet.
@@ -40,8 +43,9 @@ export default function ChatPage() {
     }
   }, [lastPing]);
 
-  const { dcMsgs, sendTo, binaryTransport } = useDataChannel(me, channels);
-  const { sendFile, getFileByFileId } = useBinaryDataChannel(binaryTransport);
+  const sessions = usePeerSessions(me, channels);
+  const { dcMsgs, sendTo } = useDataChannel(me, sessions);
+  const { sendFile, getFileByFileId } = useBinaryDataChannel(sessions);
 
   // All known users by id, including the current user (see useChatUsers).
   const users = useChatUsers(me, channels, dcMsgs);

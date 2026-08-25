@@ -4,18 +4,21 @@
  * Binary file transfer between channel members, over the binary data
  * channel (dcbin).
  *
- * useBinaryDataChannel builds the file-transfer service on the
- * BinaryTransport useDataChannel exposes for the same peer sessions: it
- * never touches signalling or peer connections itself, it moves compact
- * binary frames (the BinaryFrame codec of binaryframes.ts) between
- * peers. Sending a file streams it as FILE frames — 16 KiB chunks, up
- * to SEND_WINDOW_FRAMES unacknowledged in flight (a sliding window over
- * the per-file frame sequence) — while the receiver acknowledges every
- * accepted frame with a FACK frame: ack_seq is the cumulative next
- * expected seq, acked_bytes the cumulative contiguous byte count. SCTP
- * is ordered and reliable, so the receiver reassembles by strict
- * concatenation; a gap, an overlap or a mismatched total marks the
- * stream corrupt and the transfer is dropped.
+ * useBinaryDataChannel is one of the two consumers of the peer sessions
+ * usePeerSessions brings up (see peersessions.tsx) — decoupled from the
+ * other (useDataChannel): both build on the same peer connections,
+ * neither knowing the other. It subscribes the binary data channel
+ * (dcbin) of every session — the polite peer creates it, the other
+ * receives it via ondatachannel — and moves compact binary frames (the
+ * BinaryFrame codec of binaryframes.ts) between peers. Sending a file
+ * streams it as FILE frames — 16 KiB chunks, up to SEND_WINDOW_FRAMES
+ * unacknowledged in flight (a sliding window over the per-file frame
+ * sequence) — while the receiver acknowledges every accepted frame
+ * with a FACK frame: ack_seq is the cumulative next expected seq,
+ * acked_bytes the cumulative contiguous byte count. SCTP is ordered
+ * and reliable, so the receiver reassembles by strict concatenation; a
+ * gap, an overlap or a mismatched total marks the stream corrupt and
+ * the transfer is dropped.
  *
  * sendFile returns a reader over a ReadableStream of the transfer's
  * status (a DCFileTransfer, the same shape the messaging channel's
@@ -46,12 +49,14 @@ import {
   uuidToBytes,
   type FileAckFrame,
 } from "./binaryframes";
-import type {
-  BinaryTransport,
-  DCFileTransfer,
-  DCFileTransferKind,
-} from "./datachannel";
+import type { DCFileTransfer, DCFileTransferKind } from "./datachannel";
+import type { PeerSessions } from "./peersessions";
 import type { ChannelId, SubscriberId } from "./types";
+
+// BINARY_DATA_CHANNEL_LABEL is the label of the binary data channel
+// every pair of peers brings up alongside the messaging one, on the
+// same peer connection (see peersessions.tsx).
+const BINARY_DATA_CHANNEL_LABEL = "dcbin";
 
 // FILE_CHUNK_SIZE is the payload size of one FILE frame.
 const FILE_CHUNK_SIZE = 16 * 1024;
@@ -119,12 +124,12 @@ export interface UseBinaryDataChannelResult {
 
 /**
  * Sends and receives files as compact binary frames over the binary
- * data channel of each peer session. `transport` is the BinaryTransport
- * useDataChannel exposes for those sessions; see binaryframes.ts for
- * the frame format.
+ * data channel (dcbin) of each peer session. `sessions` is the
+ * PeerSessions primitive usePeerSessions brings up; see binaryframes.ts
+ * for the frame format.
  */
 export function useBinaryDataChannel(
-  transport: BinaryTransport,
+  sessions: PeerSessions,
 ): UseBinaryDataChannelResult {
   // Completed files by fileId: reassembled received files and the
   // originals of sent ones.
@@ -162,17 +167,23 @@ export function useBinaryDataChannel(
         }
         return;
       }
-      void transport.whenOpenChannel(channelId, to).then((dc) => {
-        if (dc === null) return;
-        ackChannelsRef.current.set(key, dc);
-        try {
-          dc.send(data);
-        } catch (err) {
-          console.warn("binarydatachannel: acknowledgement not sent", err);
-        }
-      });
+      void sessions
+        .whenOpenChannel(BINARY_DATA_CHANNEL_LABEL, channelId, to)
+        .then((dc) => {
+          if (dc === null) return;
+          ackChannelsRef.current.set(key, dc);
+          try {
+            dc.send(data);
+          } catch (err) {
+            console.warn("binarydatachannel: acknowledgement not sent", err);
+          }
+        });
     };
-    return transport.subscribeFrames((channelId, from, data) => {
+    const handleFrame = (
+      channelId: ChannelId,
+      from: SubscriberId,
+      data: ArrayBuffer,
+    ) => {
       const frame = decodeBinaryFrame(data);
       if (frame === null) {
         return;
@@ -235,14 +246,27 @@ export function useBinaryDataChannel(
         filesRef.current.set(frame.fileId, new Blob(transfer.chunks));
         setFilesVersion((v) => v + 1);
       }
-    });
-  }, [transport]);
+    };
+    return sessions.subscribeChannel(
+      BINARY_DATA_CHANNEL_LABEL,
+      (channelId, from, dc) => {
+        dc.binaryType = "arraybuffer";
+        dc.onmessage = (e) => {
+          // Anything but binary frames is dropped silently, mirroring
+          // decodeDCMsg's rule for malformed frames.
+          if (e.data instanceof ArrayBuffer) {
+            handleFrame(channelId, from, e.data);
+          }
+        };
+      },
+    );
+  }, [sessions]);
 
   // A session teardown drops the partial inbound transfers of the gone
   // peers (in-flight sends notice on their own — their channel closes);
   // completed files survive.
   useEffect(() => {
-    return transport.subscribeReset((dropped) => {
+    return sessions.subscribeReset((dropped) => {
       if (dropped === null) {
         inboundRef.current.clear();
         ackChannelsRef.current.clear();
@@ -256,7 +280,7 @@ export function useBinaryDataChannel(
       }
       ackChannelsRef.current.delete(`${dropped.channelId}:${dropped.peer}`);
     });
-  }, [transport]);
+  }, [sessions]);
 
   const getFileByFileId = useCallback((fileId: string): Blob | undefined => {
     // Registry keys are the canonical UUID form; normalize the same way.
@@ -309,7 +333,8 @@ export function useBinaryDataChannel(
               fileSizeTransferred: 0,
               fileTransferStatus: "pending",
             });
-            const dc = await transport.whenOpenChannel(
+            const dc = await sessions.whenOpenChannel(
+              BINARY_DATA_CHANNEL_LABEL,
               channelId,
               toSubscriberId,
             );
@@ -337,7 +362,7 @@ export function useBinaryDataChannel(
                 ),
               );
             dc.addEventListener("close", onChannelClose, { once: true });
-            const offReset = transport.subscribeReset((dropped) => {
+            const offReset = sessions.subscribeReset((dropped) => {
               if (
                 dropped === null ||
                 (dropped.channelId === channelId &&
@@ -446,7 +471,7 @@ export function useBinaryDataChannel(
       });
       return stream.getReader();
     },
-    [transport],
+    [sessions],
   );
 
   return { sendFile, getFileByFileId, filesVersion };

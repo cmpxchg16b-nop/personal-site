@@ -133,18 +133,24 @@ next `ping`'s `sequenceNumber` is the ack of the last reply.
 Discovery and session establishment go through the SS, but chat traffic
 itself never does: once the c2c relay has brokered the WebRTC handshake,
 the two browsers talk **directly and in-band** over a point-to-point peer
-connection. The browser-side codecs and session management live in
-`web/site/src/api/ss/datachannel.tsx` (the source of truth for the
-messaging frame format); `useDataChannel` owns the sessions and the
-message store.
+connection. The browser-side session management lives in
+`web/site/src/api/ss/peersessions.tsx`: `usePeerSessions` owns the peer
+connections and hands their data channels out by label. Two sibling
+consumers build on it, decoupled from each other: `useDataChannel` in
+`datachannel.tsx` (the source of truth for the messaging frame format,
+and the owner of the message store) subscribes `dcmsg`, and
+`useBinaryDataChannel` in `binarydatachannel.tsx` subscribes `dcbin`
+(see _Binary file transfer_).
 
-- **One peer connection, two data channels per pair.** The polite peer
-  (the smaller subscriber id) creates both — which also starts perfect
-  negotiation over the c2c relay — the impolite peer receives them via
-  `ondatachannel`, dispatched by label: `dcmsg` carries the JSON DCMsgs
-  below, `dcbin` carries compact binary frames (see _Binary file
-  transfer_). Sessions track the channel membership: they appear as the
-  listing discovers members and are torn down when a member drops out.
+- **One peer connection, two data channels per pair.** A consumer
+  subscribes a data-channel label and every session brings one up: the
+  polite peer (the smaller subscriber id) creates it — the first
+  creation starts perfect negotiation over the c2c relay — the impolite
+  peer receives it via `ondatachannel`, dispatched by label. `dcmsg`
+  carries the JSON DCMsgs below, `dcbin` carries compact binary frames
+  (see _Binary file transfer_). Sessions track the channel membership:
+  they appear as the listing discovers members and are torn down when a
+  member drops out.
 - **ICE servers** come from `GET /api/iceServers` (the `<iceServer/>`
   entries of `serverConfig.xml`), so a deployment can steer peers at its
   own STUN/TURN instance.
@@ -179,8 +185,9 @@ histories stay identical; control messages themselves are never stored.
 The second data channel of every pair carries compact binary frames; the
 source of truth for the format is `web/site/src/api/ss/binaryframes.ts`
 (the codec), and the transfer engine is `useBinaryDataChannel` in
-`binarydatachannel.tsx`, built on the `BinaryTransport` `useDataChannel`
-exposes for the same sessions. All multi-byte integers are big-endian.
+`binarydatachannel.tsx`, which owns the `dcbin` label and builds its
+transport directly on `usePeerSessions`' sessions — not on
+`useDataChannel`. All multi-byte integers are big-endian.
 Two frame kinds exist, selected by the 4-byte ASCII `frame_type`:
 
 `FILE` — one (possibly fragmented) block of a file, sender → receiver; a

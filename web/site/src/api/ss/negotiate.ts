@@ -14,8 +14,8 @@
  * (https://developer.mozilla.org/en-US/docs/Web/API/Streams_API): the
  * negotiator reads inbound events from a ReadableStream and writes
  * outbound ones to a WritableStream. A transport (e.g. the SSProxy) is
- * expected to provide both; useDataChannel (see datachannel.tsx) wires
- * one negotiator per peer to it.
+ * expected to provide both; usePeerSessions (see peersessions.tsx)
+ * wires one negotiator per peer to it.
  */
 
 import {
