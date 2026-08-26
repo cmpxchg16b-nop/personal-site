@@ -1,0 +1,24 @@
+name: dn42-coturn
+services:
+  turn:
+    container_name: dn42-coturn
+    image: docker.io/coturn/coturn:latest
+    network_mode: "ns:/run/netns/svcs"
+    volumes:
+      - "./turnserver.conf:/etc/coturn/turnserver.conf:ro"
+    command:
+      - "turnserver"
+      - "-c"
+      - "/etc/coturn/turnserver.conf"
+# memo:
+# vie1 host interconnect:
+#   container (netns svcs): fdda:8ca4:1556:3000::8376:bf73/127
+#   host: fdda:8ca4:1556:3000::8376:bf72/127
+# vie1-fra1 interconnect:
+#   vie1: fdda:8ca4:1556:3000::8376:bf71/127
+#   fra1: fdda:8ca4:1556:3000::8376:bf70/127
+# statis routes:
+# in vie1 host: fd42:d42:d42:54::1/127 via fdda:8ca4:1556:3000::8376:bf73
+# in vie1 container: fd00::/8 via fdda:8ca4:1556:3000::8376:bf70
+# in fra1: fdda:8ca4:1556:3000::8376:bf72/127 via fdda:8ca4:1556:3000::8376:bf71
+# enable all ipv6 forwarding

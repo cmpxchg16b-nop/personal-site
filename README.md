@@ -193,7 +193,12 @@ container, e.g. `-v "$PWD/serverConfig.xml:/app/serverConfig.xml"` and
 
 ## Todos
 
-1. Commenting subsystem
-2. Icons (for dark and bright variant)
-3. Math rendering (example MathML post)
-4. Support listing updates from MCP, RSS
+1. Icons (for dark and bright variant)
+2. Math rendering (example MathML post)
+3. Support listing updates from MCP, RSS
+
+### WebRTC sub-system todos
+
+1. voice and video calling
+2. message unreads
+3. peer connectionstate

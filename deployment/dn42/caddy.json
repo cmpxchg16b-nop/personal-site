@@ -27,7 +27,9 @@
                 "test_ca": "https://acme.burble.dn42/v1/staging/acme/directory",
                 "email": "{env.ACME_CONTACT_EMAIL}",
                 "acme_timeout": "300s",
-                "trusted_roots_pem_files": ["/dn42-root-ca.crt"]
+                "trusted_roots_pem_files": [
+                  "/dn42-root-ca.crt"
+                ]
               }
             ]
           }
@@ -37,13 +39,20 @@
     "http": {
       "servers": {
         "http": {
-          "listen": [":80"],
+          "listen": [
+            ":80"
+          ],
           "routes": [
             {
               "group": "http_redirect",
               "match": [
                 {
-                  "host": ["nexus.dn42", "chat.dn42"]
+                  "host": [
+                    "nexus.dn42",
+                    "chat.dn42",
+                    "exam.edu.dn42",
+                    "testcenter.edu.dn42"
+                  ]
                 }
               ],
               "handle": [
@@ -62,13 +71,17 @@
           ]
         },
         "https": {
-          "listen": [":443"],
+          "listen": [
+            ":443"
+          ],
           "routes": [
             {
               "group": "nexus",
               "match": [
                 {
-                  "host": ["nexus.dn42"]
+                  "host": [
+                    "nexus.dn42"
+                  ]
                 }
               ],
               "handle": [
@@ -84,10 +97,34 @@
               "terminal": true
             },
             {
+              "group": "testcenter",
+              "match": [
+                {
+                  "host": [
+                    "exam.edu.dn42",
+                    "testcenter.edu.dn42"
+                  ]
+                }
+              ],
+              "handle": [
+                {
+                  "handler": "reverse_proxy",
+                  "upstreams": [
+                    {
+                      "dial": "[fdda:8ca4:1556:3000::8376:bf72]:18971"
+                    }
+                  ]
+                }
+              ],
+              "terminal": true
+            },
+            {
               "group": "chat",
               "match": [
                 {
-                  "host": ["chat.dn42"]
+                  "host": [
+                    "chat.dn42"
+                  ]
                 }
               ],
               "handle": [
@@ -95,7 +132,9 @@
                   "handler": "static_response",
                   "status_code": 308,
                   "headers": {
-                    "Location": ["https://nexus.dn42/chat"]
+                    "Location": [
+                      "https://nexus.dn42/chat"
+                    ]
                   }
                 }
               ],
