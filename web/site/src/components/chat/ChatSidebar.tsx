@@ -13,7 +13,6 @@ import SearchIcon from "@mui/icons-material/Search";
 import { useTranslation } from "react-i18next";
 import type { ChatChannel } from "@/api/ss/types";
 import ConversationTree from "./ConversationTree";
-import { VolumeControl } from "./VolumeControl";
 import {
   conversationKey,
   type ActivePhoneCall,
@@ -29,12 +28,6 @@ type ChatSidebarProps = {
   // Live voice calls by conversation key (see usePhoneCalls); the member
   // entries display their ringing / in-call pills.
   calls: Record<string, ActivePhoneCall>;
-  // The call audio volumes (see useCallVolumes), adjusted chat-wide from
-  // the header's volume button.
-  localVolume: number;
-  remoteVolume: number;
-  onLocalVolumeChange: (volume: number) => void;
-  onRemoteVolumeChange: (volume: number) => void;
   // Responsive visibility is controlled by the parent (ChatApp) through sx.
   sx?: SxProps<Theme>;
 };
@@ -49,10 +42,6 @@ export default function ChatSidebar({
   selected,
   onSelect,
   calls,
-  localVolume,
-  remoteVolume,
-  onLocalVolumeChange,
-  onRemoteVolumeChange,
   sx,
 }: ChatSidebarProps) {
   const { t } = useTranslation();
@@ -115,7 +104,6 @@ export default function ChatSidebar({
           pb: 1.5,
           display: "flex",
           alignItems: "center",
-          gap: 0.5,
         }}
       >
         <TextField
@@ -138,13 +126,6 @@ export default function ChatSidebar({
             },
             htmlInput: { "aria-label": t("chat.search") },
           }}
-        />
-        {/* The chat-wide call audio volumes (mic send / speaker). */}
-        <VolumeControl
-          localVolume={localVolume}
-          remoteVolume={remoteVolume}
-          onLocalVolumeChange={onLocalVolumeChange}
-          onRemoteVolumeChange={onRemoteVolumeChange}
         />
       </Box>
       <Box sx={{ flexGrow: 1, overflowY: "auto", minHeight: 0 }}>

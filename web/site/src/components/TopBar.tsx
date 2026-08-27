@@ -6,6 +6,7 @@ import BreadcrumbNav from "./BreadcrumbNav";
 import ColorModeToggle from "./ColorModeToggle";
 import LanguageSwitcher from "./LanguageSwitcher";
 import ProfileMenu from "./ProfileMenu";
+import { TopBarActionsHost } from "./TopBarActions";
 
 // TopBar groups the breadcrumb trail (left) and the color-mode toggle
 // (right) into one sticky bar above the page content. The bar always
@@ -46,6 +47,9 @@ export default function TopBar() {
         {/* Spacer pins the toggle to the far right even when the breadcrumb
             trail is hidden. */}
         <Box sx={{ flexGrow: 1 }} />
+        {/* Slot for controls the active page contributes (see
+            TopBarActions); stays empty elsewhere. */}
+        <TopBarActionsHost />
         <ProfileMenu />
         <LanguageSwitcher />
         <ColorModeToggle />

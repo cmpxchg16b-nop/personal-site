@@ -117,7 +117,8 @@
     "volume": {
       "title": "Call audio",
       "microphone": "Microphone",
-      "speaker": "Speaker"
+      "speaker": "Speaker",
+      "echoCancellation": "Echo cancellation"
     }
   },
   "footer": {

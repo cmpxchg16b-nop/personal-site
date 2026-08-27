@@ -1,13 +1,22 @@
 "use client";
 
-// VolumeControl is the chat-scope call audio adjuster: a button opening
-// a small popover with the mic send volume (what peers hear) and the
-// speaker volume of incoming voices. The sliders drive the audio graph's
-// gain nodes (see useCallVolumes), so they apply live during a call and
-// pre-set the next one otherwise.
+// VolumeControl is the call audio adjuster: a button opening a small
+// popover with the mic send volume (what peers hear), the speaker volume
+// of incoming voices, and the echo-cancellation toggle (the capture-side
+// voice processing). They drive the audio graph (see useCallVolumes and
+// useEchoCancellation). The chat page portals it into the TopBar (see
+// TopBarActions) and only while a call session is live — with no ongoing
+// call there is nothing to adjust.
 
 import { useState } from "react";
-import { Box, IconButton, Popover, Slider, Typography } from "@mui/material";
+import {
+  Box,
+  IconButton,
+  Popover,
+  Slider,
+  Switch,
+  Typography,
+} from "@mui/material";
 import MicIcon from "@mui/icons-material/Mic";
 import VolumeUpIcon from "@mui/icons-material/VolumeUp";
 import { useTranslation } from "react-i18next";
@@ -19,6 +28,9 @@ type VolumeControlProps = {
   remoteVolume: number;
   onLocalVolumeChange: (volume: number) => void;
   onRemoteVolumeChange: (volume: number) => void;
+  // The capture-side voice processing switch (echo cancellation & co.).
+  echoCancellation: boolean;
+  onEchoCancellationChange: (on: boolean) => void;
 };
 
 export function VolumeControl({
@@ -26,6 +38,8 @@ export function VolumeControl({
   remoteVolume,
   onLocalVolumeChange,
   onRemoteVolumeChange,
+  echoCancellation,
+  onEchoCancellationChange,
 }: VolumeControlProps) {
   const { t } = useTranslation();
   // The anchor as state rather than a ref: Popover reads it during
@@ -80,6 +94,10 @@ export function VolumeControl({
         anchorEl={anchor}
         anchorOrigin={{ vertical: "bottom", horizontal: "right" }}
         transformOrigin={{ vertical: "top", horizontal: "right" }}
+        // The TopBar (the button's home) sits at modal + 1, so the
+        // popover floats one step higher to not slide under the sticky
+        // bar it is anchored to.
+        sx={{ zIndex: (theme) => theme.zIndex.modal + 2 }}
       >
         <Box
           sx={{
@@ -103,6 +121,20 @@ export function VolumeControl({
             remoteVolume,
             onRemoteVolumeChange,
           )}
+          <Box sx={{ display: "flex", alignItems: "center", gap: 0.75 }}>
+            <Typography variant="caption" color="text.secondary">
+              {t("chat.volume.echoCancellation")}
+            </Typography>
+            <Switch
+              size="small"
+              checked={echoCancellation}
+              onChange={(_, on) => onEchoCancellationChange(on)}
+              slotProps={{
+                input: { "aria-label": t("chat.volume.echoCancellation") },
+              }}
+              sx={{ ml: "auto" }}
+            />
+          </Box>
         </Box>
       </Popover>
     </>

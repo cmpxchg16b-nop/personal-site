@@ -14,8 +14,11 @@ import { useSignalling } from "@/api/ss/react";
 import ChatApp from "@/components/chat/ChatApp";
 import { buildMagicControl, parseMagicCommand } from "@/components/chat/magic";
 import { conversationKey, type TransferKind } from "@/components/chat/types";
+import { VolumeControl } from "@/components/chat/VolumeControl";
+import { TopBarActions } from "@/components/TopBarActions";
 import { useCallMedia } from "@/components/chat/useCallMedia";
 import { useCallVolumes } from "@/components/chat/useCallVolumes";
+import { useEchoCancellation } from "@/components/chat/useEchoCancellation";
 import { useChatMessages } from "@/components/chat/useChatMessages";
 import { useChatUsers } from "@/components/chat/useChatUsers";
 import { useConversationNavigation } from "@/components/chat/useConversationNavigation";
@@ -81,6 +84,13 @@ export default function ChatPage() {
   );
   const { localVolume, remoteVolume, setLocalVolume, setRemoteVolume } =
     useCallVolumes(audio);
+  const { echoCancellation, setEchoCancellation } = useEchoCancellation(audio);
+
+  // The call volumes surface in the TopBar — chat-wide chrome, not the
+  // conversation list — and only while a call session is live (calls
+  // holds just the inviting/accepted ones): with no ongoing call there
+  // is nothing to adjust.
+  const hasLiveCall = Object.keys(calls).length > 0;
 
   const handleSend = (content: string) => {
     // The composer only exists while a conversation is open, so a null
@@ -191,29 +201,39 @@ export default function ChatPage() {
   };
 
   return (
-    <ChatApp
-      channels={channels}
-      users={users}
-      currentUserId={me?.id ?? ""}
-      selected={selected}
-      onSelect={select}
-      messages={messages}
-      unread={NO_UNREAD}
-      onSend={handleSend}
-      onAttachFile={handleAttachFile}
-      onRequestFile={handleRequestFile}
-      getFileByFileId={getFileByFileId}
-      calls={calls}
-      onStartCall={startCall}
-      onAcceptCall={acceptCall}
-      onRejectCall={rejectCall}
-      onEndCall={hangupCall}
-      localAnalyser={localAnalyser}
-      remoteAnalyserFor={remoteAnalyserFor}
-      localVolume={localVolume}
-      remoteVolume={remoteVolume}
-      onLocalVolumeChange={setLocalVolume}
-      onRemoteVolumeChange={setRemoteVolume}
-    />
+    <>
+      {hasLiveCall && (
+        <TopBarActions>
+          <VolumeControl
+            localVolume={localVolume}
+            remoteVolume={remoteVolume}
+            onLocalVolumeChange={setLocalVolume}
+            onRemoteVolumeChange={setRemoteVolume}
+            echoCancellation={echoCancellation}
+            onEchoCancellationChange={setEchoCancellation}
+          />
+        </TopBarActions>
+      )}
+      <ChatApp
+        channels={channels}
+        users={users}
+        currentUserId={me?.id ?? ""}
+        selected={selected}
+        onSelect={select}
+        messages={messages}
+        unread={NO_UNREAD}
+        onSend={handleSend}
+        onAttachFile={handleAttachFile}
+        onRequestFile={handleRequestFile}
+        getFileByFileId={getFileByFileId}
+        calls={calls}
+        onStartCall={startCall}
+        onAcceptCall={acceptCall}
+        onRejectCall={rejectCall}
+        onEndCall={hangupCall}
+        localAnalyser={localAnalyser}
+        remoteAnalyserFor={remoteAnalyserFor}
+      />
+    </>
   );
 }

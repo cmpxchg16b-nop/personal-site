@@ -117,7 +117,8 @@
     "volume": {
       "title": "通话音量",
       "microphone": "麦克风",
-      "speaker": "扬声器"
+      "speaker": "扬声器",
+      "echoCancellation": "回声消除"
     }
   },
   "footer": {

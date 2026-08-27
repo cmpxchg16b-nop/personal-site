@@ -23,11 +23,13 @@
  * shared by every ongoing call: its processed track can be added to any
  * number of peer connections.
  *
- * Echo cancellation is the capture-side browser AEC: the mic is opened
- * with echoCancellation (plus noise suppression and auto gain), and the
- * remote audio plays through ctx.destination — the default output device
- * the AEC uses as its reference — so the peer's voice coming out of the
- * speaker is cancelled out of the mic instead of being transmitted back.
+ * Echo cancellation is optional and off by default (headphones are
+ * assumed): the call audio menu's toggle switches the capture-side
+ * voice processing (echo cancellation, noise suppression, auto gain)
+ * on, live via applyConstraints and for future captures. The capture
+ * itself is reference-counted (acquireLocalInput/releaseLocalInput): it
+ * opens with the first attached call and stops with the last, so the
+ * browser's recording indicator lights exactly while a call is sending.
  *
  * Browsers only let an AudioContext run after a user gesture: the context
  * is created/resumed by resume(), which the call UI invokes from its
@@ -49,15 +51,17 @@ const FFT_SMOOTHING = 0.8;
 interface RemoteEntry {
   source: MediaStreamAudioSourceNode;
   analyser: AnalyserNode;
-  stream: MediaStream;
 }
 
 export class AudioGraph {
   private ctx: AudioContext | null = null;
 
-  // The local chain, built by ensureLocalInput. localInputPromise makes
-  // the build idempotent — concurrent calls share the one mic capture.
+  // The local chain, built by acquireLocalInput. localInputPromise makes
+  // the build idempotent — concurrent acquisitions share the one mic
+  // capture — and localInputHolds counts the acquisitions: the capture
+  // stops when the last hold is released (releaseLocalInput).
   private localStream: MediaStream | null = null;
+  private localSourceNode: MediaStreamAudioSourceNode | null = null;
   private localGainNode: GainNode | null = null;
   private localAnalyserNode: AnalyserNode | null = null;
   private localDestination: MediaStreamAudioDestinationNode | null = null;
@@ -65,16 +69,31 @@ export class AudioGraph {
     track: MediaStreamTrack;
     stream: MediaStream;
   }> | null = null;
+  private localInputHolds = 0;
 
   // The remote chain: per-remote sources muxed into one gain node feeding
   // the speaker.
   private remoteGainNode: GainNode | null = null;
   private remotes = new Map<string, RemoteEntry>();
 
-  // The two user-facing volumes, kept as plain fields so nodes built
-  // later pick them up; the setters also adjust the live nodes.
+  // The user-facing settings, kept as plain fields so nodes (and
+  // captures) built later pick them up; the setters also adjust the
+  // live ones. echoCancellation gates the capture-side voice processing
+  // (echo cancellation, noise suppression, auto gain) — off by default.
   private localVolume = 1;
   private remoteVolume = 1;
+  private echoCancellation = false;
+
+  // The capture constraints of the current echo-cancellation setting.
+  // Stated explicitly: browsers turn the voice processing ON when the
+  // constraints are merely omitted, so "off" must say false.
+  private captureConstraints(): MediaTrackConstraints {
+    return {
+      echoCancellation: this.echoCancellation,
+      noiseSuppression: this.echoCancellation,
+      autoGainControl: this.echoCancellation,
+    };
+  }
 
   /**
    * Creates the AudioContext on first use and resumes it when suspended.
@@ -97,56 +116,92 @@ export class AudioGraph {
   /**
    * Opens the microphone and builds the local chain, returning the
    * processed track (and its stream, for addTrack's stream association)
-   * to put on the wire. Idempotent: concurrent and repeated calls share
-   * the one capture. A rejected call (permission denied) may be retried.
+   * to put on the wire. Idempotent: concurrent and repeated acquisitions
+   * share the one capture. Every acquisition takes a hold and must be
+   * balanced by releaseLocalInput — the capture stops with the last
+   * hold. A rejected acquisition (permission denied) takes no hold and
+   * may be retried.
    */
-  async ensureLocalInput(): Promise<{
+  async acquireLocalInput(): Promise<{
     track: MediaStreamTrack;
     stream: MediaStream;
   }> {
     this.resume();
-    if (this.localInputPromise !== null) {
-      return this.localInputPromise;
+    let promise = this.localInputPromise;
+    if (promise === null) {
+      const ctx = this.ctx;
+      if (ctx === null) {
+        // resume() just created the context; this is unreachable.
+        throw new Error("audiograph: no audio context");
+      }
+      promise = (async () => {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          audio: this.captureConstraints(),
+        });
+        if (this.ctx !== ctx) {
+          // The graph was released while the permission prompt sat open.
+          for (const track of stream.getTracks()) track.stop();
+          throw new Error("audiograph: released while opening the mic");
+        }
+        const source = ctx.createMediaStreamSource(stream);
+        const gain = ctx.createGain();
+        gain.gain.value = this.localVolume;
+        const analyser = ctx.createAnalyser();
+        analyser.fftSize = FFT_SIZE;
+        analyser.smoothingTimeConstant = FFT_SMOOTHING;
+        const destination = ctx.createMediaStreamDestination();
+        source.connect(gain);
+        gain.connect(analyser);
+        gain.connect(destination);
+        this.localStream = stream;
+        this.localSourceNode = source;
+        this.localGainNode = gain;
+        this.localAnalyserNode = analyser;
+        this.localDestination = destination;
+        const track = destination.stream.getAudioTracks()[0];
+        return { track, stream: destination.stream };
+      })();
+      this.localInputPromise = promise;
     }
-    const ctx = this.ctx;
-    if (ctx === null) {
-      // resume() just created the context; this is unreachable.
-      throw new Error("audiograph: no audio context");
-    }
-    this.localInputPromise = (async () => {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          // The acoustic echo canceller (see the module header) plus the
-          // usual voice hygiene.
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-        },
-      });
-      const source = ctx.createMediaStreamSource(stream);
-      const gain = ctx.createGain();
-      gain.gain.value = this.localVolume;
-      const analyser = ctx.createAnalyser();
-      analyser.fftSize = FFT_SIZE;
-      analyser.smoothingTimeConstant = FFT_SMOOTHING;
-      const destination = ctx.createMediaStreamDestination();
-      source.connect(gain);
-      gain.connect(analyser);
-      gain.connect(destination);
-      this.localStream = stream;
-      this.localGainNode = gain;
-      this.localAnalyserNode = analyser;
-      this.localDestination = destination;
-      const track = destination.stream.getAudioTracks()[0];
-      return { track, stream: destination.stream };
-    })();
+    // The hold is taken before the await: acquisitions sharing one
+    // pending getUserMedia are then all counted before any
+    // releaseLocalInput can run.
+    this.localInputHolds += 1;
     try {
-      return await this.localInputPromise;
+      return await promise;
     } catch (err) {
-      // Allow a retry (e.g. the user grants the permission later).
-      this.localInputPromise = null;
+      // Allow a retry (e.g. the user grants the permission later) —
+      // unless a newer acquisition already replaced the promise — and
+      // drop this acquisition's hold with the failure.
+      if (this.localInputPromise === promise) this.localInputPromise = null;
+      this.localInputHolds -= 1;
       throw err;
     }
+  }
+
+  /**
+   * Balances one acquireLocalInput hold. When the last hold goes — every
+   * call using the mic has ended — the capture is stopped (the browser's
+   * recording indicator goes out) and the local chain is torn down; the
+   * next acquisition opens a fresh capture. Acquisitions settle before
+   * their releases run (the caller awaits before attaching), so the
+   * capture is never pending here.
+   */
+  releaseLocalInput(): void {
+    if (this.localInputHolds > 0) this.localInputHolds -= 1;
+    if (this.localInputHolds > 0 || this.localInputPromise === null) return;
+    if (this.localStream !== null) {
+      for (const track of this.localStream.getTracks()) track.stop();
+    }
+    this.localSourceNode?.disconnect();
+    this.localGainNode?.disconnect();
+    this.localAnalyserNode?.disconnect();
+    this.localStream = null;
+    this.localSourceNode = null;
+    this.localGainNode = null;
+    this.localAnalyserNode = null;
+    this.localDestination = null;
+    this.localInputPromise = null;
   }
 
   /** The local FFT tap, or null until the mic chain is built. */
@@ -178,6 +233,29 @@ export class AudioGraph {
     }
   }
 
+  getEchoCancellation(): boolean {
+    return this.echoCancellation;
+  }
+
+  /**
+   * Toggles the capture-side voice processing (echo cancellation, noise
+   * suppression, auto gain). Applies live to the open mic, if any, and
+   * to every future capture.
+   */
+  setEchoCancellation(on: boolean): void {
+    this.echoCancellation = on;
+    const track = this.localStream?.getAudioTracks()[0];
+    if (track !== undefined) {
+      // Best-effort: a browser refusing the change keeps the old
+      // processing; the setting still stands for the next capture.
+      void track
+        .applyConstraints(this.captureConstraints())
+        .catch((err) =>
+          console.error("audiograph: cannot apply echo cancellation", err),
+        );
+    }
+  }
+
   /**
    * Connects a remote stream (a peer's voice, off the wire) into the
    * graph under `id`: source → analyser → the shared remote gain →
@@ -195,7 +273,7 @@ export class AudioGraph {
     analyser.smoothingTimeConstant = FFT_SMOOTHING;
     source.connect(analyser);
     source.connect(this.remoteGainNode);
-    this.remotes.set(id, { source, analyser, stream });
+    this.remotes.set(id, { source, analyser });
     stream
       .getAudioTracks()[0]
       ?.addEventListener("ended", () => this.removeRemote(id), { once: true });
@@ -229,10 +307,12 @@ export class AudioGraph {
       for (const track of this.localStream.getTracks()) track.stop();
     }
     this.localStream = null;
+    this.localSourceNode = null;
     this.localGainNode = null;
     this.localAnalyserNode = null;
     this.localDestination = null;
     this.localInputPromise = null;
+    this.localInputHolds = 0;
     if (this.ctx !== null) {
       void this.ctx.close();
       this.ctx = null;

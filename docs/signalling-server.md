@@ -289,8 +289,10 @@ Media and audio:
   track to the pair's existing peer connection (`useCallMedia` via
   `PeerSessions.addTrack`); the PerfectNegotiator renegotiates on its
   own, resolving the glare of the two near-simultaneous offers. Leaving
-  `accepted` removes the track. Remote tracks arrive via `ontrack`
-  (`PeerSessions.subscribeTracks`).
+  `accepted` removes the track — and the mic capture itself stops when
+  the last accepted call detaches, so the browser's recording indicator
+  lights exactly while a call is sending. Remote tracks arrive via
+  `ontrack` (`PeerSessions.subscribeTracks`).
 - All call audio runs through one shared `AudioContext`
   (`web/site/src/api/audio/audiograph.tsx`, provided like the SSProxy
   singleton): the microphone passes a gain node (the mic send volume)
@@ -298,10 +300,11 @@ Media and audio:
   `MediaStreamAudioDestinationNode` whose track goes on the wire; every
   peer's incoming stream passes an analyser (the remote FFT) into one
   shared gain node (the speaker volume) feeding the output — several
-  accepted calls mux there. Echo cancellation is the capture-side
-  browser AEC (`getUserMedia` with `echoCancellation`, plus noise
-  suppression and auto gain), whose reference is the same default output
-  device the graph plays to.
+  accepted calls mux there. The capture is plain `getUserMedia` by
+  default; the call audio menu's echo-cancellation toggle switches the
+  capture-side voice processing (echo cancellation, noise suppression,
+  auto gain) on, live via `applyConstraints` and for future captures
+  (headphones assumed while it is off).
 - A peer dropping out mid-call ends the session locally (a dead-session
   overlay — there is nobody left to exchange the protocol with); the log
   entry keeps its last logged status.

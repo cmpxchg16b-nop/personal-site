@@ -6,9 +6,12 @@
 // the peer's incoming stream plays through the audio graph; any other
 // state detaches both. Several calls can be accepted at once — the
 // graph muxes their remote streams, and the one mic capture feeds every
-// connection. The hook owns no session state: it is purely an effect of
-// the wire-carried invitations, decoupled from the connections'
-// signalling state.
+// connection. Every attachment holds the capture (acquireLocalInput)
+// and its detach releases it (releaseLocalInput), so the capture opens
+// with the first accepted call and stops with the last — the browser's
+// recording indicator lights exactly while a call is sending. The hook
+// owns no session state: it is purely an effect of the wire-carried
+// invitations, decoupled from the connections' signalling state.
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { AudioGraph } from "@/api/audio/audiograph";
@@ -23,10 +26,10 @@ function callKey(channelId: ChannelId, peer: SubscriberId): string {
 
 export interface UseCallMediaResult {
   /**
-   * The local mic's FFT tap, or null until the first accepted call opens
-   * the microphone. Render-safe: the hook re-renders its caller whenever
-   * an attachment changes, so reads during render see analysers the
-   * moment they exist.
+   * The local mic's FFT tap, or null while no accepted call holds the
+   * microphone open. Render-safe: the hook re-renders its caller
+   * whenever an attachment changes, so reads during render see analysers
+   * the moment they exist.
    */
   localAnalyser: AnalyserNode | null;
   /** The FFT tap of one peer's incoming voice, while connected. */
@@ -61,7 +64,8 @@ export function useCallMedia(
 
   // The send-side attachments mirror the accepted calls: attach the mic
   // track to every newly accepted call's connection, detach from every
-  // connection whose call left "accepted" (and drop its remote stream).
+  // connection whose call left "accepted" (dropping its remote stream
+  // and releasing its mic hold — the capture stops with the last one).
   useEffect(() => {
     if (audio === null) return;
     let live = true;
@@ -76,16 +80,23 @@ export function useCallMedia(
       if (sendersRef.current.has(key)) continue;
       void (async () => {
         try {
-          const { track, stream } = await audio.ensureLocalInput();
-          // The effect re-ran (or the call ended) while the mic opened.
-          if (!live || sendersRef.current.has(key)) return;
+          const { track, stream } = await audio.acquireLocalInput();
+          // The effect re-ran (or the call ended) while the mic opened:
+          // this hold has no attachment to back, so it goes back.
+          if (!live || sendersRef.current.has(key)) {
+            audio.releaseLocalInput();
+            return;
+          }
           const sender = sessions.addTrack(
             call.ref.channelId,
             call.ref.userId,
             track,
             stream,
           );
-          if (sender === null) return;
+          if (sender === null) {
+            audio.releaseLocalInput();
+            return;
+          }
           sendersRef.current.set(key, sender);
           setMediaVersion((v) => v + 1);
         } catch (err) {
@@ -101,6 +112,7 @@ export function useCallMedia(
       sessions.removeTrack(key.slice(0, sep), key.slice(sep + 1), sender);
       sendersRef.current.delete(key);
       audio.removeRemote(key);
+      audio.releaseLocalInput();
       setMediaVersion((v) => v + 1);
     }
     return () => {

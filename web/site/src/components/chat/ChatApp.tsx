@@ -82,12 +82,6 @@ type ChatAppProps = {
     channelId: ChannelId,
     peer: SubscriberId,
   ) => AnalyserNode | null;
-  // The call audio volumes (see useCallVolumes), for the sidebar's
-  // volume button.
-  localVolume: number;
-  remoteVolume: number;
-  onLocalVolumeChange: (volume: number) => void;
-  onRemoteVolumeChange: (volume: number) => void;
 };
 
 export default function ChatApp({
@@ -109,10 +103,6 @@ export default function ChatApp({
   onEndCall,
   localAnalyser,
   remoteAnalyserFor,
-  localVolume,
-  remoteVolume,
-  onLocalVolumeChange,
-  onRemoteVolumeChange,
 }: ChatAppProps) {
   const [mobileListOpen, setMobileListOpen] = useState(false);
 
@@ -164,10 +154,6 @@ export default function ChatApp({
           selected={selected}
           onSelect={handleSelect}
           calls={calls}
-          localVolume={localVolume}
-          remoteVolume={remoteVolume}
-          onLocalVolumeChange={onLocalVolumeChange}
-          onRemoteVolumeChange={onRemoteVolumeChange}
           sx={{ display: { xs: mobileListOpen ? "flex" : "none", sm: "flex" } }}
         />
         <ConversationView
