@@ -26,6 +26,12 @@
  * cross-wire the negotiators, which filter client-to-client signalling
  * by (channelId, from, to) only.
  *
+ * Media tracks ride the same connection: consumers add and remove local
+ * tracks (addTrack/removeTrack) and subscribe remote track arrivals
+ * (subscribeTracks); the PerfectNegotiator renegotiates on its own, so
+ * voice-call media needs no signalling work of its own — and no second
+ * peer connection.
+ *
  * The ICE servers for the peer connections come from GET
  * /api/iceServers (the <iceServer/> entries of the server configuration
  * document, matched to this origin) via the useICEServers query; peer
@@ -54,6 +60,16 @@ export type PeerChannelHandler = (
   channelId: ChannelId,
   peer: SubscriberId,
   dc: RTCDataChannel,
+) => void;
+
+// PeerTrackHandler is called when a remote track arrives on a session
+// (pc.ontrack), so media consumers — the voice-call feature — can pick
+// up the peer's stream. Adding the local track (addTrack) triggers a
+// renegotiation automatically: the sessions are PerfectNegotiator-driven.
+export type PeerTrackHandler = (
+  channelId: ChannelId,
+  peer: SubscriberId,
+  ev: RTCTrackEvent,
 ) => void;
 
 // SessionResetHandler is notified when peer sessions go away: `dropped`
@@ -102,6 +118,33 @@ export interface PeerSessions {
    * Subscribes to session teardowns; returns the unsubscribe function.
    */
   subscribeReset(cb: SessionResetHandler): () => void;
+  /**
+   * Adds a local media track to the session's peer connection, to be
+   * sent to the peer; the PerfectNegotiator renegotiates automatically
+   * (onnegotiationneeded), so no signalling work is needed here.
+   * Returns the sender to pass to removeTrack, or null when the session
+   * does not exist (any more).
+   */
+  addTrack(
+    channelId: ChannelId,
+    peer: SubscriberId,
+    track: MediaStreamTrack,
+    ...streams: MediaStream[]
+  ): RTCRtpSender | null;
+  /**
+   * Removes a track previously added with addTrack; a no-op when the
+   * session is gone. Removing renegotiates like adding does.
+   */
+  removeTrack(
+    channelId: ChannelId,
+    peer: SubscriberId,
+    sender: RTCRtpSender,
+  ): void;
+  /**
+   * Subscribes to remote track arrivals (pc.ontrack) of every session;
+   * returns the unsubscribe function.
+   */
+  subscribeTracks(cb: PeerTrackHandler): () => void;
 }
 
 // PeerSession is one peer connection, its data channels by label, and
@@ -123,7 +166,7 @@ interface PeerSession {
 }
 
 // SessionHooks is how a peer session reports to the hook: a channel
-// appeared, a channel opened, the session closed.
+// appeared, a channel opened, a remote track arrived, the session closed.
 interface SessionHooks {
   onChannel(
     channelId: ChannelId,
@@ -137,6 +180,7 @@ interface SessionHooks {
     label: string,
     dc: RTCDataChannel,
   ): void;
+  onTrack(channelId: ChannelId, peer: SubscriberId, ev: RTCTrackEvent): void;
   onSessionClosed(channelId: ChannelId, peer: SubscriberId): void;
 }
 
@@ -187,6 +231,10 @@ function startPeerSession(
   if (!session.polite) {
     pc.ondatachannel = (e) => attach(e.channel.label, e.channel);
   }
+  // Remote tracks are multiplexed to the track subscribers; media
+  // consumers (voice calls) attach and detach tracks freely — the
+  // PerfectNegotiator owns the (re)negotiation they trigger.
+  pc.ontrack = (ev) => hooks.onTrack(channelId, peer, ev);
 
   const negotiator = new PerfectNegotiator(pc, {
     channelId,
@@ -232,6 +280,7 @@ export function usePeerSessions(
   // subscribers, and the waiters whenOpenChannel parks until a channel
   // opens or its session goes away (peer key → label → resolvers).
   const channelHandlersRef = useRef(new Map<string, Set<PeerChannelHandler>>());
+  const trackHandlersRef = useRef(new Set<PeerTrackHandler>());
   const resetHandlersRef = useRef(new Set<SessionResetHandler>());
   const channelWaitersRef = useRef(
     new Map<string, Map<string, Set<(dc: RTCDataChannel | null) => void>>>(),
@@ -252,6 +301,9 @@ export function usePeerSessions(
         byLabel.delete(label);
         if (byLabel.size === 0) channelWaitersRef.current.delete(key);
         for (const resolve of waiters) resolve(dc);
+      },
+      onTrack: (channelId, peer, ev) => {
+        for (const cb of trackHandlersRef.current) cb(channelId, peer, ev);
       },
       onSessionClosed: (channelId, peer) => {
         const key = peerKey(channelId, peer);
@@ -418,9 +470,54 @@ export function usePeerSessions(
       resetHandlersRef.current.delete(cb);
     };
   }, []);
+  const addTrack = useCallback(
+    (
+      channelId: ChannelId,
+      peer: SubscriberId,
+      track: MediaStreamTrack,
+      ...streams: MediaStream[]
+    ) => {
+      const session = sessionsRef.current.get(peerKey(channelId, peer));
+      if (session === undefined) return null;
+      return session.pc.addTrack(track, ...streams);
+    },
+    [],
+  );
+  const removeTrack = useCallback(
+    (channelId: ChannelId, peer: SubscriberId, sender: RTCRtpSender) => {
+      const session = sessionsRef.current.get(peerKey(channelId, peer));
+      if (session === undefined || session.pc.signalingState === "closed") {
+        return;
+      }
+      session.pc.removeTrack(sender);
+    },
+    [],
+  );
+  const subscribeTracks = useCallback((cb: PeerTrackHandler) => {
+    trackHandlersRef.current.add(cb);
+    return () => {
+      trackHandlersRef.current.delete(cb);
+    };
+  }, []);
 
   return useMemo<PeerSessions>(
-    () => ({ getChannel, whenOpenChannel, subscribeChannel, subscribeReset }),
-    [getChannel, whenOpenChannel, subscribeChannel, subscribeReset],
+    () => ({
+      getChannel,
+      whenOpenChannel,
+      subscribeChannel,
+      subscribeReset,
+      addTrack,
+      removeTrack,
+      subscribeTracks,
+    }),
+    [
+      getChannel,
+      whenOpenChannel,
+      subscribeChannel,
+      subscribeReset,
+      addTrack,
+      removeTrack,
+      subscribeTracks,
+    ],
   );
 }

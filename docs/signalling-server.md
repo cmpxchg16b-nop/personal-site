@@ -169,16 +169,25 @@ SS's rule for malformed events.
 | ------------------------------------ | ------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `text/plain`                         | `plaintext`                                                                                                        | A plain-text chat line.                                                                                                                                                                                   |
 | `application/x-file-transfer-status` | `fileTransfer {fileId, kind, filename, fileMIMEType, fileSizeTotalBytes, fileSizeTransferred, fileTransferStatus}` | The UI state of a file transfer (`pending` → `running` → `done`). The file's bytes never travel in the message; the opaque, globally unique `fileId` is the handle a recipient passes back to fetch them. |
-| `application/x-chat-control`         | `chatControl {subtype, targetMessageId, text?, fileTransfer?}`                                                     | Mutates one of the sender's earlier messages instead of adding a line.                                                                                                                                    |
+| `application/x-chat-control`         | `chatControl {subtype, targetMessageId, text?, fileTransfer?, phoneSession?}`                                      | Mutates the UI state of one of the sender's earlier messages instead of adding a line — the result of something, never its cause.                                                                         |
+| `application/x-phone-session`        | `phoneSession {sessionId, status}`                                                                                 | A voice-call invitation (see _Phone sessions_): stored, rendered as the call's log entry; its `status` is the session's UI state, amended via chat control.                                               |
+| `application/x-phone-session-event`  | `phoneSessionEvent {sessionId, action}`                                                                            | One action of the phone session protocol (`accept` / `reject` / `cancel` / `end`) — see _Phone sessions_. Never rendered.                                                                                 |
 
 Chat-control semantics: `delete` drops the target message; `amend`
 rewrites the target's body — `text` for a text message, `fileTransfer`
-for a file-transfer status — while keeping its `msgId` and
-`creationTimestamp`, so an amendment never moves or reattributes a
-message. Only the sender's own messages can be targeted; unknown targets
-and body-kind mismatches are no-ops. The receiver applies a control
-message on arrival, the sender when its echo comes back, so both
-histories stay identical; control messages themselves are never stored.
+for a file-transfer status, `phoneSession` for a phone-session
+invitation (which must also name the invitation's own session) — while
+keeping its `msgId` and `creationTimestamp`, so an amendment never moves
+or reattributes a message. Only the sender's own messages can be
+targeted; unknown targets and body-kind mismatches are no-ops. A chat
+control only ever mutates **UI state**: it is how one end tells the
+other "display this differently now", the _result_ of something that
+already happened — a file transfer's acknowledgements advancing, a phone
+session's events unfolding — never the _cause_; the actions themselves
+are their own frames (the `dcbin` acknowledgement frames, the
+phone-session events). The receiver applies a control message on
+arrival, the sender when its echo comes back, so both histories stay
+identical; control messages themselves are never stored.
 
 ### Binary file transfer (`dcbin`)
 
@@ -240,6 +249,63 @@ is chosen by the composer's attach menu (attachment / photo / video,
 whose only other effect is the file dialog's `accept` filter) and is
 never derived from the file's MIME type; the transfer path over `dcbin`
 is the same for all three.
+
+### Phone sessions (voice calls)
+
+A voice call is a phone session between one (channel, subscriber) pair,
+managed per pair and deliberately decoupled from the peer connection's
+own signalling state: it rides the same per-pair connection as the
+messaging and binary channels — no dedicated connection is created for a
+call. Two deliberately separate layers:
+
+- **The session protocol — the cause.** The actions are their own wire
+  frames. The caller opens the session with an
+  `application/x-phone-session` DCMsg (`phoneSession {sessionId,
+status: "inviting"}`) — the invitation, stored on both ends as the
+  call's log entry; its arrival is what rings the callee. The session's
+  later actions are `application/x-phone-session-event` DCMsg frames
+  (`phoneSessionEvent {sessionId, action}`): the callee sends `accept` /
+  `reject`, the caller sends `cancel` (before an answer), either party
+  sends `end` (after). Each end folds the session's frames into its
+  protocol state (`usePhoneCalls`); the fold takes the precedence
+  maximum over `inviting` < `accepted` < `ended` < `cancelled` <
+  `rejected`, so a cancel/accept race settles identically on both ends
+  and a terminal session is never revived. Media attach and the live
+  indicators (the answer popup, the sidebar pills, the conversation
+  strip) read this state.
+- **The session's UI state — the dependent variable.** The invitation
+  message's stored `status` is what the history's log entry displays; it
+  only ever follows the protocol state. When a session's protocol state
+  has moved on from its logged status, the session's owner — the caller,
+  the invitation's author — reports the new UI state with a chat-control
+  `amend` of the invitation (`phoneSession {sessionId, status}`),
+  exactly like a file transfer's sender amends its status message as
+  acknowledgements arrive. Chat control's own-messages-only rule is
+  untouched; the echo keeps both logs identical.
+
+Media and audio:
+
+- When a session reaches `accepted`, both ends attach their microphone
+  track to the pair's existing peer connection (`useCallMedia` via
+  `PeerSessions.addTrack`); the PerfectNegotiator renegotiates on its
+  own, resolving the glare of the two near-simultaneous offers. Leaving
+  `accepted` removes the track. Remote tracks arrive via `ontrack`
+  (`PeerSessions.subscribeTracks`).
+- All call audio runs through one shared `AudioContext`
+  (`web/site/src/api/audio/audiograph.tsx`, provided like the SSProxy
+  singleton): the microphone passes a gain node (the mic send volume)
+  and an analyser (the local FFT) into a
+  `MediaStreamAudioDestinationNode` whose track goes on the wire; every
+  peer's incoming stream passes an analyser (the remote FFT) into one
+  shared gain node (the speaker volume) feeding the output — several
+  accepted calls mux there. Echo cancellation is the capture-side
+  browser AEC (`getUserMedia` with `echoCancellation`, plus noise
+  suppression and auto gain), whose reference is the same default output
+  device the graph plays to.
+- A peer dropping out mid-call ends the session locally (a dead-session
+  overlay — there is nobody left to exchange the protocol with); the log
+  entry keeps its last logged status.
+  amend the invitation with).
 
 ### Magic commands
 

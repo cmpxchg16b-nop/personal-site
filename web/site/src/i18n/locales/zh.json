@@ -93,6 +93,31 @@
       "running": "传输中",
       "done": "已完成",
       "download": "下载 {{filename}}"
+    },
+    "call": {
+      "start": "发起语音通话",
+      "end": "结束通话",
+      "cancel": "取消",
+      "accept": "接听",
+      "decline": "拒绝",
+      "incoming": "来电",
+      "outgoing": "去电",
+      "calling": "正在呼叫 {{name}}…",
+      "ringingHint": "在通话弹窗中接听。",
+      "inCall": "通话中",
+      "ended": "通话已结束",
+      "declined": "通话已被拒绝",
+      "cancelled": "通话已取消",
+      "missed": "未接来电",
+      "you": "你",
+      "incomingShort": "来电",
+      "callingShort": "呼叫中…",
+      "inCallShort": "通话中"
+    },
+    "volume": {
+      "title": "通话音量",
+      "microphone": "麦克风",
+      "speaker": "扬声器"
     }
   },
   "footer": {

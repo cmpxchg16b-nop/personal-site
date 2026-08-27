@@ -8,14 +8,18 @@ import {
   type Theme,
 } from "@mui/material";
 import ArrowBackIcon from "@mui/icons-material/ArrowBack";
+import CallEndIcon from "@mui/icons-material/CallEnd";
+import CallIcon from "@mui/icons-material/Call";
 import ForumOutlinedIcon from "@mui/icons-material/ForumOutlined";
 import { useTranslation } from "react-i18next";
 import type { ChatUser } from "@/api/ss/types";
+import { CallPanel } from "./CallPanel";
 import MessageInput from "./MessageInput";
 import MessageList from "./MessageList";
 import UserAvatar from "./UserAvatar";
 import {
   conversationKey,
+  type ActivePhoneCall,
   type ChatMessage,
   type Conversation,
   type TransferKind,
@@ -37,6 +41,16 @@ type ConversationViewProps = {
   // getFileByFileId resolves a completed transfer's bytes locally; the
   // media cards render from it (see MediaMessageItem).
   getFileByFileId: (fileId: string) => Blob | undefined;
+  // The live voice call with this conversation's peer, or null (see
+  // usePhoneCalls).
+  call: ActivePhoneCall | null;
+  // Rings the peer (the header's call button).
+  onStartCall: () => void;
+  // Hangs the live call up — a cancel while ringing, an end in call.
+  onEndCall: () => void;
+  // FFT taps of the two voices while in call (see useCallMedia).
+  localAnalyser: AnalyserNode | null;
+  remoteAnalyser: AnalyserNode | null;
   // onBack returns to the channel list; only reachable on phone-sized
   // viewports where the sidebar and the conversation don't share the screen.
   onBack: () => void;
@@ -55,6 +69,11 @@ export default function ConversationView({
   onAttachFile,
   onRequestFile,
   getFileByFileId,
+  call,
+  onStartCall,
+  onEndCall,
+  localAnalyser,
+  remoteAnalyser,
   onBack,
   sx,
 }: ConversationViewProps) {
@@ -172,7 +191,46 @@ export default function ConversationView({
             {t(conversation.user.online ? "chat.online" : "chat.offline")}
           </Typography>
         </Box>
+        {/* The call button, at the header's right end: it rings the peer,
+            or hangs the live call up. Incoming calls are answered from
+            the global popup, so while one rings this button just shows
+            the ringing state. */}
+        {call === null ? (
+          <IconButton
+            onClick={onStartCall}
+            disabled={!conversation.user.online}
+            aria-label={t("chat.call.start")}
+            sx={{ ml: "auto" }}
+          >
+            <CallIcon />
+          </IconButton>
+        ) : call.incoming && call.status === "inviting" ? (
+          <IconButton
+            disabled
+            aria-label={t("chat.call.incoming")}
+            sx={{ ml: "auto" }}
+          >
+            <CallIcon />
+          </IconButton>
+        ) : (
+          <IconButton
+            onClick={onEndCall}
+            aria-label={t("chat.call.end")}
+            sx={{ ml: "auto", color: "error.main" }}
+          >
+            <CallEndIcon />
+          </IconButton>
+        )}
       </Box>
+      {call !== null && (
+        <CallPanel
+          call={call}
+          peerName={conversation.user.name}
+          localAnalyser={localAnalyser}
+          remoteAnalyser={remoteAnalyser}
+          onEnd={onEndCall}
+        />
+      )}
       <MessageList
         messages={messages}
         usersById={usersById}

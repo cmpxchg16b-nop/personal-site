@@ -2,11 +2,18 @@
 
 import { useState } from "react";
 import { Paper } from "@mui/material";
-import type { ChatChannel, ChatUser } from "@/api/ss/types";
+import type {
+  ChannelId,
+  ChatChannel,
+  ChatUser,
+  SubscriberId,
+} from "@/api/ss/types";
 import ChatSidebar from "./ChatSidebar";
 import ConversationView from "./ConversationView";
+import { IncomingCallWindow } from "./IncomingCallWindow";
 import {
   conversationKey,
+  type ActivePhoneCall,
   type ChatMessage,
   type Conversation,
   type ConversationRef,
@@ -58,6 +65,29 @@ type ChatAppProps = {
   // Resolves a completed transfer's bytes locally by fileId (the media
   // cards render from it — see MediaMessageItem).
   getFileByFileId: (fileId: string) => Blob | undefined;
+  // The live voice calls, keyed by conversation key (see usePhoneCalls):
+  // the sidebar shows their state pills, an open conversation its call
+  // strip, and a ringing incoming call pops the global answer window.
+  calls: Record<string, ActivePhoneCall>;
+  // Rings a conversation's peer.
+  onStartCall: (ref: ConversationRef) => void;
+  // Picks up / declines a ringing incoming call (the popup's buttons).
+  onAcceptCall: (call: ActivePhoneCall) => void;
+  onRejectCall: (call: ActivePhoneCall) => void;
+  // Hangs a live call up — a cancel while ringing, an end in call.
+  onEndCall: (call: ActivePhoneCall) => void;
+  // FFT taps of the two voices while in call (see useCallMedia).
+  localAnalyser: AnalyserNode | null;
+  remoteAnalyserFor: (
+    channelId: ChannelId,
+    peer: SubscriberId,
+  ) => AnalyserNode | null;
+  // The call audio volumes (see useCallVolumes), for the sidebar's
+  // volume button.
+  localVolume: number;
+  remoteVolume: number;
+  onLocalVolumeChange: (volume: number) => void;
+  onRemoteVolumeChange: (volume: number) => void;
 };
 
 export default function ChatApp({
@@ -72,6 +102,17 @@ export default function ChatApp({
   onAttachFile,
   onRequestFile,
   getFileByFileId,
+  calls,
+  onStartCall,
+  onAcceptCall,
+  onRejectCall,
+  onEndCall,
+  localAnalyser,
+  remoteAnalyserFor,
+  localVolume,
+  remoteVolume,
+  onLocalVolumeChange,
+  onRemoteVolumeChange,
 }: ChatAppProps) {
   const [mobileListOpen, setMobileListOpen] = useState(false);
 
@@ -87,46 +128,80 @@ export default function ChatApp({
   const activeKey = selected === null ? null : conversationKey(selected);
   const activeMessages = activeKey === null ? [] : (messages[activeKey] ?? []);
 
+  // The open conversation's live call, and the ringing incoming call the
+  // global window answers (the latest, in the unlikely case of several).
+  const activeCall = activeKey === null ? null : (calls[activeKey] ?? null);
+  const incomingCall =
+    Object.values(calls)
+      .filter((call) => call.status === "inviting" && call.incoming)
+      .sort((a, b) => b.since - a.since)[0] ?? null;
+
   const handleSelect = (ref: ConversationRef) => {
     onSelect(ref);
     setMobileListOpen(false);
   };
 
   return (
-    <Paper
-      elevation={0}
-      sx={{
-        display: "flex",
-        height: { xs: "calc(100dvh - 80px)", sm: "calc(100dvh - 96px)" },
-        minHeight: 360,
-        border: 1,
-        borderColor: "divider",
-        // borderRadius: 2 = 24px (2 × theme.shape.borderRadius) — one step
-        // rounder than the site's plain cards, quieter than the first cut's
-        // 36px.
-        borderRadius: 2,
-        overflow: "hidden",
-      }}
-    >
-      <ChatSidebar
-        channels={channels}
-        unread={unread}
-        selected={selected}
-        onSelect={handleSelect}
-        sx={{ display: { xs: mobileListOpen ? "flex" : "none", sm: "flex" } }}
+    <>
+      <Paper
+        elevation={0}
+        sx={{
+          display: "flex",
+          height: { xs: "calc(100dvh - 80px)", sm: "calc(100dvh - 96px)" },
+          minHeight: 360,
+          border: 1,
+          borderColor: "divider",
+          // borderRadius: 2 = 24px (2 × theme.shape.borderRadius) — one step
+          // rounder than the site's plain cards, quieter than the first cut's
+          // 36px.
+          borderRadius: 2,
+          overflow: "hidden",
+        }}
+      >
+        <ChatSidebar
+          channels={channels}
+          unread={unread}
+          selected={selected}
+          onSelect={handleSelect}
+          calls={calls}
+          localVolume={localVolume}
+          remoteVolume={remoteVolume}
+          onLocalVolumeChange={onLocalVolumeChange}
+          onRemoteVolumeChange={onRemoteVolumeChange}
+          sx={{ display: { xs: mobileListOpen ? "flex" : "none", sm: "flex" } }}
+        />
+        <ConversationView
+          conversation={conversation}
+          messages={activeMessages}
+          usersById={users}
+          currentUserId={currentUserId}
+          onSend={onSend}
+          onAttachFile={onAttachFile}
+          onRequestFile={onRequestFile}
+          getFileByFileId={getFileByFileId}
+          call={activeCall}
+          onStartCall={() => selected !== null && onStartCall(selected)}
+          onEndCall={() => activeCall !== null && onEndCall(activeCall)}
+          localAnalyser={localAnalyser}
+          remoteAnalyser={
+            selected === null
+              ? null
+              : remoteAnalyserFor(selected.channelId, selected.userId)
+          }
+          onBack={() => setMobileListOpen(true)}
+          sx={{ display: { xs: mobileListOpen ? "none" : "flex", sm: "flex" } }}
+        />
+      </Paper>
+      {/* The global incoming-call popup — the one place calls are
+          answered. */}
+      <IncomingCallWindow
+        call={incomingCall}
+        caller={
+          incomingCall === null ? undefined : users[incomingCall.ref.userId]
+        }
+        onAccept={onAcceptCall}
+        onReject={onRejectCall}
       />
-      <ConversationView
-        conversation={conversation}
-        messages={activeMessages}
-        usersById={users}
-        currentUserId={currentUserId}
-        onSend={onSend}
-        onAttachFile={onAttachFile}
-        onRequestFile={onRequestFile}
-        getFileByFileId={getFileByFileId}
-        onBack={() => setMobileListOpen(true)}
-        sx={{ display: { xs: mobileListOpen ? "none" : "flex", sm: "flex" } }}
-      />
-    </Paper>
+    </>
   );
 }

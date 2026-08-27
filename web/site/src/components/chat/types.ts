@@ -2,7 +2,10 @@
 // signalling types in @/api/ss/types.
 
 import type { ChatUser } from "@/api/ss/types";
-import type { DCFileTransferKind } from "@/api/ss/datachannel";
+import type {
+  DCFileTransferKind,
+  DCPhoneSessionStatus,
+} from "@/api/ss/datachannel";
 
 // TransferKind is how a transfer is announced and rendered: a plain file
 // download card ("file") or an inline media card ("image", "video"). The
@@ -68,9 +71,32 @@ export type VideoChatMessage = TransferMessageFields & {
 // MediaChatMessage is either transfer-backed media message.
 export type MediaChatMessage = ImageChatMessage | VideoChatMessage;
 
+// PhoneSessionStatus is the lifecycle state of a voice call — the wire
+// type, re-exported so UI components stay free of api imports.
+export type PhoneSessionStatus = DCPhoneSessionStatus;
+
+// PhoneCallMessage is the call log entry of one voice call: the
+// invitation's arrival rendered in the history, its phoneStatus moving
+// with the session ("inviting" → "accepted" → "ended", …) as the
+// parties' amends land. The audio itself never travels in the message —
+// it flows over the peer connection while the status says "accepted".
+export type PhoneCallMessage = {
+  type: "phone-call";
+  id: string;
+  // The caller (the invitation's author).
+  authorId: string;
+  sessionId: string;
+  phoneStatus: PhoneSessionStatus;
+  // Unix seconds of the invitation, matching TextChatMessage.timestamp.
+  timestamp: number;
+};
+
 // ChatMessage is any message renderable in a conversation.
 export type ChatMessage =
-  TextChatMessage | FileTransferStatusMessage | MediaChatMessage;
+  | TextChatMessage
+  | FileTransferStatusMessage
+  | MediaChatMessage
+  | PhoneCallMessage;
 
 // ConversationRef identifies the selected conversation: a direct message
 // with one user, scoped to the channel the DM was opened from — opening
@@ -85,6 +111,25 @@ export type ConversationRef = {
 
 // Conversation is a ConversationRef resolved to its display target.
 export type Conversation = { kind: "dm"; channelId: string; user: ChatUser };
+
+// ActivePhoneCall is the live view of an ongoing voice call with a
+// conversation's peer: ringing ("inviting") or in call ("accepted").
+// Terminal states are not here — they live in the history as
+// PhoneCallMessages. Derived from the conversation's latest phone-call
+// message by usePhoneCalls.
+export type ActivePhoneCall = {
+  // The conversation the call belongs to.
+  ref: ConversationRef;
+  // The invitation message's id — the target the parties' status amends
+  // point at.
+  messageId: string;
+  sessionId: string;
+  status: "inviting" | "accepted";
+  // true when the peer is ringing us (we are the callee).
+  incoming: boolean;
+  // Unix seconds of the invitation.
+  since: number;
+};
 
 // conversationKey flattens a ConversationRef into the string key under which
 // its messages and unread count are stored.

@@ -84,7 +84,13 @@ export function buildMagicControl(
     }
     case "amend-file-transfer": {
       const target = history.find((m) => m.id === command.targetMessageId);
-      if (target === undefined || target.type === "text-chat") {
+      // Only transfer-backed messages carry a transferable file; a phone
+      // call's log entry or a text line is not amendable as one.
+      if (
+        target === undefined ||
+        target.type === "text-chat" ||
+        target.type === "phone-call"
+      ) {
         return null;
       }
       // The wire kind is the target's own: the UI message type is the

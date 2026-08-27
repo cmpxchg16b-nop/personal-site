@@ -1,6 +1,8 @@
 import { useMemo } from "react";
 import {
   DC_MSG_MIME_FILE_TRANSFER_STATUS,
+  DC_MSG_MIME_PHONE_SESSION,
+  DC_MSG_MIME_PHONE_SESSION_EVENT,
   type DCMsgs,
 } from "@/api/ss/datachannel";
 import { conversationKey, type ChatMessage } from "./types";
@@ -16,6 +18,11 @@ export function useChatMessages(dcMsgs: DCMsgs): Record<string, ChatMessage[]> {
     for (const bySender of Object.values(dcMsgs)) {
       for (const senderMsgs of Object.values(bySender)) {
         for (const m of senderMsgs) {
+          // Phone-session events are the call protocol's frames, not
+          // renderable messages: they drive usePhoneCalls' session
+          // state, and the log entry's status follows via chat-control
+          // amends of the invitation.
+          if (m.mimeType === DC_MSG_MIME_PHONE_SESSION_EVENT) continue;
           // The conversation's peer is the message's other end: its
           // sender, or its recipient for an echo of our own message.
           const key = conversationKey({
@@ -25,6 +32,18 @@ export function useChatMessages(dcMsgs: DCMsgs): Record<string, ChatMessage[]> {
           });
           let msg: ChatMessage;
           if (
+            m.mimeType === DC_MSG_MIME_PHONE_SESSION &&
+            m.phoneSession !== undefined
+          ) {
+            msg = {
+              type: "phone-call",
+              id: m.msgId,
+              authorId: m.fromSubscriberId,
+              sessionId: m.phoneSession.sessionId,
+              phoneStatus: m.phoneSession.status,
+              timestamp: m.creationTimestamp,
+            };
+          } else if (
             m.mimeType === DC_MSG_MIME_FILE_TRANSFER_STATUS &&
             m.fileTransfer !== undefined
           ) {

@@ -70,10 +70,83 @@ export interface DCFileTransfer {
 // chatControl field): delete or amend an earlier message.
 export const DC_MSG_MIME_CHAT_CONTROL = "application/x-chat-control";
 
+// DC_MSG_MIME_PHONE_SESSION: a phone (voice call) session invitation
+// (body in the phoneSession field). The caller opens a session by
+// sending one; it is stored and rendered as the call's log entry, and
+// its status — the session's UI state — is amended via chat control by
+// the invitation's owner as the session's events unfold (see
+// DC_MSG_MIME_PHONE_SESSION_EVENT). The invitation's arrival is also
+// the invite action itself: it is what rings the callee.
+export const DC_MSG_MIME_PHONE_SESSION = "application/x-phone-session";
+
+// DC_MSG_MIME_PHONE_SESSION_EVENT: one action on a phone session (body
+// in the phoneSessionEvent field): the callee accepts or rejects the
+// invitation, the caller cancels the ring, either party ends the call.
+// The events ARE the phone session protocol — they drive each end's
+// session state. They never appear in the UI; the log entry's status
+// only follows the session (via chat-control amends), never leads it.
+export const DC_MSG_MIME_PHONE_SESSION_EVENT =
+  "application/x-phone-session-event";
+
+// DC_PHONE_SESSION_STATUSES are the lifecycle states of a phone session.
+export const DC_PHONE_SESSION_STATUSES = [
+  "inviting",
+  "accepted",
+  "rejected",
+  "cancelled",
+  "ended",
+] as const;
+
+// DCPhoneSessionStatus is one lifecycle state of a phone session:
+// "inviting" (the caller is ringing), "accepted" (the callee picked up —
+// media flows), "rejected" (the callee declined), "cancelled" (the
+// caller hung up before an answer), "ended" (an accepted call was hung
+// up).
+export type DCPhoneSessionStatus = (typeof DC_PHONE_SESSION_STATUSES)[number];
+
+// DCPhoneSession is the body of a phone-session invitation DCMsg: the
+// session's identity plus its UI state (the status the log entry and
+// the status indicators display). The status is a dependent variable —
+// it changes only when the session's events (the accept / reject /
+// cancel / end actions) caused it, the amendment riding chat control.
+export interface DCPhoneSession {
+  /** opaque, globally unique identifier of the phone session, minted by
+      the caller with the invitation */
+  sessionId: string;
+  status: DCPhoneSessionStatus;
+}
+
+// DC_PHONE_SESSION_ACTIONS are the actions of the phone session
+// protocol.
+export const DC_PHONE_SESSION_ACTIONS = [
+  "accept",
+  "reject",
+  "cancel",
+  "end",
+] as const;
+
+// DCPhoneSessionAction is one action on a phone session: "accept" and
+// "reject" answer the invitation (the callee), "cancel" aborts the ring
+// (the caller, before an answer), "end" hangs up an accepted call
+// (either party).
+export type DCPhoneSessionAction = (typeof DC_PHONE_SESSION_ACTIONS)[number];
+
+// DCPhoneSessionEvent is the body of a phone-session-event DCMsg: one
+// action of the session protocol, addressed to the session's other
+// party. Event frames are exchanged over the data channel like any
+// DCMsg (and echoed like any), so both ends fold the same actions into
+// their session state.
+export interface DCPhoneSessionEvent {
+  /** the session the action belongs to (its invitation's sessionId) */
+  sessionId: string;
+  action: DCPhoneSessionAction;
+}
+
 // DCChatControl is the body of a chat-control DCMsg. For "delete" only
-// targetMessageId is set. For "amend" exactly one of text / fileTransfer
-// carries the target's new content; the amendment keeps the target's
-// original id and timestamp (see applyChatControlDCMsg below).
+// targetMessageId is set. For "amend" exactly one of text /
+// fileTransfer / phoneSession carries the target's new content; the
+// amendment keeps the target's original id and timestamp (see
+// applyChatControlDCMsg below).
 export interface DCChatControl {
   subtype: "delete" | "amend";
   targetMessageId: MsgId;
@@ -81,6 +154,10 @@ export interface DCChatControl {
   text?: string;
   /** amended status, when the target is a file-transfer status message */
   fileTransfer?: DCFileTransfer;
+  /** amended status, when the target is a phone-session invitation;
+      only the invitation's owner (the caller) amends it, reporting the
+      session's new UI state after its events unfolded */
+  phoneSession?: DCPhoneSession;
 }
 
 // DCMsg is a message carried over a WebRTC data channel.
@@ -111,6 +188,11 @@ export interface DCMsg {
   fileTransfer?: DCFileTransfer;
   /** the control operation when mimeType is DC_MSG_MIME_CHAT_CONTROL */
   chatControl?: DCChatControl;
+  /** the phone session state when mimeType is DC_MSG_MIME_PHONE_SESSION */
+  phoneSession?: DCPhoneSession;
+  /** the session protocol action when mimeType is
+      DC_MSG_MIME_PHONE_SESSION_EVENT */
+  phoneSessionEvent?: DCPhoneSessionEvent;
 }
 
 // DCMsgs maps channelId → sender subscriber id → the list of messages
@@ -187,6 +269,57 @@ export function newChatControlDCMsg(
   };
 }
 
+// newPhoneSessionDCMsg builds the phone-session DCMsg to
+// toSubscriberId that opens a voice call: the invitation, carrying a
+// freshly minted session id and the initial "inviting" status. The
+// message is stored on both ends (via the echo) as the call's log
+// entry; its status — the session's UI state — is amended later via
+// chat control as the session's events unfold.
+export function newPhoneSessionDCMsg(
+  channelId: ChannelId,
+  fromSubscriberId: SubscriberId,
+  toSubscriberId: SubscriberId,
+  sessionId: string,
+  inReplyTo?: MsgId,
+): DCMsg {
+  return {
+    mimeVersion: DC_MSG_MIME_VERSION,
+    channelId,
+    fromSubscriberId,
+    toSubscriberId,
+    creationTimestamp: Date.now() / 1000,
+    msgId: crypto.randomUUID(),
+    inReplyTo,
+    mimeType: DC_MSG_MIME_PHONE_SESSION,
+    plaintext: "",
+    phoneSession: { sessionId, status: "inviting" },
+  };
+}
+
+// newPhoneSessionEventDCMsg builds one phone-session-event DCMsg to
+// toSubscriberId: an action of the session protocol (accept / reject /
+// cancel / end), minting a fresh msg id and stamping the creation time.
+export function newPhoneSessionEventDCMsg(
+  channelId: ChannelId,
+  fromSubscriberId: SubscriberId,
+  toSubscriberId: SubscriberId,
+  phoneSessionEvent: DCPhoneSessionEvent,
+  inReplyTo?: MsgId,
+): DCMsg {
+  return {
+    mimeVersion: DC_MSG_MIME_VERSION,
+    channelId,
+    fromSubscriberId,
+    toSubscriberId,
+    creationTimestamp: Date.now() / 1000,
+    msgId: crypto.randomUUID(),
+    inReplyTo,
+    mimeType: DC_MSG_MIME_PHONE_SESSION_EVENT,
+    plaintext: "",
+    phoneSessionEvent,
+  };
+}
+
 // encodeDCMsg serializes a DCMsg for the wire. The data channel's
 // on-the-wire format is a private detail of this codec — JSON today, but
 // it could be XML or anything else; DCMsg itself stays agnostic to it.
@@ -207,6 +340,24 @@ function isWellFormedFileTransfer(ft: DCFileTransfer): boolean {
     (ft.fileTransferStatus === "pending" ||
       ft.fileTransferStatus === "running" ||
       ft.fileTransferStatus === "done")
+  );
+}
+
+// isWellFormedPhoneSession reports whether ps is a structurally valid
+// DCPhoneSession.
+function isWellFormedPhoneSession(ps: DCPhoneSession): boolean {
+  return (
+    typeof ps.sessionId === "string" &&
+    (DC_PHONE_SESSION_STATUSES as readonly string[]).includes(ps.status)
+  );
+}
+
+// isWellFormedPhoneSessionEvent reports whether ev is a structurally
+// valid DCPhoneSessionEvent.
+function isWellFormedPhoneSessionEvent(ev: DCPhoneSessionEvent): boolean {
+  return (
+    typeof ev.sessionId === "string" &&
+    (DC_PHONE_SESSION_ACTIONS as readonly string[]).includes(ev.action)
   );
 }
 
@@ -249,10 +400,26 @@ function decodeDCMsg(data: unknown): DCMsg | null {
       typeof cc.targetMessageId !== "string" ||
       (cc.text !== undefined && typeof cc.text !== "string") ||
       (cc.fileTransfer !== undefined &&
-        !isWellFormedFileTransfer(cc.fileTransfer))
+        !isWellFormedFileTransfer(cc.fileTransfer)) ||
+      (cc.phoneSession !== undefined &&
+        !isWellFormedPhoneSession(cc.phoneSession))
     ) {
       return null;
     }
+  }
+  if (
+    msg.mimeType === DC_MSG_MIME_PHONE_SESSION &&
+    (msg.phoneSession === undefined ||
+      !isWellFormedPhoneSession(msg.phoneSession))
+  ) {
+    return null;
+  }
+  if (
+    msg.mimeType === DC_MSG_MIME_PHONE_SESSION_EVENT &&
+    (msg.phoneSessionEvent === undefined ||
+      !isWellFormedPhoneSessionEvent(msg.phoneSessionEvent))
+  ) {
+    return null;
   }
   return msg;
 }
@@ -275,10 +442,15 @@ function appendDCMsg(prev: DCMsgs, msg: DCMsg): DCMsgs {
 
 // applyChatControlDCMsg applies a chat-control message to the sender's own
 // stored messages: "delete" drops the target, "amend" rewrites its body
-// (plaintext for a text message, fileTransfer for a file-transfer status),
-// keeping the target's msgId and creationTimestamp — an amendment never
-// moves or reattributes a message. Controls targeting another sender's
-// message, an unknown message, or a mismatched body kind are no-ops.
+// (plaintext for a text message, fileTransfer for a file-transfer status,
+// phoneSession for a phone-session invitation), keeping the target's
+// msgId and creationTimestamp — an amendment never moves or reattributes
+// a message. A chat control only ever mutates UI state: the actions that
+// CAUSED the new state are their own frames (the file-transfer
+// acknowledgements, the phone session events), never chat controls.
+// Controls targeting another sender's message, an unknown message, or a
+// mismatched body kind are no-ops; a phone-session amend must also name
+// the invitation's own session.
 function applyChatControlDCMsg(
   prev: DCMsgs,
   channelId: ChannelId,
@@ -304,6 +476,13 @@ function applyChatControlDCMsg(
     target.mimeType === DC_MSG_MIME_FILE_TRANSFER_STATUS
   ) {
     amended = { ...target, fileTransfer: cc.fileTransfer };
+  } else if (
+    cc.phoneSession !== undefined &&
+    target.mimeType === DC_MSG_MIME_PHONE_SESSION &&
+    target.phoneSession !== undefined &&
+    target.phoneSession.sessionId === cc.phoneSession.sessionId
+  ) {
+    amended = { ...target, phoneSession: cc.phoneSession };
   }
   if (amended === null) return prev;
   const next = [...list];
@@ -313,7 +492,9 @@ function applyChatControlDCMsg(
 
 // applyDCMsg folds one inbound DCMsg into the store: a chat-control
 // message mutates the sender's earlier message and is never stored;
-// anything else appends.
+// anything else appends. Phone-session events append like ordinary
+// messages — they are the session protocol's record the phone-call state
+// is folded from; useChatMessages simply never renders them.
 function applyDCMsg(prev: DCMsgs, msg: DCMsg): DCMsgs {
   const cc =
     msg.mimeType === DC_MSG_MIME_CHAT_CONTROL ? msg.chatControl : undefined;

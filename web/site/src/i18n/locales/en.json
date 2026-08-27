@@ -93,6 +93,31 @@
       "running": "Transferring",
       "done": "Completed",
       "download": "Download {{filename}}"
+    },
+    "call": {
+      "start": "Start a voice call",
+      "end": "End the call",
+      "cancel": "Cancel",
+      "accept": "Accept the call",
+      "decline": "Decline the call",
+      "incoming": "Incoming call",
+      "outgoing": "Outgoing call",
+      "calling": "Calling {{name}}…",
+      "ringingHint": "Answer from the call popup.",
+      "inCall": "In call",
+      "ended": "Call ended",
+      "declined": "Call declined",
+      "cancelled": "Call cancelled",
+      "missed": "Missed call",
+      "you": "You",
+      "incomingShort": "Incoming",
+      "callingShort": "Calling…",
+      "inCallShort": "In call"
+    },
+    "volume": {
+      "title": "Call audio",
+      "microphone": "Microphone",
+      "speaker": "Speaker"
     }
   },
   "footer": {

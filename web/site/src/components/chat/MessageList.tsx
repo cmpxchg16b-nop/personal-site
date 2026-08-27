@@ -11,11 +11,13 @@ import { dateFnsLocaleFor } from "@/i18n";
 import { MessageItem } from "./MessageItem";
 import { FileTransferStatusItem } from "./FileTransferStatusItem";
 import { MediaMessageItem } from "./MediaMessageItem";
+import { PhoneCallItem } from "./PhoneCallItem";
 import type {
   ChatMessage,
   FileTransferStatusMessage,
   MediaChatMessage,
   MessageGroup,
+  PhoneCallMessage,
 } from "./types";
 
 // GROUP_WINDOW_MS: consecutive messages by the same author within this gap
@@ -38,8 +40,8 @@ type MessageListProps = {
 };
 
 // ListItem is one renderable row of the list: a group of text messages, or
-// a standalone transfer card (transfers are never folded into text groups;
-// they break a run).
+// a standalone transfer or phone-call card (those are never folded into
+// text groups; they break a run).
 type ListItem =
   | { kind: "group"; group: MessageGroup }
   | {
@@ -47,7 +49,8 @@ type ListItem =
       message: FileTransferStatusMessage;
       author: ChatUser;
     }
-  | { kind: "media"; message: MediaChatMessage; author: ChatUser };
+  | { kind: "media"; message: MediaChatMessage; author: ChatUser }
+  | { kind: "phoneCall"; message: PhoneCallMessage; author: ChatUser };
 
 // itemTimestamp returns the Unix-seconds timestamp an item carries for the
 // day-divider logic.
@@ -72,6 +75,10 @@ function foldMessages(
     }
     if (message.type === "image-chat" || message.type === "video-chat") {
       items.push({ kind: "media", message, author });
+      continue;
+    }
+    if (message.type === "phone-call") {
+      items.push({ kind: "phoneCall", message, author });
       continue;
     }
     const last = items[items.length - 1];
@@ -189,6 +196,12 @@ export default function MessageList({
                 author={item.author}
                 isOwn={item.author.id === currentUserId}
                 onRequestFile={onRequestFile}
+              />
+            ) : item.kind === "phoneCall" ? (
+              <PhoneCallItem
+                message={item.message}
+                author={item.author}
+                isOwn={item.author.id === currentUserId}
               />
             ) : (
               <MediaMessageItem
