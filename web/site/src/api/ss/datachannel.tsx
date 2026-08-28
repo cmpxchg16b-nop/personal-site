@@ -70,11 +70,11 @@ export interface DCFileTransfer {
 // chatControl field): delete or amend an earlier message.
 export const DC_MSG_MIME_CHAT_CONTROL = "application/x-chat-control";
 
-// DC_MSG_MIME_PHONE_SESSION: a phone (voice call) session invitation
-// (body in the phoneSession field). The caller opens a session by
-// sending one; it is stored and rendered as the call's log entry, and
-// its status — the session's UI state — is amended via chat control by
-// the invitation's owner as the session's events unfold (see
+// DC_MSG_MIME_PHONE_SESSION: a phone (voice or video call) session
+// invitation (body in the phoneSession field). The caller opens a
+// session by sending one; it is stored and rendered as the call's log
+// entry, and its status — the session's UI state — is amended via chat
+// control by the invitation's owner as the session's events unfold (see
 // DC_MSG_MIME_PHONE_SESSION_EVENT). The invitation's arrival is also
 // the invite action itself: it is what rings the callee.
 export const DC_MSG_MIME_PHONE_SESSION = "application/x-phone-session";
@@ -104,16 +104,27 @@ export const DC_PHONE_SESSION_STATUSES = [
 // up).
 export type DCPhoneSessionStatus = (typeof DC_PHONE_SESSION_STATUSES)[number];
 
+// DC_PHONE_SESSION_KINDS are the kinds of a phone session.
+export const DC_PHONE_SESSION_KINDS = ["voice", "video"] as const;
+
+// DCPhoneSessionKind is what a phone session carries: "voice" attaches
+// the microphones only, "video" additionally the cameras.
+export type DCPhoneSessionKind = (typeof DC_PHONE_SESSION_KINDS)[number];
+
 // DCPhoneSession is the body of a phone-session invitation DCMsg: the
-// session's identity plus its UI state (the status the log entry and
-// the status indicators display). The status is a dependent variable —
-// it changes only when the session's events (the accept / reject /
-// cancel / end actions) caused it, the amendment riding chat control.
+// session's identity and kind plus its UI state (the status the log
+// entry and the status indicators display). The status is a dependent
+// variable — it changes only when the session's events (the accept /
+// reject / cancel / end actions) caused it, the amendment riding chat
+// control.
 export interface DCPhoneSession {
   /** opaque, globally unique identifier of the phone session, minted by
       the caller with the invitation */
   sessionId: string;
   status: DCPhoneSessionStatus;
+  /** what the session carries; absent on the wire means "voice" (the
+      field postdates the invitation) */
+  kind?: DCPhoneSessionKind;
 }
 
 // DC_PHONE_SESSION_ACTIONS are the actions of the phone session
@@ -270,16 +281,17 @@ export function newChatControlDCMsg(
 }
 
 // newPhoneSessionDCMsg builds the phone-session DCMsg to
-// toSubscriberId that opens a voice call: the invitation, carrying a
-// freshly minted session id and the initial "inviting" status. The
-// message is stored on both ends (via the echo) as the call's log
-// entry; its status — the session's UI state — is amended later via
-// chat control as the session's events unfold.
+// toSubscriberId that opens a call of the given kind: the invitation,
+// carrying a freshly minted session id and the initial "inviting"
+// status. The message is stored on both ends (via the echo) as the
+// call's log entry; its status — the session's UI state — is amended
+// later via chat control as the session's events unfold.
 export function newPhoneSessionDCMsg(
   channelId: ChannelId,
   fromSubscriberId: SubscriberId,
   toSubscriberId: SubscriberId,
   sessionId: string,
+  kind: DCPhoneSessionKind,
   inReplyTo?: MsgId,
 ): DCMsg {
   return {
@@ -292,7 +304,7 @@ export function newPhoneSessionDCMsg(
     inReplyTo,
     mimeType: DC_MSG_MIME_PHONE_SESSION,
     plaintext: "",
-    phoneSession: { sessionId, status: "inviting" },
+    phoneSession: { sessionId, status: "inviting", kind },
   };
 }
 

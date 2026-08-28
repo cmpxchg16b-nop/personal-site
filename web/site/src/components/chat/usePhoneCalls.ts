@@ -1,7 +1,7 @@
 "use client";
 
-// usePhoneCalls manages the voice-call (phone) sessions, one per
-// (channel, peer subscriber) pair. Two deliberately separate layers:
+// usePhoneCalls manages the phone (voice / video call) sessions, one
+// per (channel, peer subscriber) pair. Two deliberately separate layers:
 //
 // - The session PROTOCOL — the cause. Actions are their own wire
 //   frames: the caller's invitation (an application/x-phone-session
@@ -37,6 +37,7 @@ import {
   type DCMsg,
   type DCMsgs,
   type DCPhoneSessionAction,
+  type DCPhoneSessionKind,
   type DCPhoneSessionStatus,
 } from "@/api/ss/datachannel";
 import type { PeerSessions } from "@/api/ss/peersessions";
@@ -95,6 +96,8 @@ interface PhoneSessionModel {
   // at.
   messageId: string;
   sessionId: string;
+  // What the session carries — voice only, or voice and video.
+  kind: DCPhoneSessionKind;
   status: DCPhoneSessionStatus;
   loggedStatus: DCPhoneSessionStatus;
   // true when the peer called us (we are the callee).
@@ -112,13 +115,13 @@ export interface UsePhoneCallsResult {
    */
   calls: Record<string, ActivePhoneCall>;
   /**
-   * Rings the conversation's peer: sends the invitation. No-op without
-   * an own subscription or while a call with the peer is live. Wakes
-   * the audio graph inside the click's user gesture, so the caller's
-   * side can play and capture audio when the callee later accepts
-   * without a gesture on this end.
+   * Rings the conversation's peer with a call of the given kind: sends
+   * the invitation. No-op without an own subscription or while a call
+   * with the peer is live. Wakes the audio graph inside the click's
+   * user gesture, so the caller's side can play and capture audio when
+   * the callee later accepts without a gesture on this end.
    */
-  startCall: (ref: ConversationRef) => void;
+  startCall: (ref: ConversationRef, kind: DCPhoneSessionKind) => void;
   /** Picks up an incoming call: sends the accept event. */
   acceptCall: (call: ActivePhoneCall) => void;
   /** Declines an incoming call: sends the reject event. */
@@ -238,6 +241,9 @@ export function usePhoneCalls(
         ref,
         messageId: invitation.msgId,
         sessionId: session.sessionId,
+        // The kind field postdates the invitation: absent is a voice
+        // call.
+        kind: session.kind ?? "voice",
         status,
         loggedStatus: session.status,
         incoming: invitation.fromSubscriberId !== self,
@@ -260,6 +266,7 @@ export function usePhoneCalls(
         ref: model.ref,
         messageId: model.messageId,
         sessionId: model.sessionId,
+        kind: model.kind,
         status: model.status,
         incoming: model.incoming,
         since: model.since,
@@ -287,14 +294,20 @@ export function usePhoneCalls(
         newChatControlDCMsg(model.ref.channelId, self, model.ref.userId, {
           subtype: "amend",
           targetMessageId: model.messageId,
-          phoneSession: { sessionId: model.sessionId, status: model.status },
+          // The amend rewrites the whole phoneSession body, so the kind
+          // rides along to keep the log entry's kind.
+          phoneSession: {
+            sessionId: model.sessionId,
+            status: model.status,
+            kind: model.kind,
+          },
         }),
       );
     }
   }, [models, me?.subscriberId, sendTo, deadSessions]);
 
   const startCall = useCallback(
-    (ref: ConversationRef) => {
+    (ref: ConversationRef, kind: DCPhoneSessionKind) => {
       const self = me?.subscriberId;
       if (self === undefined) return;
       if (calls[conversationKey(ref)] !== undefined) return;
@@ -306,6 +319,7 @@ export function usePhoneCalls(
           self,
           ref.userId,
           crypto.randomUUID(),
+          kind,
         ),
       );
     },

@@ -1,17 +1,21 @@
 "use client";
 
-// PhoneCallItem renders a phone-call message: the call log entry of one
-// voice call in the conversation history. Its status text moves with the
-// call ("inviting" → "accepted" → "ended", …) as the parties' amends
-// land — the message is the invitation, amended in place. The audio
-// itself never travels in the message.
+// PhoneCallItem renders a phone-call message: the call log entry of
+// one call (voice or video) in the conversation history. Its status
+// text moves with the call ("inviting" → "accepted" → "ended", …) as
+// the parties' amends land — the message is the invitation, amended in
+// place. The media itself never travels in the message.
 
 import { Box, Typography } from "@mui/material";
 import CallEndIcon from "@mui/icons-material/CallEnd";
+import MissedVideoCallIcon from "@mui/icons-material/MissedVideoCall";
 import PhoneDisabledIcon from "@mui/icons-material/PhoneDisabled";
 import PhoneInTalkIcon from "@mui/icons-material/PhoneInTalk";
 import PhoneMissedIcon from "@mui/icons-material/PhoneMissed";
 import RingVolumeIcon from "@mui/icons-material/RingVolume";
+import VideocamIcon from "@mui/icons-material/Videocam";
+import VideocamOffIcon from "@mui/icons-material/VideocamOff";
+import VideoCallIcon from "@mui/icons-material/VideoCall";
 import { formatDistanceToNow } from "date-fns";
 import { useTranslation } from "react-i18next";
 import type { ChatUser } from "@/api/ss/types";
@@ -35,6 +39,15 @@ const STATUS_ICON = {
   ended: CallEndIcon,
   rejected: PhoneDisabledIcon,
   cancelled: PhoneMissedIcon,
+} as const;
+
+// STATUS_ICON_VIDEO is the video call's status-icon set.
+const STATUS_ICON_VIDEO = {
+  inviting: VideoCallIcon,
+  accepted: VideocamIcon,
+  ended: VideocamOffIcon,
+  rejected: VideocamOffIcon,
+  cancelled: MissedVideoCallIcon,
 } as const;
 
 export function PhoneCallItem({ message, author, isOwn }: PhoneCallItemProps) {
@@ -61,7 +74,9 @@ export function PhoneCallItem({ message, author, isOwn }: PhoneCallItemProps) {
         return isOwn ? t("chat.call.cancelled") : t("chat.call.missed");
     }
   };
-  const StatusIcon = STATUS_ICON[message.phoneStatus];
+  const StatusIcon = (
+    message.kind === "video" ? STATUS_ICON_VIDEO : STATUS_ICON
+  )[message.phoneStatus];
   // Ringing and in-call entries are live states, tinted; the rest are
   // settled history.
   const live =

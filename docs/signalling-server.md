@@ -170,13 +170,13 @@ Every frame is one JSON `DCMsg`: `mimeVersion` (`1.0`), `channelId`,
 tag, and the body. Malformed frames are dropped silently, mirroring the
 SS's rule for malformed events.
 
-| `mimeType`                           | Body                                                                                                               | Meaning                                                                                                                                                                                                   |
-| ------------------------------------ | ------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `text/plain`                         | `plaintext`                                                                                                        | A plain-text chat line.                                                                                                                                                                                   |
-| `application/x-file-transfer-status` | `fileTransfer {fileId, kind, filename, fileMIMEType, fileSizeTotalBytes, fileSizeTransferred, fileTransferStatus}` | The UI state of a file transfer (`pending` → `running` → `done`). The file's bytes never travel in the message; the opaque, globally unique `fileId` is the handle a recipient passes back to fetch them. |
-| `application/x-chat-control`         | `chatControl {subtype, targetMessageId, text?, fileTransfer?, phoneSession?}`                                      | Mutates the UI state of one of the sender's earlier messages instead of adding a line — the result of something, never its cause.                                                                         |
-| `application/x-phone-session`        | `phoneSession {sessionId, status}`                                                                                 | A voice-call invitation (see _Phone sessions_): stored, rendered as the call's log entry; its `status` is the session's UI state, amended via chat control.                                               |
-| `application/x-phone-session-event`  | `phoneSessionEvent {sessionId, action}`                                                                            | One action of the phone session protocol (`accept` / `reject` / `cancel` / `end`) — see _Phone sessions_. Never rendered.                                                                                 |
+| `mimeType`                           | Body                                                                                                               | Meaning                                                                                                                                                                                                                                            |
+| ------------------------------------ | ------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `text/plain`                         | `plaintext`                                                                                                        | A plain-text chat line.                                                                                                                                                                                                                            |
+| `application/x-file-transfer-status` | `fileTransfer {fileId, kind, filename, fileMIMEType, fileSizeTotalBytes, fileSizeTransferred, fileTransferStatus}` | The UI state of a file transfer (`pending` → `running` → `done`). The file's bytes never travel in the message; the opaque, globally unique `fileId` is the handle a recipient passes back to fetch them.                                          |
+| `application/x-chat-control`         | `chatControl {subtype, targetMessageId, text?, fileTransfer?, phoneSession?}`                                      | Mutates the UI state of one of the sender's earlier messages instead of adding a line — the result of something, never its cause.                                                                                                                  |
+| `application/x-phone-session`        | `phoneSession {sessionId, status, kind?}`                                                                          | A call invitation (see _Phone sessions_): stored, rendered as the call's log entry; its `status` is the session's UI state, amended via chat control. `kind` is `voice` (the default when absent — the field postdates the invitation) or `video`. |
+| `application/x-phone-session-event`  | `phoneSessionEvent {sessionId, action}`                                                                            | One action of the phone session protocol (`accept` / `reject` / `cancel` / `end`) — see _Phone sessions_. Never rendered.                                                                                                                          |
 
 Chat-control semantics: `delete` drops the target message; `amend`
 rewrites the target's body — `text` for a text message, `fileTransfer`
@@ -255,23 +255,25 @@ whose only other effect is the file dialog's `accept` filter) and is
 never derived from the file's MIME type; the transfer path over `dcbin`
 is the same for all three.
 
-### Phone sessions (voice calls)
+### Phone sessions (voice and video calls)
 
-A voice call is a phone session between one (channel, subscriber) pair,
-managed per pair and deliberately decoupled from the peer connection's
-own signalling state: it rides the same per-pair connection as the
-messaging and binary channels — no dedicated connection is created for a
-call. Two deliberately separate layers:
+A call — voice or video — is a phone session between one (channel,
+subscriber) pair, managed per pair and deliberately decoupled from the
+peer connection's own signalling state: it rides the same per-pair
+connection as the messaging and binary channels — no dedicated
+connection is created for a call. Two deliberately separate layers:
 
 - **The session protocol — the cause.** The actions are their own wire
   frames. The caller opens the session with an
-  `application/x-phone-session` DCMsg (`phoneSession {sessionId,
+  `application/x-phone-session` DCMsg (`phoneSession {sessionId, kind,
 status: "inviting"}`) — the invitation, stored on both ends as the
-  call's log entry; its arrival is what rings the callee. The session's
-  later actions are `application/x-phone-session-event` DCMsg frames
-  (`phoneSessionEvent {sessionId, action}`): the callee sends `accept` /
-  `reject`, the caller sends `cancel` (before an answer), either party
-  sends `end` (after). Each end folds the session's frames into its
+  call's log entry; its arrival is what rings the callee. `kind` says
+  what the session carries: `voice` attaches the microphones only,
+  `video` additionally the cameras (see _Media and audio_). The
+  session's later actions are `application/x-phone-session-event` DCMsg
+  frames (`phoneSessionEvent {sessionId, action}`): the callee sends
+  `accept` / `reject`, the caller sends `cancel` (before an answer),
+  either party sends `end` (after). Each end folds the session's frames into its
   protocol state (`usePhoneCalls`); the fold takes the precedence
   maximum over `inviting` < `accepted` < `ended` < `cancelled` <
   `rejected`, so a cancel/accept race settles identically on both ends
@@ -298,6 +300,18 @@ Media and audio:
   the last accepted call detaches, so the browser's recording indicator
   lights exactly while a call is sending. Remote tracks arrive via
   `ontrack` (`PeerSessions.subscribeTracks`).
+- A video call additionally attaches the local camera track — a plain
+  `getUserMedia({ video: true })` capture in `useCallMedia`,
+  reference-counted between concurrent video calls exactly like the
+  mic — and keeps the peer's incoming video track as its own
+  MediaStream. The videos render in floating, draggable, borderless
+  cards scoped to the chat app, not the conversation (`VideoWindow`):
+  one peer view per accepted video call, captioned with the peer's
+  name, plus one mirrored "me" preview while the camera sends. The
+  cards' video elements are muted: the call's audio keeps flowing
+  through the audio graph below, so the volume menu and the FFT taps
+  apply unchanged. A denied camera degrades the call, never fails it —
+  a video call without a camera is a voice call.
 - All call audio runs through one shared `AudioContext`
   (`web/site/src/api/audio/audiograph.tsx`, provided like the SSProxy
   singleton): the microphone passes a gain node (the mic send volume)

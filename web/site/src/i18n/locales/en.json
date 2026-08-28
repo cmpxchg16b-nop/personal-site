@@ -99,11 +99,13 @@
     },
     "call": {
       "start": "Start a voice call",
+      "startVideo": "Start a video call",
       "end": "End the call",
       "cancel": "Cancel",
       "accept": "Accept the call",
       "decline": "Decline the call",
       "incoming": "Incoming call",
+      "incomingVideo": "Incoming video call",
       "outgoing": "Outgoing call",
       "calling": "Calling {{name}}…",
       "ringingHint": "Answer from the call popup.",
@@ -113,6 +115,7 @@
       "cancelled": "Call cancelled",
       "missed": "Missed call",
       "you": "You",
+      "me": "Me",
       "incomingShort": "Incoming",
       "callingShort": "Calling…",
       "inCallShort": "In call"

@@ -99,11 +99,13 @@
     },
     "call": {
       "start": "发起语音通话",
+      "startVideo": "发起视频通话",
       "end": "结束通话",
       "cancel": "取消",
       "accept": "接听",
       "decline": "拒绝",
       "incoming": "来电",
+      "incomingVideo": "视频来电",
       "outgoing": "去电",
       "calling": "正在呼叫 {{name}}…",
       "ringingHint": "在通话弹窗中接听。",
@@ -113,6 +115,7 @@
       "cancelled": "通话已取消",
       "missed": "未接来电",
       "you": "你",
+      "me": "我",
       "incomingShort": "来电",
       "callingShort": "呼叫中…",
       "inCallShort": "通话中"

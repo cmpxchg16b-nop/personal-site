@@ -40,6 +40,9 @@ export function useChatMessages(dcMsgs: DCMsgs): Record<string, ChatMessage[]> {
               id: m.msgId,
               authorId: m.fromSubscriberId,
               sessionId: m.phoneSession.sessionId,
+              // The kind field postdates the invitation: absent is a
+              // voice call.
+              kind: m.phoneSession.kind ?? "voice",
               phoneStatus: m.phoneSession.status,
               timestamp: m.creationTimestamp,
             };

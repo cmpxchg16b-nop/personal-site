@@ -97,7 +97,11 @@ export function CallPanel({
             />
             <Typography variant="body2" sx={{ fontWeight: 600 }}>
               {call.incoming
-                ? t("chat.call.incoming")
+                ? t(
+                    call.kind === "video"
+                      ? "chat.call.incomingVideo"
+                      : "chat.call.incoming",
+                  )
                 : t("chat.call.calling", { name: peerName })}
             </Typography>
             {call.incoming && (

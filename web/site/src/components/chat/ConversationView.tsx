@@ -11,6 +11,7 @@ import ArrowBackIcon from "@mui/icons-material/ArrowBack";
 import CallEndIcon from "@mui/icons-material/CallEnd";
 import CallIcon from "@mui/icons-material/Call";
 import ForumOutlinedIcon from "@mui/icons-material/ForumOutlined";
+import VideocamIcon from "@mui/icons-material/Videocam";
 import { useTranslation } from "react-i18next";
 import type { ChatUser } from "@/api/ss/types";
 import { CallPanel } from "./CallPanel";
@@ -48,8 +49,10 @@ type ConversationViewProps = {
   // (see usePeerSessions' connectionStates), or null when no session
   // exists (yet); the header's presence line renders it.
   connectionState: RTCPeerConnectionState | null;
-  // Rings the peer (the header's call button).
+  // Rings the peer (the header's voice call button).
   onStartCall: () => void;
+  // Rings the peer with video (the header's video call button).
+  onStartVideoCall: () => void;
   // Hangs the live call up — a cancel while ringing, an end in call.
   onEndCall: () => void;
   // FFT taps of the two voices while in call (see useCallMedia).
@@ -105,6 +108,7 @@ export default function ConversationView({
   call,
   connectionState,
   onStartCall,
+  onStartVideoCall,
   onEndCall,
   localAnalyser,
   remoteAnalyser,
@@ -230,36 +234,53 @@ export default function ConversationView({
             {t(presenceKey(conversation.user.online, connectionState))}
           </Typography>
         </Box>
-        {/* The call button, at the header's right end: it rings the peer,
-            or hangs the live call up. Incoming calls are answered from
+        {/* The call buttons, at the header's right end: they ring the
+            peer — voice and video. While a call is live, its kind's
+            button shows the state (or hangs the call up) and the other
+            kind's button is disabled. Incoming calls are answered from
             the global popup, so while one rings this button just shows
             the ringing state. */}
-        {call === null ? (
-          <IconButton
-            onClick={onStartCall}
-            disabled={!conversation.user.online}
-            aria-label={t("chat.call.start")}
-            sx={{ ml: "auto" }}
-          >
-            <CallIcon />
-          </IconButton>
-        ) : call.incoming && call.status === "inviting" ? (
-          <IconButton
-            disabled
-            aria-label={t("chat.call.incoming")}
-            sx={{ ml: "auto" }}
-          >
-            <CallIcon />
-          </IconButton>
-        ) : (
-          <IconButton
-            onClick={onEndCall}
-            aria-label={t("chat.call.end")}
-            sx={{ ml: "auto", color: "error.main" }}
-          >
-            <CallEndIcon />
-          </IconButton>
-        )}
+        {(["video", "voice"] as const).map((kind, index) => {
+          const KindIcon = kind === "video" ? VideocamIcon : CallIcon;
+          const sx = index === 0 ? { ml: "auto" } : undefined;
+          if (call === null || call.kind !== kind) {
+            return (
+              <IconButton
+                key={kind}
+                onClick={kind === "video" ? onStartVideoCall : onStartCall}
+                disabled={call !== null || !conversation.user.online}
+                aria-label={t(
+                  kind === "video" ? "chat.call.startVideo" : "chat.call.start",
+                )}
+                sx={sx}
+              >
+                <KindIcon />
+              </IconButton>
+            );
+          }
+          if (call.incoming && call.status === "inviting") {
+            return (
+              <IconButton
+                key={kind}
+                disabled
+                aria-label={t("chat.call.incoming")}
+                sx={sx}
+              >
+                <KindIcon />
+              </IconButton>
+            );
+          }
+          return (
+            <IconButton
+              key={kind}
+              onClick={onEndCall}
+              aria-label={t("chat.call.end")}
+              sx={{ ...sx, color: "error.main" }}
+            >
+              <CallEndIcon />
+            </IconButton>
+          );
+        })}
       </Box>
       {call !== null && (
         <CallPanel

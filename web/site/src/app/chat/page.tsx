@@ -72,11 +72,8 @@ export default function ChatPage() {
   const audio = useAudioGraph();
   const { calls, startCall, acceptCall, rejectCall, hangupCall } =
     usePhoneCalls(me, dcMsgs, sessions, sendTo, audio);
-  const { localAnalyser, remoteAnalyserFor } = useCallMedia(
-    sessions,
-    audio,
-    calls,
-  );
+  const { localAnalyser, remoteAnalyserFor, localCamera, remoteVideoFor } =
+    useCallMedia(sessions, audio, calls);
   const { localVolume, remoteVolume, setLocalVolume, setRemoteVolume } =
     useCallVolumes(audio);
   const { echoCancellation, setEchoCancellation } = useEchoCancellation(audio);
@@ -229,6 +226,8 @@ export default function ChatPage() {
         onEndCall={hangupCall}
         localAnalyser={localAnalyser}
         remoteAnalyserFor={remoteAnalyserFor}
+        localCamera={localCamera}
+        remoteVideoFor={remoteVideoFor}
       />
     </>
   );

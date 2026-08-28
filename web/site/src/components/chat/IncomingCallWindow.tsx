@@ -12,6 +12,7 @@ import { Avatar, Box, IconButton, Paper, Typography } from "@mui/material";
 import CallIcon from "@mui/icons-material/Call";
 import CallEndIcon from "@mui/icons-material/CallEnd";
 import DragIndicatorIcon from "@mui/icons-material/DragIndicator";
+import VideocamIcon from "@mui/icons-material/Videocam";
 import { useTranslation } from "react-i18next";
 import type { ChatUser } from "@/api/ss/types";
 import UserAvatar from "./UserAvatar";
@@ -112,7 +113,11 @@ export function IncomingCallWindow({
           {caller?.name ?? call.ref.userId}
         </Typography>
         <Typography variant="caption" color="text.secondary">
-          {t("chat.call.incoming")}
+          {t(
+            call.kind === "video"
+              ? "chat.call.incomingVideo"
+              : "chat.call.incoming",
+          )}
         </Typography>
         <Box sx={{ display: "flex", gap: 3, mt: 0.5 }}>
           <IconButton
@@ -135,7 +140,7 @@ export function IncomingCallWindow({
               "&:hover": { bgcolor: "success.dark" },
             }}
           >
-            <CallIcon />
+            {call.kind === "video" ? <VideocamIcon /> : <CallIcon />}
           </IconButton>
         </Box>
       </Box>

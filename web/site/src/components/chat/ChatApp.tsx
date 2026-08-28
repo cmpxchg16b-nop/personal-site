@@ -2,6 +2,7 @@
 
 import { useState } from "react";
 import { Paper } from "@mui/material";
+import { useTranslation } from "react-i18next";
 import type {
   ChannelId,
   ChatChannel,
@@ -12,12 +13,14 @@ import type { PeerConnectionStates } from "@/api/ss/peersessions";
 import ChatSidebar from "./ChatSidebar";
 import ConversationView from "./ConversationView";
 import { IncomingCallWindow } from "./IncomingCallWindow";
+import { VideoWindow } from "./VideoWindow";
 import {
   conversationKey,
   type ActivePhoneCall,
   type ChatMessage,
   type Conversation,
   type ConversationRef,
+  type PhoneCallKind,
   type TransferKind,
 } from "./types";
 
@@ -74,8 +77,8 @@ type ChatAppProps = {
   // usePeerSessions): the open conversation's presence line renders its
   // peer's state.
   connectionStates: PeerConnectionStates;
-  // Rings a conversation's peer.
-  onStartCall: (ref: ConversationRef) => void;
+  // Rings a conversation's peer with a call of the given kind.
+  onStartCall: (ref: ConversationRef, kind: PhoneCallKind) => void;
   // Picks up / declines a ringing incoming call (the popup's buttons).
   onAcceptCall: (call: ActivePhoneCall) => void;
   onRejectCall: (call: ActivePhoneCall) => void;
@@ -87,6 +90,15 @@ type ChatAppProps = {
     channelId: ChannelId,
     peer: SubscriberId,
   ) => AnalyserNode | null;
+  // The local camera's stream while an accepted video call holds it —
+  // the "me" view (see useCallMedia).
+  localCamera: MediaStream | null;
+  // One pair's incoming camera stream while its accepted video call
+  // carries it — the peer view (see useCallMedia).
+  remoteVideoFor: (
+    channelId: ChannelId,
+    peer: SubscriberId,
+  ) => MediaStream | null;
 };
 
 export default function ChatApp({
@@ -109,7 +121,10 @@ export default function ChatApp({
   onEndCall,
   localAnalyser,
   remoteAnalyserFor,
+  localCamera,
+  remoteVideoFor,
 }: ChatAppProps) {
+  const { t } = useTranslation();
   const [mobileListOpen, setMobileListOpen] = useState(false);
 
   const conversation: Conversation | null =
@@ -138,6 +153,13 @@ export default function ChatApp({
     selected === null
       ? null
       : (connectionStates[selected.channelId]?.[selected.userId] ?? null);
+
+  // The accepted video calls show their floating views: one peer view
+  // per call (its camera stream may not have arrived yet), and the one
+  // shared "me" view while the camera is sending.
+  const videoCalls = Object.values(calls).filter(
+    (call) => call.status === "accepted" && call.kind === "video",
+  );
 
   const handleSelect = (ref: ConversationRef) => {
     onSelect(ref);
@@ -180,7 +202,12 @@ export default function ChatApp({
           getFileByFileId={getFileByFileId}
           call={activeCall}
           connectionState={peerConnectionState}
-          onStartCall={() => selected !== null && onStartCall(selected)}
+          onStartCall={() =>
+            selected !== null && onStartCall(selected, "voice")
+          }
+          onStartVideoCall={() =>
+            selected !== null && onStartCall(selected, "video")
+          }
           onEndCall={() => activeCall !== null && onEndCall(activeCall)}
           localAnalyser={localAnalyser}
           remoteAnalyser={
@@ -202,6 +229,29 @@ export default function ChatApp({
         onAccept={onAcceptCall}
         onReject={onRejectCall}
       />
+      {/* The video calls' floating views: the peers' cameras, and our
+          own while it sends. */}
+      {videoCalls.map((call) => {
+        const stream = remoteVideoFor(call.ref.channelId, call.ref.userId);
+        if (stream === null) return null;
+        return (
+          <VideoWindow
+            key={conversationKey(call.ref)}
+            title={users[call.ref.userId]?.name ?? call.ref.userId}
+            stream={stream}
+            home={{ top: 120, right: 48 }}
+          />
+        );
+      })}
+      {videoCalls.length > 0 && localCamera !== null && (
+        <VideoWindow
+          title={t("chat.call.me")}
+          stream={localCamera}
+          mirrored
+          home={{ bottom: 72, right: 48 }}
+          width={200}
+        />
+      )}
     </>
   );
 }

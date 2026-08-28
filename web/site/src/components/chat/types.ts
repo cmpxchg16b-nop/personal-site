@@ -4,6 +4,7 @@
 import type { ChatUser } from "@/api/ss/types";
 import type {
   DCFileTransferKind,
+  DCPhoneSessionKind,
   DCPhoneSessionStatus,
 } from "@/api/ss/datachannel";
 
@@ -75,6 +76,11 @@ export type MediaChatMessage = ImageChatMessage | VideoChatMessage;
 // type, re-exported so UI components stay free of api imports.
 export type PhoneSessionStatus = DCPhoneSessionStatus;
 
+// PhoneCallKind is what a call carries — voice only, or voice and
+// video — the wire type, re-exported so UI components stay free of api
+// imports.
+export type PhoneCallKind = DCPhoneSessionKind;
+
 // PhoneCallMessage is the call log entry of one voice call: the
 // invitation's arrival rendered in the history, its phoneStatus moving
 // with the session ("inviting" → "accepted" → "ended", …) as the
@@ -86,8 +92,10 @@ export type PhoneCallMessage = {
   // The caller (the invitation's author).
   authorId: string;
   sessionId: string;
+  // What the call carries — voice only, or voice and video.
+  kind: PhoneCallKind;
   phoneStatus: PhoneSessionStatus;
-  // Unix seconds of the invitation, matching TextChatMessage.timestamp.
+  // Unix seconds of the invitation.
   timestamp: number;
 };
 
@@ -124,6 +132,8 @@ export type ActivePhoneCall = {
   // point at.
   messageId: string;
   sessionId: string;
+  // What the call carries — voice only, or voice and video.
+  kind: PhoneCallKind;
   status: "inviting" | "accepted";
   // true when the peer is ringing us (we are the callee).
   incoming: boolean;
