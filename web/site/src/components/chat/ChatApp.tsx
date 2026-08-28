@@ -250,7 +250,7 @@ export default function ChatApp({
             key={conversationKey(call.ref)}
             title={users[call.ref.userId]?.name ?? call.ref.userId}
             stream={stream}
-            home={{ top: 96, right: 48 }}
+            home={{ top: 120, right: 48 }}
           />
         );
       })}
