@@ -1,15 +1,14 @@
 import { useMemo } from "react";
 import {
   DC_MSG_MIME_FILE_TRANSFER_STATUS,
-  DC_MSG_MIME_PHONE_SESSION,
-  DC_MSG_MIME_PHONE_SESSION_EVENT,
+  DC_MSG_MIME_SIP,
   type DCMsgs,
 } from "@/api/ss/datachannel";
 import { conversationKey, type ChatMessage } from "./types";
 
 // useChatMessages derives the conversations' renderable messages from the
-// raw data-channel store: the peers' messages plus the echoes of our own
-// (echo set), mapped onto the chat domain, keyed by conversation key,
+// raw data-channel store: the peers' messages plus our own sends (echo
+// set), mapped onto the chat domain, keyed by conversation key,
 // oldest first. Chat-control effects are already applied to the store by
 // useDataChannel. Derived at render time — there is nothing to sync.
 export function useChatMessages(dcMsgs: DCMsgs): Record<string, ChatMessage[]> {
@@ -18,32 +17,34 @@ export function useChatMessages(dcMsgs: DCMsgs): Record<string, ChatMessage[]> {
     for (const bySender of Object.values(dcMsgs)) {
       for (const senderMsgs of Object.values(bySender)) {
         for (const m of senderMsgs) {
-          // Phone-session events are the call protocol's frames, not
-          // renderable messages: they drive usePhoneCalls' session
-          // state, and the log entry's status follows via chat-control
-          // amends of the invitation.
-          if (m.mimeType === DC_MSG_MIME_PHONE_SESSION_EVENT) continue;
+          // A dialog's SIP messages past the INVITE (responses, CANCEL,
+          // BYE) are the call protocol's frames, not renderable
+          // messages: they drive usePhoneCalls' session state, and the
+          // log entry's status follows via chat-control amends of the
+          // INVITE.
+          if (m.mimeType === DC_MSG_MIME_SIP && m.sip?.method !== "INVITE") {
+            continue;
+          }
           // The conversation's peer is the message's other end: its
-          // sender, or its recipient for an echo of our own message.
+          // sender, or its recipient for our own copy (echo set —
+          // bounced back for chat kinds, recorded at send time for
+          // SIP).
           const key = conversationKey({
             kind: "dm",
             channelId: m.channelId,
             userId: m.echo === true ? m.toSubscriberId : m.fromSubscriberId,
           });
           let msg: ChatMessage;
-          if (
-            m.mimeType === DC_MSG_MIME_PHONE_SESSION &&
-            m.phoneSession !== undefined
-          ) {
+          if (m.mimeType === DC_MSG_MIME_SIP && m.sip !== undefined) {
             msg = {
               type: "phone-call",
               id: m.msgId,
               authorId: m.fromSubscriberId,
-              sessionId: m.phoneSession.sessionId,
-              // The kind field postdates the invitation: absent is a
-              // voice call.
-              kind: m.phoneSession.kind ?? "voice",
-              phoneStatus: m.phoneSession.status,
+              callId: m.sip.callId,
+              // X-Media stands in for the stripped SDP's m= lines:
+              // absent is a voice call.
+              kind: m.sip["X-Media"] ?? "voice",
+              phoneStatus: m.sip["X-Call-Status"] ?? "inviting",
               timestamp: m.creationTimestamp,
             };
           } else if (

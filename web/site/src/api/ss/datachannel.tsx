@@ -19,7 +19,10 @@
  * anything else. A data channel does not echo its own messages back,
  * so the recipient bounces every message it accepts back to the sender
  * with the echo flag set: the sender's own messages arrive as echoes
- * over the same channel.
+ * over the same channel. The one exception is the call protocol
+ * (application/x-sip): like real SIP, a dialog message is never
+ * bounced — the sender records its own copy when it sends, so a
+ * call's behavior never depends on an echo.
  */
 
 import { useCallback, useEffect, useState } from "react";
@@ -70,26 +73,41 @@ export interface DCFileTransfer {
 // chatControl field): delete or amend an earlier message.
 export const DC_MSG_MIME_CHAT_CONTROL = "application/x-chat-control";
 
-// DC_MSG_MIME_PHONE_SESSION: a phone (voice or video call) session
-// invitation (body in the phoneSession field). The caller opens a
-// session by sending one; it is stored and rendered as the call's log
-// entry, and its status — the session's UI state — is amended via chat
-// control by the invitation's owner as the session's events unfold (see
-// DC_MSG_MIME_PHONE_SESSION_EVENT). The invitation's arrival is also
-// the invite action itself: it is what rings the callee.
-export const DC_MSG_MIME_PHONE_SESSION = "application/x-phone-session";
+// DC_MSG_MIME_SIP: one message of the phone (voice or video call)
+// session protocol (body in the sip field) — a SIP subset with the SDP
+// body stripped. Every message of a call's dialog is one of these, and
+// every one is behavior: the caller's INVITE opens the dialog (stored
+// and rendered as the call's log entry; its arrival is what rings the
+// callee), the callee answers it with a response (200 OK / 603
+// Decline), the caller aborts the ring with a CANCEL, either party
+// hangs an established call up with a BYE. Each end folds the dialog's
+// messages into its session state (see usePhoneCalls); the log entry's
+// displayed status only follows the dialog (via chat-control amends of
+// the INVITE), never leads it.
+//
+// The subset and its deliberate omissions:
+//
+// - The SDP body is stripped. This system's actual SDP offer/answer
+//   lives elsewhere: it rides the SS's client-to-client relay between
+//   the two browsers' PerfectNegotiators (see peersessions.tsx) when
+//   the pair's peer connection negotiates and renegotiates. These
+//   messages are pure dialog verbs.
+// - No ACK, no CSeq, and no echo: SCTP delivery is ordered and
+//   reliable, and the fold is order-independent (a precedence
+//   maximum). Unlike every other DCMsg kind, a dialog message is never
+//   bounced back to its sender — like real SIP, each end advances its
+//   own state from its own sends (recorded locally at send time, see
+//   useDataChannel) and the peer's sends (received), never from an
+//   echo.
+// - From / To live on the DCMsg envelope (fromSubscriberId /
+//   toSubscriberId); the dialog identifier (SIP's Call-ID) is in the
+//   body.
+// - What cannot be expressed in standard SIP terms travels as SIP-style
+//   extension headers (X-*), see DCSip.
+export const DC_MSG_MIME_SIP = "application/x-sip";
 
-// DC_MSG_MIME_PHONE_SESSION_EVENT: one action on a phone session (body
-// in the phoneSessionEvent field): the callee accepts or rejects the
-// invitation, the caller cancels the ring, either party ends the call.
-// The events ARE the phone session protocol — they drive each end's
-// session state. They never appear in the UI; the log entry's status
-// only follows the session (via chat-control amends), never leads it.
-export const DC_MSG_MIME_PHONE_SESSION_EVENT =
-  "application/x-phone-session-event";
-
-// DC_PHONE_SESSION_STATUSES are the lifecycle states of a phone session.
-export const DC_PHONE_SESSION_STATUSES = [
+// DC_CALL_STATUSES are the lifecycle states of a phone call's dialog.
+export const DC_CALL_STATUSES = [
   "inviting",
   "accepted",
   "rejected",
@@ -97,65 +115,77 @@ export const DC_PHONE_SESSION_STATUSES = [
   "ended",
 ] as const;
 
-// DCPhoneSessionStatus is one lifecycle state of a phone session:
-// "inviting" (the caller is ringing), "accepted" (the callee picked up —
-// media flows), "rejected" (the callee declined), "cancelled" (the
-// caller hung up before an answer), "ended" (an accepted call was hung
-// up).
-export type DCPhoneSessionStatus = (typeof DC_PHONE_SESSION_STATUSES)[number];
+// DCCallStatus is one lifecycle state of a phone call: "inviting" (the
+// caller's INVITE is ringing), "accepted" (the callee answered 200 OK —
+// media flows), "rejected" (the callee answered 603 Decline),
+// "cancelled" (the caller CANCELed before an answer), "ended" (an
+// accepted call was hung up with a BYE).
+export type DCCallStatus = (typeof DC_CALL_STATUSES)[number];
 
-// DC_PHONE_SESSION_KINDS are the kinds of a phone session.
-export const DC_PHONE_SESSION_KINDS = ["voice", "video"] as const;
+// DC_CALL_KINDS are the kinds of a phone call.
+export const DC_CALL_KINDS = ["voice", "video"] as const;
 
-// DCPhoneSessionKind is what a phone session carries: "voice" attaches
-// the microphones only, "video" additionally the cameras.
-export type DCPhoneSessionKind = (typeof DC_PHONE_SESSION_KINDS)[number];
+// DCCallKind is what a call carries: "voice" attaches the microphones
+// only, "video" additionally the cameras.
+export type DCCallKind = (typeof DC_CALL_KINDS)[number];
 
-// DCPhoneSession is the body of a phone-session invitation DCMsg: the
-// session's identity and kind plus its UI state (the status the log
-// entry and the status indicators display). The status is a dependent
-// variable — it changes only when the session's events (the accept /
-// reject / cancel / end actions) caused it, the amendment riding chat
-// control.
-export interface DCPhoneSession {
-  /** opaque, globally unique identifier of the phone session, minted by
-      the caller with the invitation */
-  sessionId: string;
-  status: DCPhoneSessionStatus;
-  /** what the session carries; absent on the wire means "voice" (the
-      field postdates the invitation) */
-  kind?: DCPhoneSessionKind;
-}
+// DC_SIP_METHODS are the request methods of the SIP subset: the caller
+// opens the dialog with an INVITE and aborts the ring with a CANCEL
+// (before a final response); either party hangs an established dialog
+// up with a BYE.
+export const DC_SIP_METHODS = ["INVITE", "CANCEL", "BYE"] as const;
 
-// DC_PHONE_SESSION_ACTIONS are the actions of the phone session
-// protocol.
-export const DC_PHONE_SESSION_ACTIONS = [
-  "accept",
-  "reject",
-  "cancel",
-  "end",
-] as const;
+// DCSipMethod is one request method of the SIP subset.
+export type DCSipMethod = (typeof DC_SIP_METHODS)[number];
 
-// DCPhoneSessionAction is one action on a phone session: "accept" and
-// "reject" answer the invitation (the callee), "cancel" aborts the ring
-// (the caller, before an answer), "end" hangs up an accepted call
-// (either party).
-export type DCPhoneSessionAction = (typeof DC_PHONE_SESSION_ACTIONS)[number];
+// DC_SIP_RESPONSE_OK / DC_SIP_RESPONSE_DECLINE are the INVITE's final
+// responses: the callee picks up (200 OK) or declines (603 Decline).
+export const DC_SIP_RESPONSE_OK = { code: 200, phrase: "OK" } as const;
+export const DC_SIP_RESPONSE_DECLINE = {
+  code: 603,
+  phrase: "Decline",
+} as const;
 
-// DCPhoneSessionEvent is the body of a phone-session-event DCMsg: one
-// action of the session protocol, addressed to the session's other
-// party. Event frames are exchanged over the data channel like any
-// DCMsg (and echoed like any), so both ends fold the same actions into
-// their session state.
-export interface DCPhoneSessionEvent {
-  /** the session the action belongs to (its invitation's sessionId) */
-  sessionId: string;
-  action: DCPhoneSessionAction;
+// DCSipResponse is a SIP status line: the response code and its reason
+// phrase, as one of the well-known pairs above.
+export type DCSipResponse =
+  typeof DC_SIP_RESPONSE_OK | typeof DC_SIP_RESPONSE_DECLINE;
+
+// DCSip is the body of a SIP-subset DCMsg: one message of a call's
+// dialog, addressed to the dialog's other party by callId. The messages
+// ARE the phone session protocol — they drive each end's session state.
+// They travel the data channel like any DCMsg, but — unlike any other
+// kind — are never echoed: the sender folds its own send in at send
+// time (see useDataChannel), so both ends fold the same messages into
+// their session state without any bounce. Only the INVITE is rendered
+// (the call's log entry) and only the INVITE is amendable (its
+// X-Call-Status, via chat control).
+export interface DCSip {
+  /** the dialog's identifier — SIP's Call-ID header; minted by the
+      caller with the INVITE, named by every later message of the
+      dialog */
+  callId: string;
+  /** the start line of a request: its method. Exactly one of method /
+      response is set — a SIP start line is a request line XOR a
+      status line */
+  method?: DCSipMethod;
+  /** the start line of a response: its status line */
+  response?: DCSipResponse;
+  /** extension header, INVITE only: what the dialog carries — "voice"
+      or "video" — standing in for the stripped SDP body's m= lines;
+      absent means "voice" */
+  "X-Media"?: DCCallKind;
+  /** extension header, INVITE only: the dialog's logged UI state — the
+      status the log entry and the status indicators display. Not a
+      SIP notion, and a dependent variable: it changes only when the
+      dialog's messages caused it, the amendment riding chat control
+      (and only the INVITE's author — the caller — amends) */
+  "X-Call-Status"?: DCCallStatus;
 }
 
 // DCChatControl is the body of a chat-control DCMsg. For "delete" only
 // targetMessageId is set. For "amend" exactly one of text /
-// fileTransfer / phoneSession carries the target's new content; the
+// fileTransfer / sip carries the target's new content; the
 // amendment keeps the target's original id and timestamp (see
 // applyChatControlDCMsg below).
 export interface DCChatControl {
@@ -165,10 +195,10 @@ export interface DCChatControl {
   text?: string;
   /** amended status, when the target is a file-transfer status message */
   fileTransfer?: DCFileTransfer;
-  /** amended status, when the target is a phone-session invitation;
-      only the invitation's owner (the caller) amends it, reporting the
-      session's new UI state after its events unfolded */
-  phoneSession?: DCPhoneSession;
+  /** amended content, when the target is a call's INVITE; only the
+      INVITE's author (the caller) amends it, reporting the dialog's
+      new UI state (X-Call-Status) after its messages unfolded */
+  sip?: DCSip;
 }
 
 // DCMsg is a message carried over a WebRTC data channel.
@@ -184,10 +214,11 @@ export interface DCMsg {
   msgId: MsgId;
   inReplyTo?: MsgId;
   /**
-   * true when this frame is an echo: the recipient's copy of the
-   * message bounced back to its sender, so the sender sees its own
-   * message — a data channel does not echo on its own. Absent on the
-   * original send; echoes are never echoed again.
+   * true marks the sender's own copy of the message. For echoed kinds
+   * the copy arrives bounced back by the recipient (a data channel
+   * does not echo on its own; echoes are never echoed again). A SIP
+   * message (application/x-sip) is never bounced: the sender records
+   * its own copy at send time. Absent on the original wire frame.
    */
   echo?: boolean;
   /** the body kind; see DC_MSG_MIME_PLAINTEXT et al. */
@@ -199,11 +230,8 @@ export interface DCMsg {
   fileTransfer?: DCFileTransfer;
   /** the control operation when mimeType is DC_MSG_MIME_CHAT_CONTROL */
   chatControl?: DCChatControl;
-  /** the phone session state when mimeType is DC_MSG_MIME_PHONE_SESSION */
-  phoneSession?: DCPhoneSession;
-  /** the session protocol action when mimeType is
-      DC_MSG_MIME_PHONE_SESSION_EVENT */
-  phoneSessionEvent?: DCPhoneSessionEvent;
+  /** the SIP-subset message when mimeType is DC_MSG_MIME_SIP */
+  sip?: DCSip;
 }
 
 // DCMsgs maps channelId → sender subscriber id → the list of messages
@@ -280,18 +308,16 @@ export function newChatControlDCMsg(
   };
 }
 
-// newPhoneSessionDCMsg builds the phone-session DCMsg to
-// toSubscriberId that opens a call of the given kind: the invitation,
-// carrying a freshly minted session id and the initial "inviting"
-// status. The message is stored on both ends (via the echo) as the
-// call's log entry; its status — the session's UI state — is amended
-// later via chat control as the session's events unfold.
-export function newPhoneSessionDCMsg(
+// newSipDCMsg builds the DCMsg carrying one message of a call's
+// SIP-subset dialog to toSubscriberId — an INVITE (the call's log
+// entry, stored on both ends via the echo), a response to it, a
+// CANCEL, or a BYE — minting a fresh msg id and stamping the creation
+// time.
+export function newSipDCMsg(
   channelId: ChannelId,
   fromSubscriberId: SubscriberId,
   toSubscriberId: SubscriberId,
-  sessionId: string,
-  kind: DCPhoneSessionKind,
+  sip: DCSip,
   inReplyTo?: MsgId,
 ): DCMsg {
   return {
@@ -302,33 +328,9 @@ export function newPhoneSessionDCMsg(
     creationTimestamp: Date.now() / 1000,
     msgId: crypto.randomUUID(),
     inReplyTo,
-    mimeType: DC_MSG_MIME_PHONE_SESSION,
+    mimeType: DC_MSG_MIME_SIP,
     plaintext: "",
-    phoneSession: { sessionId, status: "inviting", kind },
-  };
-}
-
-// newPhoneSessionEventDCMsg builds one phone-session-event DCMsg to
-// toSubscriberId: an action of the session protocol (accept / reject /
-// cancel / end), minting a fresh msg id and stamping the creation time.
-export function newPhoneSessionEventDCMsg(
-  channelId: ChannelId,
-  fromSubscriberId: SubscriberId,
-  toSubscriberId: SubscriberId,
-  phoneSessionEvent: DCPhoneSessionEvent,
-  inReplyTo?: MsgId,
-): DCMsg {
-  return {
-    mimeVersion: DC_MSG_MIME_VERSION,
-    channelId,
-    fromSubscriberId,
-    toSubscriberId,
-    creationTimestamp: Date.now() / 1000,
-    msgId: crypto.randomUUID(),
-    inReplyTo,
-    mimeType: DC_MSG_MIME_PHONE_SESSION_EVENT,
-    plaintext: "",
-    phoneSessionEvent,
+    sip,
   };
 }
 
@@ -355,21 +357,47 @@ function isWellFormedFileTransfer(ft: DCFileTransfer): boolean {
   );
 }
 
-// isWellFormedPhoneSession reports whether ps is a structurally valid
-// DCPhoneSession.
-function isWellFormedPhoneSession(ps: DCPhoneSession): boolean {
+// isWellFormedSip reports whether sip is a structurally valid DCSip: a
+// callId, a start line that is a request line XOR a status line, and
+// the extension headers on the INVITE alone (X-Call-Status required
+// there, X-Media optional).
+function isWellFormedSip(sip: DCSip): boolean {
+  if (typeof sip.callId !== "string") return false;
+  // SIP's start line is a request line XOR a status line.
+  if ((sip.method === undefined) === (sip.response === undefined)) {
+    return false;
+  }
+  // Extension headers belong to the INVITE alone.
+  if (
+    sip.method !== "INVITE" &&
+    (sip["X-Media"] !== undefined || sip["X-Call-Status"] !== undefined)
+  ) {
+    return false;
+  }
+  if (sip.response !== undefined) {
+    const r = sip.response;
+    return (
+      (r.code === DC_SIP_RESPONSE_OK.code &&
+        r.phrase === DC_SIP_RESPONSE_OK.phrase) ||
+      (r.code === DC_SIP_RESPONSE_DECLINE.code &&
+        r.phrase === DC_SIP_RESPONSE_DECLINE.phrase)
+    );
+  }
+  const method = sip.method;
+  if (
+    method === undefined ||
+    !(DC_SIP_METHODS as readonly string[]).includes(method)
+  ) {
+    return false;
+  }
+  if (method !== "INVITE") return true;
+  const status = sip["X-Call-Status"];
+  const media = sip["X-Media"];
   return (
-    typeof ps.sessionId === "string" &&
-    (DC_PHONE_SESSION_STATUSES as readonly string[]).includes(ps.status)
-  );
-}
-
-// isWellFormedPhoneSessionEvent reports whether ev is a structurally
-// valid DCPhoneSessionEvent.
-function isWellFormedPhoneSessionEvent(ev: DCPhoneSessionEvent): boolean {
-  return (
-    typeof ev.sessionId === "string" &&
-    (DC_PHONE_SESSION_ACTIONS as readonly string[]).includes(ev.action)
+    typeof status === "string" &&
+    (DC_CALL_STATUSES as readonly string[]).includes(status) &&
+    (media === undefined ||
+      (DC_CALL_KINDS as readonly string[]).includes(media))
   );
 }
 
@@ -413,23 +441,14 @@ function decodeDCMsg(data: unknown): DCMsg | null {
       (cc.text !== undefined && typeof cc.text !== "string") ||
       (cc.fileTransfer !== undefined &&
         !isWellFormedFileTransfer(cc.fileTransfer)) ||
-      (cc.phoneSession !== undefined &&
-        !isWellFormedPhoneSession(cc.phoneSession))
+      (cc.sip !== undefined && !isWellFormedSip(cc.sip))
     ) {
       return null;
     }
   }
   if (
-    msg.mimeType === DC_MSG_MIME_PHONE_SESSION &&
-    (msg.phoneSession === undefined ||
-      !isWellFormedPhoneSession(msg.phoneSession))
-  ) {
-    return null;
-  }
-  if (
-    msg.mimeType === DC_MSG_MIME_PHONE_SESSION_EVENT &&
-    (msg.phoneSessionEvent === undefined ||
-      !isWellFormedPhoneSessionEvent(msg.phoneSessionEvent))
+    msg.mimeType === DC_MSG_MIME_SIP &&
+    (msg.sip === undefined || !isWellFormedSip(msg.sip))
   ) {
     return null;
   }
@@ -455,14 +474,14 @@ function appendDCMsg(prev: DCMsgs, msg: DCMsg): DCMsgs {
 // applyChatControlDCMsg applies a chat-control message to the sender's own
 // stored messages: "delete" drops the target, "amend" rewrites its body
 // (plaintext for a text message, fileTransfer for a file-transfer status,
-// phoneSession for a phone-session invitation), keeping the target's
+// sip for a call's INVITE), keeping the target's
 // msgId and creationTimestamp — an amendment never moves or reattributes
 // a message. A chat control only ever mutates UI state: the actions that
 // CAUSED the new state are their own frames (the file-transfer
-// acknowledgements, the phone session events), never chat controls.
+// acknowledgements, the dialog's SIP messages), never chat controls.
 // Controls targeting another sender's message, an unknown message, or a
-// mismatched body kind are no-ops; a phone-session amend must also name
-// the invitation's own session.
+// mismatched body kind are no-ops; an INVITE amend must also be an
+// INVITE naming the target dialog's own callId.
 function applyChatControlDCMsg(
   prev: DCMsgs,
   channelId: ChannelId,
@@ -489,12 +508,14 @@ function applyChatControlDCMsg(
   ) {
     amended = { ...target, fileTransfer: cc.fileTransfer };
   } else if (
-    cc.phoneSession !== undefined &&
-    target.mimeType === DC_MSG_MIME_PHONE_SESSION &&
-    target.phoneSession !== undefined &&
-    target.phoneSession.sessionId === cc.phoneSession.sessionId
+    cc.sip !== undefined &&
+    target.mimeType === DC_MSG_MIME_SIP &&
+    target.sip !== undefined &&
+    target.sip.method === "INVITE" &&
+    cc.sip.method === "INVITE" &&
+    target.sip.callId === cc.sip.callId
   ) {
-    amended = { ...target, phoneSession: cc.phoneSession };
+    amended = { ...target, sip: cc.sip };
   }
   if (amended === null) return prev;
   const next = [...list];
@@ -504,9 +525,10 @@ function applyChatControlDCMsg(
 
 // applyDCMsg folds one inbound DCMsg into the store: a chat-control
 // message mutates the sender's earlier message and is never stored;
-// anything else appends. Phone-session events append like ordinary
-// messages — they are the session protocol's record the phone-call state
-// is folded from; useChatMessages simply never renders them.
+// anything else appends. SIP messages append like ordinary messages —
+// they are the call protocol's record the phone-call state is folded
+// from; useChatMessages renders the INVITE (the log entry) and simply
+// never renders the rest of the dialog.
 function applyDCMsg(prev: DCMsgs, msg: DCMsg): DCMsgs {
   const cc =
     msg.mimeType === DC_MSG_MIME_CHAT_CONTROL ? msg.chatControl : undefined;
@@ -519,16 +541,21 @@ function applyDCMsg(prev: DCMsgs, msg: DCMsg): DCMsgs {
 export interface UseDataChannelResult {
   /**
    * Messages received from data channels so far: first key the channel
-   * id, second key the sender's subscriber id, oldest first. Our own
-   * messages come back as echoes (echo set) under our own subscriber
-   * id. Chat-control messages are applied on arrival — the target is
+   * id, second key the sender's subscriber id, oldest first. The own
+   * subscriber id's list holds our own sends (echo set): chat kinds
+   * arrive as echoes bounced back by their recipients; SIP messages are
+   * never echoed, so our own SIP sends are recorded at send time.
+   * Chat-control messages are applied on arrival — the target is
    * deleted or amended in place — and never show up in the store.
    */
   dcMsgs: DCMsgs;
   /**
    * Sends one DCMsg on the data channel to msg.toSubscriberId. While no
    * channel to that peer is open — not negotiated yet, or the peer is
-   * gone — the message is dropped with a warning.
+   * gone — the message is dropped with a warning. A SIP message that
+   * goes out is additionally recorded locally as our own send (echo
+   * set): SIP messages are never echoed back, so the call's state must
+   * advance from the send itself.
    */
   sendTo: (msg: DCMsg) => void;
 }
@@ -579,8 +606,12 @@ export function useDataChannel(
             return;
           }
           setDcMsgs((prev) => applyDCMsg(prev, msg));
-          // Bounce the message back so the sender sees its own message.
-          dc.send(encodeDCMsg({ ...msg, echo: true }));
+          // Bounce the message back so the sender sees its own message
+          // — except SIP messages: like real SIP, a dialog message is
+          // never bounced; the sender records its own sends (sendTo).
+          if (msg.mimeType !== DC_MSG_MIME_SIP) {
+            dc.send(encodeDCMsg({ ...msg, echo: true }));
+          }
         };
       },
     );
@@ -602,6 +633,13 @@ export function useDataChannel(
         return;
       }
       dc.send(encodeDCMsg(msg));
+      // A SIP message is never echoed back (the receive path skips its
+      // bounce): record the sender's own copy locally, echo set, so the
+      // dialog's state advances from the send itself — never from a
+      // bounce.
+      if (msg.mimeType === DC_MSG_MIME_SIP) {
+        setDcMsgs((prev) => applyDCMsg(prev, { ...msg, echo: true }));
+      }
     },
     [sessions],
   );

@@ -3,9 +3,9 @@
 
 import type { ChatUser } from "@/api/ss/types";
 import type {
+  DCCallKind,
+  DCCallStatus,
   DCFileTransferKind,
-  DCPhoneSessionKind,
-  DCPhoneSessionStatus,
 } from "@/api/ss/datachannel";
 
 // TransferKind is how a transfer is announced and rendered: a plain file
@@ -74,28 +74,29 @@ export type MediaChatMessage = ImageChatMessage | VideoChatMessage;
 
 // PhoneSessionStatus is the lifecycle state of a voice call — the wire
 // type, re-exported so UI components stay free of api imports.
-export type PhoneSessionStatus = DCPhoneSessionStatus;
+export type PhoneSessionStatus = DCCallStatus;
 
 // PhoneCallKind is what a call carries — voice only, or voice and
 // video — the wire type, re-exported so UI components stay free of api
 // imports.
-export type PhoneCallKind = DCPhoneSessionKind;
+export type PhoneCallKind = DCCallKind;
 
 // PhoneCallMessage is the call log entry of one voice call: the
-// invitation's arrival rendered in the history, its phoneStatus moving
-// with the session ("inviting" → "accepted" → "ended", …) as the
-// parties' amends land. The audio itself never travels in the message —
+// INVITE's arrival rendered in the history, its phoneStatus moving
+// with the dialog ("inviting" → "accepted" → "ended", …) as the
+// caller's amends land. The audio itself never travels in the message —
 // it flows over the peer connection while the status says "accepted".
 export type PhoneCallMessage = {
   type: "phone-call";
   id: string;
-  // The caller (the invitation's author).
+  // The caller (the INVITE's author).
   authorId: string;
-  sessionId: string;
+  // The dialog's identifier (the INVITE's Call-ID).
+  callId: string;
   // What the call carries — voice only, or voice and video.
   kind: PhoneCallKind;
   phoneStatus: PhoneSessionStatus;
-  // Unix seconds of the invitation.
+  // Unix seconds of the INVITE.
   timestamp: number;
 };
 
@@ -123,15 +124,16 @@ export type Conversation = { kind: "dm"; channelId: string; user: ChatUser };
 // ActivePhoneCall is the live view of an ongoing voice call with a
 // conversation's peer: ringing ("inviting") or in call ("accepted").
 // Terminal states are not here — they live in the history as
-// PhoneCallMessages. Derived from the conversation's latest phone-call
-// message by usePhoneCalls.
+// PhoneCallMessages. Derived from the conversation's latest INVITE by
+// usePhoneCalls.
 export type ActivePhoneCall = {
   // The conversation the call belongs to.
   ref: ConversationRef;
-  // The invitation message's id — the target the parties' status amends
+  // The INVITE message's id — the target the caller's status amends
   // point at.
   messageId: string;
-  sessionId: string;
+  // The dialog's identifier (the INVITE's Call-ID).
+  callId: string;
   // What the call carries — voice only, or voice and video.
   kind: PhoneCallKind;
   status: "inviting" | "accepted";

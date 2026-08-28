@@ -162,7 +162,10 @@ says the peer's signalling client is connected.
 - **Echo.** A data channel does not echo; the recipient bounces every
   message back with `echo: true` so the sender sees its own message.
   Echoes are never echoed again. Both sides therefore build the same
-  history from the same frames.
+  history from the same frames. The one exception is the call protocol
+  (`application/x-sip`): like real SIP, a dialog message is never
+  bounced — the sender records its own copy at send time, so a call's
+  behavior never depends on an echo.
 
 Every frame is one JSON `DCMsg`: `mimeVersion` (`1.0`), `channelId`,
 `fromSubscriberId`, `toSubscriberId`, `creationTimestamp` (Unix seconds),
@@ -170,27 +173,26 @@ Every frame is one JSON `DCMsg`: `mimeVersion` (`1.0`), `channelId`,
 tag, and the body. Malformed frames are dropped silently, mirroring the
 SS's rule for malformed events.
 
-| `mimeType`                           | Body                                                                                                               | Meaning                                                                                                                                                                                                                                            |
-| ------------------------------------ | ------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `text/plain`                         | `plaintext`                                                                                                        | A plain-text chat line.                                                                                                                                                                                                                            |
-| `application/x-file-transfer-status` | `fileTransfer {fileId, kind, filename, fileMIMEType, fileSizeTotalBytes, fileSizeTransferred, fileTransferStatus}` | The UI state of a file transfer (`pending` → `running` → `done`). The file's bytes never travel in the message; the opaque, globally unique `fileId` is the handle a recipient passes back to fetch them.                                          |
-| `application/x-chat-control`         | `chatControl {subtype, targetMessageId, text?, fileTransfer?, phoneSession?}`                                      | Mutates the UI state of one of the sender's earlier messages instead of adding a line — the result of something, never its cause.                                                                                                                  |
-| `application/x-phone-session`        | `phoneSession {sessionId, status, kind?}`                                                                          | A call invitation (see _Phone sessions_): stored, rendered as the call's log entry; its `status` is the session's UI state, amended via chat control. `kind` is `voice` (the default when absent — the field postdates the invitation) or `video`. |
-| `application/x-phone-session-event`  | `phoneSessionEvent {sessionId, action}`                                                                            | One action of the phone session protocol (`accept` / `reject` / `cancel` / `end`) — see _Phone sessions_. Never rendered.                                                                                                                          |
+| `mimeType`                           | Body                                                                                                               | Meaning                                                                                                                                                                                                                                                                     |
+| ------------------------------------ | ------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `text/plain`                         | `plaintext`                                                                                                        | A plain-text chat line.                                                                                                                                                                                                                                                     |
+| `application/x-file-transfer-status` | `fileTransfer {fileId, kind, filename, fileMIMEType, fileSizeTotalBytes, fileSizeTransferred, fileTransferStatus}` | The UI state of a file transfer (`pending` → `running` → `done`). The file's bytes never travel in the message; the opaque, globally unique `fileId` is the handle a recipient passes back to fetch them.                                                                   |
+| `application/x-chat-control`         | `chatControl {subtype, targetMessageId, text?, fileTransfer?, sip?}`                                               | Mutates the UI state of one of the sender's earlier messages instead of adding a line — the result of something, never its cause.                                                                                                                                           |
+| `application/x-sip`                  | `sip {callId, method?/response?, X-Media?, X-Call-Status?}`                                                        | One message of a call's SIP-subset dialog (see _Phone sessions_): the caller's INVITE (stored, rendered as the call's log entry; its arrival rings the callee), the callee's response (`200 OK` / `603 Decline`), the caller's CANCEL, or either party's BYE. Never echoed. |
 
 Chat-control semantics: `delete` drops the target message; `amend`
 rewrites the target's body — `text` for a text message, `fileTransfer`
-for a file-transfer status, `phoneSession` for a phone-session
-invitation (which must also name the invitation's own session) — while
+for a file-transfer status, `sip` for a call's INVITE (which must also
+be an INVITE naming the target dialog's own `callId`) — while
 keeping its `msgId` and `creationTimestamp`, so an amendment never moves
 or reattributes a message. Only the sender's own messages can be
 targeted; unknown targets and body-kind mismatches are no-ops. A chat
 control only ever mutates **UI state**: it is how one end tells the
 other "display this differently now", the _result_ of something that
-already happened — a file transfer's acknowledgements advancing, a phone
-session's events unfolding — never the _cause_; the actions themselves
-are their own frames (the `dcbin` acknowledgement frames, the
-phone-session events). The receiver applies a control message on
+already happened — a file transfer's acknowledgements advancing, a call
+dialog's messages unfolding — never the _cause_; the actions themselves
+are their own frames (the `dcbin` acknowledgement frames, the SIP
+dialog's messages). The receiver applies a control message on
 arrival, the sender when its echo comes back, so both histories stay
 identical; control messages themselves are never stored.
 
@@ -263,32 +265,47 @@ peer connection's own signalling state: it rides the same per-pair
 connection as the messaging and binary channels — no dedicated
 connection is created for a call. Two deliberately separate layers:
 
-- **The session protocol — the cause.** The actions are their own wire
-  frames. The caller opens the session with an
-  `application/x-phone-session` DCMsg (`phoneSession {sessionId, kind,
-status: "inviting"}`) — the invitation, stored on both ends as the
-  call's log entry; its arrival is what rings the callee. `kind` says
-  what the session carries: `voice` attaches the microphones only,
-  `video` additionally the cameras (see _Media and audio_). The
-  session's later actions are `application/x-phone-session-event` DCMsg
-  frames (`phoneSessionEvent {sessionId, action}`): the callee sends
-  `accept` / `reject`, the caller sends `cancel` (before an answer),
-  either party sends `end` (after). Each end folds the session's frames into its
-  protocol state (`usePhoneCalls`); the fold takes the precedence
-  maximum over `inviting` < `accepted` < `ended` < `cancelled` <
-  `rejected`, so a cancel/accept race settles identically on both ends
-  and a terminal session is never revived. Media attach and the live
-  indicators (the answer popup, the sidebar pills, the conversation
-  strip) read this state.
-- **The session's UI state — the dependent variable.** The invitation
-  message's stored `status` is what the history's log entry displays; it
-  only ever follows the protocol state. When a session's protocol state
-  has moved on from its logged status, the session's owner — the caller,
-  the invitation's author — reports the new UI state with a chat-control
-  `amend` of the invitation (`phoneSession {sessionId, status}`),
-  exactly like a file transfer's sender amends its status message as
-  acknowledgements arrive. Chat control's own-messages-only rule is
-  untouched; the echo keeps both logs identical.
+- **The session protocol — the cause.** The actions are a SIP subset
+  with the SDP body stripped: `application/x-sip` DCMsgs (body `sip`),
+  one per dialog action. The caller opens the dialog with an INVITE —
+  stored on both ends as the call's log entry; its arrival is what
+  rings the callee. The callee answers the INVITE with a final
+  response — `200 OK` (accept) or `603 Decline` (reject); the caller
+  aborts the ring with a CANCEL (before the answer); either party hangs
+  an established call up with a BYE. The body carries the dialog's
+  identifier (`callId` — SIP's Call-ID) and its start line (a request
+  `method` XOR a `response` status line); what cannot be expressed in
+  standard SIP terms rides as extension headers (X-*): `X-Media` says
+  what the call carries — `voice` (the default when absent) attaches
+  the microphones only, `video` additionally the cameras (see _Media
+  and audio_) — standing in for the stripped SDP body's `m=` lines; and
+  `X-Call-Status` carries the UI state (below). The SDP body is
+  stripped because this system's actual SDP offer/answer lives
+  elsewhere: it rides the SS's client-to-client relay between the two
+  ends' PerfectNegotiators as the pair's peer connection negotiates and
+  renegotiates — these messages are pure dialog verbs. The subset also
+  omits SIP's ACK and CSeq (SCTP delivery is ordered and reliable, and
+  the state fold is order-independent) and — unlike every other DCMsg
+  kind — a dialog message is **never echoed**: like real SIP, each end
+  advances its own state from its own sends (recorded locally at send
+  time) and the peer's sends (received), never from a bounce. Each end
+  folds the dialog's messages into its protocol state (`usePhoneCalls`)
+  as the precedence maximum over `inviting` < `accepted` < `ended` <
+  `cancelled` < `rejected`, so a cancel/accept race settles identically
+  on both ends and a terminal session is never revived. Media attach
+  and the live indicators (the answer popup, the sidebar pills, the
+  conversation strip) read this state.
+- **The session's UI state — the dependent variable.** The INVITE's
+  stored `X-Call-Status` header is what the history's log entry
+  displays; it only ever follows the protocol state. When a session's
+  protocol state has moved on from its logged status, the session's
+  owner — the caller, the INVITE's author — reports the new UI state
+  with a chat-control `amend` of the INVITE (a `sip` body: the INVITE
+  again, `X-Call-Status` updated), exactly like a file transfer's
+  sender amends its status message as acknowledgements arrive. Chat
+  control is a separate layer with its own echo discipline and its
+  own-messages-only rule — the SIP dialog never echoes and never
+  depends on chat control.
 
 Media and audio:
 
@@ -340,9 +357,8 @@ Media and audio:
   pulling it the track stays muted and the graph sees silence; the
   graph alone carries the audible path.
 - A peer dropping out mid-call ends the session locally (a dead-session
-  overlay — there is nobody left to exchange the protocol with); the log
+  overlay — there is nobody left to exchange the dialog with); the log
   entry keeps its last logged status.
-  amend the invitation with).
 
 ### Magic commands
 

@@ -3,42 +3,50 @@
 // usePhoneCalls manages the phone (voice / video call) sessions, one
 // per (channel, peer subscriber) pair. Two deliberately separate layers:
 //
-// - The session PROTOCOL — the cause. Actions are their own wire
-//   frames: the caller's invitation (an application/x-phone-session
-//   DCMsg, also stored as the call's log entry) and the session events
-//   (application/x-phone-session-event DCMsgs: accept / reject / cancel
-//   / end). Each end folds the session's frames into its state below;
-//   media (useCallMedia) and the live indicators (the answer popup, the
-//   sidebar pills, the conversation strip) read this state.
+// - The session PROTOCOL — the cause. The actions are their own wire
+//   frames: a SIP subset (application/x-sip DCMsgs, see
+//   datachannel.tsx) with the SDP body stripped — the caller's INVITE
+//   opens the dialog (also stored as the call's log entry), the callee
+//   answers it with a response (200 OK / 603 Decline), the caller
+//   callee answers it with a response (200 OK / 603 Decline), the
+//   caller aborts the ring with a CANCEL, either party hangs up with a
+//   BYE. Each end folds the dialog's messages into its state below —
+//   its own sends fold in at send time (a SIP message is never
+//   echoed), the peer's sends on arrival; media (useCallMedia) and the
+//   live indicators (the answer popup, the sidebar pills, the
+//   conversation strip) read this state.
 //
-// - The session's UI STATE — the dependent variable. The invitation
-//   message's stored status is what the history's log entry displays;
-//   it only follows the protocol state, never leads it. When the
-//   protocol state of a session we OWN (we are the caller — the
-//   invitation's author) has moved on from its logged status, this hook
-//   reports the new UI state with a chat-control amend, exactly like a
-//   file transfer's sender amends its status message as
-//   acknowledgements arrive. The receiver applies the amend on arrival,
-//   we apply our own via its echo, and chat control keeps its
-//   own-messages-only rule.
+// - The session's UI STATE — the dependent variable. The INVITE's
+//   X-Call-Status header is what the history's log entry displays; it
+//   only follows the protocol state, never leads it. When the protocol
+//   state of a session we OWN (we are the caller — the INVITE's author)
+//   has moved on from its logged status, this hook reports the new UI
+//   state with a chat-control amend, exactly like a file transfer's
+//   sender amends its status message as acknowledgements arrive. Chat
+//   control is a separate layer with its own echo discipline (the
+//   receiver applies the amend on arrival, we apply our own via its
+//   echo) and its own-messages-only rule — the SIP dialog itself never
+//   echoes and never depends on chat control.
 //
 // Both layers are decoupled from the peer connection's own signalling
 // state: the connection is usePeerSessions', shared with messaging and
-// file transfer, and no dedicated connection is created for a call.
+// file transfer, and no dedicated connection is created for a call (the
+// actual SDP offer/answer rides the SS's client-to-client relay between
+// the two ends' PerfectNegotiators — hence the stripped SDP body here).
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { AudioGraph } from "@/api/audio/audiograph";
 import {
-  DC_MSG_MIME_PHONE_SESSION,
-  DC_MSG_MIME_PHONE_SESSION_EVENT,
+  DC_MSG_MIME_SIP,
+  DC_SIP_RESPONSE_DECLINE,
+  DC_SIP_RESPONSE_OK,
   newChatControlDCMsg,
-  newPhoneSessionDCMsg,
-  newPhoneSessionEventDCMsg,
+  newSipDCMsg,
+  type DCCallKind,
+  type DCCallStatus,
   type DCMsg,
   type DCMsgs,
-  type DCPhoneSessionAction,
-  type DCPhoneSessionKind,
-  type DCPhoneSessionStatus,
+  type DCSip,
 } from "@/api/ss/datachannel";
 import type { PeerSessions } from "@/api/ss/peersessions";
 import type { ChatUser } from "@/api/ss/types";
@@ -49,29 +57,35 @@ import {
   type ConversationRef,
 } from "./types";
 
-// statusOfAction maps a session protocol action onto the session state
-// it establishes.
-function statusOfAction(action: DCPhoneSessionAction): DCPhoneSessionStatus {
-  switch (action) {
-    case "accept":
-      return "accepted";
-    case "reject":
-      return "rejected";
-    case "cancel":
+// statusEstablishedBy maps one message of the dialog onto the session
+// state it establishes: the INVITE opens "inviting" (the fold's
+// floor), the INVITE's final response answers it (200 OK → accepted,
+// 603 Decline → rejected), a CANCEL aborts the ring, a BYE hangs an
+// established call up.
+function statusEstablishedBy(sip: DCSip): DCCallStatus {
+  if (sip.response !== undefined) {
+    return sip.response.code === DC_SIP_RESPONSE_OK.code
+      ? "accepted"
+      : "rejected";
+  }
+  switch (sip.method) {
+    case "CANCEL":
       return "cancelled";
-    case "end":
+    case "BYE":
       return "ended";
+    default:
+      return "inviting"; // INVITE
   }
 }
 
 // statusPrecedence totally orders the session states so that folding a
-// session's frames yields the same state on both ends regardless of
+// dialog's messages yields the same state on both ends regardless of
 // arrival order (each end sees its own sends as echoes and the peer's
 // sends directly): the fold is the precedence maximum. A no-call
 // terminal (rejected/cancelled) therefore always settles a cancel/accept
 // race the same way on both ends, and a terminal session is never
 // revived.
-function statusPrecedence(status: DCPhoneSessionStatus): number {
+function statusPrecedence(status: DCCallStatus): number {
   switch (status) {
     case "inviting":
       return 0;
@@ -87,22 +101,22 @@ function statusPrecedence(status: DCPhoneSessionStatus): number {
 }
 
 // PhoneSessionModel is one (channel, peer) pair's current phone session:
-// the protocol state its frames fold into (status — it leads), plus the
-// UI state the invitation message currently shows (loggedStatus — it
-// follows, via this hook's chat-control amends).
+// the protocol state its dialog's messages fold into (status — it
+// leads), plus the UI state the INVITE currently shows (loggedStatus —
+// it follows, via this hook's chat-control amends).
 interface PhoneSessionModel {
   ref: ConversationRef;
-  // The invitation message's id — the target the UI-state amends point
-  // at.
+  // The INVITE message's id — the target the UI-state amends point at.
   messageId: string;
-  sessionId: string;
+  // The dialog's identifier (the INVITE's Call-ID).
+  callId: string;
   // What the session carries — voice only, or voice and video.
-  kind: DCPhoneSessionKind;
-  status: DCPhoneSessionStatus;
-  loggedStatus: DCPhoneSessionStatus;
+  kind: DCCallKind;
+  status: DCCallStatus;
+  loggedStatus: DCCallStatus;
   // true when the peer called us (we are the callee).
   incoming: boolean;
-  // Unix seconds of the invitation.
+  // Unix seconds of the INVITE.
   since: number;
 }
 
@@ -116,19 +130,19 @@ export interface UsePhoneCallsResult {
   calls: Record<string, ActivePhoneCall>;
   /**
    * Rings the conversation's peer with a call of the given kind: sends
-   * the invitation. No-op without an own subscription or while a call
+   * the INVITE. No-op without an own subscription or while a call
    * with the peer is live. Wakes the audio graph inside the click's
    * user gesture, so the caller's side can play and capture audio when
    * the callee later accepts without a gesture on this end.
    */
-  startCall: (ref: ConversationRef, kind: DCPhoneSessionKind) => void;
-  /** Picks up an incoming call: sends the accept event. */
+  startCall: (ref: ConversationRef, kind: DCCallKind) => void;
+  /** Picks up an incoming call: answers the INVITE 200 OK. */
   acceptCall: (call: ActivePhoneCall) => void;
-  /** Declines an incoming call: sends the reject event. */
+  /** Declines an incoming call: answers the INVITE 603 Decline. */
   rejectCall: (call: ActivePhoneCall) => void;
   /**
-   * Hangs up a live call: sends the cancel event while still ringing
-   * (the caller), the end event once accepted (either party).
+   * Hangs up a live call: sends a CANCEL while still ringing (the
+   * caller), a BYE once accepted (either party).
    */
   hangupCall: (call: ActivePhoneCall) => void;
 }
@@ -141,10 +155,10 @@ export function usePhoneCalls(
   audio: AudioGraph | null,
 ): UsePhoneCallsResult {
   // Sessions force-ended locally: when a peer's session drops mid-call
-  // there is nobody left to exchange the protocol with, so the
-  // session's death is kept in this local overlay instead of on the
-  // wire. The derivation treats overlaid sessions as terminated; the
-  // history's call log entry keeps its last logged status.
+  // there is nobody left to exchange the dialog with, so the session's
+  // death is kept in this local overlay instead of on the wire. The
+  // derivation treats overlaid sessions as terminated; the history's
+  // call log entry keeps its last logged status.
   const [deadSessions, setDeadSessions] = useState<ReadonlySet<string>>(
     new Set(),
   );
@@ -163,7 +177,7 @@ export function usePhoneCalls(
         ) {
           continue;
         }
-        dying.add(call.sessionId);
+        dying.add(call.callId);
       }
       if (dying.size > 0) {
         setDeadSessions((prev) => new Set([...prev, ...dying]));
@@ -171,29 +185,23 @@ export function usePhoneCalls(
     });
   }, [sessions]);
 
-  // The session models: fold every conversation's phone frames — the
-  // invitations and the session events of both parties — into the
-  // current session's protocol state.
+  // The session models: fold every conversation's SIP messages — both
+  // parties' dialogs, invitations and answers alike — into the current
+  // session's protocol state.
   const models = useMemo(() => {
     const self = me?.subscriberId;
     if (self === undefined) return {};
-    // First collect each conversation's invitations and events. A
-    // conversation's frames live in the peer's sender list (their
-    // sends) and in our own (the echoes of our sends).
-    const perConversation = new Map<
-      string,
-      { invitations: DCMsg[]; events: DCMsg[] }
-    >();
+    // First collect each conversation's SIP messages. A conversation's
+    // frames live in the peer's sender list (their sends) and in our
+    // own (our sends, recorded locally at send time — SIP is never
+    // echoed).
+    const perConversation = new Map<string, DCMsg[]>();
     for (const [channelId, bySender] of Object.entries(dcMsgs)) {
       for (const list of Object.values(bySender)) {
         for (const m of list) {
-          const isInvitation =
-            m.mimeType === DC_MSG_MIME_PHONE_SESSION &&
-            m.phoneSession !== undefined;
-          const isEvent =
-            m.mimeType === DC_MSG_MIME_PHONE_SESSION_EVENT &&
-            m.phoneSessionEvent !== undefined;
-          if (!isInvitation && !isEvent) continue;
+          if (m.mimeType !== DC_MSG_MIME_SIP || m.sip === undefined) {
+            continue;
+          }
           // The conversation's peer is the frame's other end: its
           // sender, or its recipient for an echo of our own frame.
           const key = conversationKey({
@@ -201,36 +209,30 @@ export function usePhoneCalls(
             channelId,
             userId: m.echo === true ? m.toSubscriberId : m.fromSubscriberId,
           });
-          const bucket = perConversation.get(key) ?? {
-            invitations: [],
-            events: [],
-          };
-          (isInvitation ? bucket.invitations : bucket.events).push(m);
+          const bucket = perConversation.get(key) ?? [];
+          bucket.push(m);
           perConversation.set(key, bucket);
         }
       }
     }
     const out: Record<string, PhoneSessionModel> = {};
-    for (const [key, { invitations, events }] of perConversation) {
-      // The current session is the latest invitation's; earlier ones
-      // are terminated calls' log entries.
-      let invitation: DCMsg | null = null;
-      for (const m of invitations) {
-        if (
-          invitation === null ||
-          m.creationTimestamp > invitation.creationTimestamp
-        ) {
-          invitation = m;
+    for (const [key, dialog] of perConversation) {
+      // The current session is the latest INVITE's dialog; earlier
+      // ones are terminated calls' log entries.
+      let invite: DCMsg | null = null;
+      for (const m of dialog) {
+        if (m.sip?.method !== "INVITE") continue;
+        if (invite === null || m.creationTimestamp > invite.creationTimestamp) {
+          invite = m;
         }
       }
-      if (invitation === null) continue;
-      const session = invitation.phoneSession;
-      if (session === undefined) continue;
-      let status: DCPhoneSessionStatus = "inviting";
-      for (const m of events) {
-        const ev = m.phoneSessionEvent;
-        if (ev === undefined || ev.sessionId !== session.sessionId) continue;
-        const s = statusOfAction(ev.action);
+      if (invite === null || invite.sip === undefined) continue;
+      const invitation = invite.sip;
+      let status: DCCallStatus = "inviting";
+      for (const m of dialog) {
+        const sip = m.sip;
+        if (sip === undefined || sip.callId !== invitation.callId) continue;
+        const s = statusEstablishedBy(sip);
         if (statusPrecedence(s) > statusPrecedence(status)) {
           status = s;
         }
@@ -239,15 +241,15 @@ export function usePhoneCalls(
       if (ref === null) continue;
       out[key] = {
         ref,
-        messageId: invitation.msgId,
-        sessionId: session.sessionId,
-        // The kind field postdates the invitation: absent is a voice
-        // call.
-        kind: session.kind ?? "voice",
+        messageId: invite.msgId,
+        callId: invitation.callId,
+        // X-Media stands in for the stripped SDP's m= lines: absent is
+        // a voice call.
+        kind: invitation["X-Media"] ?? "voice",
         status,
-        loggedStatus: session.status,
-        incoming: invitation.fromSubscriberId !== self,
-        since: invitation.creationTimestamp,
+        loggedStatus: invitation["X-Call-Status"] ?? "inviting",
+        incoming: invite.fromSubscriberId !== self,
+        since: invite.creationTimestamp,
       };
     }
     return out;
@@ -261,11 +263,11 @@ export function usePhoneCalls(
       if (model.status !== "inviting" && model.status !== "accepted") {
         continue;
       }
-      if (deadSessions.has(model.sessionId)) continue;
+      if (deadSessions.has(model.callId)) continue;
       out[key] = {
         ref: model.ref,
         messageId: model.messageId,
-        sessionId: model.sessionId,
+        callId: model.callId,
         kind: model.kind,
         status: model.status,
         incoming: model.incoming,
@@ -279,27 +281,28 @@ export function usePhoneCalls(
   }, [calls]);
 
   // The UI state follows the protocol state: for a session we own (we
-  // are the caller — the invitation's author), report the new status on
-  // the invitation message with a chat-control amend whenever the two
-  // have drifted apart. Self-terminating: the amend's echo brings the
-  // logged status up to date, ending the drift.
+  // are the caller — the INVITE's author), report the new status on the
+  // INVITE message with a chat-control amend whenever the two have
+  // drifted apart. Self-terminating: the amend's echo brings the logged
+  // status up to date, ending the drift.
   useEffect(() => {
     const self = me?.subscriberId;
     if (self === undefined) return;
     for (const model of Object.values(models)) {
       if (model.incoming) continue;
       if (model.status === model.loggedStatus) continue;
-      if (deadSessions.has(model.sessionId)) continue;
+      if (deadSessions.has(model.callId)) continue;
       sendTo(
         newChatControlDCMsg(model.ref.channelId, self, model.ref.userId, {
           subtype: "amend",
           targetMessageId: model.messageId,
-          // The amend rewrites the whole phoneSession body, so the kind
-          // rides along to keep the log entry's kind.
-          phoneSession: {
-            sessionId: model.sessionId,
-            status: model.status,
-            kind: model.kind,
+          // The amend rewrites the INVITE's whole sip body, so the
+          // X-Media header rides along to keep the log entry's kind.
+          sip: {
+            callId: model.callId,
+            method: "INVITE",
+            "X-Media": model.kind,
+            "X-Call-Status": model.status,
           },
         }),
       );
@@ -307,35 +310,34 @@ export function usePhoneCalls(
   }, [models, me?.subscriberId, sendTo, deadSessions]);
 
   const startCall = useCallback(
-    (ref: ConversationRef, kind: DCPhoneSessionKind) => {
+    (ref: ConversationRef, kind: DCCallKind) => {
       const self = me?.subscriberId;
       if (self === undefined) return;
       if (calls[conversationKey(ref)] !== undefined) return;
       // Inside the click's user gesture: wake the audio graph.
       audio?.resume();
       sendTo(
-        newPhoneSessionDCMsg(
-          ref.channelId,
-          self,
-          ref.userId,
-          crypto.randomUUID(),
-          kind,
-        ),
+        newSipDCMsg(ref.channelId, self, ref.userId, {
+          callId: crypto.randomUUID(),
+          method: "INVITE",
+          "X-Media": kind,
+          "X-Call-Status": "inviting",
+        }),
       );
     },
     [me?.subscriberId, calls, sendTo, audio],
   );
 
-  // act sends one session protocol event; its echo folds it into our
-  // own session state.
-  const act = useCallback(
-    (call: ActivePhoneCall, action: DCPhoneSessionAction) => {
+  // say sends one message of the call's dialog; the send itself folds
+  // it into our own session state (SIP messages are never echoed).
+  const say = useCallback(
+    (call: ActivePhoneCall, startLine: Omit<DCSip, "callId">) => {
       const self = me?.subscriberId;
       if (self === undefined) return;
       sendTo(
-        newPhoneSessionEventDCMsg(call.ref.channelId, self, call.ref.userId, {
-          sessionId: call.sessionId,
-          action,
+        newSipDCMsg(call.ref.channelId, self, call.ref.userId, {
+          callId: call.callId,
+          ...startLine,
         }),
       );
     },
@@ -346,18 +348,18 @@ export function usePhoneCalls(
     (call: ActivePhoneCall) => {
       // Inside the click's user gesture: wake the audio graph.
       audio?.resume();
-      act(call, "accept");
+      say(call, { response: DC_SIP_RESPONSE_OK });
     },
-    [act, audio],
+    [say, audio],
   );
   const rejectCall = useCallback(
-    (call: ActivePhoneCall) => act(call, "reject"),
-    [act],
+    (call: ActivePhoneCall) => say(call, { response: DC_SIP_RESPONSE_DECLINE }),
+    [say],
   );
   const hangupCall = useCallback(
     (call: ActivePhoneCall) =>
-      act(call, call.status === "accepted" ? "end" : "cancel"),
-    [act],
+      say(call, { method: call.status === "accepted" ? "BYE" : "CANCEL" }),
+    [say],
   );
 
   return { calls, startCall, acceptCall, rejectCall, hangupCall };
