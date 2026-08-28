@@ -229,20 +229,10 @@ export default function ChatApp({
         onAccept={onAcceptCall}
         onReject={onRejectCall}
       />
-      {/* The video calls' floating views: the peers' cameras, and our
-          own while it sends. */}
-      {videoCalls.map((call) => {
-        const stream = remoteVideoFor(call.ref.channelId, call.ref.userId);
-        if (stream === null) return null;
-        return (
-          <VideoWindow
-            key={conversationKey(call.ref)}
-            title={users[call.ref.userId]?.name ?? call.ref.userId}
-            stream={stream}
-            home={{ top: 120, right: 48 }}
-          />
-        );
-      })}
+      {/* The video calls' floating views: our own camera while it
+          sends, then the peers' cameras — rendered later at the same
+          z-index, a peer view always covers the "me" view, never the
+          other way round. */}
       {videoCalls.length > 0 && localCamera !== null && (
         <VideoWindow
           title={t("chat.call.me")}
@@ -252,6 +242,18 @@ export default function ChatApp({
           width={200}
         />
       )}
+      {videoCalls.map((call) => {
+        const stream = remoteVideoFor(call.ref.channelId, call.ref.userId);
+        if (stream === null) return null;
+        return (
+          <VideoWindow
+            key={conversationKey(call.ref)}
+            title={users[call.ref.userId]?.name ?? call.ref.userId}
+            stream={stream}
+            home={{ top: 96, right: 48 }}
+          />
+        );
+      })}
     </>
   );
 }
