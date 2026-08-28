@@ -5,7 +5,7 @@
 // conversation), like the incoming-call window: it stays visible while
 // the user wanders the chat. A borderless card: the video fills it,
 // captioned with the peer's name (the peer view) or "me" (our own
-// preview, mirrored like a mirror). Drag it by its caption strip.
+// preview, mirrored like a mirror). The whole card is draggable.
 
 import { useEffect, useRef, useState } from "react";
 import type { PointerEvent as ReactPointerEvent } from "react";
@@ -78,6 +78,10 @@ export function VideoWindow({
   return (
     <Paper
       elevation={8}
+      onPointerDown={onDragStart}
+      onPointerMove={onDragMove}
+      onPointerUp={onDragEnd}
+      onPointerCancel={onDragEnd}
       sx={{
         position: "fixed",
         ...home,
@@ -86,14 +90,12 @@ export function VideoWindow({
         borderRadius: 2,
         overflow: "hidden",
         transform: `translate(${offset.x}px, ${offset.y}px)`,
+        cursor: "grab",
+        touchAction: "none",
       }}
     >
-      {/* The caption strip doubles as the drag handle. */}
+      {/* The caption strip: the peer's name, or "me" for our own. */}
       <Box
-        onPointerDown={onDragStart}
-        onPointerMove={onDragMove}
-        onPointerUp={onDragEnd}
-        onPointerCancel={onDragEnd}
         sx={{
           display: "flex",
           alignItems: "center",
@@ -101,8 +103,6 @@ export function VideoWindow({
           px: 1,
           py: 0.25,
           bgcolor: "action.hover",
-          cursor: "grab",
-          touchAction: "none",
           color: "text.secondary",
         }}
       >

@@ -238,7 +238,7 @@ export default function ChatApp({
           title={t("chat.call.me")}
           stream={localCamera}
           mirrored
-          home={{ bottom: 72, right: 48 }}
+          home={{ bottom: 60, right: 48 }}
           width={200}
         />
       )}
