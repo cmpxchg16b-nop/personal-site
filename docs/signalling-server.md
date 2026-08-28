@@ -313,7 +313,13 @@ Media and audio:
   inside a user gesture: `resume()` runs from the call UI's click
   handlers (call, accept), and a context found suspended by a
   gesture-less path (a peer's track off the wire) is resumed by an
-  unlock listener on the next gesture anywhere in the document.
+  unlock listener on the next gesture anywhere in the document. Every
+  remote stream is additionally attached to a muted `<audio>` element:
+  Chrome never decodes a WebRTC-received stream that is only attached
+  to WebAudio (chromium issue 40094084, unfixed since M56 — Safari and
+  Firefox decode such streams natively), so without the media element
+  pulling it the track stays muted and the graph sees silence; the
+  graph alone carries the audible path.
 - A peer dropping out mid-call ends the session locally (a dead-session
   overlay — there is nobody left to exchange the protocol with); the log
   entry keeps its last logged status.

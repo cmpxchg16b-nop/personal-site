@@ -53,10 +53,12 @@ const FFT_SMOOTHING = 0.8;
 // user gesture a suspended AudioContext may be resumed from.
 const UNLOCK_EVENTS = ["pointerdown", "keydown", "touchstart"] as const;
 
-// One connected remote stream: its graph nodes, kept for teardown.
+// One connected remote stream: its graph nodes and the muted media
+// element Chrome needs to decode the stream at all, kept for teardown.
 interface RemoteEntry {
   source: MediaStreamAudioSourceNode;
   analyser: AnalyserNode;
+  element: HTMLAudioElement;
 }
 
 export class AudioGraph {
@@ -386,6 +388,19 @@ export class AudioGraph {
    * graph under `id`: source → analyser → the shared remote gain →
    * speakers. An `id` already connected is left alone. The entry tears
    * itself down when the stream's audio track ends.
+   *
+   * Chrome never decodes a WebRTC-received stream that is only attached
+   * to WebAudio: the received packets are discarded before the decoder
+   * and the track stays muted, so the graph and its analysers see pure
+   * silence (chromium issue 40094084, unfixed since M56 — Safari and
+   * Firefox decode such streams natively). The workaround is a muted
+   * <audio> element pulling the same stream: with a media element
+   * attached, Chrome decodes, and the graph's tap receives the samples.
+   * The element is muted (the graph carries the audible path through
+   * the remote gain) and detached (kept alive by this entry — a
+   * garbage-collected element would stop the pull); muted autoplay is
+   * gesture-free, so play() from this network-triggered path is
+   * allowed.
    */
   addRemote(id: string, stream: MediaStream): void {
     if (this.remotes.has(id)) return;
@@ -398,7 +413,15 @@ export class AudioGraph {
     analyser.smoothingTimeConstant = FFT_SMOOTHING;
     source.connect(analyser);
     source.connect(this.remoteGainNode);
-    this.remotes.set(id, { source, analyser });
+    const element = document.createElement("audio");
+    element.srcObject = stream;
+    element.muted = true;
+    void element
+      .play()
+      .catch((err) =>
+        console.error(`[audiograph] remote pull element failed: id=${id}`, err),
+      );
+    this.remotes.set(id, { source, analyser, element });
     const track = stream.getAudioTracks()[0];
     if (track === undefined) return;
     console.info(
@@ -423,6 +446,8 @@ export class AudioGraph {
     this.remotes.delete(id);
     entry.source.disconnect();
     entry.analyser.disconnect();
+    entry.element.pause();
+    entry.element.srcObject = null;
   }
 
   /** The FFT tap of the remote stream connected under `id`, if any. */
