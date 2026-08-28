@@ -44,6 +44,10 @@ type ConversationViewProps = {
   // The live voice call with this conversation's peer, or null (see
   // usePhoneCalls).
   call: ActivePhoneCall | null;
+  // The live state of the peer connection to the conversation's user
+  // (see usePeerSessions' connectionStates), or null when no session
+  // exists (yet); the header's presence line renders it.
+  connectionState: RTCPeerConnectionState | null;
   // Rings the peer (the header's call button).
   onStartCall: () => void;
   // Hangs the live call up — a cancel while ringing, an end in call.
@@ -58,6 +62,35 @@ type ConversationViewProps = {
   sx?: SxProps<Theme>;
 };
 
+// presenceKey is the header status line's i18n key. An offline user
+// (gone from the SS listing) is just "offline"; an online one shows the
+// peer connection's real state — the listing's online flag only says the
+// peer's signalling client is connected, nearly always true. "new", or
+// no session yet, reads "unconnected".
+function presenceKey(
+  online: boolean,
+  connectionState: RTCPeerConnectionState | null,
+):
+  | "chat.offline"
+  | "chat.connected"
+  | "chat.connecting"
+  | "chat.disconnected"
+  | "chat.unconnected" {
+  if (!online) return "chat.offline";
+  switch (connectionState) {
+    case "connected":
+      return "chat.connected";
+    case "connecting":
+      return "chat.connecting";
+    case "disconnected":
+    case "failed":
+    case "closed":
+      return "chat.disconnected";
+    default:
+      return "chat.unconnected";
+  }
+}
+
 // ConversationView is the right-hand side of the chat: a header naming the
 // conversation, the scrollable message history, and the composer.
 export default function ConversationView({
@@ -70,6 +103,7 @@ export default function ConversationView({
   onRequestFile,
   getFileByFileId,
   call,
+  connectionState,
   onStartCall,
   onEndCall,
   localAnalyser,
@@ -177,7 +211,12 @@ export default function ConversationView({
         >
           <ArrowBackIcon />
         </IconButton>
-        <UserAvatar user={conversation.user} size={36} showPresence />
+        <UserAvatar
+          user={conversation.user}
+          size={36}
+          showPresence
+          connectionState={connectionState}
+        />
         <Box sx={{ minWidth: 0 }}>
           <Typography variant="subtitle1" noWrap sx={{ fontWeight: 600 }}>
             {conversation.user.name}
@@ -188,7 +227,7 @@ export default function ConversationView({
             noWrap
             sx={{ display: "flex", alignItems: "center", gap: 0.5 }}
           >
-            {t(conversation.user.online ? "chat.online" : "chat.offline")}
+            {t(presenceKey(conversation.user.online, connectionState))}
           </Typography>
         </Box>
         {/* The call button, at the header's right end: it rings the peer,

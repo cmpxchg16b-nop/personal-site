@@ -140,7 +140,12 @@ consumers build on it, decoupled from each other: `useDataChannel` in
 `datachannel.tsx` (the source of truth for the messaging frame format,
 and the owner of the message store) subscribes `dcmsg`, and
 `useBinaryDataChannel` in `binarydatachannel.tsx` subscribes `dcbin`
-(see _Binary file transfer_).
+(see _Binary file transfer_). `usePeerSessions` also returns every
+session's live `connectionState` (channel → peer → state); the
+conversation header renders it — the presence line (Unconnected /
+Connecting / Connected / Disconnected) and the avatar dot (green only
+while connected) — in place of the listing's online flag, which only
+says the peer's signalling client is connected.
 
 - **One peer connection, two data channels per pair.** A consumer
   subscribes a data-channel label and every session brings one up: the

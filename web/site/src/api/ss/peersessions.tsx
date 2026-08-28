@@ -39,7 +39,7 @@
  * connection negotiates with the configured servers.
  */
 
-import { useCallback, useEffect, useMemo, useRef } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { useICEServers } from "@/hooks/useICEServers";
 import { PerfectNegotiator } from "./negotiate";
@@ -78,6 +78,15 @@ export type PeerTrackHandler = (
 export type SessionResetHandler = (
   dropped: { channelId: ChannelId; peer: SubscriberId } | null,
 ) => void;
+
+// PeerConnectionStates is the live connection state of every peer
+// session, by channel and peer subscriber id. A session's entry appears
+// with its first state change and goes with the session's teardown; a
+// missing entry reads as "new".
+export type PeerConnectionStates = Record<
+  ChannelId,
+  Record<SubscriberId, RTCPeerConnectionState>
+>;
 
 // PeerSessions is the peer-connection plumbing the data-channel
 // consumers (useDataChannel, useBinaryDataChannel) build on: one peer
@@ -181,6 +190,11 @@ interface SessionHooks {
     dc: RTCDataChannel,
   ): void;
   onTrack(channelId: ChannelId, peer: SubscriberId, ev: RTCTrackEvent): void;
+  onConnectionState(
+    channelId: ChannelId,
+    peer: SubscriberId,
+    state: RTCPeerConnectionState,
+  ): void;
   onSessionClosed(channelId: ChannelId, peer: SubscriberId): void;
 }
 
@@ -235,6 +249,9 @@ function startPeerSession(
   // consumers (voice calls) attach and detach tracks freely — the
   // PerfectNegotiator owns the (re)negotiation they trigger.
   pc.ontrack = (ev) => hooks.onTrack(channelId, peer, ev);
+  // The connection state feeds the UI's presence line.
+  pc.onconnectionstatechange = () =>
+    hooks.onConnectionState(channelId, peer, pc.connectionState);
 
   const negotiator = new PerfectNegotiator(pc, {
     channelId,
@@ -249,8 +266,11 @@ function startPeerSession(
     );
 
   session.close = () => {
+    // The state handler goes first: close()'s queued "closed" event must
+    // not report — a teardown is announced through onSessionClosed.
     // Cancelling the inbound stream ends negotiate(), which releases its
     // stream locks; closing the connection stops ICE and its events.
+    pc.onconnectionstatechange = null;
     void inStream.cancel();
     pc.close();
     hooks.onSessionClosed(channelId, peer);
@@ -269,13 +289,20 @@ function startPeerSession(
  * brought up before the query settles, so every peer connection is
  * created with the configured servers (with none when the query fails —
  * local-network peers still connect).
+ *
+ * The returned connectionStates map carries every session's live
+ * RTCPeerConnection.connectionState (channelId → peer → state), for the
+ * UI's presence line; a session's entry appears with its first state
+ * change and goes with the session's teardown.
  */
 export function usePeerSessions(
   me: ChatUser | null,
   channels: ChatChannel[],
-): PeerSessions {
+): { sessions: PeerSessions; connectionStates: PeerConnectionStates } {
   const proxy = useSSProxy();
   const sessionsRef = useRef(new Map<string, PeerSession>());
+  const [connectionStates, setConnectionStates] =
+    useState<PeerConnectionStates>({});
   // The consumers' channel subscriptions by label, the teardown
   // subscribers, and the waiters whenOpenChannel parks until a channel
   // opens or its session goes away (peer key → label → resolvers).
@@ -305,7 +332,30 @@ export function usePeerSessions(
       onTrack: (channelId, peer, ev) => {
         for (const cb of trackHandlersRef.current) cb(channelId, peer, ev);
       },
+      onConnectionState: (channelId, peer, state) => {
+        setConnectionStates((prev) => ({
+          ...prev,
+          [channelId]: { ...prev[channelId], [peer]: state },
+        }));
+      },
       onSessionClosed: (channelId, peer) => {
+        // The session's connection-state entry goes with it: the last
+        // reported state must not linger (a re-registered peer would
+        // briefly render it until the new session's first transition).
+        setConnectionStates((prev) => {
+          const byPeer = prev[channelId];
+          if (byPeer === undefined || byPeer[peer] === undefined) {
+            return prev;
+          }
+          const nextByPeer = { ...byPeer };
+          delete nextByPeer[peer];
+          if (Object.keys(nextByPeer).length === 0) {
+            const next = { ...prev };
+            delete next[channelId];
+            return next;
+          }
+          return { ...prev, [channelId]: nextByPeer };
+        });
         const key = peerKey(channelId, peer);
         const byLabel = channelWaitersRef.current.get(key);
         if (byLabel !== undefined) {
@@ -358,6 +408,7 @@ export function usePeerSessions(
       }
       channelWaitersRef.current.clear();
       for (const cb of resetHandlersRef.current) cb(null);
+      setConnectionStates({});
     };
   }, [proxy, me]);
 
@@ -500,7 +551,7 @@ export function usePeerSessions(
     };
   }, []);
 
-  return useMemo<PeerSessions>(
+  const sessions = useMemo<PeerSessions>(
     () => ({
       getChannel,
       whenOpenChannel,
@@ -520,4 +571,5 @@ export function usePeerSessions(
       subscribeTracks,
     ],
   );
+  return { sessions, connectionStates };
 }

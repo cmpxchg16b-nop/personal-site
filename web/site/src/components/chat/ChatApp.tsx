@@ -8,6 +8,7 @@ import type {
   ChatUser,
   SubscriberId,
 } from "@/api/ss/types";
+import type { PeerConnectionStates } from "@/api/ss/peersessions";
 import ChatSidebar from "./ChatSidebar";
 import ConversationView from "./ConversationView";
 import { IncomingCallWindow } from "./IncomingCallWindow";
@@ -69,6 +70,10 @@ type ChatAppProps = {
   // the sidebar shows their state pills, an open conversation its call
   // strip, and a ringing incoming call pops the global answer window.
   calls: Record<string, ActivePhoneCall>;
+  // The peer sessions' live connection states, by channel and peer (see
+  // usePeerSessions): the open conversation's presence line renders its
+  // peer's state.
+  connectionStates: PeerConnectionStates;
   // Rings a conversation's peer.
   onStartCall: (ref: ConversationRef) => void;
   // Picks up / declines a ringing incoming call (the popup's buttons).
@@ -97,6 +102,7 @@ export default function ChatApp({
   onRequestFile,
   getFileByFileId,
   calls,
+  connectionStates,
   onStartCall,
   onAcceptCall,
   onRejectCall,
@@ -125,6 +131,13 @@ export default function ChatApp({
     Object.values(calls)
       .filter((call) => call.status === "inviting" && call.incoming)
       .sort((a, b) => b.since - a.since)[0] ?? null;
+
+  // The open conversation's peer connection state, for the header's
+  // presence line; null when no session exists (yet).
+  const peerConnectionState =
+    selected === null
+      ? null
+      : (connectionStates[selected.channelId]?.[selected.userId] ?? null);
 
   const handleSelect = (ref: ConversationRef) => {
     onSelect(ref);
@@ -166,6 +179,7 @@ export default function ChatApp({
           onRequestFile={onRequestFile}
           getFileByFileId={getFileByFileId}
           call={activeCall}
+          connectionState={peerConnectionState}
           onStartCall={() => selected !== null && onStartCall(selected)}
           onEndCall={() => activeCall !== null && onEndCall(activeCall)}
           localAnalyser={localAnalyser}

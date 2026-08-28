@@ -41,18 +41,13 @@ const NO_UNREAD: Record<string, number> = {};
 export default function ChatPage() {
   // Latency monitor: the latest answered ping of the signalling server
   // connection, re-measured once a second.
-  const { lastPing, channels, me } = useSignalling();
-  useEffect(() => {
-    if (lastPing !== null) {
-      console.log(
-        `[chat] signalling server RTT: ${lastPing.rtt.toFixed(1)} ms ` +
-          `(ping_id=${lastPing.id} ping_seq=${lastPing.seq} ` +
-          `at=${new Date(lastPing.at).toISOString()})`,
-      );
-    }
-  }, [lastPing]);
+  const { channels, me } = useSignalling();
 
-  const sessions = usePeerSessions(me, channels);
+  // The peer sessions, and their live connection states by channel and
+  // peer — the open conversation's presence line renders the latter (the
+  // SS listing's online flag only says the peer's signalling client is
+  // connected, nearly always true).
+  const { sessions, connectionStates } = usePeerSessions(me, channels);
   const { dcMsgs, sendTo } = useDataChannel(me, sessions);
   const { sendFile, getFileByFileId } = useBinaryDataChannel(sessions);
 
@@ -227,6 +222,7 @@ export default function ChatPage() {
         onRequestFile={handleRequestFile}
         getFileByFileId={getFileByFileId}
         calls={calls}
+        connectionStates={connectionStates}
         onStartCall={startCall}
         onAcceptCall={acceptCall}
         onRejectCall={rejectCall}
