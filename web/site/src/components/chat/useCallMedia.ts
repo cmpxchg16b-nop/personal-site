@@ -56,8 +56,12 @@ export function useCallMedia(
     if (audio === null) return;
     return sessions.subscribeTracks((channelId, peer, ev) => {
       if (ev.track.kind !== "audio") return;
-      const stream = ev.streams[0] ?? new MediaStream([ev.track]);
-      audio.addRemote(callKey(channelId, peer), stream);
+      // Bind the bare track in a fresh stream, never ev.streams[0]:
+      // stream-association semantics differ across browsers, and a
+      // shared association stream can accumulate ended tracks whose
+      // ordering decides which track the source node binds (the MDN
+      // "track ordering" note on MediaStreamAudioSourceNode).
+      audio.addRemote(callKey(channelId, peer), new MediaStream([ev.track]));
       setMediaVersion((v) => v + 1);
     });
   }, [sessions, audio]);

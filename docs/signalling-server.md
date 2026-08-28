@@ -300,11 +300,20 @@ Media and audio:
   `MediaStreamAudioDestinationNode` whose track goes on the wire; every
   peer's incoming stream passes an analyser (the remote FFT) into one
   shared gain node (the speaker volume) feeding the output — several
-  accepted calls mux there. The capture is plain `getUserMedia` by
-  default; the call audio menu's echo-cancellation toggle switches the
-  capture-side voice processing (echo cancellation, noise suppression,
-  auto gain) on, live via `applyConstraints` and for future captures
-  (headphones assumed while it is off).
+  accepted calls mux there. The capture states the voice-processing
+  constraints (echo cancellation, noise suppression, auto gain)
+  explicitly — browsers turn the processing on when they are merely
+  omitted, so "off" says false — and falls back to a plain
+  `{ audio: true }` capture when the constraint solver rejects them
+  (Firefox answers even `false` with `NotFoundError` on a backend
+  lacking the named capability). The call audio menu's
+  echo-cancellation toggle switches the processing on, live via
+  `applyConstraints` and for future captures (headphones assumed while
+  it is off). Autoplay policies only let the `AudioContext` start
+  inside a user gesture: `resume()` runs from the call UI's click
+  handlers (call, accept), and a context found suspended by a
+  gesture-less path (a peer's track off the wire) is resumed by an
+  unlock listener on the next gesture anywhere in the document.
 - A peer dropping out mid-call ends the session locally (a dead-session
   overlay — there is nobody left to exchange the protocol with); the log
   entry keeps its last logged status.
