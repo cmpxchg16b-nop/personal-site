@@ -8,18 +8,24 @@ in process memory.
 
 ## Components
 
-| Layer          | Location                       | Role                                                                                                                                      |
-| -------------- | ------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------- |
-| Wire prototype | `web/site/src/api/ss/types.ts` | The browser-side TypeScript prototype; the source of truth for the wire format.                                                           |
-| Model          | `pkg/models/ss`                | Go wire types (field- and JSON-compatible with the prototype), the `SignallingServiceProvider` interface, and `SimpleOnMemorySSProvider`. |
-| Transport      | `pkg/api/websocket_ss`         | `WebSocketSSHandler`, an `http.Handler` bridging WebSocket connections to a provider.                                                     |
-| Wiring         | `cmd/server/main.go`           | Mounts the handler at `/api/ss/ws`, backed by the in-memory provider.                                                                     |
-| E2E tests      | `e2e/websocket_ss_test.go`     | Drives the real server binary over WebSocket with deliberately independent wire views.                                                    |
+| Layer            | Location                           | Role                                                                                                                                                                                   |
+| ---------------- | ---------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Wire prototype   | `web/site/src/api/ss/types.ts`     | The browser-side TypeScript prototype; the source of truth for the wire format.                                                                                                        |
+| Model            | `pkg/models/ss`                    | Go wire types (field- and JSON-compatible with the prototype), the `SignallingServiceProvider` interface, and `SimpleOnMemorySSProvider`.                                              |
+| Negotiator       | `web/site/src/api/ss/negotiate.ts` | Browser-side MDN perfect negotiation over the c2c relay (the prototype).                                                                                                               |
+| Negotiator       | `pkg/rtc`                          | The Go counterpart of `negotiate.ts` on `pion/webrtc`: `Negotiator` interface + `PerfectNegotiator`, reading from and writing to Go channels.                                          |
+| Headless client  | `pkg/rtc` (`client.go`)            | `HeadlessRTCClient` — the Go counterpart of `useSignalling` + `usePeerSessions`: a bot peer driving one session per channel member, over a caller-supplied channel pair (see below).   |
+| Client transport | `pkg/rtc` (`transport.go`)         | `SignallingTransport`, the client's SSProxy: pumps a channel pair to/from the SS; `WebSocketSignallingTransport` is the production one.                                                |
+| Echo bot         | `pkg/rtc/echobot`                  | The reference data-channel stack of an echo-purpose bot on `HeadlessRTCClient`: serves the well-known `dcmsg`/`dcbin` labels (see below).                                              |
+| Transport        | `pkg/api/websocket_ss`             | `WebSocketSSHandler`, an `http.Handler` bridging WebSocket connections to a provider.                                                                                                  |
+| Wiring           | `cmd/server/main.go`               | Mounts the handler at `/api/ss/ws`, backed by the in-memory provider; when the configuration document carries an `<echoBot/>` element, also hosts the bot as a client of the endpoint. |
+| E2E tests        | `e2e/websocket_ss_test.go`         | Drives the real server binary over WebSocket with deliberately independent wire views.                                                                                                 |
 
 ```mermaid
 graph TD
     A[browser client A] <-->|WebSocket| H["WebSocketSSHandler: hub goroutine + CAM table"]
     B[browser client B] <-->|WebSocket| H
+    C["echo bot (cmd/server, pkg/rtc/echobot)"] <-->|WebSocket| H
     H -->|inMsg service channel| P["SimpleOnMemorySSProvider: single Run goroutine owns all state"]
     P -->|outMsg| H
 ```
@@ -50,14 +56,18 @@ implementation must provide.
   `registerResult {channelId, subscriberId}` on success or an `err`
   otherwise. An **empty `subscriberId`** asks the SS to assign one,
   sequentially, from the automatic assignment range **1000-1999** (the
-  assigned id comes back in `registerResult`; empty always mints a fresh
+  assigned id comes back in `registerResult`; empty always creates a fresh
   subscriber, even from an already-registered tuple). Clients picking
   their own subscriber ids are recommended to **preserve the 1000-1999
   range** for automatic registration. A subscriber id is bound to zero or
   one (user id, user session id, channel id) tuple: re-registration of a
-  live id by the same tuple is a refresh (renewing `lastActive`,
-  optionally updating the username), while another tuple is rejected
-  with `SubscriberIdIsRegistered`.
+  live id by the same tuple is a refresh (renewing `lastActive`), while
+  another tuple is rejected with `SubscriberIdIsRegistered`. The
+  **`username`** is the subscriber's display name, but it is never the
+  client's to choose: the WebSocket endpoint overrides it with the
+  session's username (the JWT's username claim) before the event reaches
+  the SS, so clients send it empty and `UsernameTaken` can only fire when
+  two live sessions carry the same username claim.
 - **`channelKeepAlive {channelId, subscriberId}`** — renews the caller's
   membership of a channel: the SS refreshes the subscriber's
   `lastActive`. Sent periodically once registered. **Nothing is answered
@@ -124,6 +134,16 @@ to the resolved destination. `from` and the payload pass through
 unchanged. An unknown channel yields a `ChannelNotFound` error; an
 unknown subscriber in it yields `SubscriberNotFound`.
 
+`sessionDesc`/`rtcICECandidate` traffic is produced and consumed by the
+perfect negotiators on each end (`negotiate.ts` in the browser,
+`pkg/rtc` in Go). The pattern is the MDN perfect negotiation — the
+lexicographically smaller subscriber id is the polite peer — with one
+Go-side deviation: pion cannot roll a pending local offer back (the
+browser's implicit rollback has no pion counterpart), so the polite Go
+peer yields to a colliding offer by **rebuilding its peer connection**
+through the caller-provided `NewPeerConnection` factory and answering
+on the fresh one.
+
 Ping sessions between clients follow the sequence rules: a `pong` keeps
 the `pingId` and answers `ackSequenceNumber = sequenceNumber + 1`; the
 next `ping`'s `sequenceNumber` is the ack of the last reply.
@@ -146,6 +166,57 @@ conversation header renders it — the presence line (Unconnected /
 Connecting / Connected / Disconnected) and the avatar dot (green only
 while connected) — in place of the listing's online flag, which only
 says the peer's signalling client is connected.
+
+The Go side's counterpart is `HeadlessRTCClient` (`pkg/rtc/client.go`) —
+a headless peer, more of a bot than a full client. Its `Run` mirrors
+`Negotiator.Negotiate` and `SignallingServiceProvider.Run`: it serves a
+caller-supplied pair of channels (inbound/outbound `SignallingEvent`s),
+so the client knows nothing about WebSockets or authentication. It
+registers as a channel subscriber (SS-assigned or configured id, with
+the browser's retry-on-conflict), keeps the membership alive, renews the
+member listing, and reconciles one peer session per member. Data
+channels are dispatched by label to handlers registered with
+`HandleDataChannel` — the `http.ServeMux.Handle` shape; like the
+browser's `usePeerSessions`, the client hardcodes no label: `dcmsg`,
+`dcbin`, and any other protocol belong to the caller.
+
+A bot built on the client is three layers. The client is the bot client
+(above). `pkg/rtc/msg_handler` is the data-channel layer: its `Server`
+serves the two well-known labels and owns every sub-message protocol
+mechanic — the echo rule (every accepted message is bounced back verbatim
+with `echo` set; echoes and SIP dialog messages are never bounced), the
+strict FILE-frame reassembly (a gap, an overlap, or a mismatched `total`
+drops the transfer), and the per-frame acknowledgement. It distills the
+raw frames into bot messages — a plain-text chat line, one accepted chunk
+of a file transfer, a completely transferred file attachment, a call
+dialog message — and hands them to a `BotMessageHandler`, which answers
+through the invocation's `ResponseWriter` (a chat reply, an amendment of
+an earlier message, a call's final response; the call-accepting side is
+shaped on webrtc's `TrackLocal`/`TrackRemote` for when the client grows
+media support). The reference `BotMessageHandler` is `pkg/rtc/echobot`:
+an echo-purpose policy that answers a plain-text chat line with a fresh
+message of identical content, declines every incoming call — voice or
+video — with a `603 Decline`, and reports every inbound file's running
+sha256 over the session's messaging channel: a `sha256:<hex>` chat
+message opened at the first chunk (referring back to the transfer's
+announcement) and amended via chat control, throttled to one amend per
+500 chunks except that the first and the final chunk always report, so
+the report opens immediately and ends on the complete digest. The file's
+bytes are never retained — the hash is the deliverable, and it is
+complete the moment the last chunk lands.
+
+The server binary itself hosts the bot when the configuration document
+carries an `<echoBot/>` element (see `serverConfig.xsd`): `cmd/server`
+drives it over a `WebSocketSignallingTransport` to the configured
+endpoint — typically the same server's own `/api/ss/ws` — with the
+configured session token as its credential, reconnecting when the
+connection drops. The token doubles as the bot's whole identity: the
+endpoint stamps its subject/session onto the bot's events, and its
+username claim is the registration's display name, like every client's.
+To the signalling server the bot is an ordinary authenticated client and
+needs no special casing anywhere; the element's attributes (channel,
+subscriber id, ICE servers, the periodic knobs) map onto
+`RTCClientConfiguration`.
 
 - **One peer connection, two data channels per pair.** A consumer
   subscribes a data-channel label and every session brings one up: the

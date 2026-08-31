@@ -89,7 +89,7 @@ func newTestRSAKey(t *testing.T) (key *rsa.PrivateKey, kid, jwksJSON string) {
 	return key, kid, jwksJSON
 }
 
-// signToken mints an RS256-signed JWT with the given claims, tagged with kid
+// signToken creates an RS256-signed JWT with the given claims, tagged with kid
 // so the verifier can match it against the JWKS.
 func signToken(t *testing.T, key *rsa.PrivateKey, kid string, claims jwt.MapClaims) string {
 	t.Helper()

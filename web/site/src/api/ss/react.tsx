@@ -294,21 +294,23 @@ async function awaitRepliesOn(
 // stored subscriber id is reused when present, an empty id asks the SS to
 // assign one (from the 1000-1999 range) which is then persisted for
 // reuse. A stored id the SS rejects as bound to another session is
-// forgotten and retried once with an empty id. It resolves to the
-// registered subscriber id and the caller's user id — which the SS
-// echoes in the reply's `to`, populated server-side from the session —
-// or null when registration failed.
+// forgotten and retried once with an empty id. The registration's display
+// name is not the client's to choose: the server stamps the session's
+// username onto the register event, so the wire field goes empty. It
+// resolves to the registered subscriber id and the caller's user id —
+// which the SS echoes in the reply's `to`, populated server-side from the
+// session — or null when registration failed.
 async function registerSubscriber(
   read: () => ReadableStream<SignallingEvent>,
   send: (ev: SignallingEvent) => Promise<void>,
-  username: string,
 ): Promise<{ subscriberId: SubscriberId; userId: UserId | null } | null> {
   let subscriberId = loadStoredSubscriberId() ?? "";
   for (let attempt = 0; attempt < 2; attempt++) {
     const msgId = crypto.randomUUID();
     const replyPromise = awaitReplyOn(read(), msgId, REGISTER_REPLY_TIMEOUT_MS);
     await send({
-      // `from` is populated server-side from the caller's session.
+      // `from` is populated server-side from the caller's session; so is
+      // the registration's username — the wire value is ignored.
       from: {},
       to: { serviceId: WELLKNOWN_SVC_ID_SS },
       msgId,
@@ -316,7 +318,7 @@ async function registerSubscriber(
         register: {
           subscriberId,
           channelId: WELLKNOWN_CH_ID_MAIN,
-          username,
+          username: "",
         },
       },
     });
@@ -331,7 +333,7 @@ async function registerSubscriber(
         storeSubscriberId(result.subscriberId);
       }
       console.info(
-        `signalling: registered as subscriber ${result.subscriberId} (${username})`,
+        `signalling: registered as subscriber ${result.subscriberId}`,
       );
       return {
         subscriberId: result.subscriberId,
@@ -647,9 +649,17 @@ export function useSignalling(): SignallingState {
       subscriberId: SubscriberId;
       userId: UserId | null;
     } | null> = (async () => {
-      let username = "";
+      // The login guard: registration needs an authenticated session (the
+      // WS handshake is not on the JWT whitelist), and a session can die
+      // mid-connection — expired or logged out elsewhere. Check the
+      // profile before registering; a 401 bounces to the login page. The
+      // profile's username is only reused below as `me`'s display name —
+      // the registration itself carries no username: the server stamps
+      // the session's own.
+      let name = "";
       try {
-        username = (await fetchProfile(abort.signal)).username.trim();
+        const profile = await fetchProfile(abort.signal);
+        name = profile.username.trim() || profile.subject_id;
       } catch (err) {
         if (err instanceof DOMException && err.name === "AbortError")
           return null;
@@ -665,21 +675,20 @@ export function useSignalling(): SignallingState {
         );
         return null;
       }
-      if (!live || username === "") {
+      if (!live) {
         return null;
       }
       try {
         const reg = await registerSubscriber(
           () => proxy.getReadStream(),
           (ev) => writer.write(ev),
-          username,
         );
         if (live && reg !== null && reg.userId !== null) {
           setRegistered({
             proxy,
             me: {
               id: reg.userId,
-              name: username,
+              name,
               online: true,
               channelId: WELLKNOWN_CH_ID_MAIN,
               subscriberId: reg.subscriberId,

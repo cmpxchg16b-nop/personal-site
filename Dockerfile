@@ -47,10 +47,10 @@ COPY --from=builder /personal-site /usr/local/bin/personal-site
 EXPOSE 8080
 
 # The runtime image is scratch — no shell, no curl — so the health check
-# reuses the server binary itself: --healthz-probe GETs /api/healthz on the
-# loopback address and exits non-zero on failure. The probe port follows the
-# ADDR environment variable, like the server's --addr flag.
+# reuses the server binary itself: `serve --healthz-probe` GETs /api/healthz
+# on the loopback address and exits non-zero on failure. The probe port
+# follows the ADDR environment variable, like the server's --addr flag.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD ["/usr/local/bin/personal-site", "--healthz-probe"]
+    CMD ["/usr/local/bin/personal-site", "serve", "--healthz-probe"]
 
 ENTRYPOINT ["/usr/local/bin/personal-site"]

@@ -124,4 +124,33 @@
     allowedOrigin="https://www.example.com"
   />
   -->
+
+  <!-- The built-in echo bot (optional): an echo-purpose headless RTC peer
+       (pkg/rtc/echobot) living in the server process as a plain signalling
+       client of the WebSocket endpoint url points at — typically this
+       server's own /api/ss/ws. Wired only when url and jwt are both
+       non-empty.
+
+       jwt is the bot's session token, sent as a bearer token on the
+       handshake; issue one with the server binary's sign subcommand (it
+       signs with the same JWT secret the server reads). The token is the
+       bot's whole identity: its sub and jti claims are its address, its
+       username claim its display name.
+
+       Optional attributes (empty selects the default): channelId is the
+       main channel; subscriberId asks the SS for an id from the automatic
+       assignment range 1000-1999 — set a fixed id outside that range for a
+       stable, recognizable address; iceServers is a comma-separated list
+       of ICE server URLs for the bot's peer connections — empty means
+       none (host candidates only); keepAliveInterval, memberListInterval,
+       replyTimeout and reconnectInterval are Go duration strings (e.g.
+       "5s") with code-side defaults — keep the keepalive well below the
+       server's subscriber aging (the ss-aging flag, default 10s).
+  <echoBot
+    url="wss://example.com/api/ss/ws"
+    jwt=""
+    subscriberId="echobot"
+    keepAliveInterval="5s"
+  />
+  -->
 </serverConfig>

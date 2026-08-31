@@ -252,7 +252,7 @@ func TestServeHTTP_RealTicketGenerator(t *testing.T) {
 }
 
 // TestGetMapClaims verifies the claim set built for visitor sessions and that
-// consecutive calls mint distinct identities (unique jti and subject).
+// consecutive calls create distinct identities (unique jti and subject).
 func TestGetMapClaims(t *testing.T) {
 	h := newTestHandler(&stubTicketGenerator{}, testIssuer)
 	r := httptest.NewRequest(http.MethodGet, "/api/login/visitor", nil)
@@ -296,7 +296,7 @@ func TestGetMapClaims(t *testing.T) {
 		t.Errorf("exp - nbf = %v, want validity %v", got, want)
 	}
 
-	// Each call must mint a fresh identity.
+	// Each call must create a fresh identity.
 	if sub2, _ := claims2["sub"].(string); sub2 == sub1 {
 		t.Errorf("two GetMapClaims calls returned the same subject %q, want distinct visitor ids", sub1)
 	}

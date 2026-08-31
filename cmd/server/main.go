@@ -29,6 +29,8 @@ import (
 	pkgmodelsserverconfig "personal-site/pkg/models/serverconfig"
 	pkgmodelsshortlink "personal-site/pkg/models/shortlink"
 	pkgmodelsss "personal-site/pkg/models/ss"
+	"personal-site/pkg/rtc"
+	"personal-site/pkg/rtc/echobot"
 	pkgsession "personal-site/pkg/session"
 
 	"github.com/alecthomas/kong"
@@ -39,7 +41,20 @@ import (
 // middleware. It defaults to slog.Default() (text handler on stderr).
 var logger = slog.Default()
 
+// CLI is the command line of the server binary: two subcommands sharing
+// the JWT secret indirection. Root flags must precede the subcommand word.
 type CLI struct {
+	JWTAuthSecretFromEnv  string `name:"jwt-auth-secret-from-env" help:"Name of the environment variable that contains the JWT secret" default:"JWT_SECRET"`
+	JWTAuthSecretFromFile string `name:"jwt-auth-secret-from-file" help:"Path to the file that contains the JWT secret"`
+	JWTIssuer             string `help:"The issuer of the JWT token" default:"personal-site"`
+
+	Serve ServeCmd `cmd:"" help:"Run the server."`
+	Sign  SignCmd  `cmd:"" help:"Sign a session JWT with the deployment's secret, print it on stdout, and exit."`
+}
+
+// ServeCmd is the "serve" subcommand: the server itself. Its flag set is
+// what the binary took before the subcommand split.
+type ServeCmd struct {
 	Addr      string `name:"addr" help:"Listening address." env:"ADDR" default:":8080"`
 	ConfigXML string `name:"config-xml" help:"Path to the server configuration XML document (see serverConfig.xsd)." env:"CONFIG_XML" type:"existingfile"`
 	// SSAging is the subscriber aging interval of the in-memory signalling
@@ -52,19 +67,17 @@ type CLI struct {
 	// HEALTHCHECK uses it, because the scratch-based image has no shell or
 	// curl to probe with.
 	HealthzProbe                bool          `name:"healthz-probe" help:"Probe the server's /api/healthz endpoint and exit."`
-	JWTAuthSecretFromEnv        string        `name:"jwt-auth-secret-from-env" help:"Name of the environment variable that contains the JWT secret" default:"JWT_SECRET"`
-	JWTAuthSecretFromFile       string        `name:"jwt-auth-secret-from-file" help:"Path to the file that contains the JWT secret"`
 	SubjectBlacklistTxtPath     string        `name:"subj-blacklist-path" help:"Path to the blacklist text file, one subject id per a line"`
 	RejectVisitor               bool          `name:"reject-visitor" help:"Reject requests from visitors (subjects with the 'visitor:' prefix)" default:"false"`
 	VisitorSessionValidity      time.Duration `name:"validity-of-visitor-session" help:"Validity of visitor session" default:"168h"`
 	VisitorSessionTicketGenIntv time.Duration `name:"visitor-jwt-ticket-gen-intv" help:"We issue visitor token based on some ticket generator, this is the interval of how fast it generate tickets" default:"1s"`
-	JWTIssuer                   string        `help:"The issuer of the JWT token" default:"personal-site"`
 	NonceLifespan               time.Duration `name:"nonce-lifespan" help:"Lifespan of the OAuth nonce." default:"10m"`
 }
 
-func (cli *CLI) Run() error {
-	if cli.HealthzProbe {
-		return runHealthzProbe(cli.Addr)
+// Run serves. cli carries the root flags shared with the other subcommands.
+func (cmd *ServeCmd) Run(cli *CLI) error {
+	if cmd.HealthzProbe {
+		return runHealthzProbe(cmd.Addr)
 	}
 
 	ctx := context.Background()
@@ -75,8 +88,8 @@ func (cli *CLI) Run() error {
 	// providers below re-read the same document on every request instead, so
 	// their edits apply without a restart.
 	var serverCfg *pkgmodelsserverconfig.ServerConfigXML
-	if cli.ConfigXML != "" {
-		cfg, err := pkgmodelsserverconfig.LoadServerConfig(cli.ConfigXML)
+	if cmd.ConfigXML != "" {
+		cfg, err := pkgmodelsserverconfig.LoadServerConfig(cmd.ConfigXML)
 		if err != nil {
 			return err
 		}
@@ -99,7 +112,7 @@ func (cli *CLI) Run() error {
 	}
 	keyProvider := pkgauth.NewStaticSecretProvider(jwtSec)
 	var blProvider pkgauth.BlackListProvider
-	if blTxtPath := cli.SubjectBlacklistTxtPath; blTxtPath != "" {
+	if blTxtPath := cmd.SubjectBlacklistTxtPath; blTxtPath != "" {
 		txtblProvider, err := pkgauth.NewTextBasedBlackListProvider(blTxtPath)
 		if err != nil {
 			return fmt.Errorf("failed to load blacklist file: %v", err)
@@ -109,7 +122,7 @@ func (cli *CLI) Run() error {
 		blProvider = pkgauth.NewNullBlackListProvider()
 	}
 	tokenIssuer := pkgauth.NewStaticKeyJWTIssuer(keyProvider, cli.JWTIssuer)
-	tickIssuer := pkgauth.NewSharedTickingTicketGenerator(cli.VisitorSessionTicketGenIntv)
+	tickIssuer := pkgauth.NewSharedTickingTicketGenerator(cmd.VisitorSessionTicketGenIntv)
 	tickIssuer.Run(ctx)
 	cookieBuilder := &pkgcookie.SimpleCookieBuilder{}
 
@@ -134,8 +147,8 @@ func (cli *CLI) Run() error {
 	// restart. Registered unconditionally — with no --config-xml the handler
 	// serves empty lists — so the frontend can always rely on it.
 	var dynProvider pkgmodelsdyn.DynBlogDataProvider
-	if cli.ConfigXML != "" {
-		dynProvider = pkgmodelsdyn.NewFSBasedDynBlogData(cli.ConfigXML)
+	if cmd.ConfigXML != "" {
+		dynProvider = pkgmodelsdyn.NewFSBasedDynBlogData(cmd.ConfigXML)
 	}
 	muxHandlerDyn.Handle("/api/dyn/", pkgapidyn.NewDynamicBlogDataHandler(dynProvider))
 
@@ -157,7 +170,7 @@ func (cli *CLI) Run() error {
 	// development the browser's origin is the frontend dev server proxying
 	// /api/* here, which the default origin check would reject.
 	ssHandler := pkgapiwebsocketss.NewWebSocketSSHandler(
-		context.Background(), pkgmodelsss.NewSimpleOnMemorySSProviderWithAging(cli.SSAging), sm)
+		context.Background(), pkgmodelsss.NewSimpleOnMemorySSProviderWithAging(cmd.SSAging), sm)
 	ssHandler.Upgrader.CheckOrigin = pkgapiwebsocketss.CheckOriginAllowing(allowedOrigins)
 	muxHandlerDyn.Handle("/api/ss/ws", ssHandler)
 
@@ -187,7 +200,7 @@ func (cli *CLI) Run() error {
 	// visitor JWT and sets it as the session cookie.
 	visitorLoginHandler := pkgapiloginvisitor.NewVisitorLoginHandler(
 		tokenIssuer,
-		cli.VisitorSessionValidity,
+		cmd.VisitorSessionValidity,
 		tickIssuer,
 		allowedOrigins,
 		cookieBuilder,
@@ -225,7 +238,7 @@ func (cli *CLI) Run() error {
 			return fmt.Errorf("github OAuth login: %w", err)
 		}
 		nonceIssuer := &pkgauth.StaticKeyNonceIssuer{
-			NonceLifespan:  cli.NonceLifespan,
+			NonceLifespan:  cmd.NonceLifespan,
 			SecretProvider: keyProvider,
 		}
 		githubLoginHandler := pkgapiloginoauth2github.NewGithubOAuthLoginHandler(
@@ -255,7 +268,7 @@ func (cli *CLI) Run() error {
 	// can be used as-is.
 	if serverCfg != nil {
 		nonceIssuer := &pkgauth.StaticKeyNonceIssuer{
-			NonceLifespan:  cli.NonceLifespan,
+			NonceLifespan:  cmd.NonceLifespan,
 			SecretProvider: keyProvider,
 		}
 		for _, opt := range serverCfg.OIDCLoginOptions.Options {
@@ -291,7 +304,25 @@ func (cli *CLI) Run() error {
 		}
 	}
 
-	jwtValidator := pkgauth.NewStaticKeyJWTValidator(keyProvider, blProvider, cli.RejectVisitor)
+	jwtValidator := pkgauth.NewStaticKeyJWTValidator(keyProvider, blProvider, cmd.RejectVisitor)
+
+	// The built-in echo bot: an echo-purpose headless RTC peer
+	// (pkg/rtc/echobot) living in this process as a plain signalling
+	// client of the WebSocket endpoint its <echoBot/> configuration
+	// points at — typically this server's own /api/ss/ws. Wired only when
+	// the element carries a url and a jwt (so a sample element with empty
+	// values can ship in the document unused); the token doubles as the
+	// bot's whole identity: sub/jti become its signalling address, and the
+	// username claim becomes its display name — the endpoint stamps it
+	// onto the bot's registration, like every client's. The bot lives
+	// for the process lifetime, re-establishing the connection when it
+	// drops.
+	if serverCfg != nil && serverCfg.EchoBot != nil &&
+		serverCfg.EchoBot.URL != "" && serverCfg.EchoBot.JWT != "" {
+		if err := startEchoBot(ctx, serverCfg.EchoBot); err != nil {
+			return fmt.Errorf("echo bot: %w", err)
+		}
+	}
 
 	var authRejectHandler http.Handler = nil
 
@@ -328,8 +359,8 @@ func (cli *CLI) Run() error {
 	// JWT-protected subtree — and unconditionally: with no --config-xml
 	// every id answers 404.
 	var shortLinkProvider pkgmodelsshortlink.ShortLinkDataProvider
-	if cli.ConfigXML != "" {
-		shortLinkProvider = pkgmodelsshortlink.NewFsShortLinkDataProvider(cli.ConfigXML)
+	if cmd.ConfigXML != "" {
+		shortLinkProvider = pkgmodelsshortlink.NewFsShortLinkDataProvider(cmd.ConfigXML)
 	}
 
 	muxHandlerGeneral := http.NewServeMux()
@@ -343,12 +374,103 @@ func (cli *CLI) Run() error {
 	// additionally get the detailed HTTP log above.
 	handler := pkglog.WithLogTraceId(pkglog.WithOverallLog(logger, muxHandlerGeneral))
 
-	logger.Info("listening", "addr", cli.Addr)
-	return http.ListenAndServe(cli.Addr, handler)
+	logger.Info("listening", "addr", cmd.Addr)
+	return http.ListenAndServe(cmd.Addr, handler)
 }
 
 func (cli *CLI) getJWTSecret() ([]byte, error) {
 	return getJWTSecFromSomewhere(cli.JWTAuthSecretFromEnv, cli.JWTAuthSecretFromFile)
+}
+
+// defaultEchoBotReconnectInterval is how long the bot waits before
+// re-establishing a lost signalling connection, unless the
+// configuration's <echoBot/> element says otherwise.
+const defaultEchoBotReconnectInterval = 5 * time.Second
+
+// startEchoBot wires the built-in echo bot: a pkg/rtc/echobot Bot on a
+// pkg/rtc HeadlessRTCClient, driven over a pkg/rtc
+// WebSocketSignallingTransport to the endpoint cfg.URL points at, with
+// cfg.JWT as the session credential, sent as a bearer token (the
+// endpoint is not on the JWT whitelist). The bot never inspects the
+// token itself: validating it is the server's job, so a bad token
+// surfaces as the reconnect loop's logged 401s. The bot runs until ctx
+// is done, re-establishing the signalling connection every
+// reconnectInterval when it drops.
+func startEchoBot(ctx context.Context, cfg *pkgmodelsserverconfig.EchoBotXML) error {
+	keepAliveInterval, err := pkgmodelsserverconfig.ParseDuration(cfg.KeepAliveInterval, 0)
+	if err != nil {
+		return fmt.Errorf("keepAliveInterval: %w", err)
+	}
+	memberListInterval, err := pkgmodelsserverconfig.ParseDuration(cfg.MemberListInterval, 0)
+	if err != nil {
+		return fmt.Errorf("memberListInterval: %w", err)
+	}
+	replyTimeout, err := pkgmodelsserverconfig.ParseDuration(cfg.ReplyTimeout, 0)
+	if err != nil {
+		return fmt.Errorf("replyTimeout: %w", err)
+	}
+	reconnectInterval, err := pkgmodelsserverconfig.ParseDuration(cfg.ReconnectInterval, defaultEchoBotReconnectInterval)
+	if err != nil {
+		return fmt.Errorf("reconnectInterval: %w", err)
+	}
+
+	// The token doubles as the bot's whole identity: the endpoint stamps
+	// its subject/session onto the bot's events and its username claim
+	// onto the registration's display name — like every client's. The
+	// bot never inspects the token itself: validating it is the server's
+	// job, and only the server knows how.
+	// An empty iceServers attribute means exactly that: no ICE servers —
+	// the bot's peer connections run on host candidates alone.
+	iceServers := pkgapiiceservers.ParseURLs(cfg.IceServers)
+
+	client, err := rtc.NewHeadlessRTCClient(rtc.PerfectNegotiatorFactory, rtc.RTCClientConfiguration{
+		ChannelId:          pkgmodelsss.ChannelId(cfg.ChannelId),
+		SubscriberId:       pkgmodelsss.SubscriberId(cfg.SubscriberId),
+		ICEServers:         iceServers,
+		KeepAliveInterval:  keepAliveInterval,
+		MemberListInterval: memberListInterval,
+		ReplyTimeout:       replyTimeout,
+		Logger:             logger,
+	})
+	if err != nil {
+		return err
+	}
+	// The bot registers its dcmsg/dcbin handlers on the client at
+	// construction; it needs no further driving.
+	echobot.New(client, echobot.Configuration{Logger: logger})
+
+	transport := &rtc.WebSocketSignallingTransport{
+		URL:    cfg.URL,
+		Header: http.Header{"Authorization": []string{"Bearer " + cfg.JWT}},
+	}
+	go func() {
+		for ctx.Err() == nil {
+			// One channel pair per attempt: a transport run closes its
+			// outbound side when it returns, which is how the client
+			// observes the drop.
+			toSS := make(chan *pkgmodelsss.SignallingEvent, 64)
+			fromSS := make(chan *pkgmodelsss.SignallingEvent, 64)
+			attemptCtx, stop := context.WithCancel(ctx)
+			transportErr := make(chan error, 1)
+			go func() { transportErr <- transport.Run(attemptCtx, toSS, fromSS) }()
+			runErr := client.Run(attemptCtx, fromSS, toSS)
+			stop()
+			terr := <-transportErr
+			if ctx.Err() != nil {
+				return
+			}
+			logger.Warn("echo bot: signalling connection ended, reconnecting",
+				"clientErr", runErr, "transportErr", terr, "retryIn", reconnectInterval)
+			select {
+			case <-time.After(reconnectInterval):
+			case <-ctx.Done():
+			}
+		}
+	}()
+	logger.Info("echo bot wired",
+		"url", cfg.URL, "channelId", cfg.ChannelId,
+		"subscriberId", cfg.SubscriberId)
+	return nil
 }
 
 // dotEnvFiles are the dotenv files loaded at startup, in decreasing order
@@ -425,9 +547,8 @@ func main() {
 	loadDotEnvFiles()
 
 	var cli CLI
-	kong.Parse(&cli)
-	if err := cli.Run(); err != nil {
-		logger.Error("server exited", "error", err)
-		os.Exit(1)
-	}
+	ctx := kong.Parse(&cli)
+	// kong's dispatch: RunNode binds the targets of the selected path, so
+	// each subcommand's Run(cli *CLI) receives the root flags.
+	ctx.FatalIfErrorf(ctx.Run())
 }

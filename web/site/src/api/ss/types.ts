@@ -55,7 +55,10 @@ export interface ClientToSSRegEv {
    * registration. */
   subscriberId: SubscriberId;
   channelId: ChannelId;
-  // descriptive, lowercase, no-space, valid dns label for displaying the subscriber in UI
+  // The subscriber's display name — descriptive, lowercase, no-space, valid
+  // dns label. The server never trusts the wire value: the WS endpoint
+  // stamps the session's username (the JWT's username claim) onto every
+  // registration, so clients send it empty.
   username: string;
 }
 

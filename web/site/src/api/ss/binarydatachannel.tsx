@@ -389,6 +389,26 @@ export function useBinaryDataChannel(
               let offset = 0;
               let lastEmit = Date.now();
               let lastEmitted = 0;
+              // Reports the acknowledged progress, throttled to one running
+              // status per STATUS_UPDATE_INTERVAL_MS. Must run while the
+              // send window is being filled, not only when it stalls: a fast
+              // receiver acks quickly enough that the window never fills, so
+              // the stall site alone would report nothing until the end.
+              const maybeEmitRunning = () => {
+                const now = Date.now();
+                if (
+                  ackedBytes > lastEmitted &&
+                  now - lastEmit >= STATUS_UPDATE_INTERVAL_MS
+                ) {
+                  emit({
+                    ...base,
+                    fileSizeTransferred: ackedBytes,
+                    fileTransferStatus: "running",
+                  });
+                  lastEmit = now;
+                  lastEmitted = ackedBytes;
+                }
+              };
               for (;;) {
                 // Fill the send window: up to SEND_WINDOW_FRAMES
                 // unacknowledged frames in flight. An empty file is a
@@ -421,24 +441,13 @@ export function useBinaryDataChannel(
                   );
                   seq += 1;
                   offset = end;
+                  maybeEmitRunning();
                 }
                 if (cancelled) return;
                 if (failure !== null) throw failure;
                 // Done once everything sent has been acknowledged.
                 if (ackedSeq === seq && ackedBytes === total) break;
-                const now = Date.now();
-                if (
-                  ackedBytes > lastEmitted &&
-                  now - lastEmit >= STATUS_UPDATE_INTERVAL_MS
-                ) {
-                  emit({
-                    ...base,
-                    fileSizeTransferred: ackedBytes,
-                    fileTransferStatus: "running",
-                  });
-                  lastEmit = now;
-                  lastEmitted = ackedBytes;
-                }
+                maybeEmitRunning();
                 await new Promise<void>((resolve) => {
                   wake = resolve;
                 });

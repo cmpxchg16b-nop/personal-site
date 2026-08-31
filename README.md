@@ -50,6 +50,19 @@ variable name with `--jwt-auth-secret-from-env`). Conventional `.env.local`
 / `.env` files are loaded before flag parsing, so a gitignored `.env.local`
 is the place for local secrets.
 
+Machine clients that cannot log in interactively — the built-in echo bot's
+`<echoBot/>` element is the example — carry a static session token instead.
+Issue one with the server binary's `sign` subcommand, which signs with the
+same secret indirection as the server itself:
+
+```sh
+go run ./cmd/server sign --sub bot:echo --username "Echo Bot" --validity 720h
+```
+
+The token alone is printed on stdout, so the command composes in a shell.
+`--jti` defaults to a fresh random session id; `--validity 0` issues a token
+without an expiry claim.
+
 ## Dynamic blog data
 
 The lists a blog-style site changes often — post metadata, projects, author
@@ -104,9 +117,11 @@ meant for sharing, so they are served without the `/api` prefix:
 
 ## Layout
 
-- `cmd/server/` — the Go server entrypoint (`main.go`): static export,
-  the login/auth wiring, `/api/profile`, `/api/healthz`, the `/api/dyn/`
-  mount, and the `/links/` mount.
+- `cmd/server/` — the Go server entrypoint: the `serve` subcommand
+  (`main.go`) serves the static export and wires the login/auth stack,
+  `/api/profile`, `/api/healthz`, the `/api/dyn/` mount, the `/links/`
+  mount and the signalling endpoint; the `sign` subcommand (`sign.go`)
+  issues session JWTs for machine clients.
 - `pkg/` — the Go packages behind the server's endpoints:
   - `pkg/models/dyn/` — `DynBlogData`, the `DynBlogDataProvider` interface,
     and `FSBasedDynBlogData`.
@@ -146,7 +161,7 @@ Build the frontend, then run the server:
 
 ```sh
 cd web/site && npm ci && npm run build && cd ../..
-go run ./cmd/server --config-xml=serverConfig.xml
+go run ./cmd/server serve --config-xml=serverConfig.xml
 ```
 
 The server needs a JWT secret at startup (it signs the login session
@@ -159,7 +174,7 @@ For frontend development with hot reload, run the two side by side:
 
 ```sh
 cd web/site && npm run dev   # http://localhost:3000, /api proxied to :8080
-go run ./cmd/server --config-xml=serverConfig.xml   # in another terminal
+go run ./cmd/server serve --config-xml=serverConfig.xml   # in another terminal
 ```
 
 ## Container image
@@ -177,7 +192,7 @@ interface and exits non-zero on failure.
 
 Mount a configuration document to serve your dynamic blog data from the
 container, e.g. `-v "$PWD/serverConfig.xml:/app/serverConfig.xml"` and
-`--config-xml=serverConfig.xml` appended to the entrypoint arguments.
+`serve --config-xml=serverConfig.xml` appended to the entrypoint arguments.
 
 ## Making it yours
 
@@ -199,6 +214,6 @@ container, e.g. `-v "$PWD/serverConfig.xml:/app/serverConfig.xml"` and
 
 ### WebRTC sub-system todos
 
-1. voice and video calling
-2. message unreads
-3. peer connectionstate
+1. Audio-inline messaging
+2. Radio bot
+3. Message unreads display

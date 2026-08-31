@@ -85,7 +85,7 @@ type EPAddr struct {
 type ClientToSSRegEv struct {
 	// SubscriberId may be empty: the SS then assigns one sequentially
 	// from the automatic assignment range 1000-1999 and echoes it in the
-	// registerResult reply. An empty id always mints a fresh subscriber,
+	// registerResult reply. An empty id always creates a fresh subscriber,
 	// even from an already-registered tuple. Clients picking their own
 	// subscriber ids are recommended to preserve that range for
 	// automatic registration.
@@ -93,7 +93,11 @@ type ClientToSSRegEv struct {
 	ChannelId    ChannelId    `json:"channelId"`
 
 	// Username is descriptive: lowercase, no-space, valid DNS label, for
-	// displaying the subscriber in the UI.
+	// displaying the subscriber in the UI. The WebSocket endpoint
+	// overrides it with the caller's session username (the JWT's username
+	// claim) before the event reaches the provider, so clients send it
+	// empty; the value only matters to SS providers reached through other
+	// transports.
 	Username string `json:"username"`
 }
 
@@ -485,7 +489,7 @@ func (p *SimpleOnMemorySSProvider) handleRegister(ctx context.Context, channels 
 	now := time.Now()
 	// An empty subscriber id asks the SS to assign one, sequentially,
 	// from the automatic assignment range; the assigned id is echoed in
-	// the registerResult reply. Empty always mints a fresh subscriber,
+	// the registerResult reply. Empty always creates a fresh subscriber,
 	// even from an already-registered tuple.
 	if reg.SubscriberId == "" {
 		reg.SubscriberId = ch.assignSubscriberId(now, p.aging)
@@ -746,7 +750,7 @@ func replyErr(ev *SignallingEvent, code ErrorCode, msg string) *SignallingEvent 
 	return reply(ev, &SSToClientEv{Err: &SSToClientErrEv{ErrorCode: code, ErrorMsg: msg}})
 }
 
-// newMsgId mints a message id uniquely, statelessly, independently.
+// newMsgId generates a message id uniquely, statelessly, independently.
 func newMsgId() MsgId {
 	return MsgId(uuid.NewString())
 }

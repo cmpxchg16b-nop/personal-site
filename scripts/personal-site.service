@@ -13,7 +13,7 @@ Wants=network-online.target
 Type=simple
 User=@SERVICE_USER@
 WorkingDirectory=@PROJECT_DIR@
-ExecStart=@PROJECT_DIR@/server --addr=:18972 --config-xml=serverConfig.xml
+ExecStart=@PROJECT_DIR@/server serve --addr=:18972 --config-xml=serverConfig.xml
 Restart=on-failure
 RestartSec=5
 NoNewPrivileges=true

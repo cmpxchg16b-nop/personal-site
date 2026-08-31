@@ -25,6 +25,7 @@ import (
 const (
 	testUserIdHeader        = "X-Test-UserId"
 	testUserSessionIdHeader = "X-Test-UserSessionId"
+	testUsernameHeader      = "X-Test-Username"
 )
 
 func startTestServer(t *testing.T) *httptest.Server {
@@ -45,6 +46,9 @@ func startTestServer(t *testing.T) *httptest.Server {
 		if v := r.Header.Get(testUserSessionIdHeader); v != "" {
 			ctx = context.WithValue(ctx, pkgutils.CtxKeySessionId, v)
 		}
+		if v := r.Header.Get(testUsernameHeader); v != "" {
+			ctx = context.WithValue(ctx, pkgutils.CtxKeyUsername, v)
+		}
 		sessionized.ServeHTTP(w, r.WithContext(ctx))
 	})
 	srv := httptest.NewServer(adapter)
@@ -56,8 +60,10 @@ func startTestServer(t *testing.T) *httptest.Server {
 }
 
 // dial opens a websocket connection with the test-only identity headers;
-// empty userId/sessionId omit the respective header.
-func dial(t *testing.T, srv *httptest.Server, userId, sessionId string) *websocket.Conn {
+// empty userId/sessionId omit the respective header. username is the
+// session's username — what the JWT middleware would have extracted from
+// the token's username claim.
+func dial(t *testing.T, srv *httptest.Server, userId, sessionId, username string) *websocket.Conn {
 	t.Helper()
 	header := http.Header{}
 	if userId != "" {
@@ -65,6 +71,9 @@ func dial(t *testing.T, srv *httptest.Server, userId, sessionId string) *websock
 	}
 	if sessionId != "" {
 		header.Set(testUserSessionIdHeader, sessionId)
+	}
+	if username != "" {
+		header.Set(testUsernameHeader, username)
 	}
 	url := "ws" + strings.TrimPrefix(srv.URL, "http")
 	c, _, err := websocket.DefaultDialer.Dial(url, header)
@@ -175,7 +184,7 @@ func TestMissingIdentityHeadersRejected(t *testing.T) {
 
 func TestRegisterAckPopulatedFromHeaders(t *testing.T) {
 	srv := startTestServer(t)
-	alice := dial(t, srv, "u-alice", "s-alice")
+	alice := dial(t, srv, "u-alice", "s-alice", "alice")
 
 	// The client leaves From empty; the handler populates it.
 	ack := mustRegister(t, alice, "alice", "alice")
@@ -194,9 +203,9 @@ func TestRegisterAckPopulatedFromHeaders(t *testing.T) {
 
 func TestRelayUnicastNoFlood(t *testing.T) {
 	srv := startTestServer(t)
-	alice := dial(t, srv, "u-alice", "s-alice")
-	bob := dial(t, srv, "u-bob", "s-bob")
-	carol := dial(t, srv, "u-carol", "s-carol")
+	alice := dial(t, srv, "u-alice", "s-alice", "alice")
+	bob := dial(t, srv, "u-bob", "s-bob", "bob")
+	carol := dial(t, srv, "u-carol", "s-carol", "carol")
 	mustRegister(t, alice, "alice", "alice")
 	mustRegister(t, bob, "bob", "bob")
 	mustRegister(t, carol, "carol", "carol")
@@ -253,8 +262,8 @@ func TestRelayUnicastNoFlood(t *testing.T) {
 // identity before the event reaches anyone.
 func TestForgedFromOverridden(t *testing.T) {
 	srv := startTestServer(t)
-	alice := dial(t, srv, "u-alice", "s-alice")
-	bob := dial(t, srv, "u-bob", "s-bob")
+	alice := dial(t, srv, "u-alice", "s-alice", "alice")
+	bob := dial(t, srv, "u-bob", "s-bob", "bob")
 	mustRegister(t, alice, "alice", "alice")
 	mustRegister(t, bob, "bob", "bob")
 
@@ -277,9 +286,48 @@ func TestForgedFromOverridden(t *testing.T) {
 	}
 }
 
+// TestRegisterUsernameOverriddenFromSession checks that a client-supplied
+// registration username is never trusted: the handler overrides it with
+// the session's username, exactly like the From fields. A forged username
+// neither lands on the registration nor triggers UsernameTaken against
+// the impersonated name.
+func TestRegisterUsernameOverriddenFromSession(t *testing.T) {
+	srv := startTestServer(t)
+	alice := dial(t, srv, "u-alice", "s-alice", "alice-real")
+	bob := dial(t, srv, "u-bob", "s-bob", "bob-real")
+
+	// alice registers asking for a forged display name; bob asks for
+	// alice's real one. Both registrations succeed — the wire value is
+	// discarded — and the profiles carry the session usernames.
+	mustRegister(t, alice, "alice", "mallory")
+	mustRegister(t, bob, "bob", "alice-real")
+
+	query := func(c *websocket.Conn, msgId string, sub ss.SubscriberId) *ss.SignallingEvent {
+		t.Helper()
+		writeEvent(t, c, &ss.SignallingEvent{
+			MsgId: ss.MsgId(msgId),
+			C2SEv: &ss.ClientToSSEv{UserProfileQuery: &ss.ClientToSSUserProfileQuery{
+				SubscriberId: sub,
+				ChannelId:    ss.WellKnownChIdMain,
+			}},
+		})
+		reply := readEvent(t, c)
+		if reply.S2CEv == nil || reply.S2CEv.Err != nil || reply.S2CEv.Profile == nil {
+			t.Fatalf("profile reply = %+v, want a profile and no error", reply)
+		}
+		return reply
+	}
+	if p := query(bob, "m-q-alice", "alice").S2CEv.Profile; p.Username != "alice-real" {
+		t.Errorf("alice's profile username = %q, want her session username %q", p.Username, "alice-real")
+	}
+	if p := query(alice, "m-q-bob", "bob").S2CEv.Profile; p.Username != "bob-real" {
+		t.Errorf("bob's profile username = %q, want his session username %q", p.Username, "bob-real")
+	}
+}
+
 func TestReconnectRelearnsAddress(t *testing.T) {
 	srv := startTestServer(t)
-	first := dial(t, srv, "u-alice", "s-alice")
+	first := dial(t, srv, "u-alice", "s-alice", "alice")
 	mustRegister(t, first, "alice", "alice")
 	first.Close()
 
@@ -288,7 +336,7 @@ func TestReconnectRelearnsAddress(t *testing.T) {
 	// still knows "alice", bound to this same (user, session, channel)
 	// tuple, so the re-registration is a refresh — its ack must arrive
 	// here (it would otherwise be routed to the dead first connection).
-	second := dial(t, srv, "u-alice", "s-alice")
+	second := dial(t, srv, "u-alice", "s-alice", "alice")
 	writeEvent(t, second, registerEvent("m-reg-again", "alice", "alice"))
 	reply := readEvent(t, second)
 	if reply.S2CEv == nil || reply.S2CEv.Err != nil {

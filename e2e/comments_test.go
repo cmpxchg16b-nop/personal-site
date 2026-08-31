@@ -63,9 +63,18 @@ func startServerWithArgs(t *testing.T, args ...string) string {
 	if err := ln.Close(); err != nil {
 		t.Fatalf("release the reserved port: %v", err)
 	}
+	return startServerOnAddr(t, addr, args...)
+}
+
+// startServerOnAddr launches the server binary on addr; see
+// startServerWithArgs. Callers that need the address before the server
+// starts — e.g. to reference it in the configuration document — reserve
+// the port themselves.
+func startServerOnAddr(t *testing.T, addr string, args ...string) string {
+	t.Helper()
 
 	var output bytes.Buffer
-	cmd := exec.Command(serverBin, append([]string{"--addr", addr}, args...)...)
+	cmd := exec.Command(serverBin, append([]string{"serve", "--addr", addr}, args...)...)
 	cmd.Stdout = &output
 	cmd.Stderr = &output
 	// The server requires a JWT secret at startup (it signs and validates the

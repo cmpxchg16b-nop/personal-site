@@ -157,16 +157,24 @@ type signallingEventView struct {
 }
 
 // ssWSClient is a websocket client of the signalling endpoint, speaking
-// the view types above. Its connection identity (userId, sessionId) is the
-// visitor session's (subject id, session id), assigned by the server — the
-// jwtCookie is what the connection authenticates with.
+// the view types above. Its connection identity (userId, sessionId) and
+// username are the session's, assigned by the server — the jwtCookie (or
+// a bearer token, for machine clients) is what the connection
+// authenticates with.
 type ssWSClient struct {
 	t         *testing.T
 	conn      *websocket.Conn
 	baseURL   string
 	jwtCookie string
-	userId    string
-	sessionId string
+	// bearerToken, when set, authenticates the dial with an Authorization
+	// header instead of the session cookie.
+	bearerToken string
+	userId      string
+	sessionId   string
+	// username is the session's username (the JWT's username claim) — what
+	// the endpoint stamps onto the client's registrations regardless of
+	// the wire value.
+	username string
 }
 
 // dialSS logs in as a fresh visitor and connects to the signalling
@@ -179,7 +187,18 @@ func dialSS(t *testing.T, baseURL string) *ssWSClient {
 		t.Fatal("visitor login did not set a jwt cookie")
 	}
 	c := &ssWSClient{t: t, baseURL: baseURL, jwtCookie: jwtCookie}
-	c.userId, c.sessionId, _ = profileIdentity(t, baseURL, jwtCookie)
+	c.userId, c.sessionId, c.username = profileIdentity(t, baseURL, jwtCookie)
+	c.redial()
+	t.Cleanup(func() { c.conn.Close() })
+	return c
+}
+
+// dialSSWithToken connects to the signalling endpoint of the server at
+// baseURL, authenticating with the given session token as a bearer
+// credential — the way machine clients (e.g. the echo bot) do.
+func dialSSWithToken(t *testing.T, baseURL, token string) *ssWSClient {
+	t.Helper()
+	c := &ssWSClient{t: t, baseURL: baseURL, bearerToken: token}
 	c.redial()
 	t.Cleanup(func() { c.conn.Close() })
 	return c
@@ -190,7 +209,11 @@ func dialSS(t *testing.T, baseURL string) *ssWSClient {
 func (c *ssWSClient) redial() {
 	c.t.Helper()
 	header := http.Header{}
-	header.Set("Cookie", "jwt="+c.jwtCookie)
+	if c.bearerToken != "" {
+		header.Set("Authorization", "Bearer "+c.bearerToken)
+	} else {
+		header.Set("Cookie", "jwt="+c.jwtCookie)
+	}
 	url := "ws" + strings.TrimPrefix(c.baseURL, "http") + "/api/ss/ws"
 	conn, _, err := websocket.DefaultDialer.Dial(url, header)
 	if err != nil {
@@ -213,6 +236,8 @@ func (c *ssWSClient) send(ev *signallingEventView) {
 	}
 }
 
+// recv reads the next event, whatever it is. The read deadline is the
+// test's timeout: every await is bounded by it.
 func (c *ssWSClient) recv() *signallingEventView {
 	c.t.Helper()
 	c.conn.SetReadDeadline(time.Now().Add(5 * time.Second))
@@ -227,6 +252,21 @@ func (c *ssWSClient) recv() *signallingEventView {
 	return &ev
 }
 
+// recvReply awaits the response to the request msgId: request and
+// response are correlated by the inReplyTo field, so events that do not
+// correlate — a relayed c2c event, say a fellow channel member's RTC
+// session negotiation, which reaches a subscriber unsolicited — are
+// skipped, and a response that never comes surfaces as recv's read
+// timeout.
+func (c *ssWSClient) recvReply(msgId string) *signallingEventView {
+	c.t.Helper()
+	for {
+		if ev := c.recv(); ev.InReplyTo == msgId {
+			return ev
+		}
+	}
+}
+
 // expectSilent asserts that nothing arrives within a short window. A read
 // timeout corrupts a gorilla connection, so this must be the last
 // operation on the client.
@@ -238,10 +278,12 @@ func (c *ssWSClient) expectSilent() {
 	}
 }
 
-// register registers sub with username and consumes the ack, which must
+// register registers sub and consumes the ack, which must
 // be error-free, correlated with the request, and carry the matching
 // registerResult. An empty sub asks the server to assign a subscriber id
-// from the automatic assignment range; the assigned id is returned.
+// from the automatic assignment range; the assigned id is returned. The
+// username parameter is the wire value only — the server discards it and
+// stamps the session's username onto the registration.
 func (c *ssWSClient) register(msgId, sub, username string) *signallingEventView {
 	c.t.Helper()
 	c.send(&signallingEventView{
@@ -252,15 +294,12 @@ func (c *ssWSClient) register(msgId, sub, username string) *signallingEventView 
 			Username:     username,
 		}},
 	})
-	ack := c.recv()
+	ack := c.recvReply(msgId)
 	if ack.S2CEv == nil {
 		c.t.Fatalf("register ack carries no s2CEv: %+v", ack)
 	}
 	if ack.S2CEv.Err != nil {
 		c.t.Fatalf("register ack carries an error: %+v", ack.S2CEv.Err)
-	}
-	if ack.InReplyTo != msgId {
-		c.t.Fatalf("register ack inReplyTo = %q, want %q", ack.InReplyTo, msgId)
 	}
 	if ack.S2CEv.RegisterResult == nil {
 		c.t.Fatalf("register ack carries no registerResult: %+v", ack.S2CEv)
@@ -286,15 +325,12 @@ func (c *ssWSClient) registerExpectingError(msgId, sub, channelId, username stri
 			Username:     username,
 		}},
 	})
-	reply := c.recv()
+	reply := c.recvReply(msgId)
 	if reply.S2CEv == nil || reply.S2CEv.Err == nil {
 		c.t.Fatalf("register reply = %+v, want an s2CEv error", reply)
 	}
 	if reply.S2CEv.Err.ErrorCode != wantCode {
 		c.t.Fatalf("register error code = %d, want %d (%s)", reply.S2CEv.Err.ErrorCode, wantCode, reply.S2CEv.Err.ErrorMsg)
-	}
-	if reply.InReplyTo != msgId {
-		c.t.Fatalf("register error reply inReplyTo = %q, want %q", reply.InReplyTo, msgId)
 	}
 }
 
@@ -307,8 +343,10 @@ func TestSSRegisterAndProfile(t *testing.T) {
 	alice := dialSS(t, baseURL)
 
 	// A successful registration is acknowledged by the SS service, To the
-	// address the handler populated from the caller's session.
-	ack := alice.register("e2e-reg-1", "alice", "alice")
+	// address the handler populated from the caller's session. The wire
+	// username is deliberately wrong: the endpoint stamps the session's
+	// username onto the registration instead.
+	ack := alice.register("e2e-reg-1", "alice", "wire-name-ignored")
 	if ack.From.ServiceId != ssServiceId {
 		t.Errorf("ack from.serviceId = %q, want %q", ack.From.ServiceId, ssServiceId)
 	}
@@ -327,16 +365,13 @@ func TestSSRegisterAndProfile(t *testing.T) {
 			ChannelId:    ssMainChannelId,
 		}},
 	})
-	reply := alice.recv()
+	reply := alice.recvReply("e2e-query-1")
 	if reply.S2CEv == nil || reply.S2CEv.Err != nil || reply.S2CEv.Profile == nil {
 		t.Fatalf("profile reply = %+v, want a profile and no error", reply)
 	}
 	profile := reply.S2CEv.Profile
-	if profile.SubscriberId != "alice" || profile.ChannelId != ssMainChannelId || profile.Username != "alice" {
-		t.Errorf("profile = %+v, want alice in the main channel", profile)
-	}
-	if reply.InReplyTo != "e2e-query-1" {
-		t.Errorf("profile reply inReplyTo = %q, want %q", reply.InReplyTo, "e2e-query-1")
+	if profile.SubscriberId != "alice" || profile.ChannelId != ssMainChannelId || profile.Username != alice.username {
+		t.Errorf("profile = %+v, want alice in the main channel with her session username %q", profile, alice.username)
 	}
 
 	// Querying an unknown subscriber answers SubscriberNotFound.
@@ -347,7 +382,7 @@ func TestSSRegisterAndProfile(t *testing.T) {
 			ChannelId:    ssMainChannelId,
 		}},
 	})
-	reply = alice.recv()
+	reply = alice.recvReply("e2e-query-2")
 	if reply.S2CEv == nil || reply.S2CEv.Err == nil || reply.S2CEv.Err.ErrorCode != ssErrSubscriberNotFound {
 		t.Errorf("unknown subscriber reply = %+v, want error code %d", reply, ssErrSubscriberNotFound)
 	}
@@ -356,13 +391,30 @@ func TestSSRegisterAndProfile(t *testing.T) {
 	// channel) tuple is a refresh, not an error...
 	alice.register("e2e-reg-2", "alice", "alice")
 
-	// ...while another identity cannot take the id over, a taken username
-	// is rejected, and an unknown channel is rejected — each with its
-	// well-known code.
+	// ...while another identity cannot take the id over, and an unknown
+	// channel is rejected — each with its well-known code. (UsernameTaken
+	// needs two live sessions sharing a username claim now that the
+	// endpoint stamps it; TestSSRegisterUsernameTaken covers that.)
 	bob := dialSS(t, baseURL)
 	bob.registerExpectingError("e2e-reg-3", "alice", ssMainChannelId, "bob", ssErrSubscriberIdIsRegistered)
-	bob.registerExpectingError("e2e-reg-4", "bob", ssMainChannelId, "alice", ssErrUsernameTaken)
 	bob.registerExpectingError("e2e-reg-5", "bob", "no-such-channel", "bob", ssErrChannelNotFound)
+
+	alice.expectSilent()
+	bob.expectSilent()
+}
+
+// TestSSRegisterUsernameTaken covers the username uniqueness check end to
+// end: the endpoint stamps each registration with the session's username,
+// so the collision comes from two sessions whose tokens carry the same
+// username claim — the wire values are irrelevant.
+func TestSSRegisterUsernameTaken(t *testing.T) {
+	baseURL := startServer(t)
+
+	alice := dialSSWithToken(t, baseURL, issueSessionToken(t, "bot:dup-1", "dup-name"))
+	bob := dialSSWithToken(t, baseURL, issueSessionToken(t, "bot:dup-2", "dup-name"))
+
+	alice.register("e2e-dup-1", "", "alice-wire")
+	bob.registerExpectingError("e2e-dup-2", "", ssMainChannelId, "bob-wire", ssErrUsernameTaken)
 
 	alice.expectSilent()
 	bob.expectSilent()
@@ -387,7 +439,8 @@ func TestSSRegisterAutoAssign(t *testing.T) {
 		t.Fatalf("second auto-assigned subscriber id = %q, want %q", got, "1001")
 	}
 
-	// The assigned id is a working, queryable registration.
+	// The assigned id is a working, queryable registration; the profile
+	// carries alice's session username, not the wire value.
 	alice.send(&signallingEventView{
 		MsgId: "e2e-auto-query",
 		C2SEv: &clientToSSEvView{UserProfileQuery: &userProfileQueryView{
@@ -395,9 +448,9 @@ func TestSSRegisterAutoAssign(t *testing.T) {
 			ChannelId:    ssMainChannelId,
 		}},
 	})
-	reply := alice.recv()
-	if reply.S2CEv == nil || reply.S2CEv.Profile == nil || reply.S2CEv.Profile.Username != "auto-alice" {
-		t.Fatalf("profile of auto-assigned id = %+v, want username auto-alice", reply)
+	reply := alice.recvReply("e2e-auto-query")
+	if reply.S2CEv == nil || reply.S2CEv.Profile == nil || reply.S2CEv.Profile.Username != alice.username {
+		t.Fatalf("profile of auto-assigned id = %+v, want alice's session username %q", reply, alice.username)
 	}
 }
 
@@ -581,15 +634,12 @@ func TestSSListChannelMembers(t *testing.T) {
 		if pages > 10 {
 			t.Fatal("too many channelMbsListResult pages for a 3-member channel")
 		}
-		reply := alice.recv()
+		reply := alice.recvReply("e2e-list-1")
 		if reply.S2CEv == nil || reply.S2CEv.ChannelMbsListResult == nil {
 			t.Fatalf("reply = %+v, want a channelMbsListResult", reply)
 		}
 		if reply.S2CEv.Err != nil {
 			t.Fatalf("page carries an error: %+v", reply.S2CEv.Err)
-		}
-		if reply.InReplyTo != "e2e-list-1" {
-			t.Errorf("page inReplyTo = %q, want %q", reply.InReplyTo, "e2e-list-1")
 		}
 		if reply.From.ServiceId != ssServiceId {
 			t.Errorf("page from.serviceId = %q, want %q", reply.From.ServiceId, ssServiceId)
@@ -617,12 +667,9 @@ func TestSSListChannelMembers(t *testing.T) {
 		MsgId: "e2e-list-2",
 		C2SEv: &clientToSSEvView{ListChannelMembers: &listChannelMembersView{ChannelId: "no-such-channel"}},
 	})
-	reply := alice.recv()
+	reply := alice.recvReply("e2e-list-2")
 	if reply.S2CEv == nil || reply.S2CEv.Err == nil || reply.S2CEv.Err.ErrorCode != ssErrChannelNotFound {
 		t.Errorf("unknown channel reply = %+v, want error code %d", reply, ssErrChannelNotFound)
-	}
-	if reply.InReplyTo != "e2e-list-2" {
-		t.Errorf("error reply inReplyTo = %q, want %q", reply.InReplyTo, "e2e-list-2")
 	}
 
 	alice.expectSilent()
@@ -645,15 +692,12 @@ func TestSSListChannelsAndProfile(t *testing.T) {
 		MsgId: "e2e-list-channels",
 		C2SEv: &clientToSSEvView{ListChannels: &listChannelsView{}},
 	})
-	list := alice.recv()
+	list := alice.recvReply("e2e-list-channels")
 	if list.S2CEv == nil || list.S2CEv.ChannelListResult == nil {
 		t.Fatalf("list reply = %+v, want a channelListResult", list)
 	}
 	if list.S2CEv.Err != nil {
 		t.Fatalf("list reply carries an error: %+v", list.S2CEv.Err)
-	}
-	if list.InReplyTo != "e2e-list-channels" {
-		t.Errorf("list inReplyTo = %q, want %q", list.InReplyTo, "e2e-list-channels")
 	}
 	page := list.S2CEv.ChannelListResult
 	if page.HasMore || len(page.Channels) != 1 || page.Channels[0] != ssMainChannelId {
@@ -665,7 +709,7 @@ func TestSSListChannelsAndProfile(t *testing.T) {
 		MsgId: "e2e-ch-profile",
 		C2SEv: &clientToSSEvView{ChannelProfileQuery: &channelProfileQueryView{ChannelId: ssMainChannelId}},
 	})
-	profile := alice.recv()
+	profile := alice.recvReply("e2e-ch-profile")
 	if profile.S2CEv == nil || profile.S2CEv.ChannelProfile == nil {
 		t.Fatalf("profile reply = %+v, want a channelProfile", profile)
 	}
@@ -678,7 +722,7 @@ func TestSSListChannelsAndProfile(t *testing.T) {
 		MsgId: "e2e-ch-profile-unknown",
 		C2SEv: &clientToSSEvView{ChannelProfileQuery: &channelProfileQueryView{ChannelId: "no-such-channel"}},
 	})
-	errReply := alice.recv()
+	errReply := alice.recvReply("e2e-ch-profile-unknown")
 	if errReply.S2CEv == nil || errReply.S2CEv.Err == nil || errReply.S2CEv.Err.ErrorCode != ssErrChannelNotFound {
 		t.Fatalf("unknown channel reply = %+v, want error code %d", errReply, ssErrChannelNotFound)
 	}
@@ -704,7 +748,7 @@ func TestSSClientServerPing(t *testing.T) {
 			MsgId: msgId,
 			C2SEv: &clientToSSEvView{Ping: &pingPongView{PingId: "e2e-liveness", SequenceNumber: seq}},
 		})
-		pong := alice.recv()
+		pong := alice.recvReply(msgId)
 		if pong.S2CEv == nil || pong.S2CEv.Pong == nil {
 			t.Fatalf("round %d: reply = %+v, want an s2c pong", round, pong)
 		}
@@ -722,9 +766,6 @@ func TestSSClientServerPing(t *testing.T) {
 		}
 		if pong.To.UserId != alice.userId || pong.To.UserSessionId != alice.sessionId {
 			t.Errorf("round %d: pong to = %+v, want alice's session identity", round, pong.To)
-		}
-		if pong.InReplyTo != msgId {
-			t.Errorf("round %d: pong inReplyTo = %q, want %q", round, pong.InReplyTo, msgId)
 		}
 		seq = pong.S2CEv.Pong.AckSequenceNumber
 	}
@@ -759,15 +800,12 @@ func TestSSChannelKeepAlive(t *testing.T) {
 	expectKeepAliveErr := func(c *ssWSClient, ev *signallingEventView, wantCode int) {
 		t.Helper()
 		c.send(ev)
-		reply := c.recv()
+		reply := c.recvReply(ev.MsgId)
 		if reply.S2CEv == nil || reply.S2CEv.Err == nil {
 			t.Fatalf("keepalive reply = %+v, want an s2CEv error", reply)
 		}
 		if reply.S2CEv.Err.ErrorCode != wantCode {
 			t.Fatalf("keepalive error code = %d, want %d (%s)", reply.S2CEv.Err.ErrorCode, wantCode, reply.S2CEv.Err.ErrorMsg)
-		}
-		if reply.InReplyTo != ev.MsgId {
-			t.Fatalf("keepalive error reply inReplyTo = %q, want %q", reply.InReplyTo, ev.MsgId)
 		}
 	}
 
@@ -926,12 +964,12 @@ func TestSSQuickReconnectRoaming(t *testing.T) {
 				ChannelId:    ssMainChannelId,
 			}},
 		})
-		reply := alice.recv()
+		reply := alice.recvReply(msgId)
 		if reply.S2CEv == nil || reply.S2CEv.Err != nil || reply.S2CEv.Profile == nil {
 			t.Fatalf("%s: reply = %+v, want a profile and no error", msgId, reply)
 		}
-		if p := reply.S2CEv.Profile; p.SubscriberId != "bob" || p.Username != "bob" {
-			t.Errorf("%s: profile = %+v, want bob", msgId, p)
+		if p := reply.S2CEv.Profile; p.SubscriberId != "bob" || p.Username != bob.username {
+			t.Errorf("%s: profile = %+v, want bob with his session username %q", msgId, p, bob.username)
 		}
 	}
 
@@ -952,7 +990,7 @@ func TestSSQuickReconnectRoaming(t *testing.T) {
 		MsgId: "e2e-bob-alive",
 		C2SEv: &clientToSSEvView{Ping: &pingPongView{PingId: "e2e-bob-liveness", SequenceNumber: 1}},
 	})
-	if pong := bob.recv(); pong.S2CEv == nil || pong.S2CEv.Pong == nil {
+	if pong := bob.recvReply("e2e-bob-alive"); pong.S2CEv == nil || pong.S2CEv.Pong == nil {
 		t.Fatalf("bob liveness reply = %+v, want a pong", pong)
 	}
 
@@ -992,7 +1030,7 @@ func TestSSSubscriberAging(t *testing.T) {
 				ChannelId:    ssMainChannelId,
 			}},
 		})
-		return alice.recv()
+		return alice.recvReply(msgId)
 	}
 
 	// Within the aging interval bob's profile is queryable.
@@ -1009,8 +1047,7 @@ func TestSSSubscriberAging(t *testing.T) {
 		t.Fatalf("expired query reply = %+v, want error code %d", reply, ssErrSubscriberNotFound)
 	}
 
-	// The expired subscriber id and username are free again: dave takes
-	// them over.
+	// The expired subscriber id is free again: dave takes it over.
 	dave := dialSS(t, baseURL)
 	dave.register("e2e-reg-dave", "bob", "bob")
 

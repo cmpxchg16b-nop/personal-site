@@ -72,6 +72,55 @@
           minOccurs="0"
           maxOccurs="unbounded"
         />
+        <!-- The built-in echo bot: an echo-purpose headless RTC peer
+             (pkg/rtc/echobot on pkg/rtc's HeadlessRTCClient) living in
+             the server process as a plain signalling client of the
+             WebSocket endpoint url points at — typically this server's
+             own /api/ss/ws. It registers as a member of the configured
+             channel and serves the well-known dcmsg/dcbin data-channel
+             labels: every accepted chat message is bounced back to its
+             sender with echo set (a plain-text line additionally gets an
+             identical reply), incoming calls are declined with 603, and
+             inbound file transfers are acknowledged while their running
+             sha256 is reported over the messaging channel. The bot is
+             wired only when url and jwt are non-empty, so a sample
+             element with empty values can ship in the document unused.
+
+             url:  the signalling endpoint's WebSocket URL (ws:// or
+                   wss://), e.g. "wss://example.com/api/ss/ws".
+             jwt:  the bot's session token, sent as a bearer token on the
+                   WebSocket handshake (the endpoint is not on the JWT
+                   whitelist): any token the deployment's JWT validator
+                   accepts — issue one with the server binary's sign
+                   subcommand, which signs with the same JWT secret the
+                   server reads. The token is the bot's whole identity: the
+                   endpoint stamps its subject (sub) and session id
+                   (jti) onto the bot's events, and its username claim
+                   is the registration's display name, like every
+                   client's; mind its expiry (exp).
+
+             The remaining attributes mirror the fields of
+             rtc.RTCClientConfiguration (with a lowercased first
+             letter); empty selects the wiring's defaults:
+               * channelId     the well-known main channel.
+               * subscriberId  empty asks the SS to assign one from the
+                               automatic assignment range 1000-1999. A
+                               fixed id outside that range gives the bot
+                               a stable, recognizable address.
+               * iceServers    a comma-separated list of ICE server URLs
+                               for the bot's peer connections; surround-
+                               ing whitespace is ignored. Empty means no
+                               ICE servers: the bot connects with host
+                               candidates alone.
+               * keepAliveInterval, memberListInterval, replyTimeout
+                               the client's periodic knobs, Go
+                               time.Duration strings (e.g. "5s"); keep
+                               the keepalive well below the server's
+                               subscriber aging (the ss-aging flag,
+                               default 10s).
+               * reconnectInterval  how long to wait before re-estab-
+                               lishing a lost signalling connection. -->
+        <xsd:element name="echoBot" type="echoBotType" minOccurs="0" />
       </xsd:sequence>
     </xsd:complexType>
   </xsd:element>
@@ -85,6 +134,24 @@
       use="optional"
       default=""
     />
+  </xsd:complexType>
+
+  <!-- A single echo bot configuration; see the echoBot element above. -->
+  <xsd:complexType name="echoBotType">
+    <xsd:attribute name="url" type="xsd:string" use="required" />
+    <xsd:attribute name="jwt" type="xsd:string" use="required" />
+    <xsd:attribute name="channelId" type="xsd:string" use="optional" />
+    <xsd:attribute name="subscriberId" type="xsd:string" use="optional" />
+    <xsd:attribute
+      name="iceServers"
+      type="xsd:string"
+      use="optional"
+      default=""
+    />
+    <xsd:attribute name="keepAliveInterval" type="xsd:string" use="optional" />
+    <xsd:attribute name="memberListInterval" type="xsd:string" use="optional" />
+    <xsd:attribute name="replyTimeout" type="xsd:string" use="optional" />
+    <xsd:attribute name="reconnectInterval" type="xsd:string" use="optional" />
   </xsd:complexType>
 
   <!-- The configurable list of generic OIDC login providers; holds zero or

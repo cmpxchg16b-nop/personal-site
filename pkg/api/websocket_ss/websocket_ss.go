@@ -9,7 +9,10 @@
 // the session id is the user session id. The endpoint is not on the
 // server's JWT whitelist, so every connection belongs to an authenticated
 // session; the From EPAddr of every inbound message is overridden with it
-// — a client-supplied From is untrusted input and is discarded.
+// — a client-supplied From is untrusted input and is discarded. The same
+// discipline applies to the register event's username: it is overridden
+// with the session's username (the JWT's username claim), so a client
+// never picks its own display name — it may send the field empty.
 //
 // Like a learning switch, the handler builds the association between a
 // connection's remote ip:port and the (user id, user session id) pair by
@@ -103,9 +106,11 @@ func NewWebSocketSSHandler(ctx context.Context, provider ss.SignallingServicePro
 func (h *WebSocketSSHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var userId ss.UserId
 	var sessionId ss.UserSessionId
+	var username string
 	if sess, ok := h.sm.GetSessionFromContext(r.Context()); ok {
 		userId = ss.UserId(sess.SubjectId())
 		sessionId = ss.UserSessionId(sess.Id())
+		username = sess.Username()
 	}
 	if userId == "" || sessionId == "" {
 		http.Error(w, "session carries no identity (subject id or session id is empty)", http.StatusBadRequest)
@@ -125,7 +130,7 @@ func (h *WebSocketSSHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	go h.writePump(c)
-	go h.readPump(c, userId, sessionId)
+	go h.readPump(c, userId, sessionId, username)
 }
 
 // hub is the single goroutine owning the connection set and the learned
@@ -215,13 +220,15 @@ func (h *WebSocketSSHandler) note(n hubNote) bool {
 	}
 }
 
-// readPump parses the text frames of c as SignallingEvents, overrides
-// their From fields with the connection's session identity (client-
-// supplied From values are not trusted), and hands the events to the hub.
+// readPump parses the text frames of c as SignallingEvents and hands them
+// to the hub, overriding what the client may not choose: the From fields
+// are stamped with the connection's session identity, and a register
+// event's username is stamped with the session's username (a client-
+// supplied From or display name is untrusted input and is discarded).
 // Binary and unparseable frames are skipped. It
 // returns when the connection fails or the handler shuts down, and
 // reports the closure to the hub.
-func (h *WebSocketSSHandler) readPump(c *wsConn, userId ss.UserId, sessionId ss.UserSessionId) {
+func (h *WebSocketSSHandler) readPump(c *wsConn, userId ss.UserId, sessionId ss.UserSessionId, username string) {
 	defer h.note(hubNote{kind: noteClosed, conn: c})
 	for {
 		mt, data, err := c.conn.ReadMessage()
@@ -237,6 +244,9 @@ func (h *WebSocketSSHandler) readPump(c *wsConn, userId ss.UserId, sessionId ss.
 		}
 		ev.From.UserId = userId
 		ev.From.UserSessionId = sessionId
+		if ev.C2SEv != nil && ev.C2SEv.Register != nil {
+			ev.C2SEv.Register.Username = username
+		}
 		if !h.note(hubNote{kind: noteMessage, conn: c, ev: &ev}) {
 			return
 		}
