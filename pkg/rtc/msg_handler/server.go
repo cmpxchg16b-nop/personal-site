@@ -6,12 +6,19 @@ package msg_handler
 //
 //   - dcmsg (the messaging channel): decode and validation, the echo
 //     discipline (every accepted message is bounced back verbatim with
-//     echo set — echoes and the call protocol excepted), and the
-//     file-transfer announcements the binary side correlates with.
+//     echo set — echoes and the call protocol excepted), the
+//     file-transfer announcements the binary side correlates with, and
+//     the call log's conditioning: the Server sniffs the call dialogs and
+//     amends the INVITEs of the bot's own outgoing calls as their status
+//     moves (the caller's X-Call-Status duty) — below the interface,
+//     never the handler's, like the echo rule.
 //   - dcbin (the binary channel): strict reassembly of inbound file
 //     streams (a gap, an overlap, or a mismatched total drops the
 //     transfer) and the acknowledgement of every accepted frame, so the
 //     sender's sliding window keeps advancing.
+//   - media: the client's track handler fans inbound tracks out to the
+//     per-peer registrations the handlers make through their
+//     ResponseWriter's OnTrack.
 //
 // What remains — what a message MEANS to the bot — is dispatched to the
 // BotMessageHandler.
@@ -127,16 +134,74 @@ type messagingReply struct {
 	announcement *FileAnnouncement
 }
 
-func (peerUpNote) isServerNote()    {}
-func (peerDownNote) isServerNote()  {}
-func (announceNote) isServerNote()  {}
-func (messagingNote) isServerNote() {}
+// trackCallback is a peer's registered inbound-media callback (a
+// ResponseWriter's OnTrack).
+type trackCallback func(remote *webrtc.TrackRemote, receiver *webrtc.RTPReceiver)
+
+// onTrackNote registers (replaces) the peer's inbound-media callback. It
+// lives apart from the peerRecord: a glare rebuild replaces the record
+// (peerUpNote) mid-session, and the registration must survive it.
+type onTrackNote struct {
+	peer ss.SubscriberId
+	fn   trackCallback
+}
+
+// onTrackQueryNote asks the hub for the peer's current inbound-media
+// callback (nil when none is registered).
+type onTrackQueryNote struct {
+	peer  ss.SubscriberId
+	reply chan trackCallback
+}
+
+// inviteSentNote records a call the bot just opened (ResponseWriter's
+// Invite): the dialog's call id, the INVITE's msg id (the amend target),
+// and the addressing the hub needs to send the later status amends. The
+// fold of the dialog's inbound messages keeps the INVITE's logged UI
+// status current — the caller's duty (usePhoneCalls' amend effect on the
+// browser), deliberately the Server's and not the handler's: it is the
+// messaging channel's classical conditioning, like the echo rule.
+type inviteSentNote struct {
+	peer        ss.SubscriberId
+	channelId   ss.ChannelId
+	self        ss.SubscriberId
+	callId      string
+	inviteMsgId ss.MsgId
+	media       MediaKind
+}
+
+// sipDialogNote reports an inbound message of a call's dialog that
+// establishes a logged status (a response, a CANCEL, a BYE — an INVITE
+// opens the peer's own call, which the peer logs itself).
+type sipDialogNote struct {
+	peer        ss.SubscriberId
+	callId      string
+	established string // one of the callStatus* values
+}
+
+// outgoingCall is the hub's record of one bot-opened call: the INVITE's
+// identity and addressing, and its currently logged UI status.
+type outgoingCall struct {
+	channelId   ss.ChannelId
+	self        ss.SubscriberId
+	inviteMsgId ss.MsgId
+	media       MediaKind
+	status      string
+}
+
+func (peerUpNote) isServerNote()       {}
+func (peerDownNote) isServerNote()     {}
+func (announceNote) isServerNote()     {}
+func (messagingNote) isServerNote()    {}
+func (onTrackNote) isServerNote()      {}
+func (onTrackQueryNote) isServerNote() {}
+func (inviteSentNote) isServerNote()   {}
+func (sipDialogNote) isServerNote()    {}
 
 // NewServer constructs a Server and registers it for the well-known
-// messaging and binary data-channel labels on client; every distilled
-// bot message goes to handler. It panics when a label is already taken,
-// mirroring the client's HandleDataChannel. The Server's hub goroutine
-// starts here.
+// messaging and binary data-channel labels on client, plus the client's
+// media-track handler; every distilled bot message goes to handler. It
+// panics when a label is already taken, mirroring the client's
+// HandleDataChannel. The Server's hub goroutine starts here.
 func NewServer(client *rtc.HeadlessRTCClient, handler BotMessageHandler, config Configuration) *Server {
 	if client == nil {
 		panic("msg_handler: nil client")
@@ -157,14 +222,20 @@ func NewServer(client *rtc.HeadlessRTCClient, handler BotMessageHandler, config 
 	go s.hub()
 	client.HandleDataChannel(DataChannelLabelMessages, rtc.DataChannelHandlerFunc(s.serveMessages))
 	client.HandleDataChannel(DataChannelLabelBinary, rtc.DataChannelHandlerFunc(s.serveBinary))
+	client.HandleTrack(rtc.TrackHandlerFunc(s.serveTrack))
 	return s
 }
 
 // hub is the Server's single stateful goroutine: it owns the peer
 // registry — every handler goroutine reaches it through serviceChan
-// notes.
+// notes. Besides the peer records it keeps the peers' inbound-media
+// callbacks (onTracks) and the bot's own outgoing calls (outCalls) — both
+// keyed by peer and both outliving a peerRecord swap (a glare rebuild
+// re-invokes the channel handlers mid-session but must not lose either).
 func (s *Server) hub() {
 	peers := make(map[ss.SubscriberId]*peerRecord)
+	onTracks := make(map[ss.SubscriberId]trackCallback)
+	outCalls := make(map[ss.SubscriberId]map[string]*outgoingCall)
 	for note := range s.serviceChan {
 		switch n := note.(type) {
 		case peerUpNote:
@@ -172,6 +243,8 @@ func (s *Server) hub() {
 		case peerDownNote:
 			if entry, ok := peers[n.peer]; ok && entry.dcmsg == n.dcmsg {
 				delete(peers, n.peer)
+				delete(onTracks, n.peer)
+				delete(outCalls, n.peer)
 			}
 		case announceNote:
 			if entry, ok := peers[n.peer]; ok && entry.dcmsg == n.dcmsg {
@@ -183,6 +256,25 @@ func (s *Server) hub() {
 				reply = messagingReply{dcmsg: entry.dcmsg, announcement: entry.announced[n.fileId]}
 			}
 			n.reply <- reply
+		case onTrackNote:
+			onTracks[n.peer] = n.fn
+		case onTrackQueryNote:
+			n.reply <- onTracks[n.peer]
+		case inviteSentNote:
+			calls := outCalls[n.peer]
+			if calls == nil {
+				calls = make(map[string]*outgoingCall)
+				outCalls[n.peer] = calls
+			}
+			calls[n.callId] = &outgoingCall{
+				channelId:   n.channelId,
+				self:        n.self,
+				inviteMsgId: n.inviteMsgId,
+				media:       n.media,
+				status:      callStatusInviting,
+			}
+		case sipDialogNote:
+			s.foldDialog(peers, outCalls, n)
 		}
 	}
 }
@@ -196,6 +288,125 @@ func (s *Server) messagingChannel(peer ss.SubscriberId, fileId string) (*webrtc.
 	s.serviceChan <- messagingNote{peer: peer, fileId: fileId, reply: reply}
 	r := <-reply
 	return r.dcmsg, r.announcement
+}
+
+// setOnTrack registers fn for the peer's inbound media tracks (a
+// ResponseWriter's OnTrack).
+func (s *Server) setOnTrack(peer ss.SubscriberId, fn trackCallback) {
+	s.serviceChan <- onTrackNote{peer: peer, fn: fn}
+}
+
+// onTrackCallback asks the hub for the peer's current inbound-media
+// callback (nil when none is registered).
+func (s *Server) onTrackCallback(peer ss.SubscriberId) trackCallback {
+	reply := make(chan trackCallback, 1)
+	s.serviceChan <- onTrackQueryNote{peer: peer, reply: reply}
+	return <-reply
+}
+
+// serveTrack is the client's media-track handler: a remote track arrived
+// on a peer session — fan it out to the callback the peer's handler
+// registered through a ResponseWriter's OnTrack. A track nobody registered
+// for is dropped (logged): media is never handled unless asked for.
+func (s *Server) serveTrack(_ context.Context, _ ss.ChannelId, peer ss.SubscriberId, track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
+	fn := s.onTrackCallback(peer)
+	if fn == nil {
+		s.logger.Debug("msg_handler: inbound track with no OnTrack registered; dropping",
+			"peer", peer, "kind", track.Kind())
+		return
+	}
+	fn(track, receiver)
+}
+
+// foldDialog folds one inbound message of a call's dialog into the record
+// of the bot's own outgoing call it belongs to — the caller's logged
+// status duty, the Server's sniffing counterpart of the browser's
+// usePhoneCalls amend effect: when the folded status drifts from the
+// logged one, the bot's INVITE is amended in place (a chat-control amend
+// carrying the INVITE's sip body with the new X-Call-Status), so the
+// history's log entry follows the dialog. The fold is the precedence
+// maximum, settling a cancel/accept race identically on both ends, and a
+// terminal status drops the record — a terminal session is never revived.
+// Runs on the hub goroutine.
+func (s *Server) foldDialog(peers map[ss.SubscriberId]*peerRecord, outCalls map[ss.SubscriberId]map[string]*outgoingCall, n sipDialogNote) {
+	call := outCalls[n.peer][n.callId]
+	if call == nil {
+		return // not one of the bot's own calls: its caller owns the log
+	}
+	if callStatusPrecedence(n.established) <= callStatusPrecedence(call.status) {
+		return // already logged, or a stale lower-precedence message
+	}
+	call.status = n.established
+	if callStatusTerminal(call.status) {
+		delete(outCalls[n.peer], n.callId)
+	}
+	entry := peers[n.peer]
+	if entry == nil {
+		return // the session is gone; nothing to amend on
+	}
+	msg := newDCMsgOut(call.channelId, call.self, n.peer)
+	msg.MimeType = dcMsgMimeChatControl
+	msg.ChatControl = &dcChatControlBody{
+		Subtype:         "amend",
+		TargetMessageId: call.inviteMsgId,
+		// The amend rewrites the INVITE's whole sip body, so the X-Media
+		// header rides along to keep the log entry's kind — mirroring the
+		// frontend's status amend.
+		Sip: &dcSipBody{
+			CallId:      n.callId,
+			Method:      sipMethodInvite,
+			XMedia:      string(call.media),
+			XCallStatus: call.status,
+		},
+	}
+	if err := s.sendText(entry.dcmsg, msg.encode()); err != nil {
+		s.logger.Warn("msg_handler: call-status amend not sent",
+			"peer", n.peer, "callId", n.callId, "err", err)
+	}
+}
+
+// dialogStatusOf maps an inbound SIP dialog message onto the logged call
+// status it establishes — the frontend's statusEstablishedBy. ok is false
+// for an INVITE: it opens the peer's own call, which the peer logs itself.
+func dialogStatusOf(sip *dcSipIn) (status string, ok bool) {
+	if sip.response != nil {
+		if sip.response.Code == sipResponseOKCode {
+			return callStatusAccepted, true
+		}
+		return callStatusRejected, true
+	}
+	switch sip.method {
+	case sipMethodCancel:
+		return callStatusCancelled, true
+	case sipMethodBye:
+		return callStatusEnded, true
+	}
+	return "", false
+}
+
+// callStatusPrecedence totally orders the phone session's logged UI states
+// so the fold settles identically on both ends regardless of arrival order
+// — mirroring the frontend's statusPrecedence.
+func callStatusPrecedence(status string) int {
+	switch status {
+	case callStatusInviting:
+		return 0
+	case callStatusAccepted:
+		return 1
+	case callStatusEnded:
+		return 2
+	case callStatusCancelled:
+		return 3
+	case callStatusRejected:
+		return 4
+	}
+	return -1
+}
+
+// callStatusTerminal reports whether the status settles the call: a
+// terminal session is never revived, so its record is dropped.
+func callStatusTerminal(status string) bool {
+	return status == callStatusEnded || status == callStatusCancelled || status == callStatusRejected
 }
 
 // canonicalFileId normalizes a file id the way the wire codec does
@@ -276,7 +487,14 @@ func (s *Server) serveMessages(ctx context.Context, channelId ss.ChannelId, peer
 		}
 		if msg.mimeType == dcMsgMimeSip {
 			// The call protocol is never bounced; the dialog message goes
-			// straight to the handler.
+			// straight to the handler. But the Server sniffs it first: the
+			// message may advance the logged status of one of the bot's own
+			// outgoing calls — the caller's duty, owned here (the messaging
+			// channel's conditioning, like the echo rule), never the
+			// handler's.
+			if established, ok := dialogStatusOf(msg.sip); ok {
+				s.serviceChan <- sipDialogNote{peer: peer, callId: msg.sip.callId, established: established}
+			}
 			s.handler.HandleCalling(ctx, sipMessageOf(msg), &responseWriter{
 				server:    s,
 				dc:        dc,
@@ -285,6 +503,7 @@ func (s *Server) serveMessages(ctx context.Context, channelId ss.ChannelId, peer
 				peer:      peer,
 				inReplyTo: msg.msgId,
 				callId:    msg.sip.callId,
+				isInvite:  msg.sip.method == sipMethodInvite,
 			})
 			return
 		}

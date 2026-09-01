@@ -88,12 +88,14 @@ type dcSipBody struct {
 }
 
 // dcChatControlBody is the wire form of a chat-control DCMsg body (the
-// frontend's DCChatControl) — the subset the echo bot sends: an "amend"
-// rewriting a text message's plaintext.
+// frontend's DCChatControl): an "amend" rewriting a text message's
+// plaintext, or rewriting a call INVITE's sip body — the caller's way of
+// reporting the dialog's new logged UI state (X-Call-Status).
 type dcChatControlBody struct {
-	Subtype         string   `json:"subtype"`
-	TargetMessageId ss.MsgId `json:"targetMessageId"`
-	Text            string   `json:"text,omitempty"`
+	Subtype         string     `json:"subtype"`
+	TargetMessageId ss.MsgId   `json:"targetMessageId"`
+	Text            string     `json:"text,omitempty"`
+	Sip             *dcSipBody `json:"sip,omitempty"`
 }
 
 // dcMsgOut is the wire form of an outbound DCMsg — the fields the echo bot

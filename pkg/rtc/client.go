@@ -19,7 +19,10 @@ package rtc
 // carry: the browser application runs a JSON messaging protocol on
 // "dcmsg" and a binary file transfer on "dcbin", but here those labels —
 // and every other — belong to the caller, registered with
-// HandleDataChannel the way an http.ServeMux registers patterns.
+// HandleDataChannel the way an http.ServeMux registers patterns. Media is
+// the same shape: local tracks attach per session with AddTrack (the
+// session's negotiator renegotiates on its own), remote tracks arrive at
+// the handler registered with HandleTrack.
 //
 // Concurrency model: a single hub goroutine — started by the constructor
 // and living for the client's lifetime, like SimpleOnMemorySSProvider's
@@ -100,6 +103,32 @@ func (f DataChannelHandlerFunc) ServeDataChannel(ctx context.Context, channelId 
 
 var _ DataChannelHandler = DataChannelHandlerFunc(nil)
 
+// TrackHandler handles one remote media track arriving on a peer session —
+// the counterpart of DataChannelHandler for the peer connection's OnTrack:
+// the peer's microphone (or any track the peer adds mid-session, once the
+// channels are long up) arrives here.
+//
+// ServeTrack is invoked once per (session, track): when a remote track
+// arrives on the session's peer connection — and again for the re-arrived
+// track after a glare rebuild replaced the session's peer connection (the
+// renegotiation re-announces it). ctx is the peer session's context (see
+// DataChannelHandler). Every invocation runs on its own goroutine; a
+// panicking handler is logged and swallowed.
+type TrackHandler interface {
+	ServeTrack(ctx context.Context, channelId ss.ChannelId, peer ss.SubscriberId, track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver)
+}
+
+// TrackHandlerFunc adapts a function to a TrackHandler — the counterpart
+// of DataChannelHandlerFunc.
+type TrackHandlerFunc func(ctx context.Context, channelId ss.ChannelId, peer ss.SubscriberId, track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver)
+
+// ServeTrack implements TrackHandler.
+func (f TrackHandlerFunc) ServeTrack(ctx context.Context, channelId ss.ChannelId, peer ss.SubscriberId, track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
+	f(ctx, channelId, peer, track, receiver)
+}
+
+var _ TrackHandler = TrackHandlerFunc(nil)
+
 var (
 	// ErrNilNegotiatorFactory is returned by NewHeadlessRTCClient when the
 	// negotiator factory is nil.
@@ -112,6 +141,11 @@ var (
 	// ErrAlreadyRunning is returned by Run when a previous Run call on the
 	// same client is still in flight.
 	ErrAlreadyRunning = errors.New("rtc: Run is already running")
+
+	// ErrNoPeerSession is returned by AddTrack when the client holds no
+	// peer session with the given subscriber (no Run is in flight, or the
+	// peer is not a channel member).
+	ErrNoPeerSession = errors.New("rtc: no peer session with the given subscriber")
 )
 
 // errPeerSessionGone answers a rebuild request that arrived after its
@@ -211,6 +245,11 @@ type HeadlessRTCClient struct {
 	// hub goroutine; registered via handleNote, so it persists across
 	// runs like an http.ServeMux's patterns.
 	handlers map[string]DataChannelHandler
+
+	// trackHandler is the remote-media-track handler (pc.OnTrack),
+	// registered via trackHandlerNote; nil until one is registered. Owned
+	// by the hub goroutine.
+	trackHandler TrackHandler
 }
 
 // NewHeadlessRTCClient constructs a HeadlessRTCClient whose peer sessions
@@ -300,6 +339,66 @@ func (c *HeadlessRTCClient) HandleDataChannelFunc(label string, handler func(ctx
 	c.HandleDataChannel(label, DataChannelHandlerFunc(handler))
 }
 
+// HandleTrack registers handler for the remote media tracks of every peer
+// session — the counterpart of HandleDataChannel for the peer
+// connection's OnTrack, and the mirror of the browser's
+// PeerSessions.subscribeTracks. It panics when handler is nil or a track
+// handler is already registered. It is safe to call before or while Run is
+// in flight.
+func (c *HeadlessRTCClient) HandleTrack(handler TrackHandler) {
+	if handler == nil {
+		panic("rtc: nil track handler")
+	}
+	ack := make(chan error, 1)
+	c.serviceChan <- trackHandlerNote{handler: handler, ack: ack}
+	if err := <-ack; err != nil {
+		panic(err)
+	}
+}
+
+// HandleTrackFunc registers a function as the remote-media-track handler —
+// the counterpart of HandleDataChannelFunc.
+func (c *HeadlessRTCClient) HandleTrackFunc(handler func(ctx context.Context, channelId ss.ChannelId, peer ss.SubscriberId, track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver)) {
+	c.HandleTrack(TrackHandlerFunc(handler))
+}
+
+// AddTrack adds track to the peer session's peer connection, to be sent to
+// the peer — the mirror of the browser's PeerSessions.addTrack: the
+// session's negotiator renegotiates automatically (pion fires
+// OnNegotiationNeeded), so no signalling work is needed here. It returns
+// the sender, mirroring pion's own AddTrack. ErrNoPeerSession is returned
+// when there is no session with the peer; re-adding an already attached
+// track is a no-op returning its current sender.
+//
+// The track survives a glare rebuild: the client re-adds the session's
+// tracks to the rebuilt connection. The returned sender does NOT — it
+// belongs to the replaced connection — so RemoveTrack keys by track, never
+// by sender. The track must be a comparable implementation (pion's track
+// types are pointers).
+func (c *HeadlessRTCClient) AddTrack(peer ss.SubscriberId, track webrtc.TrackLocal) (*webrtc.RTPSender, error) {
+	if track == nil {
+		panic("rtc: nil track")
+	}
+	reply := make(chan addTrackReply, 1)
+	c.serviceChan <- addTrackNote{peer: peer, track: track, reply: reply}
+	r := <-reply
+	return r.sender, r.err
+}
+
+// RemoveTrack removes track (previously added with AddTrack) from the peer
+// session — the mirror of the browser's PeerSessions.removeTrack, keyed by
+// track rather than sender so a glare rebuild (which swaps the sender)
+// cannot stale the caller's handle. Removing renegotiates like adding
+// does. It is a no-op when the session or the track is already gone.
+func (c *HeadlessRTCClient) RemoveTrack(peer ss.SubscriberId, track webrtc.TrackLocal) error {
+	if track == nil {
+		panic("rtc: nil track")
+	}
+	reply := make(chan error, 1)
+	c.serviceChan <- removeTrackNote{peer: peer, track: track, reply: reply}
+	return <-reply
+}
+
 // SubscriberId reports the subscriber id the client is registered as;
 // empty while no Run is registered (before the first one, between runs,
 // after the last one ended).
@@ -376,6 +475,40 @@ type announcedNote struct {
 	dc   *webrtc.DataChannel
 }
 
+// trackHandlerNote registers the remote-media-track handler (HandleTrack).
+type trackHandlerNote struct {
+	handler TrackHandler
+	ack     chan<- error // buffered: non-nil on a duplicate registration
+}
+
+// addTrackNote attaches a local media track to a peer session's peer
+// connection (AddTrack).
+type addTrackNote struct {
+	peer  ss.SubscriberId
+	track webrtc.TrackLocal
+	reply chan<- addTrackReply // buffered: answered once
+}
+
+type addTrackReply struct {
+	sender *webrtc.RTPSender
+	err    error
+}
+
+// removeTrackNote detaches a local media track from a peer session's peer
+// connection (RemoveTrack).
+type removeTrackNote struct {
+	peer  ss.SubscriberId
+	track webrtc.TrackLocal
+	reply chan<- error // buffered: answered once
+}
+
+// trackNote reports a remote media track arriving on a session (OnTrack).
+type trackNote struct {
+	sess     *peerSession
+	track    *webrtc.TrackRemote
+	receiver *webrtc.RTPReceiver
+}
+
 // rebuildNote is a session's glare yield: the negotiator needs a fresh
 // peer connection, re-wired and re-stocked with the session's channels.
 type rebuildNote struct {
@@ -392,12 +525,16 @@ type rebuildReply struct {
 type selfNote struct{ reply chan<- ss.SubscriberId }
 type peersNote struct{ reply chan<- []ss.SubscriberId }
 
-func (runNote) isClientNote()       {}
-func (handleNote) isClientNote()    {}
-func (announcedNote) isClientNote() {}
-func (rebuildNote) isClientNote()   {}
-func (selfNote) isClientNote()      {}
-func (peersNote) isClientNote()     {}
+func (runNote) isClientNote()          {}
+func (handleNote) isClientNote()       {}
+func (announcedNote) isClientNote()    {}
+func (trackHandlerNote) isClientNote() {}
+func (addTrackNote) isClientNote()     {}
+func (removeTrackNote) isClientNote()  {}
+func (trackNote) isClientNote()        {}
+func (rebuildNote) isClientNote()      {}
+func (selfNote) isClientNote()         {}
+func (peersNote) isClientNote()        {}
 
 // clientRun is the hub's state for one served connection: the Run
 // request's channels and context, the registration, the tickers, the
@@ -441,6 +578,14 @@ func (c *HeadlessRTCClient) hub() {
 				c.handleDataChannelNote(run, n)
 			case announcedNote:
 				c.handleAnnouncedNote(run, n)
+			case trackHandlerNote:
+				c.handleTrackHandlerNote(n)
+			case addTrackNote:
+				c.handleAddTrackNote(run, n)
+			case removeTrackNote:
+				c.handleRemoveTrackNote(run, n)
+			case trackNote:
+				c.handleTrackNote(run, n)
 			case rebuildNote:
 				c.handleRebuildNote(run, n)
 			case selfNote:
@@ -824,13 +969,100 @@ func (c *HeadlessRTCClient) handleAnnouncedNote(run *clientRun, n announcedNote)
 	c.dispatchDataChannel(n.sess, n.dc, handler)
 }
 
+// handleTrackHandlerNote registers the remote-media-track handler,
+// rejecting a duplicate registration.
+func (c *HeadlessRTCClient) handleTrackHandlerNote(n trackHandlerNote) {
+	if c.trackHandler != nil {
+		n.ack <- errors.New("rtc: multiple track handler registrations")
+		return
+	}
+	c.trackHandler = n.handler
+	n.ack <- nil
+}
+
+// handleAddTrackNote attaches a local media track to the session's peer
+// connection and records it, so a glare rebuild can re-add it to the
+// rebuilt connection. Adding fires the peer connection's
+// OnNegotiationNeeded — the session's negotiator renegotiates on its own.
+func (c *HeadlessRTCClient) handleAddTrackNote(run *clientRun, n addTrackNote) {
+	if run == nil {
+		n.reply <- addTrackReply{err: ErrNoPeerSession}
+		return
+	}
+	sess := run.sessions[n.peer]
+	if sess == nil {
+		n.reply <- addTrackReply{err: ErrNoPeerSession}
+		return
+	}
+	for _, st := range sess.tracks {
+		if st.track == n.track {
+			// Already attached: a no-op returning the current sender.
+			n.reply <- addTrackReply{sender: st.sender}
+			return
+		}
+	}
+	sender, err := sess.pc.AddTrack(n.track)
+	if err != nil {
+		n.reply <- addTrackReply{err: err}
+		return
+	}
+	sess.tracks = append(sess.tracks, sessionTrack{track: n.track, sender: sender})
+	n.reply <- addTrackReply{sender: sender}
+}
+
+// handleRemoveTrackNote detaches a local media track from the session's
+// peer connection; a no-op when the session or the track is already gone.
+func (c *HeadlessRTCClient) handleRemoveTrackNote(run *clientRun, n removeTrackNote) {
+	if run == nil {
+		n.reply <- nil
+		return
+	}
+	sess := run.sessions[n.peer]
+	if sess == nil {
+		n.reply <- nil
+		return
+	}
+	for i, st := range sess.tracks {
+		if st.track == n.track {
+			var err error
+			if sess.pc.SignalingState() != webrtc.SignalingStateClosed {
+				err = sess.pc.RemoveTrack(st.sender)
+			}
+			if err != nil {
+				n.reply <- err
+				return
+			}
+			sess.tracks = slices.Delete(sess.tracks, i, i+1)
+			n.reply <- nil
+			return
+		}
+	}
+	n.reply <- nil // never attached: the desired end state
+}
+
+// handleTrackNote dispatches a remote media track arriving on a session to
+// the registered track handler, if any.
+func (c *HeadlessRTCClient) handleTrackNote(run *clientRun, n trackNote) {
+	if run == nil || run.sessions[n.sess.peer] != n.sess {
+		return // a late event of a torn-down session
+	}
+	handler := c.trackHandler
+	if handler == nil {
+		c.logger.Debug("rtc: remote track with no track handler", "peer", n.sess.peer, "kind", n.track.Kind())
+		return
+	}
+	c.dispatchTrack(n.sess, n.track, n.receiver, handler)
+}
+
 // handleRebuildNote is the hub side of a session's glare yield: a fresh
 // peer connection, re-wired and re-stocked with the session's channels —
 // every known label is re-created locally (the peer's own channels died
-// with the replaced connection either way), and the label handlers are
-// re-invoked with the fresh channels. The session's state is swapped only
-// once the fresh connection is fully stocked, so a failure leaves the
-// session untouched. See PerfectNegotiatorOptions.NewPeerConnection.
+// with the replaced connection either way), the label handlers are
+// re-invoked with the fresh channels, and the session's local media tracks
+// are re-added (pion cannot roll back; the browser's implicit rollback
+// preserves its transceivers, so the rebuild must). The session's state is
+// swapped only once the fresh connection is fully stocked, so a failure
+// leaves the session untouched. See PerfectNegotiatorOptions.NewPeerConnection.
 func (c *HeadlessRTCClient) handleRebuildNote(run *clientRun, n rebuildNote) {
 	if run == nil || run.sessions[n.sess.peer] != n.sess {
 		n.reply <- rebuildReply{err: errPeerSessionGone}
@@ -860,8 +1092,22 @@ func (c *HeadlessRTCClient) handleRebuildNote(run *clientRun, n rebuildNote) {
 			toDispatch = append(toDispatch, pending{dc, handler})
 		}
 	}
+	// The tracks, re-added before the swap completes: the negotiator
+	// answers the colliding offer on the fresh connection, and the answer
+	// must carry them.
+	tracks := make([]sessionTrack, 0, len(n.sess.tracks))
+	for _, st := range n.sess.tracks {
+		sender, err := fresh.AddTrack(st.track)
+		if err != nil {
+			_ = fresh.Close()
+			n.reply <- rebuildReply{err: fmt.Errorf("rtc: re-add track %q: %w", st.track.ID(), err)}
+			return
+		}
+		tracks = append(tracks, sessionTrack{track: st.track, sender: sender})
+	}
 	n.sess.pc = fresh
 	n.sess.channels = channels
+	n.sess.tracks = tracks
 	n.reply <- rebuildReply{pc: fresh}
 	for _, p := range toDispatch {
 		c.dispatchDataChannel(n.sess, p.dc, p.handler)
@@ -870,11 +1116,18 @@ func (c *HeadlessRTCClient) handleRebuildNote(run *clientRun, n rebuildNote) {
 
 // attachPeerConnection wires the client's own pion handlers on pc —
 // distinct from the negotiator's (OnNegotiationNeeded, OnICECandidate):
-// every data channel the peer announces is reported to the hub.
+// every data channel the peer announces is reported to the hub, and so is
+// every remote media track arriving mid-session.
 func (c *HeadlessRTCClient) attachPeerConnection(sess *peerSession, pc *webrtc.PeerConnection) {
 	pc.OnDataChannel(func(dc *webrtc.DataChannel) {
 		select {
 		case c.serviceChan <- announcedNote{sess: sess, dc: dc}:
+		case <-sess.ctx.Done():
+		}
+	})
+	pc.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
+		select {
+		case c.serviceChan <- trackNote{sess: sess, track: track, receiver: receiver}:
 		case <-sess.ctx.Done():
 		}
 	})
@@ -892,6 +1145,20 @@ func (c *HeadlessRTCClient) dispatchDataChannel(sess *peerSession, dc *webrtc.Da
 			}
 		}()
 		handler.ServeDataChannel(sess.ctx, c.channelId, sess.peer, dc)
+	}()
+}
+
+// dispatchTrack invokes the track handler on its own goroutine, recovering
+// panics — like dispatchDataChannel, user code must not be able to stall
+// or crash the client.
+func (c *HeadlessRTCClient) dispatchTrack(sess *peerSession, track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver, handler TrackHandler) {
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				c.logger.Error("rtc: track handler panicked", "peer", sess.peer, "err", r)
+			}
+		}()
+		handler.ServeTrack(sess.ctx, c.channelId, sess.peer, track, receiver)
 	}()
 }
 
@@ -944,6 +1211,16 @@ type peerSession struct {
 	// never touched elsewhere.
 	pc       *webrtc.PeerConnection
 	channels map[string]*webrtc.DataChannel
+	tracks   []sessionTrack
+}
+
+// sessionTrack is one local media track attached to the session's peer
+// connection, with its current sender — refreshed when a glare rebuild
+// re-adds the track to the rebuilt connection, so the session's record
+// never holds a stale sender.
+type sessionTrack struct {
+	track  webrtc.TrackLocal
+	sender *webrtc.RTPSender
 }
 
 // run drives the session's negotiation until the session's context ends.

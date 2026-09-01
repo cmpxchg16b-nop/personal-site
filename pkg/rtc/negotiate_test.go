@@ -20,8 +20,11 @@ import (
 // middle as a dumb c2c relay.
 
 // testTimeout bounds every wait in the suite; local ICE is fast, so
-// hitting it means a real failure, not slowness.
-const testTimeout = 10 * time.Second
+// hitting it means a real failure, not slowness. It is generous all the
+// same: under the race detector with the sibling suites (echobot,
+// musicbot) running in parallel, a pion handshake can take several
+// seconds on a loaded machine.
+const testTimeout = 30 * time.Second
 
 // testClient is one in-process SS client: a peer connection with a
 // negotiator attached, plus the transport channels the test pumps

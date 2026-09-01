@@ -31,6 +31,7 @@ import (
 	pkgmodelsss "personal-site/pkg/models/ss"
 	"personal-site/pkg/rtc"
 	"personal-site/pkg/rtc/echobot"
+	"personal-site/pkg/rtc/musicbot"
 	pkgsession "personal-site/pkg/session"
 
 	"github.com/alecthomas/kong"
@@ -306,21 +307,27 @@ func (cmd *ServeCmd) Run(cli *CLI) error {
 
 	jwtValidator := pkgauth.NewStaticKeyJWTValidator(keyProvider, blProvider, cmd.RejectVisitor)
 
-	// The built-in echo bot: an echo-purpose headless RTC peer
-	// (pkg/rtc/echobot) living in this process as a plain signalling
-	// client of the WebSocket endpoint its <echoBot/> configuration
-	// points at — typically this server's own /api/ss/ws. Wired only when
-	// the element carries a url and a jwt (so a sample element with empty
-	// values can ship in the document unused); the token doubles as the
-	// bot's whole identity: sub/jti become its signalling address, and the
-	// username claim becomes its display name — the endpoint stamps it
-	// onto the bot's registration, like every client's. The bot lives
-	// for the process lifetime, re-establishing the connection when it
-	// drops.
+	// The built-in bots: headless RTC peers (pkg/rtc/echobot,
+	// pkg/rtc/musicbot) living in this process as plain signalling
+	// clients of the WebSocket endpoint their <echoBot/> or <musicBot/>
+	// configuration points at — typically this server's own /api/ss/ws.
+	// Wired only when the element carries a url and a jwt (so a sample
+	// element with empty values can ship in the document unused); the
+	// token doubles as the bot's whole identity: sub/jti become its
+	// signalling address, and the username claim becomes its display name
+	// — the endpoint stamps it onto the bot's registration, like every
+	// client's. The bots live for the process lifetime, re-establishing
+	// the connection when it drops.
 	if serverCfg != nil && serverCfg.EchoBot != nil &&
 		serverCfg.EchoBot.URL != "" && serverCfg.EchoBot.JWT != "" {
 		if err := startEchoBot(ctx, serverCfg.EchoBot); err != nil {
 			return fmt.Errorf("echo bot: %w", err)
+		}
+	}
+	if serverCfg != nil && serverCfg.MusicBot != nil &&
+		serverCfg.MusicBot.URL != "" && serverCfg.MusicBot.JWT != "" {
+		if err := startMusicBot(ctx, serverCfg.MusicBot); err != nil {
+			return fmt.Errorf("music bot: %w", err)
 		}
 	}
 
@@ -382,13 +389,27 @@ func (cli *CLI) getJWTSecret() ([]byte, error) {
 	return getJWTSecFromSomewhere(cli.JWTAuthSecretFromEnv, cli.JWTAuthSecretFromFile)
 }
 
-// defaultEchoBotReconnectInterval is how long the bot waits before
+// defaultBotReconnectInterval is how long a bot waits before
 // re-establishing a lost signalling connection, unless the
-// configuration's <echoBot/> element says otherwise.
-const defaultEchoBotReconnectInterval = 5 * time.Second
+// configuration's bot element says otherwise.
+const defaultBotReconnectInterval = 5 * time.Second
 
-// startEchoBot wires the built-in echo bot: a pkg/rtc/echobot Bot on a
-// pkg/rtc HeadlessRTCClient, driven over a pkg/rtc
+// startEchoBot wires the built-in echo bot (pkg/rtc/echobot).
+func startEchoBot(ctx context.Context, cfg *pkgmodelsserverconfig.BotClientXML) error {
+	return startBotClient(ctx, "echo bot", cfg, func(client *rtc.HeadlessRTCClient) {
+		echobot.New(client, echobot.Configuration{Logger: logger})
+	})
+}
+
+// startMusicBot wires the built-in music bot (pkg/rtc/musicbot).
+func startMusicBot(ctx context.Context, cfg *pkgmodelsserverconfig.BotClientXML) error {
+	return startBotClient(ctx, "music bot", cfg, func(client *rtc.HeadlessRTCClient) {
+		musicbot.New(client, musicbot.Configuration{Logger: logger})
+	})
+}
+
+// startBotClient wires one built-in bot: a pkg/rtc bot (attached by wire)
+// on a pkg/rtc HeadlessRTCClient, driven over a pkg/rtc
 // WebSocketSignallingTransport to the endpoint cfg.URL points at, with
 // cfg.JWT as the session credential, sent as a bearer token (the
 // endpoint is not on the JWT whitelist). The bot never inspects the
@@ -396,7 +417,7 @@ const defaultEchoBotReconnectInterval = 5 * time.Second
 // surfaces as the reconnect loop's logged 401s. The bot runs until ctx
 // is done, re-establishing the signalling connection every
 // reconnectInterval when it drops.
-func startEchoBot(ctx context.Context, cfg *pkgmodelsserverconfig.EchoBotXML) error {
+func startBotClient(ctx context.Context, name string, cfg *pkgmodelsserverconfig.BotClientXML, wire func(client *rtc.HeadlessRTCClient)) error {
 	keepAliveInterval, err := pkgmodelsserverconfig.ParseDuration(cfg.KeepAliveInterval, 0)
 	if err != nil {
 		return fmt.Errorf("keepAliveInterval: %w", err)
@@ -409,7 +430,7 @@ func startEchoBot(ctx context.Context, cfg *pkgmodelsserverconfig.EchoBotXML) er
 	if err != nil {
 		return fmt.Errorf("replyTimeout: %w", err)
 	}
-	reconnectInterval, err := pkgmodelsserverconfig.ParseDuration(cfg.ReconnectInterval, defaultEchoBotReconnectInterval)
+	reconnectInterval, err := pkgmodelsserverconfig.ParseDuration(cfg.ReconnectInterval, defaultBotReconnectInterval)
 	if err != nil {
 		return fmt.Errorf("reconnectInterval: %w", err)
 	}
@@ -437,7 +458,7 @@ func startEchoBot(ctx context.Context, cfg *pkgmodelsserverconfig.EchoBotXML) er
 	}
 	// The bot registers its dcmsg/dcbin handlers on the client at
 	// construction; it needs no further driving.
-	echobot.New(client, echobot.Configuration{Logger: logger})
+	wire(client)
 
 	transport := &rtc.WebSocketSignallingTransport{
 		URL:    cfg.URL,
@@ -459,7 +480,7 @@ func startEchoBot(ctx context.Context, cfg *pkgmodelsserverconfig.EchoBotXML) er
 			if ctx.Err() != nil {
 				return
 			}
-			logger.Warn("echo bot: signalling connection ended, reconnecting",
+			logger.Warn(name+": signalling connection ended, reconnecting",
 				"clientErr", runErr, "transportErr", terr, "retryIn", reconnectInterval)
 			select {
 			case <-time.After(reconnectInterval):
@@ -467,7 +488,7 @@ func startEchoBot(ctx context.Context, cfg *pkgmodelsserverconfig.EchoBotXML) er
 			}
 		}
 	}()
-	logger.Info("echo bot wired",
+	logger.Info(name+" wired",
 		"url", cfg.URL, "channelId", cfg.ChannelId,
 		"subscriberId", cfg.SubscriberId)
 	return nil

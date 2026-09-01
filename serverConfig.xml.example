@@ -153,4 +153,18 @@
     keepAliveInterval="5s"
   />
   -->
+
+  <!-- The built-in music bot (optional): a music-purpose headless RTC
+       peer (pkg/rtc/musicbot), wired exactly like the echo bot above —
+       same attributes, same identity story. Its chat is a CLI: /help,
+       /list-songs, /play <song> (the bot phones you and plays a
+       programmatically generated song). Video calls are declined, voice
+       calls accepted.
+  <musicBot
+    url="wss://example.com/api/ss/ws"
+    jwt=""
+    subscriberId="musicbot"
+    keepAliveInterval="5s"
+  />
+  -->
 </serverConfig>

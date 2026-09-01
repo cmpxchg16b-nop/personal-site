@@ -13,7 +13,11 @@
 //   - one accepted chunk of an inbound file transfer (FileChunk),
 //   - a completely transferred file attachment (Attachment — a file,
 //     photo, or video attachment),
-//   - one message of a call's SIP-subset dialog (SipMessage).
+//   - one message of a call's SIP-subset dialog (SipMessage) — an
+//     incoming INVITE answered with the ResponseWriter's Accept or
+//     Reject, an outgoing call opened with its Invite, the call's media
+//     offered as webrtc TrackLocals and the peer's inbound media arriving
+//     at the registered OnTrack callback.
 //
 // The protocol mechanics stay with the Server, below the interface, and
 // are no concern of a BotMessageHandler: malformed frames are dropped

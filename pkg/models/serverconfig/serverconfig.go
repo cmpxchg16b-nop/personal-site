@@ -32,7 +32,11 @@ type ServerConfigXML struct {
 	// EchoBot is nil when the document has no <echoBot/> element; the
 	// built-in echo bot is wired only when the element is present and
 	// carries a url and a jwt (see cmd/server).
-	EchoBot *EchoBotXML `xml:"echoBot"`
+	EchoBot *BotClientXML `xml:"echoBot"`
+	// MusicBot is nil when the document has no <musicBot/> element; the
+	// built-in music bot is wired only when the element is present and
+	// carries a url and a jwt (see cmd/server).
+	MusicBot *BotClientXML `xml:"musicBot"`
 }
 
 // OIDCLoginOptionsXML mirrors the <oidcLoginOptions/> section of
@@ -92,18 +96,18 @@ type LoginOptionXML struct {
 	AllowedOrigins string `xml:"allowedOrigins,attr"`
 }
 
-// EchoBotXML mirrors the <echoBot/> section of serverConfig.xml: the
-// built-in echo-purpose bot (pkg/rtc/echobot on a pkg/rtc
-// HeadlessRTCClient), which lives in the server process as a plain
-// signalling client of the WebSocket endpoint URL points at — typically
-// this server's own /api/ss/ws. JWT is the bot's session token, sent as a
-// bearer token on the WebSocket handshake (the endpoint is not on the JWT
-// whitelist); the token is the bot's whole identity — the endpoint stamps
-// its subject/session onto the bot's events, and its username claim is
-// the registration's display name, like every client's. The remaining
-// attribute names mirror the fields of rtc.RTCClientConfiguration with a
-// lowercased first letter.
-type EchoBotXML struct {
+// BotClientXML mirrors a bot client section of serverConfig.xml
+// (<echoBot/>, <musicBot/>): a built-in bot (pkg/rtc/echobot,
+// pkg/rtc/musicbot on a pkg/rtc HeadlessRTCClient), which lives in the
+// server process as a plain signalling client of the WebSocket endpoint
+// URL points at — typically this server's own /api/ss/ws. JWT is the
+// bot's session token, sent as a bearer token on the WebSocket handshake
+// (the endpoint is not on the JWT whitelist); the token is the bot's
+// whole identity — the endpoint stamps its subject/session onto the bot's
+// events, and its username claim is the registration's display name, like
+// every client's. The remaining attribute names mirror the fields of
+// rtc.RTCClientConfiguration with a lowercased first letter.
+type BotClientXML struct {
 	URL string `xml:"url,attr"`
 	JWT string `xml:"jwt,attr"`
 	// ChannelId is the channel the bot registers in; empty selects the

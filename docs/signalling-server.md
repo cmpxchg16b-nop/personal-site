@@ -8,24 +8,27 @@ in process memory.
 
 ## Components
 
-| Layer            | Location                           | Role                                                                                                                                                                                   |
-| ---------------- | ---------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Wire prototype   | `web/site/src/api/ss/types.ts`     | The browser-side TypeScript prototype; the source of truth for the wire format.                                                                                                        |
-| Model            | `pkg/models/ss`                    | Go wire types (field- and JSON-compatible with the prototype), the `SignallingServiceProvider` interface, and `SimpleOnMemorySSProvider`.                                              |
-| Negotiator       | `web/site/src/api/ss/negotiate.ts` | Browser-side MDN perfect negotiation over the c2c relay (the prototype).                                                                                                               |
-| Negotiator       | `pkg/rtc`                          | The Go counterpart of `negotiate.ts` on `pion/webrtc`: `Negotiator` interface + `PerfectNegotiator`, reading from and writing to Go channels.                                          |
-| Headless client  | `pkg/rtc` (`client.go`)            | `HeadlessRTCClient` — the Go counterpart of `useSignalling` + `usePeerSessions`: a bot peer driving one session per channel member, over a caller-supplied channel pair (see below).   |
-| Client transport | `pkg/rtc` (`transport.go`)         | `SignallingTransport`, the client's SSProxy: pumps a channel pair to/from the SS; `WebSocketSignallingTransport` is the production one.                                                |
-| Echo bot         | `pkg/rtc/echobot`                  | The reference data-channel stack of an echo-purpose bot on `HeadlessRTCClient`: serves the well-known `dcmsg`/`dcbin` labels (see below).                                              |
-| Transport        | `pkg/api/websocket_ss`             | `WebSocketSSHandler`, an `http.Handler` bridging WebSocket connections to a provider.                                                                                                  |
-| Wiring           | `cmd/server/main.go`               | Mounts the handler at `/api/ss/ws`, backed by the in-memory provider; when the configuration document carries an `<echoBot/>` element, also hosts the bot as a client of the endpoint. |
-| E2E tests        | `e2e/websocket_ss_test.go`         | Drives the real server binary over WebSocket with deliberately independent wire views.                                                                                                 |
+| Layer            | Location                           | Role                                                                                                                                                                                                      |
+| ---------------- | ---------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Wire prototype   | `web/site/src/api/ss/types.ts`     | The browser-side TypeScript prototype; the source of truth for the wire format.                                                                                                                           |
+| Model            | `pkg/models/ss`                    | Go wire types (field- and JSON-compatible with the prototype), the `SignallingServiceProvider` interface, and `SimpleOnMemorySSProvider`.                                                                 |
+| Negotiator       | `web/site/src/api/ss/negotiate.ts` | Browser-side MDN perfect negotiation over the c2c relay (the prototype).                                                                                                                                  |
+| Negotiator       | `pkg/rtc`                          | The Go counterpart of `negotiate.ts` on `pion/webrtc`: `Negotiator` interface + `PerfectNegotiator`, reading from and writing to Go channels.                                                             |
+| Headless client  | `pkg/rtc` (`client.go`)            | `HeadlessRTCClient` — the Go counterpart of `useSignalling` + `usePeerSessions`: a bot peer driving one session per channel member, over a caller-supplied channel pair (see below).                      |
+| Client transport | `pkg/rtc` (`transport.go`)         | `SignallingTransport`, the client's SSProxy: pumps a channel pair to/from the SS; `WebSocketSignallingTransport` is the production one.                                                                   |
+| Echo bot         | `pkg/rtc/echobot`                  | The reference data-channel stack of an echo-purpose bot on `HeadlessRTCClient`: serves the well-known `dcmsg`/`dcbin` labels (see below).                                                                 |
+| Bot DC layer     | `pkg/rtc/msg_handler`              | The data-channel layer of a bot: `Server` serves `dcmsg`/`dcbin` (echo rule, transfer reassembly and acks, the call log's status amends) and distills frames into bot messages for a `BotMessageHandler`. |
+| Music bot        | `pkg/rtc/musicbot`                 | A music-purpose `BotMessageHandler`: chat CLI (`/help`, `/list-songs`, `/play`), voice calls answered with a generated song (PCMU), video declined.                                                       |
+| Transport        | `pkg/api/websocket_ss`             | `WebSocketSSHandler`, an `http.Handler` bridging WebSocket connections to a provider.                                                                                                                     |
+| Wiring           | `cmd/server/main.go`               | Mounts the handler at `/api/ss/ws`, backed by the in-memory provider; when the configuration document carries an `<echoBot/>` or `<musicBot/>` element, also hosts the bots as clients of the endpoint.   |
+| E2E tests        | `e2e/websocket_ss_test.go`         | Drives the real server binary over WebSocket with deliberately independent wire views.                                                                                                                    |
 
 ```mermaid
 graph TD
     A[browser client A] <-->|WebSocket| H["WebSocketSSHandler: hub goroutine + CAM table"]
     B[browser client B] <-->|WebSocket| H
     C["echo bot (cmd/server, pkg/rtc/echobot)"] <-->|WebSocket| H
+    D["music bot (cmd/server, pkg/rtc/musicbot)"] <-->|WebSocket| H
     H -->|inMsg service channel| P["SimpleOnMemorySSProvider: single Run goroutine owns all state"]
     P -->|outMsg| H
 ```
@@ -178,7 +181,12 @@ member listing, and reconciles one peer session per member. Data
 channels are dispatched by label to handlers registered with
 `HandleDataChannel` — the `http.ServeMux.Handle` shape; like the
 browser's `usePeerSessions`, the client hardcodes no label: `dcmsg`,
-`dcbin`, and any other protocol belong to the caller.
+`dcbin`, and any other protocol belong to the caller. Media mirrors the
+browser too: `AddTrack`/`RemoveTrack` attach and detach a session's
+local tracks (the negotiator renegotiates on its own, and a glare
+rebuild re-adds the tracks to the rebuilt connection), and remote tracks
+arrive at the handler registered with `HandleTrack` — the counterpart of
+`PeerSessions.subscribeTracks`.
 
 A bot built on the client is three layers. The client is the bot client
 (above). `pkg/rtc/msg_handler` is the data-channel layer: its `Server`
@@ -186,14 +194,20 @@ serves the two well-known labels and owns every sub-message protocol
 mechanic — the echo rule (every accepted message is bounced back verbatim
 with `echo` set; echoes and SIP dialog messages are never bounced), the
 strict FILE-frame reassembly (a gap, an overlap, or a mismatched `total`
-drops the transfer), and the per-frame acknowledgement. It distills the
-raw frames into bot messages — a plain-text chat line, one accepted chunk
-of a file transfer, a completely transferred file attachment, a call
-dialog message — and hands them to a `BotMessageHandler`, which answers
-through the invocation's `ResponseWriter` (a chat reply, an amendment of
-an earlier message, a call's final response; the call-accepting side is
-shaped on webrtc's `TrackLocal`/`TrackRemote` for when the client grows
-media support). The reference `BotMessageHandler` is `pkg/rtc/echobot`:
+drops the transfer), the per-frame acknowledgement, and the call log's
+conditioning: the Server sniffs the call dialogs and amends the INVITEs
+of the bot's own outgoing calls as their status moves (the caller's
+X-Call-Status duty — below the interface, like the echo rule). It
+distills the raw frames into bot messages — a plain-text chat line, one
+accepted chunk of a file transfer, a completely transferred file
+attachment, a call dialog message — and hands them to a
+`BotMessageHandler`, which answers through the invocation's
+`ResponseWriter`: a chat reply, an amendment of an earlier message, a
+call's final response (Accept/Reject), an outgoing call (`Invite`), and
+the call's media — local tracks offered with Accept/AttachMedia (pion
+`TrackLocal`s on the pair's existing peer connection), the peer's inbound
+media arriving at the registered OnTrack callback. The reference
+`BotMessageHandler` is `pkg/rtc/echobot`:
 an echo-purpose policy that answers a plain-text chat line with a fresh
 message of identical content, declines every incoming call — voice or
 video — with a `603 Decline`, and reports every inbound file's running
@@ -205,11 +219,24 @@ the report opens immediately and ends on the complete digest. The file's
 bytes are never retained — the hash is the deliverable, and it is
 complete the moment the last chunk lands.
 
-The server binary itself hosts the bot when the configuration document
-carries an `<echoBot/>` element (see `serverConfig.xsd`): `cmd/server`
-drives it over a `WebSocketSignallingTransport` to the configured
+The second handler is `pkg/rtc/musicbot`, the music bot: chat with it is
+a CLI — `/help`, `/list-songs`, and `/play <song>`, which phones the
+user (the bot's own voice INVITE) and plays the song once accepted, or
+switches it mid-call. An incoming voice call is accepted and answered
+with the music; a video call is declined on the spot; an attachment of
+any kind is refused with a chat reply. The one initial song is
+programmatically generated — an eight-bar pentatonic loop synthesized to
+8 kHz mono PCM, G.711 μ-law encoded (PCMU, the WebRTC audio codec every
+browser offers and a pure-Go encoder can produce) — and plays
+indefinitely, fed to the call's track twenty milliseconds at a time by
+the call's player; the peer's own audio is drained and discarded.
+
+The server binary itself hosts the bots when the configuration document
+carries an `<echoBot/>` or `<musicBot/>` element (see `serverConfig.xsd`):
+`cmd/server`
+drives them over a `WebSocketSignallingTransport` to the configured
 endpoint — typically the same server's own `/api/ss/ws` — with the
-configured session token as its credential, reconnecting when the
+configured session token as their credential, reconnecting when the
 connection drops. The token doubles as the bot's whole identity: the
 endpoint stamps its subject/session onto the bot's events, and its
 username claim is the registration's display name, like every client's.

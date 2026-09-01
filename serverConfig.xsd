@@ -120,7 +120,16 @@
                                default 10s).
                * reconnectInterval  how long to wait before re-estab-
                                lishing a lost signalling connection. -->
-        <xsd:element name="echoBot" type="echoBotType" minOccurs="0" />
+        <xsd:element name="echoBot" type="botClientType" minOccurs="0" />
+        <!-- The built-in music bot: a music-purpose headless RTC peer
+             (pkg/rtc/musicbot), living in the server process exactly like
+             the echo bot above (the attributes are the same). Its chat
+             is a CLI — /help, /list-songs, /play <song> — video calls
+             are declined, voice calls accepted and answered with a
+             programmatically generated song (G.711 μ-law), and /play
+             phones the user itself. Wired only when url and jwt are
+             non-empty. -->
+        <xsd:element name="musicBot" type="botClientType" minOccurs="0" />
       </xsd:sequence>
     </xsd:complexType>
   </xsd:element>
@@ -136,8 +145,9 @@
     />
   </xsd:complexType>
 
-  <!-- A single echo bot configuration; see the echoBot element above. -->
-  <xsd:complexType name="echoBotType">
+  <!-- A single bot client configuration (echo bot, music bot); see the
+       echoBot and musicBot elements above. -->
+  <xsd:complexType name="botClientType">
     <xsd:attribute name="url" type="xsd:string" use="required" />
     <xsd:attribute name="jwt" type="xsd:string" use="required" />
     <xsd:attribute name="channelId" type="xsd:string" use="optional" />

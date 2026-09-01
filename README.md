@@ -50,8 +50,9 @@ variable name with `--jwt-auth-secret-from-env`). Conventional `.env.local`
 / `.env` files are loaded before flag parsing, so a gitignored `.env.local`
 is the place for local secrets.
 
-Machine clients that cannot log in interactively — the built-in echo bot's
-`<echoBot/>` element is the example — carry a static session token instead.
+Machine clients that cannot log in interactively — the built-in bots'
+`<echoBot/>` and `<musicBot/>` elements are the examples — carry a static
+session token instead.
 Issue one with the server binary's `sign` subcommand, which signs with the
 same secret indirection as the server itself:
 
