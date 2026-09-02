@@ -2,9 +2,9 @@
 
 The signalling sub-system lets the site's visitors discover each other and
 broker WebRTC session establishment (session descriptions and trickle ICE
-candidates) between them. It is a prototype: client identity comes from
-experimental HTTP headers, only the main channel exists, and all state lives
-in process memory.
+candidates) between them. Client identity comes from the caller's JWT
+session (see _Identity_). It is a prototype: only the main channel
+exists, and all state lives in process memory.
 
 ## Components
 
@@ -38,8 +38,9 @@ graph TD
 Every message is a single envelope, `SignallingEvent`:
 
 - **`from` / `to` (`EPAddr`)** — packed addresses holding `userId`,
-  `userSessionId`, or `serviceId`. A browser client may leave `from` empty;
-  the server handler populates it from the request's identity headers.
+  `userSessionId`, or `serviceId`. A client may leave `from` empty — and
+  anything it does send is discarded: the server handler overrides `from`
+  with the request's session identity (see _Identity_).
 - **`msgId`** — generated uniquely, statelessly, independently per message.
 - **`inReplyTo`** — correlates a reply with the message it answers.
 - **One payload slot**: `c2SEv` (client → SS), `s2CEv` (SS → client), or
@@ -483,7 +484,7 @@ target id or a kind mismatch makes the command a no-op.
 - The WebSocket handler **never learns subscriber ids**. Like a learning
   switch, it builds the association between a connection's remote
   `ip:port` and the `(userId, userSessionId)` pair purely by sniffing the
-  `from` field of inbound messages (after header population).
+  `from` field of inbound messages (after the identity override).
 - Outbound events are routed by their `to` EPAddr to **every
   connection the address was learned on** — one address can map to
   several connections (two tabs sharing a session, or a reconnect whose
@@ -543,12 +544,26 @@ One integration detail: `pkg/log`'s logging `responseWriter` implements
 `http.ResponseController` — without the passthrough, every upgrade behind
 the logging middleware would fail with 500.
 
-## Identity (experimental)
+## Identity
 
-For now, client identity comes from two request headers:
-`X-Exp-UserId` and `X-Exp-UserSessionId`. A handshake missing either is
-rejected with `400` before the upgrade. This stands in for the future
-cookie/JWT-based population described by the prototype.
+Client identity comes from the caller's session — the JWT cookie of the
+site's login system (see the README's _Sign-in and sessions_): the
+session's subject id is the user id and the session id is the user
+session id. The endpoint is **not** on the server's JWT whitelist, so
+every connection belongs to an authenticated session: a request without
+one never reaches the handler (the auth middleware answers `401`), and a
+session carrying no identity (an empty subject or session id) is
+rejected with `400` before the upgrade.
+
+The session is trusted, the wire is not: the handler **overrides** the
+`from` EPAddr of every inbound message with the connection's session
+identity — a client-supplied `from` is untrusted input and is discarded
+— and applies the same discipline to the register event's `username`,
+overridden with the session's username (the JWT's username claim), so a
+client never picks its own display name. Machine clients that cannot log
+in interactively (the built-in bots) carry a static session token issued
+by the server binary's `sign` subcommand; to the endpoint they are
+ordinary authenticated sessions.
 
 ## Current limitations
 
@@ -568,10 +583,14 @@ cookie/JWT-based population described by the prototype.
   suites: registration and its error codes, profile query, c2s ping/pong
   session rules, channel-keepalive renewal and its error codes, relay
   pass-through with `to` rewriting, member-list paging, shutdown/close
-  semantics, header rejection, unicast routing, and address re-learning
-  across reconnects.
+  semantics, handshake rejection when the session carries no identity,
+  forged-`from` and forged-username overriding, unicast routing, and
+  address re-learning across reconnects. (The suite drives identity
+  through test-only headers mapped onto the session middleware's context
+  values, keeping the dial sites unchanged.)
 - `e2e/websocket_ss_test.go` exercises the real built server binary:
   register + profile, a 3-round c2c ping/pong session (seq/ack chaining),
   RTC payload pass-through, the members list, c2s ping before
-  registration, and handshake rejection. Its wire views are deliberately
+  registration, and handshake rejection without a session — all dialled
+  with real issued session tokens. Its wire views are deliberately
   independent copies, so accidental wire-format drift fails there.

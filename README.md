@@ -116,6 +116,59 @@ meant for sharing, so they are served without the `/api` prefix:
 - **Wired unconditionally.** `main.go` mounts the handler at `/links/`
   even without `--config-xml`; every id then answers 404.
 
+## WebRTC chat
+
+The site also carries a chat subsystem: signed-in visitors discover each
+other in a shared channel on the `/chat` page and then talk
+**peer-to-peer** — text lines, file/image/video attachments with live
+progress, and voice and video calls — with two built-in bots to talk to.
+`docs/signalling-server.md` is the full protocol write-up; the short
+version:
+
+- **Signalling over WebSocket.** `WebSocketSSHandler`
+  (`pkg/api/websocket_ss`), mounted at `/api/ss/ws` on the in-memory
+  `SimpleOnMemorySSProvider` (`pkg/models/ss`), registers each client as
+  a channel subscriber and relays the WebRTC handshake — session
+  descriptions and trickle ICE candidates — between subscribers.
+  Discovery and establishment only: chat traffic itself never passes
+  through the server. Identity comes from the caller's JWT session (the
+  path is not whitelisted): the endpoint stamps the session's subject
+  and session id onto every event and overrides the display name with
+  the token's username claim. Registrations live in process memory and
+  age out lazily (`--ss-aging`, default `10s`) unless the client keeps
+  them alive. ICE servers come from `GET /api/iceServers` — public
+  bootstrap data serving the `<iceServer/>` entries of
+  `serverConfig.xml`.
+- **Perfect negotiation.** Each end runs the MDN perfect-negotiation
+  pattern over the relay — `web/site/src/api/ss/negotiate.ts` in the
+  browser, `PerfectNegotiator` (`pkg/rtc`, on `pion/webrtc`) in Go —
+  with the lexicographically smaller subscriber id as the polite peer.
+- **Two data channels per pair.** Once connected, the peers talk
+  directly and in-band: `dcmsg` carries JSON frames — plain text,
+  file-transfer status, chat-control edits (delete/amend, own messages
+  only), and a SIP subset (`INVITE` / `200 OK` / `603 Decline` /
+  `CANCEL` / `BYE`) driving the calls — while `dcbin` carries the file
+  bytes as compact binary frames (16 KiB chunks under a 64-frame sliding
+  window, cumulative acknowledgements, strict reassembly). Ordinary
+  messages echo back to the sender so both sides build the same history;
+  call dialog messages, like real SIP, never echo.
+- **Calls ride the same connection.** Accepting a call attaches the
+  microphone — and the camera, for a video call — to the pair's existing
+  peer connection, and the negotiators renegotiate on their own. All
+  call audio runs through one shared `AudioContext` graph (per-call
+  volumes, FFT visualizations); remote videos render in floating,
+  draggable cards.
+- **Headless Go bots.** `HeadlessRTCClient` (`pkg/rtc`) is the Go
+  counterpart of the browser client, and the server binary hosts two
+  bots on it as ordinary authenticated clients when the configuration
+  document carries an `<echoBot/>` or `<musicBot/>` element: the echo
+  bot (`pkg/rtc/echobot`) answers text verbatim, declines every call,
+  and reports the running sha256 of any file it receives; the music bot
+  (`pkg/rtc/musicbot`) answers a chat CLI (`/help`, `/list-songs`,
+  `/play <song>`) and voice calls with a generated PCMU song. Their
+  static session tokens are issued with the `sign` subcommand (see
+  _Sign-in and sessions_).
+
 ## Layout
 
 - `cmd/server/` — the Go server entrypoint: the `serve` subcommand
@@ -215,6 +268,5 @@ container, e.g. `-v "$PWD/serverConfig.xml:/app/serverConfig.xml"` and
 
 ### WebRTC sub-system todos
 
-1. Audio-inline messaging
-2. Radio bot
-3. Message unreads display
+1. Audio-inline message
+2. Message unreads display
