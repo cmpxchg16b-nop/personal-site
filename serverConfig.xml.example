@@ -157,14 +157,45 @@
   <!-- The built-in music bot (optional): a music-purpose headless RTC
        peer (pkg/rtc/musicbot), wired exactly like the echo bot above —
        same attributes, same identity story. Its chat is a CLI: /help,
-       /list-songs, /play <song> (the bot phones you and plays a
-       programmatically generated song). Video calls are declined, voice
-       calls accepted.
+       /list-songs, /play <song> (the bot phones you and plays the
+       song). Video calls are declined, voice calls accepted.
+
+       The songbook is the element's audioSource children (see
+       serverConfig.xsd's audioSourceType): name is what the CLI
+       addresses, sampleFormatType/bitDepth/numericType/numChannels/
+       sampleRate/numTotalSamples describe the samples — the accepted
+       combinations are linear_pcm at 48000 Hz with 2 channels (played
+       as opus, keeping its rate and channels) and mu_law at 8000 Hz
+       mono (played as PCMU) — and the data is either the element's
+       base64 text or at url: a filesystem path (relative to this
+       document) or an http(s) URL. compression="flac" wraps the data
+       in a FLAC stream whose header's stream info takes precedence
+       over the declared metadata; sample data loads lazily when a
+       call first plays the song, and a numTotalSamples of 0 denotes a
+       streaming source of unknown length. The example points at the
+       repository's synthesized chiptune loop (regenerate it with
+       `go run ./cmd/synthchiptune`); a container has no filesystem
+       beside its mount points — serve or mount the asset there, or
+       use an http url.
   <musicBot
     url="wss://example.com/api/ss/ws"
     jwt=""
     subscriberId="musicbot"
     keepAliveInterval="5s"
-  />
+  >
+    <audioSource
+      id="chiptune-001"
+      name="chiptune"
+      description="a programmatically generated chiptune loop, playing indefinitely"
+      author="personal-site"
+      sampleFormatType="mu_law"
+      bitDepth="8"
+      numericType="unsigned_integer"
+      numChannels="1"
+      sampleRate="8000"
+      numTotalSamples="128000"
+      url="assets/chiptune.ulaw"
+    />
+  </musicBot>
   -->
 </serverConfig>

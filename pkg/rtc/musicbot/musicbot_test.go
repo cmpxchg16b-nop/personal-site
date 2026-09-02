@@ -10,12 +10,14 @@ package musicbot
 // client's HandleTrack) and real RTP off the wire.
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"os"
 	"slices"
 	"strings"
@@ -24,9 +26,13 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/mewkiz/flac"
+	"github.com/mewkiz/flac/frame"
+	"github.com/mewkiz/flac/meta"
 	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v4"
 
+	"personal-site/pkg/models/audiosource"
 	"personal-site/pkg/models/ss"
 	"personal-site/pkg/rtc"
 	"personal-site/pkg/rtc/msg_handler"
@@ -179,15 +185,146 @@ func startClient(t *testing.T, net *clientTestNet, name string, configure func(*
 	return c
 }
 
-// startBot builds a client with the music bot attached and Runs it on the
-// net.
-func startBot(t *testing.T, net *clientTestNet, name string, id ss.SubscriberId) *rtc.HeadlessRTCClient {
+// startBot builds a client with the music bot attached (serving the
+// given songbook) and Runs it on the net.
+func startBot(t *testing.T, net *clientTestNet, name string, id ss.SubscriberId, sources []*audiosource.AudioSourceData) *rtc.HeadlessRTCClient {
 	t.Helper()
 	c := startClient(t, net, name, func(c *rtc.RTCClientConfiguration) {
 		c.SubscriberId = id
 	})
-	New(c, Configuration{Logger: testLogger(t)})
+	New(c, Configuration{Logger: testLogger(t), AudioSources: sources})
 	return c
+}
+
+// requiresOpus skips the test when the opus encoder is unavailable (a
+// build without cgo — the linear pcm path needs libopus).
+func requiresOpus(t *testing.T) {
+	t.Helper()
+	if _, err := newMusicEncoder(opusSampleRate, opusChannels); err != nil {
+		t.Skipf("the opus encoder is unavailable: %v", err)
+	}
+}
+
+// testSongbook is the wire suite's standard songbook: the μ-law
+// "chiptune" stand-in (the default song incoming calls answer with), a
+// linear PCM song, and a flac song — one of every playable family.
+func testSongbook(t *testing.T) []*audiosource.AudioSourceData {
+	t.Helper()
+	return []*audiosource.AudioSourceData{
+		muLawSong("chiptune", 10),
+		pcmSong("stereo", 2400),
+		flacSong(t, "flac", 2400),
+	}
+}
+
+// muLawSong is a μ-law source (8000 Hz, mono) whose bytes are a
+// deterministic non-silent pattern — the RTP assertions need music,
+// not silence. frames is the song's length in 20 ms frames.
+func muLawSong(name string, frames int) *audiosource.AudioSourceData {
+	data := make([]byte, frames*samplesPerFrame)
+	for i := range data {
+		data[i] = byte(i * 7) // every residue mod 256 appears
+	}
+	return &audiosource.AudioSourceData{
+		Id:               "test-" + name,
+		Name:             name,
+		Description:      "a test mu-law song",
+		Author:           "the test suite",
+		SampleFormatType: audiosource.SampleMuLaw,
+		BitDepth:         8,
+		NumericType:      audiosource.NumUnsignedInt,
+		NumChannels:      1,
+		Interleaved:      true,
+		InlineData:       data,
+		Compression:      audiosource.CompressionNone,
+		SampleRate:       8000,
+		NumTotalSamples:  len(data),
+	}
+}
+
+// pcmSong is a linear PCM source (48000 Hz, stereo, signed 16-bit)
+// carrying distinct tones per channel. samples is the inter-channel
+// sample count.
+func pcmSong(name string, samples int) *audiosource.AudioSourceData {
+	data := make([]byte, samples*4)
+	for i := 0; i < samples; i++ {
+		l := int16(20000 * math.Sin(2*math.Pi*float64(i)/48)) // 1 kHz
+		r := int16(14000 * math.Sin(2*math.Pi*float64(i)/16)) // 3 kHz
+		binary.LittleEndian.PutUint16(data[4*i:], uint16(l))
+		binary.LittleEndian.PutUint16(data[4*i+2:], uint16(r))
+	}
+	return &audiosource.AudioSourceData{
+		Id:               "test-" + name,
+		Name:             name,
+		Description:      "a test linear pcm song",
+		Author:           "the test suite",
+		SampleFormatType: audiosource.SampleLinearPCM,
+		BitDepth:         16,
+		NumericType:      audiosource.NumSignedInt,
+		NumChannels:      2,
+		Interleaved:      true,
+		InlineData:       data,
+		Compression:      audiosource.CompressionNone,
+		SampleRate:       48000,
+		NumTotalSamples:  samples,
+	}
+}
+
+// flacSong is a linear PCM source whose inline data is a flac stream
+// encoding a stereo tone — encoded with mewkiz/flac's encoder, an
+// encoder independent of everything the bot plays it through.
+func flacSong(t *testing.T, name string, samples int) *audiosource.AudioSourceData {
+	t.Helper()
+	src := pcmSong(name, samples)
+	src.Compression = audiosource.CompressionFLAC
+
+	channels := make([][]int32, 2)
+	for ch := range channels {
+		channels[ch] = make([]int32, samples)
+	}
+	for i := 0; i < samples; i++ {
+		for ch := 0; ch < 2; ch++ {
+			o := 4*i + 2*ch
+			channels[ch][i] = int32(uint16(src.InlineData[o]) | uint16(src.InlineData[o+1])<<8)
+		}
+	}
+	var buf bytes.Buffer
+	enc, err := flac.NewEncoder(&buf, &meta.StreamInfo{
+		BlockSizeMin:  uint16(samples),
+		BlockSizeMax:  uint16(samples),
+		SampleRate:    48000,
+		NChannels:     2,
+		BitsPerSample: 16,
+		NSamples:      uint64(samples),
+	})
+	if err != nil {
+		t.Fatalf("flac.NewEncoder: %v", err)
+	}
+	f := &frame.Frame{
+		Header: frame.Header{
+			HasFixedBlockSize: true,
+			BlockSize:         uint16(samples),
+			SampleRate:        48000,
+			Channels:          frame.ChannelsLR,
+			BitsPerSample:     16,
+			Num:               0,
+		},
+	}
+	for _, ch := range channels {
+		f.Subframes = append(f.Subframes, &frame.Subframe{
+			SubHeader: frame.SubHeader{Pred: frame.PredVerbatim},
+			Samples:   ch,
+			NSamples:  samples,
+		})
+	}
+	if err := enc.WriteFrame(f); err != nil {
+		t.Fatalf("WriteFrame: %v", err)
+	}
+	if err := enc.Close(); err != nil {
+		t.Fatalf("Close the flac encoder: %v", err)
+	}
+	src.InlineData = buf.Bytes()
+	return src
 }
 
 // pairUp waits for both clients to be registered and to hold a session
@@ -576,7 +713,7 @@ func isCallStatusAmend(inviteMsgId ss.MsgId, callId, status string) func(*rawMsg
 // line is also bounced verbatim — the Server's echo rule.
 func TestMusicBotHelpAndUnknownCommand(t *testing.T) {
 	net := newClientTestNet(t, ss.DefaultSubscriberAging)
-	bot := startBot(t, net, "bot", "2-bot")
+	bot := startBot(t, net, "bot", "2-bot", testSongbook(t))
 	user, probe, _ := startUserProbe(t, net, "user", "1-user") // polite: creates the channels
 	botId, userId := pairUp(t, bot, user)
 
@@ -607,7 +744,7 @@ func TestMusicBotHelpAndUnknownCommand(t *testing.T) {
 // song is listed, the reply threaded on the command.
 func TestMusicBotListsSongs(t *testing.T) {
 	net := newClientTestNet(t, ss.DefaultSubscriberAging)
-	bot := startBot(t, net, "bot", "2-bot")
+	bot := startBot(t, net, "bot", "2-bot", testSongbook(t))
 	user, probe, _ := startUserProbe(t, net, "user", "1-user")
 	botId, userId := pairUp(t, bot, user)
 
@@ -623,6 +760,11 @@ func TestMusicBotListsSongs(t *testing.T) {
 	if !strings.Contains(list.plaintext, "Available songs") {
 		t.Fatalf("the song list = %q", list.plaintext)
 	}
+	for _, name := range []string{"stereo", "flac"} {
+		if !strings.Contains(list.plaintext, name) {
+			t.Fatalf("the song list = %q, want the injected song %q", list.plaintext, name)
+		}
+	}
 }
 
 // TestMusicBotRefusesAttachments covers the attachment policy: the
@@ -631,7 +773,7 @@ func TestMusicBotListsSongs(t *testing.T) {
 // refusal, threaded on the announcement.
 func TestMusicBotRefusesAttachments(t *testing.T) {
 	net := newClientTestNet(t, ss.DefaultSubscriberAging)
-	bot := startBot(t, net, "bot", "2-bot")
+	bot := startBot(t, net, "bot", "2-bot", testSongbook(t))
 	user, probe, _ := startUserProbe(t, net, "user", "1-user")
 	botId, userId := pairUp(t, bot, user)
 
@@ -685,7 +827,7 @@ func TestMusicBotRefusesAttachments(t *testing.T) {
 // protocol's discipline).
 func TestMusicBotDeclinesVideoCalls(t *testing.T) {
 	net := newClientTestNet(t, ss.DefaultSubscriberAging)
-	bot := startBot(t, net, "bot", "2-bot")
+	bot := startBot(t, net, "bot", "2-bot", testSongbook(t))
 	user, probe, tprobe := startUserProbe(t, net, "user", "1-user")
 	botId, userId := pairUp(t, bot, user)
 
@@ -727,7 +869,7 @@ func TestMusicBotDeclinesVideoCalls(t *testing.T) {
 // what plays, and a BYE ends it (a second INVITE is taken anew).
 func TestMusicBotAcceptsVoiceCall(t *testing.T) {
 	net := newClientTestNet(t, ss.DefaultSubscriberAging)
-	bot := startBot(t, net, "bot", "2-bot")
+	bot := startBot(t, net, "bot", "2-bot", testSongbook(t))
 	user, probe, tprobe := startUserProbe(t, net, "user", "1-user")
 	botId, userId := pairUp(t, bot, user)
 
@@ -800,7 +942,7 @@ func TestMusicBotAcceptsVoiceCall(t *testing.T) {
 // anew).
 func TestMusicBotPlayPhonesTheUser(t *testing.T) {
 	net := newClientTestNet(t, ss.DefaultSubscriberAging)
-	bot := startBot(t, net, "bot", "2-bot")
+	bot := startBot(t, net, "bot", "2-bot", testSongbook(t))
 	user, probe, tprobe := startUserProbe(t, net, "user", "1-user")
 	botId, userId := pairUp(t, bot, user)
 
@@ -874,7 +1016,7 @@ func TestMusicBotPlayPhonesTheUser(t *testing.T) {
 // answered (threaded on the command) without a call.
 func TestMusicBotPlayUnknownSong(t *testing.T) {
 	net := newClientTestNet(t, ss.DefaultSubscriberAging)
-	bot := startBot(t, net, "bot", "2-bot")
+	bot := startBot(t, net, "bot", "2-bot", testSongbook(t))
 	user, probe, _ := startUserProbe(t, net, "user", "1-user")
 	botId, userId := pairUp(t, bot, user)
 
@@ -899,7 +1041,7 @@ func TestMusicBotPlayUnknownSong(t *testing.T) {
 // anew).
 func TestMusicBotCallDeclined(t *testing.T) {
 	net := newClientTestNet(t, ss.DefaultSubscriberAging)
-	bot := startBot(t, net, "bot", "2-bot")
+	bot := startBot(t, net, "bot", "2-bot", testSongbook(t))
 	user, probe, _ := startUserProbe(t, net, "user", "1-user")
 	botId, userId := pairUp(t, bot, user)
 
@@ -937,4 +1079,184 @@ func TestMusicBotCallDeclined(t *testing.T) {
 	waitBotMessage(t, probe, botId, "the fresh INVITE", func(m *rawMsg) bool {
 		return isSipInvite(m) && m.sip.CallId != "" && m.sip.CallId != callId
 	})
+}
+
+// playSongAndAnswer drives the outbound call flow up to the answered
+// call: /play <song>, the INVITE, the 200 OK — returning the dialog's
+// call id.
+func playSongAndAnswer(t *testing.T, probe *wireProbe, dc *webrtc.DataChannel, botId, userId ss.SubscriberId, song string) string {
+	t.Helper()
+	m := baseMsg(ss.WellKnownChIdMain, userId, botId)
+	m["plaintext"] = "/play " + song
+	if err := dc.SendText(mustJSON(t, m)); err != nil {
+		t.Fatalf("SendText: %v", err)
+	}
+	invite := waitBotMessage(t, probe, botId, "the bot's INVITE", isSipInvite)
+	callId := invite.sip.CallId
+	if callId == "" {
+		t.Fatalf("the INVITE = %+v carries no call id", invite)
+	}
+	answer := baseMsg(ss.WellKnownChIdMain, userId, botId)
+	answer["mimeType"] = wireMimeSip
+	answer["sip"] = map[string]any{"callId": callId, "response": map[string]any{"code": 200, "phrase": "OK"}}
+	if err := dc.SendText(mustJSON(t, answer)); err != nil {
+		t.Fatalf("SendText: %v", err)
+	}
+	return callId
+}
+
+// TestMusicBotPlaysPCMSongAsOpus covers the linear PCM family, end to
+// end through real media: /play on a 48 kHz stereo song phones the user,
+// and the answered call's track carries opus (48000 Hz, stereo) — the
+// song keeps its rate and channels, nothing is downmixed — with
+// non-empty packets on the wire.
+func TestMusicBotPlaysPCMSongAsOpus(t *testing.T) {
+	requiresOpus(t)
+	net := newClientTestNet(t, ss.DefaultSubscriberAging)
+	bot := startBot(t, net, "bot", "2-bot", testSongbook(t))
+	user, probe, tprobe := startUserProbe(t, net, "user", "1-user")
+	botId, userId := pairUp(t, bot, user)
+	dc := probe.waitDC(t, botId, msg_handler.DataChannelLabelMessages)
+
+	playSongAndAnswer(t, probe, dc, botId, userId, "stereo")
+
+	track := tprobe.waitTrack(t, 1)
+	if track.Kind() != webrtc.RTPCodecTypeAudio {
+		t.Fatalf("the track's kind is %s, want audio", track.Kind())
+	}
+	if got := track.Codec().MimeType; got != webrtc.MimeTypeOpus {
+		t.Fatalf("the track's codec is %s, want %s", got, webrtc.MimeTypeOpus)
+	}
+	if got := track.Codec().ClockRate; got != 48000 {
+		t.Fatalf("the track's clock rate is %d, want 48000", got)
+	}
+	// The music flows: several 20 ms opus packets, each non-empty.
+	for i := 0; i < 3; i++ {
+		if pkt := readOneRTP(t, track); len(pkt.Payload) == 0 {
+			t.Fatalf("opus packet %d is empty", i)
+		}
+	}
+}
+
+// TestMusicBotPlaysFLACSong covers the compressed family: a flac
+// source's song decodes lazily and rides the same opus path.
+func TestMusicBotPlaysFLACSong(t *testing.T) {
+	requiresOpus(t)
+	net := newClientTestNet(t, ss.DefaultSubscriberAging)
+	bot := startBot(t, net, "bot", "2-bot", testSongbook(t))
+	user, probe, tprobe := startUserProbe(t, net, "user", "1-user")
+	botId, userId := pairUp(t, bot, user)
+	dc := probe.waitDC(t, botId, msg_handler.DataChannelLabelMessages)
+
+	playSongAndAnswer(t, probe, dc, botId, userId, "flac")
+
+	track := tprobe.waitTrack(t, 1)
+	if got := track.Codec().MimeType; got != webrtc.MimeTypeOpus {
+		t.Fatalf("the track's codec is %s, want %s (the flac decodes to linear pcm)", got, webrtc.MimeTypeOpus)
+	}
+	if pkt := readOneRTP(t, track); len(pkt.Payload) == 0 {
+		t.Fatal("the opus packet is empty")
+	}
+}
+
+// TestMusicBotSwitchesSongFamilies covers the mid-call switch across
+// codec families: the track's codec follows the song, so the switch
+// replaces the track on the wire — the PCMU track of the chiptune is
+// succeeded by an opus track, and the music never leaves the wire.
+func TestMusicBotSwitchesSongFamilies(t *testing.T) {
+	requiresOpus(t)
+	net := newClientTestNet(t, ss.DefaultSubscriberAging)
+	bot := startBot(t, net, "bot", "2-bot", testSongbook(t))
+	user, probe, tprobe := startUserProbe(t, net, "user", "1-user")
+	botId, userId := pairUp(t, bot, user)
+	dc := probe.waitDC(t, botId, msg_handler.DataChannelLabelMessages)
+
+	playSongAndAnswer(t, probe, dc, botId, userId, "chiptune")
+	pcmuTrack := tprobe.waitTrack(t, 1)
+	if got := pcmuTrack.Codec().MimeType; got != webrtc.MimeTypePCMU {
+		t.Fatalf("the first track's codec is %s, want %s", got, webrtc.MimeTypePCMU)
+	}
+
+	m := baseMsg(ss.WellKnownChIdMain, userId, botId)
+	m["plaintext"] = "/play stereo"
+	switchMsg := ss.MsgId(m["msgId"].(string))
+	if err := dc.SendText(mustJSON(t, m)); err != nil {
+		t.Fatalf("SendText: %v", err)
+	}
+	waitBotMessage(t, probe, botId, "the now-playing line", isChatReply(switchMsg, "Now playing"))
+
+	opusTrack := tprobe.waitTrack(t, 2)
+	if got := opusTrack.Codec().MimeType; got != webrtc.MimeTypeOpus {
+		t.Fatalf("the replaced track's codec is %s, want %s", got, webrtc.MimeTypeOpus)
+	}
+	if pkt := readOneRTP(t, opusTrack); len(pkt.Payload) == 0 {
+		t.Fatal("the opus packet is empty")
+	}
+}
+
+// TestMusicBotLoopsAShortSong covers the looping: a two-frame song
+// (40 ms) keeps playing far beyond its own length — six packets are
+// three times around the loop — because the player rewinds its stream
+// at the end.
+func TestMusicBotLoopsAShortSong(t *testing.T) {
+	net := newClientTestNet(t, ss.DefaultSubscriberAging)
+	bot := startBot(t, net, "bot", "2-bot", []*audiosource.AudioSourceData{muLawSong("tiny", 2)})
+	user, probe, tprobe := startUserProbe(t, net, "user", "1-user")
+	botId, userId := pairUp(t, bot, user)
+	dc := probe.waitDC(t, botId, msg_handler.DataChannelLabelMessages)
+
+	callId := uuid.NewString()
+	m := baseMsg(ss.WellKnownChIdMain, userId, botId)
+	m["mimeType"] = wireMimeSip
+	m["sip"] = map[string]any{"callId": callId, "method": "INVITE", "X-Media": "voice", "X-Call-Status": "inviting"}
+	if err := dc.SendText(mustJSON(t, m)); err != nil {
+		t.Fatalf("SendText: %v", err)
+	}
+	waitBotMessage(t, probe, botId, "the 200 OK", isSipResponse(callId, 200))
+
+	track := tprobe.waitTrack(t, 1)
+	for i := 0; i < 6; i++ {
+		if pkt := readOneRTP(t, track); len(pkt.Payload) != 160 {
+			t.Fatalf("packet %d's payload is %d bytes, want 160 (20 ms of PCMU)", i, len(pkt.Payload))
+		}
+	}
+}
+
+// TestMusicBotEmptySongbook covers the degenerate wiring: with no song
+// injected, a voice INVITE is left unanswered (there is no song to
+// answer with) and /play answers with the unknown-song hint.
+func TestMusicBotEmptySongbook(t *testing.T) {
+	net := newClientTestNet(t, ss.DefaultSubscriberAging)
+	bot := startBot(t, net, "bot", "2-bot", nil)
+	user, probe, tprobe := startUserProbe(t, net, "user", "1-user")
+	botId, userId := pairUp(t, bot, user)
+	dc := probe.waitDC(t, botId, msg_handler.DataChannelLabelMessages)
+
+	callId := uuid.NewString()
+	m := baseMsg(ss.WellKnownChIdMain, userId, botId)
+	m["mimeType"] = wireMimeSip
+	m["sip"] = map[string]any{"callId": callId, "method": "INVITE", "X-Media": "voice", "X-Call-Status": "inviting"}
+	if err := dc.SendText(mustJSON(t, m)); err != nil {
+		t.Fatalf("SendText: %v", err)
+	}
+	time.Sleep(300 * time.Millisecond)
+	for _, frame := range probe.textsFrom(botId) {
+		if decoded := decodeMsgRaw(frame); decoded != nil && decoded.sip != nil && decoded.sip.CallId == callId {
+			t.Fatalf("the bot answered a call with no song to play: %s", frame)
+		}
+	}
+	tprobe.mu.Lock()
+	tracks := len(tprobe.tracks)
+	tprobe.mu.Unlock()
+	if tracks != 0 {
+		t.Fatalf("a songless bot offered %d tracks", tracks)
+	}
+
+	cmd := baseMsg(ss.WellKnownChIdMain, userId, botId)
+	cmd["plaintext"] = "/play chiptune"
+	if err := dc.SendText(mustJSON(t, cmd)); err != nil {
+		t.Fatalf("SendText: %v", err)
+	}
+	waitBotMessage(t, probe, botId, "the unknown-song answer",
+		isChatReply(ss.MsgId(cmd["msgId"].(string)), "Unknown song"))
 }

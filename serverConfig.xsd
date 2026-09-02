@@ -123,13 +123,14 @@
         <xsd:element name="echoBot" type="botClientType" minOccurs="0" />
         <!-- The built-in music bot: a music-purpose headless RTC peer
              (pkg/rtc/musicbot), living in the server process exactly like
-             the echo bot above (the attributes are the same). Its chat
-             is a CLI — /help, /list-songs, /play <song> — video calls
-             are declined, voice calls accepted and answered with a
-             programmatically generated song (G.711 μ-law), and /play
-             phones the user itself. Wired only when url and jwt are
+             the echo bot above (the shared attributes are the same). Its
+             chat is a CLI — /help, /list-songs, /play <song> — video calls
+             are declined, voice calls accepted and answered with a song
+             of its songbook, and /play phones the user itself. The
+             songbook is the element's audioSource children (see
+             audioSourceType); wired only when url and jwt are
              non-empty. -->
-        <xsd:element name="musicBot" type="botClientType" minOccurs="0" />
+        <xsd:element name="musicBot" type="musicBotType" minOccurs="0" />
       </xsd:sequence>
     </xsd:complexType>
   </xsd:element>
@@ -162,6 +163,128 @@
     <xsd:attribute name="memberListInterval" type="xsd:string" use="optional" />
     <xsd:attribute name="replyTimeout" type="xsd:string" use="optional" />
     <xsd:attribute name="reconnectInterval" type="xsd:string" use="optional" />
+  </xsd:complexType>
+
+  <!-- The music bot's configuration: a bot client (botClientType)
+       carrying a songbook — zero or more audioSource entries, served by
+       the bot's /list-songs and /play. -->
+  <xsd:complexType name="musicBotType">
+    <xsd:complexContent>
+      <xsd:extension base="botClientType">
+        <xsd:sequence>
+          <xsd:element
+            name="audioSource"
+            type="audioSourceType"
+            minOccurs="0"
+            maxOccurs="unbounded"
+          />
+        </xsd:sequence>
+      </xsd:extension>
+    </xsd:complexContent>
+  </xsd:complexType>
+
+  <!-- A single song of the music bot's songbook: one audio source as
+       pkg/models/audiosource models it (AudioSourceData). The element's
+       text content (optional, base64) is the source's inline data —
+       present, it takes precedence over url; absent, url locates the
+       data: an http(s) URL, or a filesystem path — relative paths
+       resolve against the configuration document's directory.
+
+       The remaining attributes mirror AudioSourceData's fields; only
+       the accepted format combinations are valid (the Go wiring
+       validates): linear PCM at 48000 Hz, 2 channels; or mu-law at
+       8000 Hz, 1 channel. numTotalSamples uses the inter-channel
+       definition — NOT multiplied by the channel count (a 2-channel,
+       1-minute, 48000 Hz source has 48000) — and 0 denotes a streaming
+       source of unknown length. Sample data loads lazily when a call
+       first plays the song; compression="flac" wraps the data in a
+       FLAC stream whose header's stream info takes precedence over the
+       declared metadata.
+
+       url:  where the data lives (see above); e.g. "assets/chiptune.ulaw"
+             for the repository's synthesized chiptune loop (regenerate
+             it with go run ./cmd/synthchiptune) or
+             "https://example.com/song.flac".
+       sampleFormatType:  "linear_pcm" or "mu_law".
+       bitDepth:  8, 16 or 32 (mu-law is 8).
+       numericType:  "unsigned_integer", "signed_integer" or "float"
+             (32-bit; linear PCM only).
+       compression:  "none" (the default) or "flac". -->
+  <xsd:complexType name="audioSourceType">
+    <xsd:simpleContent>
+      <xsd:extension base="xsd:base64Binary">
+        <xsd:attribute name="id" type="xsd:string" use="required" />
+        <xsd:attribute name="name" type="xsd:string" use="required" />
+        <xsd:attribute
+          name="description"
+          type="xsd:string"
+          use="optional"
+          default=""
+        />
+        <xsd:attribute
+          name="author"
+          type="xsd:string"
+          use="optional"
+          default=""
+        />
+        <xsd:attribute name="sampleFormatType" use="required">
+          <xsd:simpleType>
+            <xsd:restriction base="xsd:string">
+              <xsd:enumeration value="linear_pcm" />
+              <xsd:enumeration value="mu_law" />
+            </xsd:restriction>
+          </xsd:simpleType>
+        </xsd:attribute>
+        <xsd:attribute name="bitDepth" use="required">
+          <xsd:simpleType>
+            <xsd:restriction base="xsd:int">
+              <xsd:enumeration value="8" />
+              <xsd:enumeration value="16" />
+              <xsd:enumeration value="32" />
+            </xsd:restriction>
+          </xsd:simpleType>
+        </xsd:attribute>
+        <xsd:attribute name="numericType" use="required">
+          <xsd:simpleType>
+            <xsd:restriction base="xsd:string">
+              <xsd:enumeration value="unsigned_integer" />
+              <xsd:enumeration value="signed_integer" />
+              <xsd:enumeration value="float" />
+            </xsd:restriction>
+          </xsd:simpleType>
+        </xsd:attribute>
+        <xsd:attribute
+          name="numChannels"
+          type="xsd:positiveInteger"
+          use="required"
+        />
+        <xsd:attribute
+          name="interleaved"
+          type="xsd:boolean"
+          use="optional"
+          default="true"
+        />
+        <xsd:attribute name="compression" use="optional" default="none">
+          <xsd:simpleType>
+            <xsd:restriction base="xsd:string">
+              <xsd:enumeration value="none" />
+              <xsd:enumeration value="flac" />
+            </xsd:restriction>
+          </xsd:simpleType>
+        </xsd:attribute>
+        <xsd:attribute
+          name="sampleRate"
+          type="xsd:positiveInteger"
+          use="required"
+        />
+        <xsd:attribute
+          name="numTotalSamples"
+          type="xsd:nonNegativeInteger"
+          use="required"
+        />
+        <xsd:attribute name="url" type="xsd:string" use="optional" default="" />
+      </xsd:extension>
+    </xsd:simpleContent>
   </xsd:complexType>
 
   <!-- The configurable list of generic OIDC login providers; holds zero or

@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"time"
 
 	personalsite "personal-site"
@@ -24,6 +25,7 @@ import (
 	pkgauth "personal-site/pkg/auth"
 	pkgcookie "personal-site/pkg/cookie"
 	pkglog "personal-site/pkg/log"
+	"personal-site/pkg/models/audiosource"
 	pkgmodelscomment "personal-site/pkg/models/comment"
 	pkgmodelsdyn "personal-site/pkg/models/dyn"
 	pkgmodelsserverconfig "personal-site/pkg/models/serverconfig"
@@ -326,7 +328,7 @@ func (cmd *ServeCmd) Run(cli *CLI) error {
 	}
 	if serverCfg != nil && serverCfg.MusicBot != nil &&
 		serverCfg.MusicBot.URL != "" && serverCfg.MusicBot.JWT != "" {
-		if err := startMusicBot(ctx, serverCfg.MusicBot); err != nil {
+		if err := startMusicBot(ctx, serverCfg.MusicBot, filepath.Dir(cmd.ConfigXML)); err != nil {
 			return fmt.Errorf("music bot: %w", err)
 		}
 	}
@@ -401,10 +403,23 @@ func startEchoBot(ctx context.Context, cfg *pkgmodelsserverconfig.BotClientXML) 
 	})
 }
 
-// startMusicBot wires the built-in music bot (pkg/rtc/musicbot).
-func startMusicBot(ctx context.Context, cfg *pkgmodelsserverconfig.BotClientXML) error {
-	return startBotClient(ctx, "music bot", cfg, func(client *rtc.HeadlessRTCClient) {
-		musicbot.New(client, musicbot.Configuration{Logger: logger})
+// startMusicBot wires the built-in music bot (pkg/rtc/musicbot). The
+// element's audioSource children become the bot's songbook: each entry
+// is converted to the audiosource model (configDir is what a relative
+// url resolves against — the configuration document's directory) and
+// validated; an entry the model rejects fails the startup. The sample
+// data itself loads lazily, when a call first plays the song.
+func startMusicBot(ctx context.Context, cfg *pkgmodelsserverconfig.MusicBotXML, configDir string) error {
+	sources := make([]*audiosource.AudioSourceData, 0, len(cfg.AudioSources))
+	for _, entry := range cfg.AudioSources {
+		src, err := entry.AudioSourceData(configDir)
+		if err != nil {
+			return err
+		}
+		sources = append(sources, src)
+	}
+	return startBotClient(ctx, "music bot", &cfg.BotClientXML, func(client *rtc.HeadlessRTCClient) {
+		musicbot.New(client, musicbot.Configuration{Logger: logger, AudioSources: sources})
 	})
 }
 

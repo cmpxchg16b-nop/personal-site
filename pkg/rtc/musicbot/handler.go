@@ -11,13 +11,19 @@ package musicbot
 //   - a video call is declined, a voice call is accepted and answered
 //     with the song,
 //   - /play on a quiet line phones the user (the bot's own INVITE);
-//     /play mid-call switches the song.
+//     /play mid-call switches the song — a plain stream switch within
+//     a codec family, a track replacement across families (the codec
+//     follows the song).
+//
+// The songbook is injected (the Configuration's AudioSources — the
+// configuration document's audioSource entries); it is static after
+// construction, and the CLI addresses songs by their Name.
 //
 // State discipline: per-peer call state lives in a sync.Map keyed by the
 // peer; a state's fields are touched only from the peer's serialized dcmsg
 // invocations (the framework's documented guarantee) and from the session
 // watcher, which only ever CompareAndDeletes — the hashReporter's
-// discipline. The player synchronizes its own pump.
+// discipline. The player is an actor synchronizing its own pump.
 
 import (
 	"context"
@@ -28,6 +34,7 @@ import (
 
 	"github.com/pion/webrtc/v4"
 
+	"personal-site/pkg/models/audiosource"
 	"personal-site/pkg/models/ss"
 	"personal-site/pkg/rtc/msg_handler"
 )
@@ -68,9 +75,9 @@ type peerCall struct {
 type musicHandler struct {
 	logger *slog.Logger
 
-	// The songbook: songs by name, and their listing order. Static after
-	// construction.
-	songs map[string]*song
+	// The songbook: audio sources by name, and their listing order.
+	// Static after construction.
+	songs map[string]*audiosource.AudioSourceData
 	order []string
 
 	// calls is the per-peer call state. The map is shared across peers'
@@ -80,12 +87,19 @@ type musicHandler struct {
 
 var _ msg_handler.BotMessageHandler = (*musicHandler)(nil)
 
-func newMusicHandler(logger *slog.Logger) *musicHandler {
-	return &musicHandler{
+func newMusicHandler(logger *slog.Logger, sources []*audiosource.AudioSourceData) *musicHandler {
+	h := &musicHandler{
 		logger: logger,
-		songs:  map[string]*song{songChiptune.name: songChiptune},
-		order:  []string{songChiptune.name},
+		songs:  make(map[string]*audiosource.AudioSourceData, len(sources)),
 	}
+	for _, s := range sources {
+		if _, dup := h.songs[s.Name]; dup {
+			panic(fmt.Sprintf("musicbot: two songs named %q", s.Name))
+		}
+		h.songs[s.Name] = s
+		h.order = append(h.order, s.Name)
+	}
+	return h
 }
 
 // HandleChatMessage is the CLI: parse the line, answer it.
@@ -142,6 +156,12 @@ func (h *musicHandler) handleInvite(ctx context.Context, sip *msg_handler.SipMes
 		if err := w.Reject(msg_handler.SipCodeDecline, msg_handler.SipPhraseDecline); err != nil {
 			h.logger.Warn("musicbot: call decline not sent", "peer", peer, "err", err)
 		}
+		return
+	}
+	if len(h.order) == 0 {
+		// A songbook with no song has nothing to answer with; the
+		// INVITE goes unanswered (the caller may cancel).
+		h.logger.Warn("musicbot: no song to answer a voice call with", "peer", peer, "callId", sip.CallId)
 		return
 	}
 	// A second INVITE from the same peer supersedes the state the bot
@@ -225,11 +245,16 @@ func (h *musicHandler) play(ctx context.Context, msg *msg_handler.ChatMessage, w
 	}
 	if v, ok := h.calls.Load(peer); ok {
 		call := v.(*peerCall)
-		call.player.setSong(s)
+		if err := h.switchSong(ctx, peer, call, s, w); err != nil {
+			h.logger.Warn("musicbot: the song switch failed; the current song continues",
+				"peer", peer, "song", s.Name, "err", err)
+			h.say(msg.From, w, fmt.Sprintf("Could not switch to %q — the current song continues.", s.Name))
+			return
+		}
 		if call.phase == phaseActive {
-			h.say(msg.From, w, fmt.Sprintf("Now playing %q.", s.name))
+			h.say(msg.From, w, fmt.Sprintf("Now playing %q.", s.Name))
 		} else {
-			h.say(msg.From, w, fmt.Sprintf("Will play %q when you answer.", s.name))
+			h.say(msg.From, w, fmt.Sprintf("Will play %q when you answer.", s.Name))
 		}
 		return
 	}
@@ -250,14 +275,44 @@ func (h *musicHandler) play(ctx context.Context, msg *msg_handler.ChatMessage, w
 		return
 	}
 	call.callId = callId
-	h.say(msg.From, w, fmt.Sprintf("Calling you to play %q…", s.name))
+	h.say(msg.From, w, fmt.Sprintf("Calling you to play %q…", s.Name))
 }
 
-// acceptCall takes an incoming voice call: a fresh player for the default
-// song, the media answer (the track offer plus 200 OK), and the
+// switchSong points an ongoing call at another song. Within a codec
+// family it is a stream switch inside the player; across families the
+// track's codec changes with the song, so the whole player — track and
+// all — is replaced: the new track is attached before the old one is
+// detached, so the music never leaves the wire.
+func (h *musicHandler) switchSong(ctx context.Context, peer ss.SubscriberId, call *peerCall, s *audiosource.AudioSourceData, w msg_handler.ResponseWriter) error {
+	if call.player.accepts(s) {
+		return call.player.setSource(s)
+	}
+	np, err := newPlayer(ctx, h.logger, peer, s)
+	if err != nil {
+		return err
+	}
+	if call.phase == phaseActive {
+		if err := w.AttachMedia(np.track); err != nil {
+			np.stop()
+			return err
+		}
+		if err := w.DetachMedia(call.player.track); err != nil {
+			h.logger.Warn("musicbot: the replaced track not detached", "peer", peer, "err", err)
+		}
+	}
+	// While the call still rings, nothing is on the wire yet — the
+	// answer will attach whatever track the call holds by then.
+	call.player.stop()
+	call.player = np
+	return nil
+}
+
+// acceptCall takes an incoming voice call: a fresh player on the
+// default song, the media answer (the track offer plus 200 OK), and the
 // inbound-media registration.
 func (h *musicHandler) acceptCall(ctx context.Context, peer ss.SubscriberId, callId string, w msg_handler.ResponseWriter) {
-	call, err := h.startCall(ctx, peer, h.songs[h.order[0]])
+	s := h.songs[h.order[0]]
+	call, err := h.startCall(ctx, peer, s)
 	if err != nil {
 		h.logger.Warn("musicbot: cannot prepare the track", "peer", peer, "err", err)
 		return
@@ -271,14 +326,15 @@ func (h *musicHandler) acceptCall(ctx context.Context, peer ss.SubscriberId, cal
 		h.logger.Warn("musicbot: call accept failed", "peer", peer, "err", err)
 		return
 	}
-	h.logger.Info("musicbot: voice call accepted, playing", "peer", peer, "callId", callId)
-	h.say(peer, w, fmt.Sprintf("Now playing %q.", h.songs[h.order[0]].name))
+	h.logger.Info("musicbot: voice call accepted, playing", "peer", peer, "callId", callId, "song", s.Name)
+	h.say(peer, w, fmt.Sprintf("Now playing %q.", s.Name))
 }
 
-// startCall prepares one call's state: a fresh player on the song, the
-// pump running, the state recorded, the session watcher armed.
-func (h *musicHandler) startCall(ctx context.Context, peer ss.SubscriberId, s *song) (*peerCall, error) {
-	p, err := newPlayer(s)
+// startCall prepares one call's state: a fresh player on the song (its
+// stream opens here — the source's lazily loaded data), the pump
+// running, the state recorded, the session watcher armed.
+func (h *musicHandler) startCall(ctx context.Context, peer ss.SubscriberId, s *audiosource.AudioSourceData) (*peerCall, error) {
+	p, err := newPlayer(ctx, h.logger, peer, s)
 	if err != nil {
 		return nil, err
 	}
@@ -292,7 +348,6 @@ func (h *musicHandler) startCall(ctx context.Context, peer ss.SubscriberId, s *s
 		call.player.stop()
 		h.calls.CompareAndDelete(peer, call)
 	}()
-	go p.run(ctx, h.logger, peer)
 	return call, nil
 }
 
@@ -316,7 +371,7 @@ func (h *musicHandler) songListText() string {
 	var b strings.Builder
 	b.WriteString("Available songs:")
 	for _, name := range h.order {
-		fmt.Fprintf(&b, "\n- %s — %s", name, h.songs[name].blurb)
+		fmt.Fprintf(&b, "\n- %s — %s", name, h.songs[name].Description)
 	}
 	return b.String()
 }

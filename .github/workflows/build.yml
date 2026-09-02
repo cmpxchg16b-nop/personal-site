@@ -84,6 +84,14 @@ jobs:
           go-version: ${{ env.GO_VERSION }}
           cache: true
 
+      # The music bot's linear PCM path encodes opus through libopus
+      # (github.com/hraban/opus, a cgo binding): the test build links
+      # it. The pure-Go binary builds below (CGO_ENABLED=0) compile the
+      # encoder's stub instead — their music bots play μ-law sources
+      # and report the limitation for linear PCM ones.
+      - name: Install libopus for the cgo opus encoder
+        run: sudo apt-get update && sudo apt-get install -y libopus-dev pkg-config
+
       - name: Run tests with coverage
         run: go test ./... -coverpkg=./... -coverprofile=coverage.out -timeout 10m
 

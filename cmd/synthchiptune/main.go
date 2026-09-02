@@ -1,22 +1,34 @@
-package musicbot
-
-// This file is the bot's music: a fixed composition synthesized
-// programmatically — no assets, no files. The one song is an eight-bar
-// pentatonic loop ("chiptune"): a melody voice and a bass voice rendered
-// to 8 kHz mono PCM with an additive sine synth (three partials under a
-// pluck envelope), mixed, normalized, and μ-law encoded once, so the
-// players only ever copy bytes. The loop's boundaries are click-free:
-// every note fades to silence, so the wrap from the last sample back to
-// the first is inaudible. The song plays indefinitely — the players loop
-// it for as long as the call lasts.
+// Command synthchiptune is the one-off synthesizer of the chiptune
+// song the music bot ships with: an eight-bar pentatonic loop — a
+// melody voice and a bass voice — rendered to 8 kHz mono PCM with an
+// additive sine synth (three partials under a pluck envelope), mixed,
+// normalized, and G.711 μ-law encoded once. The composition once lived
+// in pkg/rtc/musicbot's source (song.go); the audio source model made
+// songs data instead, so this command renders it to the file the
+// configuration document's audioSource entry points at:
+//
+//	go run ./cmd/synthchiptune [-o assets/chiptune.ulaw]
+//
+// The output is the raw μ-law byte stream (one byte per sample,
+// 16000 Hz of nothing — 8000 samples per second), padded with silence
+// to a whole number of 20 ms frames so looping players wrap cleanly;
+// the file is byte-deterministic, so regenerating it is idempotent.
+package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"flag"
+	"fmt"
+	"log"
 	"math"
+	"math/bits"
+	"os"
 	"time"
 )
 
-// The render format: 8 kHz mono — PCMU's native rate, so the μ-law bytes
-// are one-to-one the RTP payload.
+// The render format: 8 kHz mono — PCMU's native rate, so the μ-law
+// bytes are one-to-one the RTP payload.
 const (
 	sampleRate      = 8000
 	songTempo       = 120 // beats per minute
@@ -48,15 +60,6 @@ var chiptuneBass = []note{
 	{45, 4}, {52, 4}, {50, 4}, {48, 4}, // A2 E3 D3 C3
 }
 
-// song is one rendered song: the metadata the CLI lists, and the whole
-// loop μ-law encoded — len(ulaw) is a multiple of samplesPerFrame, so the
-// players copy whole frames and wrap with a plain modulo.
-type song struct {
-	name  string
-	blurb string
-	ulaw  []byte
-}
-
 // midiFreq maps a MIDI note number to its frequency in Hz (equal
 // temperament, A4 = 440).
 func midiFreq(midi float64) float64 {
@@ -77,7 +80,7 @@ func envelope(t, dur float64) float64 {
 // synthesize renders the voices in parallel (all start at beat zero; they
 // must agree on the total length) and mixes them into one normalized PCM
 // buffer. It panics when the voices disagree on the loop's length — a
-// composition error caught at init.
+// composition error caught at render.
 func synthesize(bpm float64, voices ...[]note) []int16 {
 	var totalBeats float64
 	for i, voice := range voices {
@@ -88,7 +91,7 @@ func synthesize(bpm float64, voices ...[]note) []int16 {
 		if i == 0 {
 			totalBeats = beats
 		} else if beats != totalBeats {
-			panic("musicbot: song voices disagree on the loop length")
+			panic("synthchiptune: song voices disagree on the loop length")
 		}
 	}
 	totalSamples := int(math.Round(totalBeats * 60 / bpm * sampleRate))
@@ -124,21 +127,64 @@ func synthesize(bpm float64, voices ...[]note) []int16 {
 	return pcm
 }
 
-// newSong renders and encodes one song. The PCM is padded with silence to
-// a whole number of frames, so the players' frame arithmetic is exact.
-func newSong(name, blurb string, bpm float64, voices ...[]note) *song {
-	pcm := synthesize(bpm, voices...)
+// G.711 μ-law constants of the canonical ITU-T/Sun reference
+// implementation: the segment bias and the clip threshold.
+const (
+	muLawBias = 0x84 // 132
+	muLawClip = 32635
+)
+
+// linearToMuLaw encodes one 16-bit linear PCM sample as its μ-law byte:
+// sign, the segment (exponent) of the biased magnitude, and the mantissa,
+// complemented. (0 encodes to 0xFF, the μ-law positive zero.)
+func linearToMuLaw(sample int16) byte {
+	sign := 0
+	s := int32(sample)
+	if s < 0 {
+		sign = 0x80
+		s = -s
+	}
+	if s > muLawClip {
+		s = muLawClip
+	}
+	s += muLawBias
+	// After the bias the magnitude is at most 0x7FFF, so s>>7 fits a byte
+	// and its highest set bit is the segment.
+	exponent := 7 - bits.LeadingZeros8(uint8(s>>7))
+	mantissa := (s >> (exponent + 3)) & 0x0F
+	return byte(^(sign | (exponent << 4) | int(mantissa)))
+}
+
+// muLawEncode encodes a whole PCM buffer.
+func muLawEncode(pcm []int16) []byte {
+	out := make([]byte, len(pcm))
+	for i, sample := range pcm {
+		out[i] = linearToMuLaw(sample)
+	}
+	return out
+}
+
+// render renders the chiptune loop and μ-law encodes it. The PCM is
+// padded with silence to a whole number of frames, so players' frame
+// arithmetic is exact.
+func render() []byte {
+	pcm := synthesize(songTempo, chiptuneMelody, chiptuneBass)
 	if rem := len(pcm) % samplesPerFrame; rem != 0 {
 		pcm = append(pcm, make([]int16, samplesPerFrame-rem)...)
 	}
-	return &song{name: name, blurb: blurb, ulaw: muLawEncode(pcm)}
+	return muLawEncode(pcm)
 }
 
-// The songbook: the one initial song, programmatically generated.
-var songChiptune = newSong(
-	"chiptune",
-	"a programmatically generated chiptune loop, playing indefinitely",
-	songTempo,
-	chiptuneMelody,
-	chiptuneBass,
-)
+func main() {
+	out := flag.String("o", "assets/chiptune.ulaw", "the output file to write the μ-law song to")
+	flag.Parse()
+
+	ulaw := render()
+	if err := os.WriteFile(*out, ulaw, 0o644); err != nil {
+		log.Fatalf("write %s: %v", *out, err)
+	}
+	sum := sha256.Sum256(ulaw)
+	fmt.Printf("wrote %s: %d bytes (%d samples, %s at %d Hz), sha256 %s\n",
+		*out, len(ulaw), len(ulaw), time.Duration(len(ulaw)/sampleRate)*time.Second,
+		sampleRate, hex.EncodeToString(sum[:]))
+}

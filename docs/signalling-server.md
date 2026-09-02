@@ -18,7 +18,7 @@ exists, and all state lives in process memory.
 | Client transport | `pkg/rtc` (`transport.go`)         | `SignallingTransport`, the client's SSProxy: pumps a channel pair to/from the SS; `WebSocketSignallingTransport` is the production one.                                                                   |
 | Echo bot         | `pkg/rtc/echobot`                  | The reference data-channel stack of an echo-purpose bot on `HeadlessRTCClient`: serves the well-known `dcmsg`/`dcbin` labels (see below).                                                                 |
 | Bot DC layer     | `pkg/rtc/msg_handler`              | The data-channel layer of a bot: `Server` serves `dcmsg`/`dcbin` (echo rule, transfer reassembly and acks, the call log's status amends) and distills frames into bot messages for a `BotMessageHandler`. |
-| Music bot        | `pkg/rtc/musicbot`                 | A music-purpose `BotMessageHandler`: chat CLI (`/help`, `/list-songs`, `/play`), voice calls answered with a generated song (PCMU), video declined.                                                       |
+| Music bot        | `pkg/rtc/musicbot`                 | A music-purpose `BotMessageHandler`: chat CLI (`/help`, `/list-songs`, `/play`), voice calls answered with a song of the injected songbook (PCMU or opus, see `pkg/models/audiosource`), video declined.  |
 | Transport        | `pkg/api/websocket_ss`             | `WebSocketSSHandler`, an `http.Handler` bridging WebSocket connections to a provider.                                                                                                                     |
 | Wiring           | `cmd/server/main.go`               | Mounts the handler at `/api/ss/ws`, backed by the in-memory provider; when the configuration document carries an `<echoBot/>` or `<musicBot/>` element, also hosts the bots as clients of the endpoint.   |
 | E2E tests        | `e2e/websocket_ss_test.go`         | Drives the real server binary over WebSocket with deliberately independent wire views.                                                                                                                    |
@@ -225,12 +225,27 @@ a CLI — `/help`, `/list-songs`, and `/play <song>`, which phones the
 user (the bot's own voice INVITE) and plays the song once accepted, or
 switches it mid-call. An incoming voice call is accepted and answered
 with the music; a video call is declined on the spot; an attachment of
-any kind is refused with a chat reply. The one initial song is
-programmatically generated — an eight-bar pentatonic loop synthesized to
-8 kHz mono PCM, G.711 μ-law encoded (PCMU, the WebRTC audio codec every
-browser offers and a pure-Go encoder can produce) — and plays
-indefinitely, fed to the call's track twenty milliseconds at a time by
-the call's player; the peer's own audio is drained and discarded.
+any kind is refused with a chat reply.
+
+The songbook is injected — the `<musicBot/>` element's `<audioSource/>`
+children, modeled by `pkg/models/audiosource`'s `AudioSourceData`:
+sample data in a declared format (two combinations accepted — linear
+PCM at 48 kHz stereo, or G.711 μ-law at 8 kHz mono), inline (base64
+text) or at a url (a filesystem path or an http URL), optionally FLAC
+compressed (the file header's stream info taking precedence over the
+declared metadata), with a `numTotalSamples` of 0 denoting a streaming
+source of unknown length. Sample data loads lazily, as a stream: a
+call's player opens the song when it first plays it and reads each
+20 ms frame on demand, rewinding the stream at its end so the song
+plays indefinitely. The track's codec follows the song — a μ-law song
+rides PCMU, its bytes becoming the RTP payload as they are; a linear
+PCM song rides opus (48 kHz stereo, among the codecs every browser
+offers), encoded frame by frame with nothing downmixed or resampled
+(the opus encoder is libopus through cgo; pure-Go builds compile a
+stub whose μ-law songs play unaffected). The shipped example song is
+`assets/chiptune.ulaw` — an eight-bar pentatonic loop, synthesized to
+8 kHz mono μ-law by the one-off `go run ./cmd/synthchiptune`. The
+peer's own audio is drained and discarded.
 
 The server binary itself hosts the bots when the configuration document
 carries an `<echoBot/>` or `<musicBot/>` element (see `serverConfig.xsd`):

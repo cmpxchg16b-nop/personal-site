@@ -4,10 +4,17 @@
 package serverconfig
 
 import (
+	"encoding/base64"
 	"encoding/xml"
 	"fmt"
 	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
+	"unicode"
+
+	"personal-site/pkg/models/audiosource"
 )
 
 // ServerConfigXML mirrors the structure of serverConfig.xml (validated
@@ -35,8 +42,9 @@ type ServerConfigXML struct {
 	EchoBot *BotClientXML `xml:"echoBot"`
 	// MusicBot is nil when the document has no <musicBot/> element; the
 	// built-in music bot is wired only when the element is present and
-	// carries a url and a jwt (see cmd/server).
-	MusicBot *BotClientXML `xml:"musicBot"`
+	// carries a url and a jwt (see cmd/server). Its audioSource children
+	// are the bot's songbook.
+	MusicBot *MusicBotXML `xml:"musicBot"`
 }
 
 // OIDCLoginOptionsXML mirrors the <oidcLoginOptions/> section of
@@ -126,6 +134,107 @@ type BotClientXML struct {
 	MemberListInterval string `xml:"memberListInterval,attr"`
 	ReplyTimeout       string `xml:"replyTimeout,attr"`
 	ReconnectInterval  string `xml:"reconnectInterval,attr"`
+}
+
+// MusicBotXML mirrors the <musicBot/> section of serverConfig.xml: a
+// bot client (the embedded BotClientXML attributes) carrying the music
+// bot's songbook — zero or more <audioSource/> entries, mirrored by
+// AudioSourceXML and converted with its AudioSourceData method.
+type MusicBotXML struct {
+	BotClientXML
+	AudioSources []AudioSourceXML `xml:"audioSource"`
+}
+
+// AudioSourceXML mirrors a single <audioSource/> entry of the
+// <musicBot/> section: one audio source as pkg/models/audiosource
+// models it. The element's text content is the source's inline data,
+// base64 encoded; absent, url locates the data. The defaults the XSD
+// carries (compression "none", interleaved true) are applied by
+// AudioSourceData, since encoding/xml knows nothing of XSD defaults.
+type AudioSourceXML struct {
+	Id               string `xml:"id,attr"`
+	Name             string `xml:"name,attr"`
+	Description      string `xml:"description,attr"`
+	Author           string `xml:"author,attr"`
+	SampleFormatType string `xml:"sampleFormatType,attr"`
+	BitDepth         int    `xml:"bitDepth,attr"`
+	NumericType      string `xml:"numericType,attr"`
+	NumChannels      int    `xml:"numChannels,attr"`
+	// Interleaved is the raw interleaved attribute; the empty string
+	// selects the default (true) in AudioSourceData.
+	Interleaved string `xml:"interleaved,attr"`
+	// InlineData is the element's base64 text content; empty when the
+	// entry carries no inline data.
+	InlineData string `xml:",chardata"`
+	URL        string `xml:"url,attr"`
+	// Compression is the raw compression attribute; the empty string
+	// selects the default ("none") in AudioSourceData.
+	Compression     string `xml:"compression,attr"`
+	SampleRate      int    `xml:"sampleRate,attr"`
+	NumTotalSamples int    `xml:"numTotalSamples,attr"`
+}
+
+// AudioSourceData converts the entry into the audiosource model it
+// mirrors: the base64 text becomes the inline data, the empty
+// compression and interleaved fall back to their defaults, and a url
+// that is neither an http(s) URL nor an absolute path resolves against
+// the configuration document's directory. The result is validated — an
+// entry the model rejects is an error, a wiring-time one.
+func (x *AudioSourceXML) AudioSourceData(configDir string) (*audiosource.AudioSourceData, error) {
+	inline, err := decodeBase64Text(x.InlineData)
+	if err != nil {
+		return nil, fmt.Errorf("audioSource %s: the inline data is not valid base64: %w", x.Id, err)
+	}
+	interleaved := true
+	if x.Interleaved != "" {
+		interleaved, err = strconv.ParseBool(x.Interleaved)
+		if err != nil {
+			return nil, fmt.Errorf("audioSource %s: interleaved %q is not a boolean", x.Id, x.Interleaved)
+		}
+	}
+	compression := x.Compression
+	if compression == "" {
+		compression = audiosource.CompressionNone
+	}
+	url := x.URL
+	if url != "" && !strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://") && !filepath.IsAbs(url) {
+		url = filepath.Join(configDir, url)
+	}
+	s := &audiosource.AudioSourceData{
+		Id:               x.Id,
+		Name:             x.Name,
+		Description:      x.Description,
+		Author:           x.Author,
+		SampleFormatType: x.SampleFormatType,
+		BitDepth:         x.BitDepth,
+		NumericType:      x.NumericType,
+		NumChannels:      x.NumChannels,
+		Interleaved:      interleaved,
+		InlineData:       inline,
+		URL:              url,
+		Compression:      compression,
+		SampleRate:       x.SampleRate,
+		NumTotalSamples:  x.NumTotalSamples,
+	}
+	if err := s.Validate(); err != nil {
+		return nil, fmt.Errorf("audioSource %s: %w", x.Id, err)
+	}
+	return s, nil
+}
+
+// decodeBase64Text base64-decodes an XML element's text content, whose
+// lexical space may wrap the encoding across lines (surrounding and
+// embedded whitespace is not part of the encoding).
+func decodeBase64Text(s string) ([]byte, error) {
+	if strings.TrimSpace(s) == "" {
+		return nil, nil
+	}
+	return base64.StdEncoding.DecodeString(strings.Map(func(r rune) rune {
+		if unicode.IsSpace(r) {
+			return -1
+		}
+		return r
+	}, s))
 }
 
 // IceServerXML mirrors a single <iceServer/> entry of serverConfig.xml.

@@ -163,11 +163,20 @@ version:
   bots on it as ordinary authenticated clients when the configuration
   document carries an `<echoBot/>` or `<musicBot/>` element: the echo
   bot (`pkg/rtc/echobot`) answers text verbatim, declines every call,
-  and reports the running sha256 of any file it receives; the music bot
-  (`pkg/rtc/musicbot`) answers a chat CLI (`/help`, `/list-songs`,
-  `/play <song>`) and voice calls with a generated PCMU song. Their
-  static session tokens are issued with the `sign` subcommand (see
-  _Sign-in and sessions_).
+  and reports the running sha256 of any file it receives; the music
+  bot (`pkg/rtc/musicbot`) answers a chat CLI (`/help`, `/list-songs`,
+  `/play <song>`) and voice calls with a song of its configured
+  songbook. A song is an `<audioSource/>` child of `<musicBot/>`,
+  modeled by `pkg/models/audiosource`'s `AudioSourceData` — inline
+  (base64) or at a url, optionally FLAC compressed, with two accepted
+  format combinations: μ-law 8 kHz mono (played as PCMU, byte for
+  byte) and linear PCM 48 kHz stereo (played as opus, nothing
+  downmixed; the encoder is libopus via cgo, so pure-Go builds carry
+  a stub that plays μ-law songs only). Sample data loads lazily as a
+  stream and loops by rewinding; the shipped example song
+  (`assets/chiptune.ulaw`) is regenerated with
+  `go run ./cmd/synthchiptune`. Their static session tokens are
+  issued with the `sign` subcommand (see _Sign-in and sessions_).
 
 ## Layout
 
@@ -176,7 +185,16 @@ version:
   `/api/profile`, `/api/healthz`, the `/api/dyn/` mount, the `/links/`
   mount and the signalling endpoint; the `sign` subcommand (`sign.go`)
   issues session JWTs for machine clients.
+- `cmd/synthchiptune/` — the one-off synthesizer of the music bot's
+  example song: renders the chiptune loop to `assets/chiptune.ulaw`
+  (8 kHz mono μ-law, byte-deterministic).
+- `assets/` — the music bot's example audio asset
+  (`chiptune.ulaw`), pointed at by the sample configuration's
+  `<audioSource/>` entry.
 - `pkg/` — the Go packages behind the server's endpoints:
+  - `pkg/models/audiosource/` — `AudioSourceData` and its streaming
+    `Open`/`Rewind` access to lazily loaded, lazily decoded sample data
+    (the music bot's songbook model).
   - `pkg/models/dyn/` — `DynBlogData`, the `DynBlogDataProvider` interface,
     and `FSBasedDynBlogData`.
   - `pkg/models/shortlink/` — the `ShortLinkDataProvider` interface and
