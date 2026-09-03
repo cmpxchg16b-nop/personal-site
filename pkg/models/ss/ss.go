@@ -498,6 +498,24 @@ func (p *SimpleOnMemorySSProvider) handleRegister(ctx context.Context, channels 
 				"no subscriber id is available in the automatic assignment range 1000-1999"))
 		}
 	}
+	// A client registers exactly once per incarnation — a browser page
+	// load mints a fresh subscriber id (a reload is a new incarnation; see
+	// the browser's registerSubscriber). Any OTHER live registration of
+	// the registrar's own (user id, user session id) tuple is therefore a
+	// previous, now-dead incarnation of the same client, and is evicted
+	// here: the incarnation change becomes immediately visible to member
+	// listings (peers rebuild their stale peer sessions for the old id at
+	// once, not after aging), and the dead registration cannot keep
+	// limping along on its successor's address-matched activity (touch).
+	// The registrar's own id is exempt, so an ordinary same-id refresh —
+	// a roaming reconnect, or a bot re-registering its configured id —
+	// keeps its registration (two tabs of one session do compete; the
+	// later load wins, matching the one-incarnation-per-page model).
+	for id, sub := range ch.subscribers {
+		if id != reg.SubscriberId && sameRegistrationTuple(sub.addr, ev.From) {
+			ch.evict(id)
+		}
+	}
 	if existing := ch.live(reg.SubscriberId, now, p.aging); existing != nil {
 		if !sameRegistrationTuple(existing.addr, ev.From) {
 			return p.send(ctx, outMsg, replyErr(ev, ErrorCodeSubscriberIdIsRegistered,
@@ -841,10 +859,15 @@ func (ch *channelState) live(id SubscriberId, now time.Time, aging time.Duration
 	return sub
 }
 
-// evict removes a subscriber of the channel.
+// evict removes a subscriber of the channel. The username is freed only
+// while it still resolves to this subscriber: an incarnation replacement
+// (see handleRegister) may have re-bound it to the successor's fresh
+// registration, whose binding must survive this eviction.
 func (ch *channelState) evict(id SubscriberId) {
 	if sub, ok := ch.subscribers[id]; ok {
-		delete(ch.idsByUsername, sub.username)
+		if ch.idsByUsername[sub.username] == id {
+			delete(ch.idsByUsername, sub.username)
+		}
 		delete(ch.subscribers, id)
 	}
 }

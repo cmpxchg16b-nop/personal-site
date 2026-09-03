@@ -33,7 +33,6 @@ import {
 import { fetchProfile, ProfileApiError } from "@/api/profile";
 import { DEFAULT_SS_URL, getSSProxy, type SSProxy } from "./proxy";
 import {
-  ErrorCode,
   WELLKNOWN_CH_ID_MAIN,
   WELLKNOWN_SVC_ID_SS,
   type ChannelId,
@@ -182,30 +181,6 @@ const CHANNEL_LIST_INTERVAL_MS = 5000;
 // server's default subscriber aging (10s), like the pings.
 const CHANNEL_KEEPALIVE_INTERVAL_MS = 5000;
 
-// SUBSCRIBER_STORAGE_KEY is the localStorage key holding the subscriber id
-// the SS assigned to this browser, reused across reconnects and reloads.
-const SUBSCRIBER_STORAGE_KEY = "ss.subscriberId";
-
-function loadStoredSubscriberId(): string | null {
-  try {
-    return window.localStorage.getItem(SUBSCRIBER_STORAGE_KEY);
-  } catch {
-    return null; // storage unavailable (e.g. private mode)
-  }
-}
-
-function storeSubscriberId(id: string | null): void {
-  try {
-    if (id === null) {
-      window.localStorage.removeItem(SUBSCRIBER_STORAGE_KEY);
-    } else {
-      window.localStorage.setItem(SUBSCRIBER_STORAGE_KEY, id);
-    }
-  } catch {
-    // storage unavailable; the registration itself still worked
-  }
-}
-
 // redirectToLogin bounces to the login page, with redirect_if_succeed set
 // to the current location so a successful login comes back here.
 function redirectToLogin(): void {
@@ -290,70 +265,59 @@ async function awaitRepliesOn(
 }
 
 // registerSubscriber registers this browser as a subscriber of the main
-// channel, reading the SS's reply on its own short-lived stream: the
-// stored subscriber id is reused when present, an empty id asks the SS to
-// assign one (from the 1000-1999 range) which is then persisted for
-// reuse. A stored id the SS rejects as bound to another session is
-// forgotten and retried once with an empty id. The registration's display
-// name is not the client's to choose: the server stamps the session's
-// username onto the register event, so the wire field goes empty. It
-// resolves to the registered subscriber id and the caller's user id —
-// which the SS echoes in the reply's `to`, populated server-side from the
-// session — or null when registration failed.
+// channel, reading the SS's reply on its own short-lived stream. The
+// registration always asks for a fresh auto-assigned subscriber id (the
+// 1000-1999 range): a page load is a new incarnation, and a dead
+// incarnation's subscriber id must NOT be reused. Peer sessions are keyed
+// by subscriber id and rebuilt only when the member listing observes a
+// peer leaving and returning; re-registering the old id from the same
+// session cookie is a same-tuple refresh, so peers never see the leave,
+// keep their stale (dead) peer connection, and — the polite side having
+// negotiated already — never offer again. An impolite reincarnation then
+// waits forever (its fresh peer connection sits at signalingState "stable"
+// and ICE state "new", never connecting). A fresh id makes every reload a
+// brand-new member instead — the path that always worked; the SS evicts
+// the tuple's dead registration the moment its successor registers, so
+// peers tear their stale sessions down on their very next listing. The
+// registration's display name is not the client's to choose: the server
+// stamps the session's username onto the register event. Resolves to the
+// registered subscriber id and the caller's user id — which the SS echoes
+// in the reply's `to`, populated server-side from the session — or null
+// when registration failed.
 async function registerSubscriber(
   read: () => ReadableStream<SignallingEvent>,
   send: (ev: SignallingEvent) => Promise<void>,
 ): Promise<{ subscriberId: SubscriberId; userId: UserId | null } | null> {
-  let subscriberId = loadStoredSubscriberId() ?? "";
-  for (let attempt = 0; attempt < 2; attempt++) {
-    const msgId = crypto.randomUUID();
-    const replyPromise = awaitReplyOn(read(), msgId, REGISTER_REPLY_TIMEOUT_MS);
-    await send({
-      // `from` is populated server-side from the caller's session; so is
-      // the registration's username — the wire value is ignored.
-      from: {},
-      to: { serviceId: WELLKNOWN_SVC_ID_SS },
-      msgId,
-      c2SEv: {
-        register: {
-          subscriberId,
-          channelId: WELLKNOWN_CH_ID_MAIN,
-          username: "",
-        },
+  const msgId = crypto.randomUUID();
+  const replyPromise = awaitReplyOn(read(), msgId, REGISTER_REPLY_TIMEOUT_MS);
+  await send({
+    // `from` is populated server-side from the caller's session; so is
+    // the registration's username — the wire value is ignored.
+    from: {},
+    to: { serviceId: WELLKNOWN_SVC_ID_SS },
+    msgId,
+    c2SEv: {
+      register: {
+        subscriberId: "",
+        channelId: WELLKNOWN_CH_ID_MAIN,
+        username: "",
       },
-    });
-    const reply = await replyPromise;
-    if (!reply) {
-      console.warn("signalling: registration timed out");
-      return null;
-    }
-    const result = reply.s2CEv?.registerResult;
-    if (result) {
-      if (result.subscriberId !== subscriberId) {
-        storeSubscriberId(result.subscriberId);
-      }
-      console.info(
-        `signalling: registered as subscriber ${result.subscriberId}`,
-      );
-      return {
-        subscriberId: result.subscriberId,
-        userId: reply.to.userId ?? null,
-      };
-    }
-    const err = reply.s2CEv?.err;
-    if (
-      err?.errorCode === ErrorCode.SubscriberIdIsRegistered &&
-      subscriberId !== ""
-    ) {
-      // The stored id is still bound to another (e.g. older, not yet aged
-      // out) session: forget it and mint a fresh one.
-      storeSubscriberId(null);
-      subscriberId = "";
-      continue;
-    }
-    console.error("signalling: registration failed", err ?? reply);
+    },
+  });
+  const reply = await replyPromise;
+  if (!reply) {
+    console.warn("signalling: registration timed out");
     return null;
   }
+  const result = reply.s2CEv?.registerResult;
+  if (result) {
+    console.info(`signalling: registered as subscriber ${result.subscriberId}`);
+    return {
+      subscriberId: result.subscriberId,
+      userId: reply.to.userId ?? null,
+    };
+  }
+  console.error("signalling: registration failed", reply.s2CEv?.err ?? reply);
   return null;
 }
 

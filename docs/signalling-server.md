@@ -66,12 +66,22 @@ implementation must provide.
   range** for automatic registration. A subscriber id is bound to zero or
   one (user id, user session id, channel id) tuple: re-registration of a
   live id by the same tuple is a refresh (renewing `lastActive`), while
-  another tuple is rejected with `SubscriberIdIsRegistered`. The
-  **`username`** is the subscriber's display name, but it is never the
-  client's to choose: the WebSocket endpoint overrides it with the
-  session's username (the JWT's username claim) before the event reaches
-  the SS, so clients send it empty and `UsernameTaken` can only fire when
-  two live sessions carry the same username claim.
+  another tuple is rejected with `SubscriberIdIsRegistered`.
+  **A registration is one incarnation of its client**: a client
+  registers exactly once per incarnation (a browser page load mints a
+  fresh, empty `subscriberId`), so any _other_ live registration of the
+  registrar's own (user id, user session id) tuple is a previous, dead
+  incarnation — the SS evicts it on the spot, freeing its subscriber id
+  and username for the successor. This makes an incarnation change
+  immediately visible to `listChannelMembers` (peers rebuild their stale
+  peer sessions at once, instead of after the aging interval) and keeps
+  a dead registration from lingering on its successor's
+  address-matched activity. The **`username`** is the subscriber's
+  display name, but it is never the client's to choose: the WebSocket
+  endpoint overrides it with the session's username (the JWT's username
+  claim) before the event reaches the SS, so clients send it empty and
+  `UsernameTaken` can only fire when two live sessions carry the same
+  username claim.
 - **`channelKeepAlive {channelId, subscriberId}`** — renews the caller's
   membership of a channel: the SS refreshes the subscriber's
   `lastActive`. Sent periodically once registered. **Nothing is answered
@@ -269,7 +279,11 @@ subscriber id, ICE servers, the periodic knobs) map onto
   carries the JSON DCMsgs below, `dcbin` carries compact binary frames
   (see _Binary file transfer_). Sessions track the channel membership:
   they appear as the listing discovers members and are torn down when a
-  member drops out.
+  member drops out. Because a page reload is a **new incarnation** with a
+  fresh subscriber id (see the signalling server's roaming notes), a
+  reloaded peer is a new member — its old session is torn down and a
+  fresh one negotiated, which is what makes reloads reconnect instead of
+  deadlocking on a stale session keyed by a resurrected id.
 - **ICE servers** come from `GET /api/iceServers` (the `<iceServer/>`
   entries of `serverConfig.xml`), so a deployment can steer peers at its
   own STUN/TURN instance.
@@ -512,12 +526,21 @@ target id or a kind mismatch makes the command a no-op.
 **Roaming.** Registrations outlive connections (the prototype has no
 unregister message), and ping-session state (ping id, seq/ack chain) is
 purely client-side — so a client that quickly disconnects and reconnects
-with the same identity keeps its registration, its profile stays
-queryable (even while it is offline), and in-flight ping sessions
-continue transparently on the new connection — as long as it reconnects
-within the aging interval (below). The only requirement is that the
-reconnected client speaks first — any message (e.g. a liveness `ping`)
-re-learns its address onto the new connection, switch-style.
+with the same identity **and the same subscriber id** keeps its
+registration, its profile stays queryable (even while it is offline), and
+in-flight ping sessions continue transparently on the new connection —
+as long as it reconnects within the aging interval (below). The only
+requirement is that the reconnected client speaks first — any message
+(e.g. a liveness `ping`) re-learns its address onto the new connection,
+switch-style. A client that instead registers a **fresh** subscriber id
+(a new incarnation — every browser page load) replaces the tuple's
+previous registration on the spot (see `register`): roaming is for the
+same incarnation's connection blips, reincarnation for everything that
+rebuilds the client's peer connections — peers key their sessions by
+subscriber id and re-negotiate only for a member they see leave and
+return, so a resurrected dead incarnation's id would leave both sides
+waiting forever (the polite peer already negotiated; the impolite fresh
+peer never offers).
 
 ## Subscriber aging
 

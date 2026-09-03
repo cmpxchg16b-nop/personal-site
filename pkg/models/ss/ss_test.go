@@ -272,6 +272,89 @@ func TestRegisterErrors(t *testing.T) {
 	}
 }
 
+// TestRegisterSameTupleFreshId checks the incarnation semantics: a
+// registration from a tuple that already holds a live registration (the
+// previous incarnation of the same user session — a browser page reload
+// mints a fresh subscriber id) evicts the old registration eagerly and
+// takes its username over. The old id is immediately gone from listings
+// and queries, so peers tear their stale peer sessions down at once;
+// another tuple taking the username is still rejected.
+func TestRegisterSameTupleFreshId(t *testing.T) {
+	h := startProvider(t)
+	addr := EPAddr{UserId: "u-alice", UserSessionId: "s-alice"}
+
+	registerAuto := func(from EPAddr, msgId string) *RegisterResult {
+		t.Helper()
+		ev := registerEventFrom(from, "", WellKnownChIdMain, "alice")
+		ev.MsgId = MsgId(msgId)
+		h.in <- ev
+		ack := h.recvOut(t)
+		if ack.S2CEv == nil || ack.S2CEv.Err != nil || ack.S2CEv.RegisterResult == nil {
+			t.Fatalf("auto register ack: %+v, want a registerResult and no error", ack)
+		}
+		return ack.S2CEv.RegisterResult
+	}
+
+	first := registerAuto(addr, "m-reg-1")
+	if first.SubscriberId != "1000" {
+		t.Fatalf("first auto assignment = %s, want 1000", first.SubscriberId)
+	}
+
+	// The reincarnation, while the first registration is still live (no
+	// aging wait): a fresh id, and the old registration is evicted at
+	// once — not UsernameTaken, and not left to age out while the
+	// successor's own activity keeps refreshing it (touch).
+	second := registerAuto(addr, "m-reg-2")
+	if second.SubscriberId == first.SubscriberId {
+		t.Fatalf("reincarnation id = %s, want a fresh one", second.SubscriberId)
+	}
+
+	// The old incarnation's id is gone immediately.
+	h.in <- &SignallingEvent{
+		From:  EPAddr{UserId: "u-q", UserSessionId: "s-q"},
+		MsgId: "m-q-old",
+		C2SEv: &ClientToSSEv{UserProfileQuery: &ClientToSSUserProfileQuery{
+			SubscriberId: first.SubscriberId,
+			ChannelId:    WellKnownChIdMain,
+		}},
+	}
+	reply := h.recvOut(t)
+	if reply.S2CEv == nil || reply.S2CEv.Err == nil ||
+		reply.S2CEv.Err.ErrorCode != ErrorCodeSubscriberNotFound {
+		t.Fatalf("old incarnation profile reply = %+v, want error code %d",
+			reply, ErrorCodeSubscriberNotFound)
+	}
+
+	// The new incarnation carries the same username (it was freed with
+	// the old registration and taken over), and another tuple still
+	// cannot take it.
+	h.in <- &SignallingEvent{
+		From:  EPAddr{UserId: "u-q", UserSessionId: "s-q"},
+		MsgId: "m-q-new",
+		C2SEv: &ClientToSSEv{UserProfileQuery: &ClientToSSUserProfileQuery{
+			SubscriberId: second.SubscriberId,
+			ChannelId:    WellKnownChIdMain,
+		}},
+	}
+	profile := h.recvOut(t)
+	if profile.S2CEv == nil || profile.S2CEv.Profile == nil || profile.S2CEv.Profile.Username != "alice" {
+		t.Fatalf("new incarnation profile = %+v, want username alice", profile)
+	}
+	h.in <- registerEventFrom(EPAddr{UserId: "u-eve", UserSessionId: "s-eve"},
+		"eve", WellKnownChIdMain, "alice")
+	reply = h.recvOut(t)
+	if reply.S2CEv == nil || reply.S2CEv.Err == nil ||
+		reply.S2CEv.Err.ErrorCode != ErrorCodeUsernameTaken {
+		t.Fatalf("other-tuple username reply = %+v, want error code %d",
+			reply, ErrorCodeUsernameTaken)
+	}
+
+	// A same-id re-registration (a roaming reconnect, or a bot
+	// re-registering its configured id) is still a refresh, not an
+	// eviction of itself.
+	h.mustRegisterFrom(t, addr, second.SubscriberId, "alice")
+}
+
 func TestQueryProfile(t *testing.T) {
 	h := startProvider(t)
 	h.mustRegister(t, "alice", "alice")
