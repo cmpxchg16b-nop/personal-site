@@ -41,12 +41,15 @@ var (
 		ClockRate: sampleRate,
 		Channels:  1,
 	}
-	// opusTrackCodec carries a linear PCM source's music as opus.
+	// opusTrackCodec carries a linear PCM source's music as opus. The
+	// fmtp mirrors the one the server's peer connections negotiate
+	// (cmd/server's stereoOpusPCFactory): stereo=1 is what keeps the
+	// receiving browser from collapsing the music to mono (RFC 7587).
 	opusTrackCodec = webrtc.RTPCodecCapability{
 		MimeType:    webrtc.MimeTypeOpus,
 		ClockRate:   opusSampleRate,
 		Channels:    opusChannels,
-		SDPFmtpLine: "minptime=10;useinbandfec=1",
+		SDPFmtpLine: "minptime=10;useinbandfec=1;stereo=1",
 	}
 )
 

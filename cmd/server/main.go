@@ -38,6 +38,7 @@ import (
 
 	"github.com/alecthomas/kong"
 	"github.com/joho/godotenv"
+	"github.com/pion/webrtc/v4"
 )
 
 // logger is the application-wide structured logger used by the HTTP logging
@@ -398,7 +399,7 @@ const defaultBotReconnectInterval = 5 * time.Second
 
 // startEchoBot wires the built-in echo bot (pkg/rtc/echobot).
 func startEchoBot(ctx context.Context, cfg *pkgmodelsserverconfig.BotClientXML) error {
-	return startBotClient(ctx, "echo bot", cfg, func(client *rtc.HeadlessRTCClient) {
+	return startBotClient(ctx, "echo bot", cfg, nil, func(client *rtc.HeadlessRTCClient) {
 		echobot.New(client, echobot.Configuration{Logger: logger})
 	})
 }
@@ -418,9 +419,53 @@ func startMusicBot(ctx context.Context, cfg *pkgmodelsserverconfig.MusicBotXML, 
 		}
 		sources = append(sources, src)
 	}
-	return startBotClient(ctx, "music bot", &cfg.BotClientXML, func(client *rtc.HeadlessRTCClient) {
+	return startBotClient(ctx, "music bot", &cfg.BotClientXML, stereoOpusPCFactory(pkgapiiceservers.ParseURLs(cfg.IceServers)), func(client *rtc.HeadlessRTCClient) {
 		musicbot.New(client, musicbot.Configuration{Logger: logger, AudioSources: sources})
 	})
+}
+
+// stereoOpusPCFactory builds the music bot's peer-connection factory:
+// pion's default codecs, save that opus negotiates the stereo=1 fmtp
+// parameter (RFC 7587). Without it the peer connections advertise
+// mono-only reception, so a browser receiving the bot's stereo music
+// configures a mono opus decoder and downmixes the song on the fly —
+// wide stereo mixes lose content to the collapse. With stereo=1 the
+// offer carries it and every browser answers it, so the song keeps its
+// channels. The music bot declines video calls, yet the default video
+// codecs stay registered so a video m-line the peer proposes still
+// negotiates instead of being rejected out of hand.
+func stereoOpusPCFactory(iceServers []string) func() (*webrtc.PeerConnection, error) {
+	return func() (*webrtc.PeerConnection, error) {
+		m := &webrtc.MediaEngine{}
+		// The audio defaults, opus upgraded to stereo; the video defaults
+		// verbatim (pion's list, mirrored here because it cannot be amended
+		// after registration).
+		audio := []webrtc.RTPCodecParameters{
+			{RTPCodecCapability: webrtc.RTPCodecCapability{
+				MimeType: webrtc.MimeTypeOpus, ClockRate: 48000, Channels: 2,
+				SDPFmtpLine: "minptime=10;useinbandfec=1;stereo=1",
+			}, PayloadType: 111},
+			{RTPCodecCapability: webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeG722, ClockRate: 8000}, PayloadType: 9},
+			{RTPCodecCapability: webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypePCMU, ClockRate: 8000}, PayloadType: 0},
+			{RTPCodecCapability: webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypePCMA, ClockRate: 8000}, PayloadType: 8},
+		}
+		for _, c := range audio {
+			if err := m.RegisterCodec(c, webrtc.RTPCodecTypeAudio); err != nil {
+				return nil, fmt.Errorf("register audio codec %s: %w", c.MimeType, err)
+			}
+		}
+		if err := m.RegisterDefaultCodecs(); err != nil {
+			// The video codecs: the audio ones above are already
+			// registered, and registration is idempotent per payload type.
+			return nil, fmt.Errorf("register default codecs: %w", err)
+		}
+		api := webrtc.NewAPI(webrtc.WithMediaEngine(m))
+		config := webrtc.Configuration{}
+		if len(iceServers) > 0 {
+			config.ICEServers = []webrtc.ICEServer{{URLs: iceServers}}
+		}
+		return api.NewPeerConnection(config)
+	}
 }
 
 // startBotClient wires one built-in bot: a pkg/rtc bot (attached by wire)
@@ -432,7 +477,7 @@ func startMusicBot(ctx context.Context, cfg *pkgmodelsserverconfig.MusicBotXML, 
 // surfaces as the reconnect loop's logged 401s. The bot runs until ctx
 // is done, re-establishing the signalling connection every
 // reconnectInterval when it drops.
-func startBotClient(ctx context.Context, name string, cfg *pkgmodelsserverconfig.BotClientXML, wire func(client *rtc.HeadlessRTCClient)) error {
+func startBotClient(ctx context.Context, name string, cfg *pkgmodelsserverconfig.BotClientXML, pcFactory func() (*webrtc.PeerConnection, error), wire func(client *rtc.HeadlessRTCClient)) error {
 	keepAliveInterval, err := pkgmodelsserverconfig.ParseDuration(cfg.KeepAliveInterval, 0)
 	if err != nil {
 		return fmt.Errorf("keepAliveInterval: %w", err)
@@ -466,6 +511,7 @@ func startBotClient(ctx context.Context, name string, cfg *pkgmodelsserverconfig
 		KeepAliveInterval:  keepAliveInterval,
 		MemberListInterval: memberListInterval,
 		ReplyTimeout:       replyTimeout,
+		NewPeerConnection:  pcFactory,
 		Logger:             logger,
 	})
 	if err != nil {
