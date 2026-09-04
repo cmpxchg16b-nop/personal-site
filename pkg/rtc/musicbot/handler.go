@@ -31,6 +31,7 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/pion/webrtc/v4"
 
@@ -60,6 +61,12 @@ const (
 	// phaseActive: the call is established; the music is on the wire.
 	phaseActive
 )
+
+// hangupDetachDelay is how long the withdrawal of the call's track waits
+// after a hangup before going out: the peer's own teardown renegotiation
+// crosses it within this window, so the two offers never meet in flight
+// (see handleHangup).
+const hangupDetachDelay = 500 * time.Millisecond
 
 // peerCall is one peer's call state — touched only on the peer's
 // serialized dcmsg goroutine and by the session watcher's
@@ -143,7 +150,7 @@ func (h *musicHandler) HandleCalling(ctx context.Context, sip *msg_handler.SipMe
 	case sip.Response != nil:
 		h.handleResponse(sip, w)
 	case sip.Method == msg_handler.SipMethodBye || sip.Method == msg_handler.SipMethodCancel:
-		h.handleHangup(sip, w)
+		h.handleHangup(ctx, sip, w)
 	}
 }
 
@@ -212,7 +219,7 @@ func (h *musicHandler) handleResponse(sip *msg_handler.SipMessage, w msg_handler
 
 // handleHangup ends the call the peer hung up (BYE) or aborted (CANCEL):
 // the music stops, the track is withdrawn, the state is reset.
-func (h *musicHandler) handleHangup(sip *msg_handler.SipMessage, w msg_handler.ResponseWriter) {
+func (h *musicHandler) handleHangup(ctx context.Context, sip *msg_handler.SipMessage, w msg_handler.ResponseWriter) {
 	peer := sip.From
 	v, ok := h.calls.Load(peer)
 	if !ok {
@@ -224,9 +231,25 @@ func (h *musicHandler) handleHangup(sip *msg_handler.SipMessage, w msg_handler.R
 	}
 	h.calls.CompareAndDelete(peer, call)
 	call.player.stop()
-	if err := w.DetachMedia(call.player.track); err != nil {
-		h.logger.Warn("musicbot: track not detached on hangup", "peer", peer, "err", err)
-	}
+	track := call.player.track
+	// The peer is tearing down its own side of the call at this same
+	// instant, and its renegotiation offer races the withdrawal's: two
+	// offers in flight are a glare, and the polite peer's yield — a peer
+	// connection rebuild — presents a fresh ICE/DTLS identity that a
+	// browser cannot fold into the running transport, so the pair ends
+	// disconnected. The music is already off; the m-line's withdrawal can
+	// afford to wait out the peer's offer and go out alone.
+	go func() {
+		t := time.NewTimer(hangupDetachDelay)
+		defer t.Stop()
+		select {
+		case <-t.C:
+			if err := w.DetachMedia(track); err != nil {
+				h.logger.Warn("musicbot: track not detached on hangup", "peer", peer, "err", err)
+			}
+		case <-ctx.Done():
+		}
+	}()
 	h.logger.Info("musicbot: call ended", "peer", peer, "callId", call.callId)
 }
 

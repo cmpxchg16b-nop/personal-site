@@ -1,17 +1,18 @@
 package audiosource
 
-// This file is the source's sample data as a stream: lazily loaded
-// (nothing is touched until Open), never held as a whole (a consumer
-// reads on demand), and rewindable (the project's players loop their
-// music indefinitely — a filesystem or inline source rewinds by seeking
-// back to the first byte, an http source by re-fetching its URL).
+// This file is the source's data as a stream: lazily loaded (nothing
+// is touched until Open), never held as a whole (a consumer reads on
+// demand), and rewindable (the project's players loop their music
+// indefinitely — a filesystem or inline source rewinds by seeking back
+// to its first byte, an http source by re-fetching its URL).
 //
-// Two layers compose into a Stream: a rawReader over the source's
+// The layers beneath a Stream: a rawReader over the source's
 // (possibly compressed) bytes — inline, filesystem, or http — and the
-// decode layer above it: the passthrough of an uncompressed source, or
-// the on-demand FLAC decoding of a compressed one. When the source's
-// total sample count is known, both layers check it at end-of-data: a
-// stream that ends early (or late) is an error, not a short song.
+// decode layer above it: the passthrough of an uncompressed source, the
+// on-demand FLAC decoding of a flac one, or the Ogg demuxing of an opus
+// one (ogg.go). When the source's total sample count is known, the
+// layers check it at end-of-data: a stream that ends early (or late) is
+// an error, not a short song.
 
 import (
 	"bytes"
@@ -21,6 +22,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/mewkiz/flac"
 	"github.com/mewkiz/flac/frame"
@@ -42,14 +44,14 @@ type Format struct {
 	NumTotalSamples int
 }
 
-// Stream is one open read of a source's decoded sample data, positioned
-// at the first sample. Reading decodes on demand; the samples are
-// little-endian, interleaved channel by channel when the source has
-// several channels. A stream is single-use but rewindable, and each
-// Open call returns an independent one — sources need no
-// synchronization and carry no open-stream state.
+// Stream is one open read of a source's data. A stream is single-use
+// but rewindable, and each Open call returns an independent one —
+// sources need no synchronization and carry no open-stream state. What
+// a read serves depends on the family: a sample stream (the linear PCM
+// and μ-law families) also implements io.Reader, serving decoded sample
+// bytes; an opus source's stream is a PacketStream instead, serving
+// whole codec packets.
 type Stream interface {
-	io.Reader
 	io.Closer
 
 	// Rewind repositions the stream at the first sample, so a consumer
@@ -66,12 +68,33 @@ type Stream interface {
 	Format() Format
 }
 
-// Open starts a fresh stream of the source's decoded sample data,
-// positioned at the first sample. This is the source's first touch:
-// sample data is loaded lazily, and an http(s) source's fetch happens
-// here (honoring ctx). For a compressed source the header's stream
-// info takes precedence over the declared metadata; the effective
-// format it describes must be one of the supported combinations.
+// SampleStream is the stream of a source that holds samples (the
+// linear PCM and μ-law families): reading serves the decoded samples
+// as bytes — little-endian, interleaved channel by channel when the
+// source has several channels.
+type SampleStream interface {
+	Stream
+	io.Reader
+}
+
+// PacketStream is the stream of an opus source: instead of sample
+// bytes it serves whole Opus packets, already encoded. ReadPacket
+// returns the next packet and its duration — the media time it carries,
+// measured at the codec's own 48000 Hz clock. The data slice is valid
+// until the next ReadPacket (or Rewind); a consumer that keeps it must
+// copy it. The end of the data is io.EOF, like a reader's.
+type PacketStream interface {
+	Stream
+	ReadPacket() (data []byte, duration time.Duration, err error)
+}
+
+// Open starts a fresh stream of the source's data, positioned at the
+// first sample (or the first packet, for an opus source). This is the
+// source's first touch: sample data is loaded lazily, and an http(s)
+// source's fetch happens here (honoring ctx). For a compressed source
+// the header's stream info takes precedence over the declared
+// metadata; the effective format it describes must be one of the
+// supported combinations.
 func (s *AudioSourceData) Open(ctx context.Context) (Stream, error) {
 	if err := s.Validate(); err != nil {
 		return nil, err
@@ -87,6 +110,14 @@ func (s *AudioSourceData) Open(ctx context.Context) (Stream, error) {
 			return nil, err
 		}
 		return fs, nil
+	}
+	if s.Compression == CompressionOgg {
+		os := &oggStream{raw: raw}
+		if err := os.parse(); err != nil {
+			raw.Close()
+			return nil, err
+		}
+		return os, nil
 	}
 	return &pcmStream{raw: raw, format: s.declaredFormat()}, nil
 }
@@ -110,13 +141,16 @@ func validateFormat(f Format) error {
 	switch {
 	case f.SampleFormatType == SampleLinearPCM && f.SampleRate == 48000 && f.NumChannels == 2:
 	case f.SampleFormatType == SampleMuLaw && f.SampleRate == 8000 && f.NumChannels == 1:
+	case f.SampleFormatType == SampleOpus && f.SampleRate == 48000 && (f.NumChannels == 1 || f.NumChannels == 2):
 	default:
 		return fmt.Errorf("unsupported combination %s/%dHz/%dch", f.SampleFormatType, f.SampleRate, f.NumChannels)
 	}
-	switch f.BitDepth {
-	case 8, 16, 32:
-	default:
-		return fmt.Errorf("bit depth %d is not one of 8, 16, 32", f.BitDepth)
+	if f.SampleFormatType != SampleOpus {
+		switch f.BitDepth {
+		case 8, 16, 32:
+		default:
+			return fmt.Errorf("bit depth %d is not one of 8, 16, 32", f.BitDepth)
+		}
 	}
 	return nil
 }

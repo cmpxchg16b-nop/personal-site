@@ -25,13 +25,17 @@
 // declared format, inline or at a url, optionally flac compressed,
 // loaded and decoded lazily as a stream when a call first plays the
 // song, and looped by rewinding the stream for as long as the call
-// lasts. Two format combinations are accepted, and the track's codec
+// lasts. Three format combinations are accepted, and the track's codec
 // follows the song: a μ-law source (8000 Hz, mono) rides the pair's
 // peer connection as a PCMU track, its bytes becoming the RTP payload
 // as they are; a linear PCM source (48000 Hz, stereo) rides an opus
 // track (48000 Hz, stereo — among the audio codecs pion's default
 // media engine registers and every browser offers), encoded frame by
-// frame from the source's samples (see player.go and convert.go). A
+// frame from the source's samples (see player.go and convert.go); an
+// opus source (48000 Hz, 1 or 2 channels, Ogg-framed — typically a
+// remote stream over http) rides that same opus track with its packets
+// passed through untouched — no decoding, no re-encoding — which also
+// makes it the one linear-quality family a pure-Go build plays. A
 // mid-call song switch within a codec family is a stream swap; across
 // families the whole track is replaced on the wire.
 package musicbot

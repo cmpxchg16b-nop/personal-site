@@ -51,7 +51,9 @@ package rtc
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
+	"strings"
 	"sync/atomic"
 
 	"github.com/google/uuid"
@@ -342,6 +344,7 @@ func (n *PerfectNegotiator) makeOffer(ctx context.Context, ssEvOut chan<- *ss.Si
 	if local == nil {
 		return
 	}
+	n.logger.Info("rtc: send offer", "peer", n.options.PeerSubscriber, "sdp", sdpSummary(local.SDP))
 	n.sendToPeer(ctx, ssEvOut, &ss.ClientToClientEv{SessionDesc: local})
 }
 
@@ -372,8 +375,12 @@ func (n *PerfectNegotiator) handleSessionDesc(ctx context.Context, desc *webrtc.
 
 	n.ignoreOffer = !n.Polite && offerCollision
 	if n.ignoreOffer {
+		n.logger.Info("rtc: ignore colliding offer", "peer", n.options.PeerSubscriber)
 		return
 	}
+	n.logger.Info("rtc: apply remote description", "peer", n.options.PeerSubscriber,
+		"type", desc.Type, "signalingState", n.pc.SignalingState(), "collision", offerCollision,
+		"polite", n.Polite, "sdp", sdpSummary(desc.SDP))
 
 	// The polite peer yields to the colliding offer. In the browser this
 	// is where setRemoteDescription(offer) implicitly rolls the pending
@@ -383,6 +390,7 @@ func (n *PerfectNegotiator) handleSessionDesc(ctx context.Context, desc *webrtc.
 	// — the makingOffer window — nothing has been set locally yet and no
 	// rebuild is needed; its later SetLocalDescription simply fails.)
 	if offerCollision && n.pc.SignalingState() == webrtc.SignalingStateHaveLocalOffer {
+		n.logger.Info("rtc: glare, rebuilding the peer connection", "peer", n.options.PeerSubscriber)
 		if err := n.rebuildPeerConnection(); err != nil {
 			n.logger.Error("rtc: yield to colliding offer", "err", err)
 			n.ignoreOffer = true
@@ -412,6 +420,7 @@ func (n *PerfectNegotiator) handleSessionDesc(ctx context.Context, desc *webrtc.
 		if local == nil {
 			return
 		}
+		n.logger.Info("rtc: send answer", "peer", n.options.PeerSubscriber, "sdp", sdpSummary(local.SDP))
 		n.sendToPeer(ctx, ssEvOut, &ss.ClientToClientEv{SessionDesc: local})
 	}
 }
@@ -460,6 +469,28 @@ func (n *PerfectNegotiator) rebuildPeerConnection() error {
 // errNoPeerConnectionFactory explains a polite peer that cannot yield.
 var errNoPeerConnectionFactory = errors.New(
 	"rtc: no NewPeerConnection factory configured; the polite peer cannot yield to a colliding offer")
+
+// sdpSummary condenses a session description to what a failed
+// SetRemoteDescription is about: per m-section, the mid and the a=setup
+// role.
+func sdpSummary(raw string) string {
+	var b strings.Builder
+	mid := "?"
+	first := true
+	for line := range strings.Lines(raw) {
+		line = strings.TrimRight(line, "\r\n")
+		if rest, ok := strings.CutPrefix(line, "a=mid:"); ok {
+			mid = rest
+		} else if rest, ok := strings.CutPrefix(line, "a=setup:"); ok {
+			if !first {
+				b.WriteString("; ")
+			}
+			first = false
+			fmt.Fprintf(&b, "mid=%s setup=%s", mid, rest)
+		}
+	}
+	return b.String()
+}
 
 // sendToPeer wraps a c2c payload (a session description or an ICE
 // candidate) into the SS envelope and queues it for sending, mirroring

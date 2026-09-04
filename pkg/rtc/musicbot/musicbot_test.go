@@ -18,10 +18,13 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -325,6 +328,103 @@ func flacSong(t *testing.T, name string, samples int) *audiosource.AudioSourceDa
 	}
 	src.InlineData = buf.Bytes()
 	return src
+}
+
+// The ogg helpers below assemble test streams page by page — the
+// lacing and the page checksum a real encoder would write — so the
+// bot's demuxing and passthrough are proven against streams built
+// independently of what reads them.
+
+var oggCRCTable = func() *[256]uint32 {
+	var table [256]uint32
+	for i := range table {
+		r := uint32(i) << 24
+		for range 8 {
+			if r&(1<<31) != 0 {
+				r = (r << 1) ^ 0x04c11db7
+			} else {
+				r <<= 1
+			}
+		}
+		table[i] = r
+	}
+	return &table
+}()
+
+// writeOggPage appends one ogg page (RFC 3533) carrying the packets.
+func writeOggPage(buf *bytes.Buffer, seq *uint32, granule uint64, flags byte, packets ...[]byte) {
+	var segs []byte
+	var body bytes.Buffer
+	for _, pkt := range packets {
+		n := len(pkt)
+		body.Write(pkt)
+		for n >= 255 {
+			segs = append(segs, 255)
+			n -= 255
+		}
+		segs = append(segs, byte(n))
+	}
+	var hdr [27]byte
+	copy(hdr[:4], "OggS")
+	hdr[5] = flags
+	binary.LittleEndian.PutUint64(hdr[6:14], granule)
+	binary.LittleEndian.PutUint32(hdr[14:18], 0xABCD)
+	binary.LittleEndian.PutUint32(hdr[18:22], *seq)
+	*seq = *seq + 1
+	hdr[26] = byte(len(segs))
+	var page bytes.Buffer
+	page.Write(hdr[:])
+	page.Write(segs)
+	page.Write(body.Bytes())
+	out := page.Bytes()
+	var crc uint32
+	for _, v := range out {
+		crc = crc<<8 ^ oggCRCTable[byte(crc>>24)^v]
+	}
+	binary.LittleEndian.PutUint32(out[22:26], crc)
+	buf.Write(out)
+}
+
+// opusSong is an ogg-framed opus source (48000 Hz, stereo) carrying n
+// synthetic 20 ms packets — whole, syntactically plausible opus packets
+// whose bytes the bot passes through untouched, so the wire assertions
+// compare the payloads against the exact source bytes. It returns the
+// source and the packets.
+func opusSong(name string, n int) (*audiosource.AudioSourceData, [][]byte) {
+	packets := make([][]byte, n)
+	var buf bytes.Buffer
+	var seq uint32
+	head := make([]byte, 19)
+	copy(head, "OpusHead")
+	head[8], head[9] = 1, 2
+	binary.LittleEndian.PutUint16(head[10:12], 312)
+	binary.LittleEndian.PutUint32(head[12:16], 48000)
+	tags := make([]byte, 16)
+	copy(tags, "OpusTags")
+	writeOggPage(&buf, &seq, 0, 0x02, head)
+	writeOggPage(&buf, &seq, 0, 0, tags)
+	for i := range packets {
+		p := make([]byte, 40)
+		p[0] = 0xF8 // a fullband 20 ms frame, one per packet
+		for j := 1; j < len(p); j++ {
+			p[j] = byte(i*67 + j*31) // distinct, non-silent
+		}
+		packets[i] = p
+		writeOggPage(&buf, &seq, uint64(312+960*(i+1)), 0, p)
+	}
+	return &audiosource.AudioSourceData{
+		Id:               "test-" + name,
+		Name:             name,
+		Description:      "a test ogg opus song",
+		Author:           "the test suite",
+		SampleFormatType: audiosource.SampleOpus,
+		NumChannels:      2,
+		Interleaved:      true,
+		InlineData:       buf.Bytes(),
+		Compression:      audiosource.CompressionOgg,
+		SampleRate:       48000,
+		NumTotalSamples:  960 * n,
+	}, packets
 }
 
 // pairUp waits for both clients to be registered and to hold a session
@@ -1156,6 +1256,94 @@ func TestMusicBotPlaysFLACSong(t *testing.T) {
 	}
 	if pkt := readOneRTP(t, track); len(pkt.Payload) == 0 {
 		t.Fatal("the opus packet is empty")
+	}
+}
+
+// syncRTPToSong reads packets off the track until one matches a source
+// packet, returning its index in packets. The pump plays while the
+// track is still unbound — the empty-room window between /play and the
+// answer's negotiation — so the first packet on the wire is some
+// packet into the song (cycling); content assertions start from a
+// synced point.
+func syncRTPToSong(t *testing.T, track *webrtc.TrackRemote, packets [][]byte) int {
+	t.Helper()
+	for i := 0; i < 2*len(packets); i++ {
+		got := readOneRTP(t, track).Payload
+		for k, want := range packets {
+			if bytes.Equal(got, want) {
+				return k
+			}
+		}
+		t.Fatalf("an RTP payload was none of the source's packets: %d bytes %x…", len(got), got[:min(8, len(got))])
+	}
+	t.Fatal("no source packet on the wire after a whole cycle")
+	return 0
+}
+
+// TestMusicBotPlaysOpusSong covers the opus family, end to end through
+// real media: /play on an ogg-framed opus song phones the user, and the
+// answered call's track carries opus — the source's packets passed
+// through untouched: each RTP payload IS the source's packet, byte for
+// byte, so there is no decoding and no re-encoding. The opus family
+// needs no encoder, so the test needs no libopus either.
+func TestMusicBotPlaysOpusSong(t *testing.T) {
+	song, packets := opusSong("radio", 5)
+	net := newClientTestNet(t, ss.DefaultSubscriberAging)
+	bot := startBot(t, net, "bot", "2-bot", []*audiosource.AudioSourceData{song})
+	user, probe, tprobe := startUserProbe(t, net, "user", "1-user")
+	botId, userId := pairUp(t, bot, user)
+	dc := probe.waitDC(t, botId, msg_handler.DataChannelLabelMessages)
+
+	playSongAndAnswer(t, probe, dc, botId, userId, "radio")
+
+	track := tprobe.waitTrack(t, 1)
+	if got := track.Codec().MimeType; got != webrtc.MimeTypeOpus {
+		t.Fatalf("the track's codec is %s, want %s", got, webrtc.MimeTypeOpus)
+	}
+	if got := track.Codec().ClockRate; got != 48000 {
+		t.Fatalf("the track's clock rate is %d, want 48000", got)
+	}
+	k := syncRTPToSong(t, track, packets)
+	for i := 1; i <= 3; i++ {
+		if pkt := readOneRTP(t, track); !bytes.Equal(pkt.Payload, packets[(k+i)%len(packets)]) {
+			t.Fatalf("opus packet %d's payload was not the source's packet byte for byte", i)
+		}
+	}
+}
+
+// TestMusicBotStreamsRemoteOpusSong covers the case the family exists
+// for: the song's bytes are an http body's — fetched on open and
+// re-fetched on every loop, so a two-packet song plays far past its own
+// length with its packets alternating.
+func TestMusicBotStreamsRemoteOpusSong(t *testing.T) {
+	song, packets := opusSong("stream", 2)
+	data := song.InlineData
+	var fetches atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fetches.Add(1)
+		_, _ = w.Write(data)
+	}))
+	defer srv.Close()
+	song.InlineData = nil
+	song.URL = srv.URL
+
+	net := newClientTestNet(t, ss.DefaultSubscriberAging)
+	bot := startBot(t, net, "bot", "2-bot", []*audiosource.AudioSourceData{song})
+	user, probe, tprobe := startUserProbe(t, net, "user", "1-user")
+	botId, userId := pairUp(t, bot, user)
+	dc := probe.waitDC(t, botId, msg_handler.DataChannelLabelMessages)
+
+	playSongAndAnswer(t, probe, dc, botId, userId, "stream")
+
+	track := tprobe.waitTrack(t, 1)
+	k := syncRTPToSong(t, track, packets)
+	for i := 1; i <= 4; i++ { // two loops of the two packets, past the sync point
+		if pkt := readOneRTP(t, track); !bytes.Equal(pkt.Payload, packets[(k+i)%2]) {
+			t.Fatalf("opus packet %d's payload was not the source's packet", i)
+		}
+	}
+	if fetches.Load() < 2 {
+		t.Fatalf("the remote stream was fetched %d times, want a re-fetch per loop", fetches.Load())
 	}
 }
 

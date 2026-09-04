@@ -1,18 +1,22 @@
 package musicbot
 
 // This file is the player: one call's music source. A player owns the
-// call's outbound media track and a pump goroutine feeding it one 20 ms
-// frame per tick, so the RTP stream keeps real time.
+// call's outbound media track and a pump goroutine feeding it, so the
+// RTP stream keeps real time — one 20 ms frame per tick for the sample
+// families, the packets' own durations pacing the opus family.
 //
-// The music is a stream, not a buffer: the player reads each frame from
-// an open read of its audio source (lazily loaded on the player's
-// creation — a source's bytes are never held as a whole), and whenever
-// the read ends, the stream rewinds to its first sample and the song
-// loops — for as long as the call lasts, whatever the source's length
-// (a streaming source, of unknown length, restarts from its beginning
-// just the same). The track's codec follows the source's format: μ-law
-// bytes ride PCMU as they are; a linear PCM source rides opus, its
-// samples normalized and encoded frame by frame.
+// The music is a stream, not a buffer: the player reads each frame (or
+// packet) from an open read of its audio source (lazily loaded on the
+// player's creation — a source's bytes are never held as a whole), and
+// whenever the read ends, the stream rewinds to its first sample and
+// the song loops — for as long as the call lasts, whatever the source's
+// length (a streaming source, of unknown length, restarts from its
+// beginning just the same). The track's codec follows the source's
+// format: μ-law bytes ride PCMU as they are; a linear PCM source rides
+// opus, its samples normalized and encoded frame by frame; an opus
+// source rides opus too, its packets passed through untouched — no
+// decoding, no re-encoding, the packets the codec made going on the
+// wire byte for byte.
 //
 // The player is an actor: the pump goroutine alone touches the open
 // stream and the encoder; a mid-call song switch of the same codec
@@ -71,18 +75,24 @@ var errPlayerStopped = errors.New("musicbot: the player has stopped")
 
 // player is one call's music source: the track its music rides, and
 // the pump feeding it. The pump goroutine alone touches in, norm, enc,
-// pcm and buf; the handler goroutine reaches it through switches.
+// pcm, buf and pkts; the handler goroutine reaches it through switches.
 type player struct {
 	track *webrtc.TrackLocalStaticSample
 
-	// in is the open source stream (the μ-law path reads it directly);
-	// norm adapts it for the opus path; enc is nil exactly then.
+	// in is the open source stream of the sample families (the μ-law
+	// path reads it directly; norm adapts it for the linear pcm one);
+	// pkts is the open source stream of the opus family, read as
+	// packets. Exactly one of them is set: pkts for an opus source, in
+	// for the others; enc is nil exactly then, too, save that the opus
+	// family sets no encoder either — its packets need none.
 	src  *audiosource.AudioSourceData
 	in   loopingCloser
+	pkts packetCloser
 	norm *stereoNormalizer
 	enc  *musicEncoder
-	pcm  []int16 // one frame of interleaved s16 stereo samples
-	buf  []byte  // PCMU: the sample buffer; opus: the packet buffer
+	pcm  []int16   // one frame of interleaved s16 stereo samples
+	fpcm []float32 // one frame of interleaved float stereo samples
+	buf  []byte    // PCMU: the sample buffer; opus: the packet buffer
 
 	switches chan switchReq
 	stopCh   chan struct{}
@@ -126,8 +136,13 @@ func (p *player) tune(ctx context.Context, src *audiosource.AudioSourceData) err
 			st.Close()
 			return err
 		}
+		ss, ok := st.(audiosource.SampleStream)
+		if !ok {
+			st.Close()
+			return fmt.Errorf("musicbot: the mu-law stream serves no samples")
+		}
 		p.track = track
-		p.in = st
+		p.in = ss
 		p.norm = nil
 		p.enc = nil
 		p.buf = make([]byte, samplesPerFrame)
@@ -142,12 +157,37 @@ func (p *player) tune(ctx context.Context, src *audiosource.AudioSourceData) err
 			st.Close()
 			return err
 		}
+		ss, ok := st.(audiosource.SampleStream)
+		if !ok {
+			st.Close()
+			return fmt.Errorf("musicbot: the linear pcm stream serves no samples")
+		}
 		p.track = track
-		p.in = st
-		p.norm = newStereoNormalizer(st, f.BitDepth, f.NumericType)
+		p.in = ss
+		p.norm = newStereoNormalizer(ss, f.BitDepth, f.NumericType)
 		p.enc = enc
-		p.pcm = make([]int16, opusPCMPerFrame)
+		if f.NumericType == audiosource.NumFloat {
+			p.fpcm = make([]float32, opusPCMPerFrame)
+		} else {
+			p.pcm = make([]int16, opusPCMPerFrame)
+		}
 		p.buf = make([]byte, opusMaxPacket)
+	case audiosource.SampleOpus:
+		// The packets are the payload: no normalizer, no encoder —
+		// the track is the same opus one the linear pcm family encodes
+		// toward, fed the codec's own output instead.
+		ps, ok := st.(audiosource.PacketStream)
+		if !ok {
+			st.Close()
+			return fmt.Errorf("musicbot: the opus stream serves no packets")
+		}
+		track, err := webrtc.NewTrackLocalStaticSample(opusTrackCodec, "music-opus", "musicbot")
+		if err != nil {
+			st.Close()
+			return err
+		}
+		p.track = track
+		p.pkts = ps
 	default:
 		st.Close()
 		return fmt.Errorf("musicbot: the stream's sample format %q is not playable", f.SampleFormatType)
@@ -166,19 +206,51 @@ func (p *player) retune(ctx context.Context, src *audiosource.AudioSourceData) e
 		return err
 	}
 	f := st.Format()
-	var norm *stereoNormalizer
+	if p.pkts != nil {
+		if f.SampleFormatType != audiosource.SampleOpus {
+			st.Close()
+			return fmt.Errorf("musicbot: the switch would change the track's codec")
+		}
+		ps, ok := st.(audiosource.PacketStream)
+		if !ok {
+			st.Close()
+			return fmt.Errorf("musicbot: the opus stream serves no packets")
+		}
+		_ = p.pkts.Close()
+		p.pkts = ps
+		p.src = src
+		return nil
+	}
+	// The sample families: the new stream reads as samples, and the
+	// linear pcm family's normalizer wraps it.
 	if p.enc != nil {
 		if f.SampleFormatType != audiosource.SampleLinearPCM {
 			st.Close()
 			return fmt.Errorf("musicbot: the switch would change the track's codec")
 		}
-		norm = newStereoNormalizer(st, f.BitDepth, f.NumericType)
 	} else if f.SampleFormatType != audiosource.SampleMuLaw {
 		st.Close()
 		return fmt.Errorf("musicbot: the switch would change the track's codec")
 	}
+	ss, ok := st.(audiosource.SampleStream)
+	if !ok {
+		st.Close()
+		return fmt.Errorf("musicbot: the stream serves no samples")
+	}
+	var norm *stereoNormalizer
+	if p.enc != nil {
+		norm = newStereoNormalizer(ss, f.BitDepth, f.NumericType)
+		// The frame buffers follow the new song's numeric shape.
+		if f.NumericType == audiosource.NumFloat {
+			p.fpcm = make([]float32, opusPCMPerFrame)
+			p.pcm = nil
+		} else {
+			p.pcm = make([]int16, opusPCMPerFrame)
+			p.fpcm = nil
+		}
+	}
 	_ = p.in.Close()
-	p.in = st
+	p.in = ss
 	p.norm = norm
 	p.src = src
 	if p.enc != nil {
@@ -189,13 +261,18 @@ func (p *player) retune(ctx context.Context, src *audiosource.AudioSourceData) e
 
 // accepts reports whether the player can play src as a plain stream
 // switch — the same codec family. The family follows the declared
-// sample format type: a flac source always decodes to linear pcm, so
-// its declaration decides its family too.
+// sample format type: a flac source always decodes to linear pcm, an
+// ogg-framed one is opus, so their declarations decide their families
+// too.
 func (p *player) accepts(src *audiosource.AudioSourceData) bool {
-	if p.enc == nil {
+	switch {
+	case p.pkts != nil:
+		return src.SampleFormatType == audiosource.SampleOpus
+	case p.enc != nil:
+		return src.SampleFormatType == audiosource.SampleLinearPCM
+	default:
 		return src.SampleFormatType == audiosource.SampleMuLaw
 	}
-	return src.SampleFormatType == audiosource.SampleLinearPCM
 }
 
 // setSource asks the pump to switch to src (of the same codec family;
@@ -215,12 +292,17 @@ func (p *player) setSource(src *audiosource.AudioSourceData) error {
 	}
 }
 
-// run is the pump: one frame per frameDuration tick until the call ends
-// (stop), the session ends (ctx), or the stream fails.
+// run is the pump until the call ends (stop), the session ends (ctx),
+// or the stream fails: one frame per frameDuration tick for the sample
+// families, the packets' own durations pacing the opus family's writes.
 func (p *player) run(ctx context.Context, logger *slog.Logger, peer ss.SubscriberId) {
+	defer p.closeIn()
+	if p.pkts != nil {
+		p.runPackets(ctx, logger, peer)
+		return
+	}
 	ticker := time.NewTicker(frameDuration)
 	defer ticker.Stop()
-	defer p.closeIn()
 	for {
 		select {
 		case <-ctx.Done():
@@ -248,6 +330,16 @@ func (p *player) tick(ctx context.Context) error {
 		}
 		return p.track.WriteSample(media.Sample{Data: p.buf, Duration: frameDuration})
 	}
+	if p.fpcm != nil {
+		if err := p.norm.readFrameFloat32(ctx, p.fpcm); err != nil {
+			return err
+		}
+		n, err := p.enc.encodeFloat32(p.fpcm, p.buf)
+		if err != nil {
+			return err
+		}
+		return p.track.WriteSample(media.Sample{Data: p.buf[:n], Duration: frameDuration})
+	}
 	if err := p.norm.readFrame(ctx, p.pcm); err != nil {
 		return err
 	}
@@ -258,10 +350,88 @@ func (p *player) tick(ctx context.Context) error {
 	return p.track.WriteSample(media.Sample{Data: p.buf[:n], Duration: frameDuration})
 }
 
+// runPackets is the opus family's pump: whole packets pass from the
+// stream to the track byte for byte — no decoding, no re-encoding —
+// each written with the duration its page's granule position measured,
+// so the track's timestamps follow the music's own media time. The
+// writes are paced to real time: no faster than the durations add up
+// to, so a looping source plays at its own speed — while a live
+// source, whose reads block on the network's arrival, runs at real
+// time already and never waits.
+func (p *player) runPackets(ctx context.Context, logger *slog.Logger, peer ss.SubscriberId) {
+	var (
+		played time.Duration // the media time written since the origin
+		origin time.Time     // when the first packet went out
+		timer  *time.Timer
+	)
+	defer func() {
+		if timer != nil {
+			timer.Stop()
+		}
+	}()
+	for {
+		// Control messages are serviced between every two packets — a
+		// self-paced source (a live stream, whose reads block until the
+		// network delivers) never enters the pacing wait, so the wait's
+		// select must not be the only door.
+		select {
+		case <-ctx.Done():
+			return
+		case <-p.stopCh:
+			return
+		case req := <-p.switches:
+			// The switch is a fresh piece of music: the pacing restarts
+			// with it.
+			req.reply <- p.retune(ctx, req.src)
+			origin, played = time.Time{}, 0
+			continue
+		default:
+		}
+		pkt, dur, err := readPacketLooping(ctx, p.pkts)
+		if err != nil {
+			logger.Warn("musicbot: the opus stream failed; the player stops",
+				"peer", peer, "err", err)
+			return
+		}
+		if origin.IsZero() {
+			origin = time.Now()
+		}
+		if wait := origin.Add(played).Sub(time.Now()); wait > 0 {
+			if timer == nil {
+				timer = time.NewTimer(wait)
+			} else {
+				timer.Reset(wait)
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-p.stopCh:
+				return
+			case req := <-p.switches:
+				// The switch is a fresh piece of music: the pacing and the
+				// pending packet belong to the old one, so both go.
+				req.reply <- p.retune(ctx, req.src)
+				origin, played = time.Time{}, 0
+				continue
+			case <-timer.C:
+			}
+		}
+		if err := p.track.WriteSample(media.Sample{Data: pkt, Duration: dur}); err != nil {
+			logger.Warn("musicbot: the opus track write failed; the player stops",
+				"peer", peer, "err", err)
+			return
+		}
+		played += dur
+	}
+}
+
 // closeIn drops the open stream; the pump's deferred cleanup.
 func (p *player) closeIn() {
 	if p.in != nil {
 		_ = p.in.Close()
+	}
+	if p.pkts != nil {
+		_ = p.pkts.Close()
 	}
 }
 

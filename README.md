@@ -168,15 +168,19 @@ version:
   `/play <song>`) and voice calls with a song of its configured
   songbook. A song is an `<audioSource/>` child of `<musicBot/>`,
   modeled by `pkg/models/audiosource`'s `AudioSourceData` — inline
-  (base64) or at a url, optionally FLAC compressed, with two accepted
-  format combinations: μ-law 8 kHz mono (played as PCMU, byte for
-  byte) and linear PCM 48 kHz stereo (played as opus, nothing
-  downmixed; the encoder is libopus via cgo, so pure-Go builds carry
-  a stub that plays μ-law songs only). Sample data loads lazily as a
-  stream and loops by rewinding; the shipped example song
-  (`assets/chiptune.ulaw`) is regenerated with
-  `go run ./cmd/synthchiptune`. Their static session tokens are
-  issued with the `sign` subcommand (see _Sign-in and sessions_).
+  (base64) or at a url, optionally FLAC compressed or Ogg-framed, with
+  three accepted format combinations: μ-law 8 kHz mono (played as PCMU,
+  byte for byte), linear PCM 48 kHz stereo (played as opus, nothing
+  downmixed; integer sources encode through libopus's 16-bit API, float
+  sources through its float API — the encoder is libopus via cgo, so
+  pure-Go builds carry a stub that refuses linear PCM songs), and
+  Ogg-framed opus 48 kHz (played as-is: the packets pass through with
+  no decoding or re-encoding — the one linear-quality family a pure-Go
+  build plays). Sample data loads lazily as a stream and loops by
+  rewinding; the shipped example song (`assets/chiptune.ulaw`) is
+  regenerated with `go run ./cmd/synthchiptune`. Their static session
+  tokens are issued with the `sign` subcommand (see _Sign-in and
+  sessions_).
 
 ## Layout
 

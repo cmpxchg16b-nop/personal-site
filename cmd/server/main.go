@@ -434,8 +434,8 @@ func startMusicBot(ctx context.Context, cfg *pkgmodelsserverconfig.MusicBotXML, 
 // channels. The music bot declines video calls, yet the default video
 // codecs stay registered so a video m-line the peer proposes still
 // negotiates instead of being rejected out of hand.
-func stereoOpusPCFactory(iceServers []string) func() (*webrtc.PeerConnection, error) {
-	return func() (*webrtc.PeerConnection, error) {
+func stereoOpusPCFactory(iceServers []string) func(polite bool) (*webrtc.PeerConnection, error) {
+	return func(polite bool) (*webrtc.PeerConnection, error) {
 		m := &webrtc.MediaEngine{}
 		// The audio defaults, opus upgraded to stereo; the video defaults
 		// verbatim (pion's list, mirrored here because it cannot be amended
@@ -459,7 +459,18 @@ func stereoOpusPCFactory(iceServers []string) func() (*webrtc.PeerConnection, er
 			// registered, and registration is idempotent per payload type.
 			return nil, fmt.Errorf("register default codecs: %w", err)
 		}
-		api := webrtc.NewAPI(webrtc.WithMediaEngine(m))
+		// The answering DTLS role follows the session's politeness (the
+		// polite peer is the initial offerer, hence the DTLS server) —
+		// see rtc.RTCClientConfiguration.NewPeerConnection.
+		settingEngine := webrtc.SettingEngine{}
+		role := webrtc.DTLSRoleClient
+		if polite {
+			role = webrtc.DTLSRoleServer
+		}
+		if err := settingEngine.SetAnsweringDTLSRole(role); err != nil {
+			return nil, err
+		}
+		api := webrtc.NewAPI(webrtc.WithMediaEngine(m), webrtc.WithSettingEngine(settingEngine))
 		config := webrtc.Configuration{}
 		if len(iceServers) > 0 {
 			config.ICEServers = []webrtc.ICEServer{{URLs: iceServers}}
@@ -477,7 +488,7 @@ func stereoOpusPCFactory(iceServers []string) func() (*webrtc.PeerConnection, er
 // surfaces as the reconnect loop's logged 401s. The bot runs until ctx
 // is done, re-establishing the signalling connection every
 // reconnectInterval when it drops.
-func startBotClient(ctx context.Context, name string, cfg *pkgmodelsserverconfig.BotClientXML, pcFactory func() (*webrtc.PeerConnection, error), wire func(client *rtc.HeadlessRTCClient)) error {
+func startBotClient(ctx context.Context, name string, cfg *pkgmodelsserverconfig.BotClientXML, pcFactory func(polite bool) (*webrtc.PeerConnection, error), wire func(client *rtc.HeadlessRTCClient)) error {
 	keepAliveInterval, err := pkgmodelsserverconfig.ParseDuration(cfg.KeepAliveInterval, 0)
 	if err != nil {
 		return fmt.Errorf("keepAliveInterval: %w", err)

@@ -137,6 +137,7 @@ export class PerfectNegotiator implements RTCNegotiator {
         this.makingOffer = true;
         await this.pc.setLocalDescription();
         await this.sendToPeer({ sessionDesc: this.localDescription() });
+        logSdp(this.tag(), "send offer", this.localDescription());
       } catch (err) {
         console.error(err);
       } finally {
@@ -194,6 +195,11 @@ export class PerfectNegotiator implements RTCNegotiator {
         if (this.ignoreOffer) {
           return;
         }
+        logSdp(this.tag(), `apply remote ${description.type}`, description, {
+          signalingState: this.pc.signalingState,
+          collision: offerCollision,
+          polite: this.polite,
+        });
         this.isSettingRemoteAnswerPending = description.type === "answer";
         await this.pc.setRemoteDescription(description);
         this.isSettingRemoteAnswerPending = false;
@@ -203,6 +209,7 @@ export class PerfectNegotiator implements RTCNegotiator {
           // back the offer it was making.
           await this.pc.setLocalDescription();
           await this.sendToPeer({ sessionDesc: this.localDescription() });
+          logSdp(this.tag(), "send answer", this.localDescription());
         }
       } else if (c2c.rtcICECandidate) {
         try {
@@ -216,12 +223,21 @@ export class PerfectNegotiator implements RTCNegotiator {
         }
       }
     } catch (err) {
+      logSdp(this.tag(), "FAILED", c2c.sessionDesc, {
+        signalingState: this.pc.signalingState,
+        polite: this.polite,
+      });
       console.error(err);
     }
   }
 
   private localDescription(): RTCSessionDescriptionInit | undefined {
     return this.pc.localDescription ?? undefined;
+  }
+
+  /** The log tag identifying this negotiation pair. */
+  private tag(): string {
+    return `[negotiate ${this.options.selfSubscriber}→${this.options.peerSubscriber}${this.polite ? " polite" : ""}]`;
   }
 
   /** Wraps a c2c payload into the SS envelope and queues it for sending. */
@@ -254,4 +270,29 @@ export class PerfectNegotiator implements RTCNegotiator {
 // mirroring the server side.
 function newMsgId(): MsgId {
   return crypto.randomUUID();
+}
+
+// logSdp logs one session description's wire-relevant shape: its type,
+// and per m-section the mid and the a=setup role — the attributes a
+// "Failed to set SSL role" failure is about.
+function logSdp(
+  tag: string,
+  what: string,
+  desc: RTCSessionDescriptionInit | undefined,
+  extra?: Record<string, unknown>,
+): void {
+  if (!desc) {
+    console.log(tag, what, "(no description)", extra ?? "");
+    return;
+  }
+  const sections: string[] = [];
+  let mid = "?";
+  for (const line of desc.sdp?.split("\r\n") ?? []) {
+    if (line.startsWith("a=mid:")) {
+      mid = line.slice("a=mid:".length);
+    } else if (line.startsWith("a=setup:")) {
+      sections.push(`mid=${mid} setup=${line.slice("a=setup:".length)}`);
+    }
+  }
+  console.log(tag, what, desc.type, `[${sections.join("; ")}]`, extra ?? "");
 }

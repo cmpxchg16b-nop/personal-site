@@ -3,19 +3,25 @@ package musicbot
 // This file is the track-side half of playing an audio source: the
 // codecs the player's tracks carry, and the streaming conversion a
 // decoded linear PCM source goes through on its way to the opus
-// encoder.
+// encoder — plus the looping packet read the opus family's passthrough
+// pump is built on.
 //
-// The codec follows the source — nothing is downmixed or resampled
-// unless it must be:
+// The codec follows the source — nothing is downmixed, resampled,
+// decoded or re-encoded unless it must be:
 //
 //   - a μ-law source (8000 Hz, mono) plays as PCMU, its companded bytes
 //     becoming the RTP payload byte for byte, exactly as before the
 //     audio source model existed;
 //   - a linear PCM source (48000 Hz, stereo) plays as opus (48000 Hz,
-//     stereo): the decoded samples only change representation — every
-//     supported bit depth and numeric type normalizes to the
-//     interleaved signed 16-bit stereo the encoder consumes — and the
-//     music keeps its fidelity, its rate and its channels.
+//     stereo): the decoded samples only change representation —
+//     libopus encodes integers and floats alike, so an integer source
+//     normalizes to the interleaved signed 16-bit stereo of the integer
+//     API (signed 16-bit itself takes a bit-exact fast path), a float
+//     source rides the float API in its own shape, and nothing passes
+//     through a needless conversion on the way;
+//   - an opus source plays as opus untouched: its packets are already
+//     the payload the wire wants, so they pass through — read one,
+//     write one (see readPacketLooping and the player's packet pump).
 //
 // Both codecs are among the audio codecs pion's default media engine
 // registers, and every browser's WebRTC stack offers.
@@ -26,6 +32,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"time"
 
 	"github.com/pion/webrtc/v4"
 
@@ -99,11 +106,54 @@ func readLooping(ctx context.Context, src loopingSource, buf []byte) error {
 	return nil
 }
 
+// packetCloser is an open packet stream: readable packet by packet,
+// rewindable, closable — the shape of an opened
+// audiosource.PacketStream.
+type packetCloser interface {
+	packetSource
+	io.Closer
+}
+
+// packetSource is a readable, rewindable packet stream.
+type packetSource interface {
+	ReadPacket() (data []byte, duration time.Duration, err error)
+	Rewind(ctx context.Context) error
+}
+
+// readPacketLooping reads the next whole packet, rewinding the stream
+// to its first packet whenever it ends — the opus family's counterpart
+// of readLooping. A packet is atomic, so unlike a byte frame it cannot
+// straddle the end: a truncated final packet is the stream's own
+// discard, and the loop restarts at the first packet. Two consecutive
+// end-of-data reads without a packet between them are an empty source,
+// which would loop here forever.
+func readPacketLooping(ctx context.Context, src packetSource) ([]byte, time.Duration, error) {
+	stalled := false // the last rewind yielded no packet
+	for {
+		data, dur, err := src.ReadPacket()
+		if err == nil {
+			return data, dur, nil
+		}
+		if err != io.EOF {
+			return nil, 0, err
+		}
+		if stalled {
+			return nil, 0, fmt.Errorf("the audio source holds no packets")
+		}
+		stalled = true
+		if err := src.Rewind(ctx); err != nil {
+			return nil, 0, fmt.Errorf("rewind the audio source: %w", err)
+		}
+	}
+}
+
 // stereoNormalizer adapts one open read of a decoded linear PCM source
 // — any supported bit depth and numeric type, 48000 Hz stereo
-// interleaved — to the interleaved signed 16-bit stereo samples the
-// opus encoder consumes. The conversion is streaming: each frame reads
-// its own worth of source bytes; nothing is held beyond the frame.
+// interleaved — to the interleaved stereo frame the opus encoder
+// consumes: signed 16-bit samples for an integer source (the integer
+// API's own shape), float samples for a float one (the float API's). The
+// conversion is streaming: each frame reads its own worth of source
+// bytes; nothing is held beyond the frame.
 type stereoNormalizer struct {
 	in loopingSource
 
@@ -128,8 +178,8 @@ func newStereoNormalizer(in loopingSource, bitDepth int, numericType string) *st
 }
 
 // readFrame fills pcm — interleaved signed 16-bit stereo samples —
-// with the next frame's worth of the source, looping over the source's
-// end like the player's other reads.
+// with the next frame's worth of an integer source, looping over the
+// source's end like the player's other reads.
 func (n *stereoNormalizer) readFrame(ctx context.Context, pcm []int16) error {
 	if len(n.raw) != len(pcm)*n.width {
 		n.raw = make([]byte, len(pcm)*n.width)
@@ -146,20 +196,35 @@ func (n *stereoNormalizer) readFrame(ctx context.Context, pcm []int16) error {
 		return nil
 	}
 	for i := range pcm {
-		pcm[i] = sampleToInt16(n.raw[i*n.width:(i+1)*n.width], n.unsigned, n.float)
+		pcm[i] = sampleToInt16(n.raw[i*n.width:(i+1)*n.width], n.unsigned)
+	}
+	return nil
+}
+
+// readFrameFloat32 fills pcm — interleaved float stereo samples — with
+// the next frame's worth of a float source: the samples decode in the
+// encoder's own shape, so nothing is converted and nothing is lost —
+// only clipped, as the integer path clips what runs past [-1, 1].
+func (n *stereoNormalizer) readFrameFloat32(ctx context.Context, pcm []float32) error {
+	if len(n.raw) != len(pcm)*n.width {
+		n.raw = make([]byte, len(pcm)*n.width)
+	}
+	if err := readLooping(ctx, n.in, n.raw); err != nil {
+		return err
+	}
+	for i := range pcm {
+		v := math.Float32frombits(binary.LittleEndian.Uint32(n.raw[i*n.width:]))
+		pcm[i] = max(-1, min(1, v))
 	}
 	return nil
 }
 
 // sampleToInt16 converts one little-endian source sample of the given
-// width and numeric type to a signed 16-bit sample, normalizing through
-// [-1, 1] and clipping.
-func sampleToInt16(b []byte, unsigned, float bool) int16 {
+// integer width and signedness to a signed 16-bit sample, normalizing
+// through [-1, 1] and clipping.
+func sampleToInt16(b []byte, unsigned bool) int16 {
 	var v float64
-	switch {
-	case float:
-		v = float64(math.Float32frombits(binary.LittleEndian.Uint32(b)))
-	case unsigned:
+	if unsigned {
 		switch len(b) {
 		case 1:
 			v = (float64(b[0]) - 128) / 128
@@ -168,7 +233,7 @@ func sampleToInt16(b []byte, unsigned, float bool) int16 {
 		case 4:
 			v = (float64(binary.LittleEndian.Uint32(b)) - 2147483648) / 2147483648
 		}
-	default: // signed
+	} else {
 		switch len(b) {
 		case 1:
 			v = float64(int8(b[0])) / 128

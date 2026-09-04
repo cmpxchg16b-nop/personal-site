@@ -15,13 +15,18 @@
 // Not every format combination is supported; the accepted ones are:
 //
 //   - linear PCM, 48000 Hz, 2 channels,
-//   - G.711 μ-law, 8000 Hz, 1 channel.
+//   - G.711 μ-law, 8000 Hz, 1 channel,
+//   - Opus, 48000 Hz, 1 or 2 channels, Ogg-framed.
 //
 // Raw samples of an uncompressed source are little-endian, interleaved
 // channel by channel when the source has several channels. When a
 // source is compressed, the stream info encoded in the file header
 // takes precedence over the declared metadata: an opened stream's
-// Format reports what the stream actually holds (see Stream).
+// Format reports what the stream actually holds (see Stream). An Opus
+// source holds no samples to describe — its data is already codec
+// packets — so an open read of one serves whole packets instead of
+// sample bytes (see PacketStream); a consumer plays them by passing
+// them through, not by decoding and re-encoding them.
 package audiosource
 
 import (
@@ -36,6 +41,11 @@ const (
 	// SampleMuLaw: samples are G.711 μ-law companded bytes (one byte
 	// per sample — the WebRTC PCMU payload).
 	SampleMuLaw = "mu_law"
+	// SampleOpus: the data is Opus packets — already-encoded audio. An
+	// opus source needs the Ogg framing (see CompressionOgg), and an
+	// open read of one serves whole packets (see PacketStream): the
+	// codec's own clock is 48000 Hz, whatever rate the encoder was fed.
+	SampleOpus = "opus"
 )
 
 // The numeric types of a linear PCM sample's encoding.
@@ -57,6 +67,12 @@ const (
 	// are linear PCM, and the stream info in the file header takes
 	// precedence over the declared metadata (see Stream's Format).
 	CompressionFLAC = "flac"
+	// CompressionOgg: the data is an Ogg-framed stream of Opus packets
+	// (RFC 7845). The ID header's stream description — the channel
+	// count and the input sample rate the encoder declares — takes
+	// precedence over the declared metadata, and the stream it frames
+	// is served as whole packets (see PacketStream).
+	CompressionOgg = "ogg"
 )
 
 // dnsLabel is the Name's shape: a DNS-label-like string — lowercase
@@ -79,21 +95,27 @@ type AudioSourceData struct {
 	Description string
 	// Author is the source's author.
 	Author string
-	// SampleFormatType is the sample format: SampleLinearPCM or
-	// SampleMuLaw. For a compressed source it describes the decoded
-	// samples — FLAC always decodes to linear PCM.
+	// SampleFormatType is the sample format: SampleLinearPCM,
+	// SampleMuLaw or SampleOpus. For a compressed source it describes
+	// the decoded samples — FLAC always decodes to linear PCM.
 	SampleFormatType string
 	// BitDepth is one sample's size in bits: 8, 16 or 32. G.711 μ-law
-	// samples are 8-bit companded bytes.
+	// samples are 8-bit companded bytes. The field describes PCM
+	// samples; it does not apply to an opus source and is not checked
+	// for one.
 	BitDepth int
 	// NumericType is a linear PCM sample's numeric encoding:
-	// NumUnsignedInt, NumSignedInt or NumFloat (32-bit).
+	// NumUnsignedInt, NumSignedInt or NumFloat (32-bit). Like BitDepth
+	// it does not apply to an opus source and is not checked for one.
 	NumericType string
 	// NumChannels is the number of channels.
 	NumChannels int
 	// Interleaved says the samples of a multi-channel source are
 	// interleaved (frame by frame, channel by channel). Only
-	// interleaved sources are supported, so it must be true.
+	// interleaved sources are supported, so it must be true. The field
+	// describes PCM samples; it does not apply to an opus source (the
+	// codec carries its channels inside its packets) and is not checked
+	// for one.
 	Interleaved bool
 	// InlineData carries the source's data inline. When present, it
 	// takes precedence over URL.
@@ -104,16 +126,20 @@ type AudioSourceData struct {
 	// paths against the configuration document's directory). When
 	// InlineData is present, InlineData takes precedence.
 	URL string
-	// Compression is the data's storage compression: CompressionNone
-	// or CompressionFLAC.
+	// Compression is the data's storage compression: CompressionNone,
+	// CompressionFLAC or CompressionOgg.
 	Compression string
-	// SampleRate is the sample rate in Hz.
+	// SampleRate is the sample rate in Hz. For an opus source it is the
+	// codec's own rate — 48000, the rate the Ogg granule positions
+	// count at — and the ID header's declared input rate must match it.
 	SampleRate int
 	// NumTotalSamples is the total number of samples, using the
 	// inter-channel definition: NOT multiplied by the number of
 	// channels — a 2-channel, 1-minute, 48000 Hz source has 48000
 	// samples, not 96000. A value of 0 denotes a streaming source: the
-	// length is unknown (or unbounded).
+	// length is unknown (or unbounded). For an opus source the count is
+	// in the codec's samples (at 48000 Hz), what the Ogg granule
+	// positions measure.
 	NumTotalSamples int
 }
 
@@ -129,33 +155,37 @@ func (s *AudioSourceData) Validate() error {
 		return fmt.Errorf("audiosource: %s: name %q is not a dns-label-like string", s.Id, s.Name)
 	}
 	switch s.SampleFormatType {
-	case SampleLinearPCM, SampleMuLaw:
+	case SampleLinearPCM, SampleMuLaw, SampleOpus:
 	default:
 		return fmt.Errorf("audiosource: %s: unknown sample format type %q", s.Id, s.SampleFormatType)
 	}
-	switch s.NumericType {
-	case NumUnsignedInt, NumSignedInt, NumFloat:
-	default:
-		return fmt.Errorf("audiosource: %s: unknown numeric type %q", s.Id, s.NumericType)
-	}
 	switch s.Compression {
-	case CompressionNone, CompressionFLAC:
+	case CompressionNone, CompressionFLAC, CompressionOgg:
 	default:
 		return fmt.Errorf("audiosource: %s: unknown compression %q", s.Id, s.Compression)
 	}
-	switch s.BitDepth {
-	case 8, 16, 32:
-	default:
-		return fmt.Errorf("audiosource: %s: bit depth %d is not one of 8, 16, 32", s.Id, s.BitDepth)
-	}
-	if s.NumericType == NumFloat && s.BitDepth != 32 {
-		return fmt.Errorf("audiosource: %s: float samples require a bit depth of 32", s.Id)
+	// The numeric shape describes PCM samples; it does not apply to an
+	// opus source (see the field docs) and is not checked for one.
+	if s.SampleFormatType != SampleOpus {
+		switch s.NumericType {
+		case NumUnsignedInt, NumSignedInt, NumFloat:
+		default:
+			return fmt.Errorf("audiosource: %s: unknown numeric type %q", s.Id, s.NumericType)
+		}
+		switch s.BitDepth {
+		case 8, 16, 32:
+		default:
+			return fmt.Errorf("audiosource: %s: bit depth %d is not one of 8, 16, 32", s.Id, s.BitDepth)
+		}
+		if s.NumericType == NumFloat && s.BitDepth != 32 {
+			return fmt.Errorf("audiosource: %s: float samples require a bit depth of 32", s.Id)
+		}
+		if !s.Interleaved {
+			return fmt.Errorf("audiosource: %s: only interleaved samples are supported", s.Id)
+		}
 	}
 	if s.NumChannels < 1 {
 		return fmt.Errorf("audiosource: %s: channel count %d is not positive", s.Id, s.NumChannels)
-	}
-	if !s.Interleaved {
-		return fmt.Errorf("audiosource: %s: only interleaved samples are supported", s.Id)
 	}
 	if s.SampleRate < 1 {
 		return fmt.Errorf("audiosource: %s: sample rate %d is not positive", s.Id, s.SampleRate)
@@ -169,6 +199,12 @@ func (s *AudioSourceData) Validate() error {
 	if s.Compression == CompressionFLAC && s.SampleFormatType != SampleLinearPCM {
 		return fmt.Errorf("audiosource: %s: a flac source decodes to linear pcm", s.Id)
 	}
+	if s.Compression == CompressionOgg && s.SampleFormatType != SampleOpus {
+		return fmt.Errorf("audiosource: %s: an ogg-framed source holds opus packets", s.Id)
+	}
+	if s.SampleFormatType == SampleOpus && s.Compression != CompressionOgg {
+		return fmt.Errorf("audiosource: %s: an opus source needs the ogg framing", s.Id)
+	}
 	if s.SampleFormatType == SampleMuLaw && s.BitDepth != 8 {
 		return fmt.Errorf("audiosource: %s: mu-law samples are 8-bit", s.Id)
 	}
@@ -176,6 +212,7 @@ func (s *AudioSourceData) Validate() error {
 	switch {
 	case s.SampleFormatType == SampleLinearPCM && s.SampleRate == 48000 && s.NumChannels == 2:
 	case s.SampleFormatType == SampleMuLaw && s.SampleRate == 8000 && s.NumChannels == 1:
+	case s.SampleFormatType == SampleOpus && s.SampleRate == 48000 && (s.NumChannels == 1 || s.NumChannels == 2):
 	default:
 		return fmt.Errorf("audiosource: %s: unsupported combination %s/%dHz/%dch",
 			s.Id, s.SampleFormatType, s.SampleRate, s.NumChannels)

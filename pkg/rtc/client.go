@@ -188,11 +188,18 @@ type RTCClientConfiguration struct {
 	ICEServers []string
 
 	// NewPeerConnection creates one peer connection per peer session (and
-	// per glare rebuild). Nil selects the default: a pion peer connection
-	// configured with ICEServers. Set it to customize pion itself (a
-	// SettingEngine, media codecs, …); the client attaches its own
-	// data-channel wiring on every returned connection.
-	NewPeerConnection func() (*webrtc.PeerConnection, error)
+	// per glare rebuild). polite says whether this client is the session's
+	// polite peer — the one creating the data channels, hence the initial
+	// offerer, hence the DTLS server: its answers must keep that role
+	// (setup:passive), or the peer's transport breaks at the first
+	// renegotiation ("failed to set SSL role for the transport"). pion's
+	// defaults do NOT do this — an actpass offer is answered active — so
+	// a factory must set the answering DTLS role on the API's setting
+	// engine accordingly (see defaultPeerConnectionFactory). Nil selects
+	// the default. Set it to customize pion itself (media codecs, …); the
+	// client attaches its own data-channel wiring on every returned
+	// connection.
+	NewPeerConnection func(polite bool) (*webrtc.PeerConnection, error)
 
 	// KeepAliveInterval is how often the channel membership is renewed
 	// once registered. Non-positive selects the default; keep it well
@@ -231,7 +238,7 @@ type HeadlessRTCClient struct {
 	// The configuration, normalized at construction.
 	channelId          ss.ChannelId
 	subscriberId       ss.SubscriberId
-	newPC              func() (*webrtc.PeerConnection, error)
+	newPC              func(polite bool) (*webrtc.PeerConnection, error)
 	keepAliveInterval  time.Duration
 	memberListInterval time.Duration
 	replyTimeout       time.Duration
@@ -289,16 +296,28 @@ func NewHeadlessRTCClient(newNegotiator NegotiatorFactory, config RTCClientConfi
 	return c, nil
 }
 
-// defaultPeerConnectionFactory builds the default peer-connection factory:
-// a pion peer connection with the configured ICE servers — mirroring the
-// browser's { iceServers: urls.length ? [{ urls }] : [] }.
-func defaultPeerConnectionFactory(iceServers []string) func() (*webrtc.PeerConnection, error) {
-	return func() (*webrtc.PeerConnection, error) {
+// defaultPeerConnectionFactory builds the default peer-connection
+// factory: a pion peer connection with the configured ICE servers —
+// mirroring the browser's { iceServers: urls.length ? [{ urls }] : [] }
+// — and the answering DTLS role the session's politeness dictates: the
+// polite peer is the session's initial offerer (it creates the data
+// channels), hence the DTLS server; its answers must say so
+// (setup:passive), which pion's defaults would not do.
+func defaultPeerConnectionFactory(iceServers []string) func(polite bool) (*webrtc.PeerConnection, error) {
+	return func(polite bool) (*webrtc.PeerConnection, error) {
+		settingEngine := webrtc.SettingEngine{}
+		role := webrtc.DTLSRoleClient
+		if polite {
+			role = webrtc.DTLSRoleServer
+		}
+		if err := settingEngine.SetAnsweringDTLSRole(role); err != nil {
+			return nil, err
+		}
 		config := webrtc.Configuration{}
 		if len(iceServers) > 0 {
 			config.ICEServers = []webrtc.ICEServer{{URLs: iceServers}}
 		}
-		return webrtc.NewPeerConnection(config)
+		return webrtc.NewAPI(webrtc.WithSettingEngine(settingEngine)).NewPeerConnection(config)
 	}
 }
 
@@ -847,14 +866,15 @@ func (c *HeadlessRTCClient) reconcile(run *clientRun, members []ss.SubscriberId)
 // negotiation-needed event fired while no handler is attached (see
 // NewPerfectNegotiator).
 func (c *HeadlessRTCClient) startSession(run *clientRun, peer ss.SubscriberId) *peerSession {
-	pc, err := c.newPC()
+	polite := run.self < peer
+	pc, err := c.newPC(polite)
 	if err != nil {
 		c.logger.Error("rtc: create peer connection", "peer", peer, "err", err)
 		return nil
 	}
 	sess := &peerSession{
 		peer:     peer,
-		polite:   run.self < peer,
+		polite:   polite,
 		in:       make(chan *ss.SignallingEvent, sessionChannelBuffer),
 		out:      make(chan *ss.SignallingEvent, sessionChannelBuffer),
 		pc:       pc,
@@ -1068,7 +1088,7 @@ func (c *HeadlessRTCClient) handleRebuildNote(run *clientRun, n rebuildNote) {
 		n.reply <- rebuildReply{err: errPeerSessionGone}
 		return
 	}
-	fresh, err := c.newPC()
+	fresh, err := c.newPC(n.sess.polite)
 	if err != nil {
 		n.reply <- rebuildReply{err: err}
 		return

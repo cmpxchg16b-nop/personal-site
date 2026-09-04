@@ -21,6 +21,59 @@ import (
 // — stamping From like the server-side WebSocket handler does. All state
 // exchange between the clients flows through the provider's c2c relay.
 
+// TestDefaultPeerConnectionFactoryAnsweringRole pins the DTLS role
+// contract of the peer-connection factory: the polite peer — the
+// session's initial offerer — is the DTLS server, so its answers must
+// carry setup:passive; the impolite peer's answers carry setup:active.
+// pion's defaults answer an actpass offer with active either way,
+// flipping the polite peer's role on every renegotiation — which a
+// browser refuses ("failed to set SSL role for the transport"), leaving
+// it stuck in have-local-offer and breaking every later renegotiation.
+func TestDefaultPeerConnectionFactoryAnsweringRole(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		polite bool
+		want   string
+	}{
+		{"the polite peer answers passive", true, "a=setup:passive"},
+		{"the impolite peer answers active", false, "a=setup:active"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			factory := defaultPeerConnectionFactory(nil)
+			pc, err := factory(tc.polite)
+			if err != nil {
+				t.Fatalf("factory: %v", err)
+			}
+			defer pc.Close()
+			probe, err := webrtc.NewPeerConnection(webrtc.Configuration{})
+			if err != nil {
+				t.Fatalf("probe: %v", err)
+			}
+			defer probe.Close()
+			if _, err := probe.CreateDataChannel("probe", nil); err != nil {
+				t.Fatalf("probe CreateDataChannel: %v", err)
+			}
+			offer, err := probe.CreateOffer(nil)
+			if err != nil {
+				t.Fatalf("probe CreateOffer: %v", err)
+			}
+			if err := pc.SetRemoteDescription(offer); err != nil {
+				t.Fatalf("SetRemoteDescription: %v", err)
+			}
+			answer, err := pc.CreateAnswer(nil)
+			if err != nil {
+				t.Fatalf("CreateAnswer: %v", err)
+			}
+			if err := pc.SetLocalDescription(answer); err != nil {
+				t.Fatalf("SetLocalDescription: %v", err)
+			}
+			if got := pc.LocalDescription(); got == nil || !strings.Contains(got.SDP, tc.want) {
+				t.Fatalf("the answer carries no %q: %v", tc.want, got)
+			}
+		})
+	}
+}
+
 // clientTestNet routes between any number of clients and one
 // SimpleOnMemorySSProvider, the way the real transport does: each
 // client's outbound events are stamped with its address and forwarded to

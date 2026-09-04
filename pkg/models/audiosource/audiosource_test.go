@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/mewkiz/flac"
@@ -68,6 +69,21 @@ func TestValidate(t *testing.T) {
 		}
 		return s
 	}
+	// opusSource is a minimal valid ogg-framed opus source carrying
+	// data inline. The numeric shape fields do not apply to one and
+	// stay zero.
+	opusSource := func() *AudioSourceData {
+		return &AudioSourceData{
+			Id:               "test-source",
+			Name:             "test-source",
+			SampleFormatType: SampleOpus,
+			NumChannels:      2,
+			Interleaved:      true,
+			InlineData:       []byte{0x01},
+			Compression:      CompressionOgg,
+			SampleRate:       48000,
+		}
+	}
 	for _, tc := range []struct {
 		name string
 		src  *AudioSourceData
@@ -75,12 +91,15 @@ func TestValidate(t *testing.T) {
 	}{
 		{"the linear pcm combination", valid(nil), ""},
 		{"the mu-law combination", muLawSource(nil), ""},
+		{"the opus combination", opusSource(), ""},
+		{"a mono opus source", func() *AudioSourceData { s := opusSource(); s.NumChannels = 1; return s }(), ""},
 		{"empty id", valid(func(s *AudioSourceData) { s.Id = "" }), "empty id"},
 		{"an uppercase name", valid(func(s *AudioSourceData) { s.Name = "Ooops" }), "dns-label"},
 		{"a leading hyphen name", valid(func(s *AudioSourceData) { s.Name = "-oops" }), "dns-label"},
 		{"an unknown sample format", valid(func(s *AudioSourceData) { s.SampleFormatType = "vorbis" }), "sample format"},
 		{"an unknown numeric type", valid(func(s *AudioSourceData) { s.NumericType = "fixed" }), "numeric type"},
-		{"an unknown compression", valid(func(s *AudioSourceData) { s.Compression = "ogg" }), "compression"},
+		{"an unknown numeric type on an opus source", func() *AudioSourceData { s := opusSource(); s.NumericType = "fixed"; return s }(), ""},
+		{"an unknown compression", valid(func(s *AudioSourceData) { s.Compression = "zip" }), "compression"},
 		{"a bit depth of 24", valid(func(s *AudioSourceData) { s.BitDepth = 24 }), "bit depth"},
 		{"float at 16 bits", valid(func(s *AudioSourceData) { s.NumericType = NumFloat }), "float"},
 		{"no channels", valid(func(s *AudioSourceData) { s.NumChannels = 0 }), "channel count"},
@@ -97,6 +116,16 @@ func TestValidate(t *testing.T) {
 			s.Compression = CompressionFLAC
 			return s
 		}(), "flac source decodes"},
+		{"an ogg-framed mu-law source", func() *AudioSourceData {
+			s := muLawSource(nil)
+			s.Compression = CompressionOgg
+			return s
+		}(), "ogg-framed source holds opus packets"},
+		{"an unframed opus source", func() *AudioSourceData {
+			s := opusSource()
+			s.Compression = CompressionNone
+			return s
+		}(), "needs the ogg framing"},
 		{"a mu-law source at 16 bits", func() *AudioSourceData {
 			s := muLawSource(nil)
 			s.BitDepth = 16
@@ -104,6 +133,8 @@ func TestValidate(t *testing.T) {
 		}(), "8-bit"},
 		{"a sample rate the combination excludes", valid(func(s *AudioSourceData) { s.SampleRate = 44100 }), "unsupported combination"},
 		{"a channel count the combination excludes", valid(func(s *AudioSourceData) { s.NumChannels = 1 }), "unsupported combination"},
+		{"an opus source at another rate", func() *AudioSourceData { s := opusSource(); s.SampleRate = 44100; return s }(), "unsupported combination"},
+		{"an opus source with too many channels", func() *AudioSourceData { s := opusSource(); s.NumChannels = 6; return s }(), "unsupported combination"},
 		{"a streaming source (sample count 0)", valid(func(s *AudioSourceData) { s.NumTotalSamples = 0 }), ""},
 	} {
 		err := tc.src.Validate()
@@ -116,12 +147,24 @@ func TestValidate(t *testing.T) {
 	}
 }
 
-func TestOpenInline(t *testing.T) {
-	data := bytes.Repeat([]byte{0x00, 0x7F, 0x80, 0xFF}, 40)
-	st, err := muLawSource(data).Open(context.Background())
+// openSample opens src's stream and asserts it is a sample stream: the
+// tests' sources here are all sample families.
+func openSample(t *testing.T, src *AudioSourceData) SampleStream {
+	t.Helper()
+	st, err := src.Open(context.Background())
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
+	ss, ok := st.(SampleStream)
+	if !ok {
+		t.Fatalf("the stream of %q serves no samples", src.Id)
+	}
+	return ss
+}
+
+func TestOpenInline(t *testing.T) {
+	data := bytes.Repeat([]byte{0x00, 0x7F, 0x80, 0xFF}, 40)
+	st := openSample(t, muLawSource(data))
 	defer st.Close()
 
 	got, err := io.ReadAll(st)
@@ -139,10 +182,7 @@ func TestOpenInline(t *testing.T) {
 
 func TestOpenRewindsInlineBySeeking(t *testing.T) {
 	data := bytes.Repeat([]byte{0x2A}, 300)
-	st, err := muLawSource(data).Open(context.Background())
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
+	st := openSample(t, muLawSource(data))
 	defer st.Close()
 
 	first := make([]byte, 100)
@@ -170,10 +210,7 @@ func TestOpenFileRewindsBySeeking(t *testing.T) {
 	src := muLawSource(data)
 	src.InlineData = nil
 	src.URL = path
-	st, err := src.Open(context.Background())
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
+	st := openSample(t, src)
 	defer st.Close()
 
 	if got, err := io.ReadAll(st); err != nil || !bytes.Equal(got, data) {
@@ -191,9 +228,9 @@ func TestOpenFileRewindsBySeeking(t *testing.T) {
 
 func TestOpenHTTPRefetchesOnRewind(t *testing.T) {
 	data := bytes.Repeat([]byte{0x55}, 256)
-	fetches := 0
+	var fetches atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fetches++
+		fetches.Add(1)
 		w.Write(data)
 	}))
 	defer srv.Close()
@@ -201,13 +238,10 @@ func TestOpenHTTPRefetchesOnRewind(t *testing.T) {
 	src := muLawSource(data)
 	src.InlineData = nil
 	src.URL = srv.URL
-	st, err := src.Open(context.Background())
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
+	st := openSample(t, src)
 	defer st.Close()
-	if fetches != 1 {
-		t.Fatalf("Open fetched %d times, want 1", fetches)
+	if got := fetches.Load(); got != 1 {
+		t.Fatalf("Open fetched %d times, want 1", got)
 	}
 
 	if got, err := io.ReadAll(st); err != nil || !bytes.Equal(got, data) {
@@ -216,8 +250,8 @@ func TestOpenHTTPRefetchesOnRewind(t *testing.T) {
 	if err := st.Rewind(context.Background()); err != nil {
 		t.Fatalf("Rewind: %v", err)
 	}
-	if fetches != 2 {
-		t.Fatalf("Rewind re-fetched %d times in total, want 2", fetches)
+	if got := fetches.Load(); got != 2 {
+		t.Fatalf("Rewind re-fetched %d times in total, want 2", got)
 	}
 	if got, err := io.ReadAll(st); err != nil || !bytes.Equal(got, data) {
 		t.Fatalf("the second pass = (%d bytes, %v)", len(got), err)
@@ -225,9 +259,9 @@ func TestOpenHTTPRefetchesOnRewind(t *testing.T) {
 }
 
 func TestInlineDataTakesPrecedenceOverURL(t *testing.T) {
-	hit := false
+	var hit atomic.Bool
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		hit = true
+		hit.Store(true)
 		w.Write(bytes.Repeat([]byte{0x99}, 8))
 	}))
 	defer srv.Close()
@@ -235,16 +269,13 @@ func TestInlineDataTakesPrecedenceOverURL(t *testing.T) {
 	// Both locations carry data; the inline one must win.
 	src := muLawSource([]byte{0x01, 0x02, 0x03, 0x04})
 	src.URL = srv.URL
-	st, err := src.Open(context.Background())
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
+	st := openSample(t, src)
 	defer st.Close()
 	got, err := io.ReadAll(st)
 	if err != nil {
 		t.Fatalf("ReadAll: %v", err)
 	}
-	if hit {
+	if hit.Load() {
 		t.Error("the url was fetched although inline data is present")
 	}
 	if !bytes.Equal(got, []byte{0x01, 0x02, 0x03, 0x04}) {
@@ -254,15 +285,9 @@ func TestInlineDataTakesPrecedenceOverURL(t *testing.T) {
 
 func TestOpenIndependentStreams(t *testing.T) {
 	src := pcmSource(stereoPCMSamples(100))
-	a, err := src.Open(context.Background())
-	if err != nil {
-		t.Fatalf("first Open: %v", err)
-	}
+	a := openSample(t, src)
 	defer a.Close()
-	b, err := src.Open(context.Background())
-	if err != nil {
-		t.Fatalf("second Open: %v", err)
-	}
+	b := openSample(t, src)
 	defer b.Close()
 
 	// Reading one stream to its end leaves the other untouched at the
@@ -283,12 +308,9 @@ func TestEndOfDataCountCheck(t *testing.T) {
 	// The metadata declares five samples; the data holds ten.
 	src := muLawSource(bytes.Repeat([]byte{0x00}, 10))
 	src.NumTotalSamples = 5
-	st, err := src.Open(context.Background())
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
+	st := openSample(t, src)
 	defer st.Close()
-	_, err = io.ReadAll(st)
+	_, err := io.ReadAll(st)
 	if err == nil || !strings.Contains(err.Error(), "holds 10 bytes, want 5") {
 		t.Fatalf("ReadAll error = %v, want the end-of-data count mismatch", err)
 	}
@@ -298,10 +320,7 @@ func TestStreamingSourceChecksNothing(t *testing.T) {
 	data := bytes.Repeat([]byte{0x77}, 64)
 	src := muLawSource(data)
 	src.NumTotalSamples = 0 // a streaming source: the length is unknown
-	st, err := src.Open(context.Background())
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
+	st := openSample(t, src)
 	defer st.Close()
 	got, err := io.ReadAll(st)
 	if err != nil {
@@ -398,10 +417,7 @@ func flacSource(t *testing.T, samples []byte, sampleRate uint32, numTotalSamples
 func TestFLACDecodesAndRewinds(t *testing.T) {
 	samples := stereoPCMSamples(200)
 	src := flacSource(t, samples, 48000, 200)
-	st, err := src.Open(context.Background())
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
+	st := openSample(t, src)
 	defer st.Close()
 
 	got, err := io.ReadAll(st)
@@ -425,10 +441,7 @@ func TestFLACStreamInfoTakesPrecedence(t *testing.T) {
 	// (a valid combination either way — only the count differs).
 	src := flacSource(t, samples, 48000, 300)
 	src.NumTotalSamples = 999
-	st, err := src.Open(context.Background())
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
+	st := openSample(t, src)
 	defer st.Close()
 
 	f := st.Format()
@@ -447,10 +460,7 @@ func TestFLACStreamingHeader(t *testing.T) {
 	samples := stereoPCMSamples(50)
 	// The header's sample count is unknown (0): a streaming flac source.
 	src := flacSource(t, samples, 48000, 0)
-	st, err := src.Open(context.Background())
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
+	st := openSample(t, src)
 	defer st.Close()
 	if f := st.Format(); f.NumTotalSamples != 0 {
 		t.Fatalf("the format reports %d samples, want 0 (unknown)", f.NumTotalSamples)

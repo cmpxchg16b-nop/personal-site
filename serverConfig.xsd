@@ -192,24 +192,29 @@
 
        The remaining attributes mirror AudioSourceData's fields; only
        the accepted format combinations are valid (the Go wiring
-       validates): linear PCM at 48000 Hz, 2 channels; or mu-law at
-       8000 Hz, 1 channel. numTotalSamples uses the inter-channel
-       definition — NOT multiplied by the channel count (a 2-channel,
-       1-minute, 48000 Hz source has 48000) — and 0 denotes a streaming
-       source of unknown length. Sample data loads lazily when a call
-       first plays the song; compression="flac" wraps the data in a
-       FLAC stream whose header's stream info takes precedence over the
-       declared metadata.
+       validates): linear PCM at 48000 Hz, 2 channels; mu-law at
+       8000 Hz, 1 channel; or ogg-framed opus at 48000 Hz, 1 or 2
+       channels. numTotalSamples uses the inter-channel definition —
+       NOT multiplied by the channel count (a 2-channel, 1-minute,
+       48000 Hz source has 48000) — and 0 denotes a streaming source of
+       unknown length (an internet radio's). Sample data loads lazily
+       when a call first plays the song; compression="flac" wraps the
+       data in a FLAC stream and compression="ogg" frames it as Ogg
+       opus packets, each header's stream info taking precedence over
+       the declared metadata. For an opus source the bitDepth and
+       numericType attributes carry no meaning (opus has no sample
+       shape of its own) and are not checked.
 
        url:  where the data lives (see above); e.g. "assets/chiptune.ulaw"
              for the repository's synthesized chiptune loop (regenerate
-             it with go run ./cmd/synthchiptune) or
-             "https://example.com/song.flac".
-       sampleFormatType:  "linear_pcm" or "mu_law".
-       bitDepth:  8, 16 or 32 (mu-law is 8).
+             it with go run ./cmd/synthchiptune),
+             "https://example.com/song.flac", or an ogg opus radio such
+             as "https://example.com/stream.opus".
+       sampleFormatType:  "linear_pcm", "mu_law" or "opus".
+       bitDepth:  8, 16 or 32 (mu-law is 8; opus: unused).
        numericType:  "unsigned_integer", "signed_integer" or "float"
              (32-bit; linear PCM only).
-       compression:  "none" (the default) or "flac". -->
+       compression:  "none" (the default), "flac" or "ogg" (opus only). -->
   <xsd:complexType name="audioSourceType">
     <xsd:simpleContent>
       <xsd:extension base="xsd:base64Binary">
@@ -232,6 +237,7 @@
             <xsd:restriction base="xsd:string">
               <xsd:enumeration value="linear_pcm" />
               <xsd:enumeration value="mu_law" />
+              <xsd:enumeration value="opus" />
             </xsd:restriction>
           </xsd:simpleType>
         </xsd:attribute>
@@ -269,6 +275,7 @@
             <xsd:restriction base="xsd:string">
               <xsd:enumeration value="none" />
               <xsd:enumeration value="flac" />
+              <xsd:enumeration value="ogg" />
             </xsd:restriction>
           </xsd:simpleType>
         </xsd:attribute>

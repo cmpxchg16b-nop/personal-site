@@ -45,6 +45,13 @@ func (e *musicEncoder) encode(pcm []int16, buf []byte) (int, error) {
 	return e.enc.Encode(pcm, buf)
 }
 
+// encodeFloat32 encodes one frame of interleaved float samples ([-1,
+// 1]) into buf, returning the packet's length — a float source's own
+// shape, so nothing is lost to a 16-bit conversion.
+func (e *musicEncoder) encodeFloat32(pcm []float32, buf []byte) (int, error) {
+	return e.enc.EncodeFloat32(pcm, buf)
+}
+
 // reset clears the encoder's inter-frame state: a mid-call source
 // switch starts a new piece of music, not a continuation of the old
 // one's prediction.
