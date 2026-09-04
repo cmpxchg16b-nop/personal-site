@@ -55,7 +55,10 @@ const UNLOCK_EVENTS = ["pointerdown", "keydown", "touchstart"] as const;
 
 // One connected remote stream: its graph nodes and the muted media
 // element Chrome needs to decode the stream at all, kept for teardown.
+// track is the stream's audio track the entry is bound to — the identity
+// a replacement (see addRemote) and a stale ended event are told apart by.
 interface RemoteEntry {
+  track: MediaStreamTrack;
   source: MediaStreamAudioSourceNode;
   analyser: AnalyserNode;
   element: HTMLAudioElement;
@@ -386,8 +389,14 @@ export class AudioGraph {
   /**
    * Connects a remote stream (a peer's voice, off the wire) into the
    * graph under `id`: source → analyser → the shared remote gain →
-   * speakers. An `id` already connected is left alone. The entry tears
-   * itself down when the stream's audio track ends.
+   * speakers. An `id` already bound to the SAME track is left alone; a
+   * DIFFERENT track under the same id replaces the binding — the peer
+   * handed the pair a fresh track (the music bot's codec-family switch
+   * attaches a new track on a new m-line before withdrawing the old
+   * one), and the old track's entry would otherwise linger mute forever
+   * (a direction-flipped m-line fires `mute`, never `ended`) and swallow
+   * the new track. The entry tears itself down when its track ends —
+   * unless it has been replaced by then.
    *
    * Chrome never decodes a WebRTC-received stream that is only attached
    * to WebAudio: the received packets are discarded before the decoder
@@ -403,10 +412,17 @@ export class AudioGraph {
    * allowed.
    */
   addRemote(id: string, stream: MediaStream): void {
-    if (this.remotes.has(id)) return;
+    const track = stream.getAudioTracks()[0];
+    const existing = this.remotes.get(id);
+    if (existing !== undefined) {
+      if (track === undefined || existing.track === track) return;
+      this.removeRemote(id); // a replacement: the old track goes
+    }
     this.resume();
     const ctx = this.ctx;
-    if (ctx === null || this.remoteGainNode === null) return;
+    if (ctx === null || this.remoteGainNode === null || track === undefined) {
+      return;
+    }
     const source = ctx.createMediaStreamSource(stream);
     const analyser = ctx.createAnalyser();
     analyser.fftSize = FFT_SIZE;
@@ -421,9 +437,7 @@ export class AudioGraph {
       .catch((err) =>
         console.error(`[audiograph] remote pull element failed: id=${id}`, err),
       );
-    this.remotes.set(id, { source, analyser, element });
-    const track = stream.getAudioTracks()[0];
-    if (track === undefined) return;
+    this.remotes.set(id, { track, source, analyser, element });
     console.info(
       `[audiograph] remote connected: id=${id} muted=${track.muted} ` +
         `readyState=${track.readyState} ctx=${ctx.state}`,
@@ -434,9 +448,16 @@ export class AudioGraph {
     track.addEventListener("unmute", () =>
       console.info(`[audiograph] remote unmuted: id=${id}`),
     );
-    track.addEventListener("ended", () => this.removeRemote(id), {
-      once: true,
-    });
+    track.addEventListener(
+      "ended",
+      () => {
+        // Only this entry's own end tears it down: a replaced track ends
+        // long after its entry is gone, and must not take the successor
+        // (bound under the same id) down with it.
+        if (this.remotes.get(id)?.track === track) this.removeRemote(id);
+      },
+      { once: true },
+    );
   }
 
   /** Disconnects the remote stream connected under `id`, if any. */
