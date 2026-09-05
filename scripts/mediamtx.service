@@ -1,0 +1,26 @@
+# systemd unit for mediamtx.
+# Generated from scripts/mediamtx.service by
+# scripts/install-mediamtx-service.sh; edit the template, then re-run the
+# installer instead of modifying the installed copy.
+
+[Unit]
+Description=mediamtx - media streaming server (RTSP / RTMP / HLS / WebRTC / SRT)
+Documentation=https://github.com/bluenviron/mediamtx
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@SERVICE_USER@
+WorkingDirectory=@PROJECT_DIR@
+ExecStart=@PROJECT_DIR@/mediamtx mediamtx.yml
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+
+# mediamtx.yml is relative to WorkingDirectory. Unlike the personal-site
+# providers, mediamtx reads its config once at start, so editing mediamtx.yml
+# needs a service restart (systemctl restart mediamtx) to take effect.
+
+[Install]
+WantedBy=multi-user.target
