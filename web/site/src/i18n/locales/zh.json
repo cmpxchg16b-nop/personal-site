@@ -39,12 +39,10 @@
   },
   "live": {
     "title": "直播",
-    "subtitle": "通过 WebRTC（WHEP）传输的直播流。",
+    "subtitle": "通过 WebRTC（WHEP）建立的直播流。",
     "loadFailed": "加载直播配置失败。",
     "badge": "直播中",
-    "connecting": "连接中…",
-    "offline": "当前未在直播——稍后再来看看吧，或立即重试。",
-    "retry": "重试",
+    "offline": "当前未在直播",
     "videoLabel": "直播画面"
   },
   "about": {

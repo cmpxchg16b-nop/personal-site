@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { Box, Button, Chip, CircularProgress, Typography } from "@mui/material";
+import { Box, Chip, Typography } from "@mui/material";
 import { useTranslation } from "react-i18next";
 import { WhepClient } from "@/api/whep";
 
@@ -19,7 +19,7 @@ type Status = "connecting" | "live" | "offline";
 // 16:9 surface framed like the site's other bordered content. It owns the
 // connection's whole lifecycle: connect on mount, tear down on unmount, and
 // — because a live stream comes and goes — reconnect on its own after a
-// pause while offline (the Retry button shortcuts the pause). The element
+// pause while offline. The element
 // starts muted so browsers allow autoplay; the native controls let the
 // viewer unmute and go fullscreen.
 export default function WhepVideo({ url }: { url: string }) {
@@ -97,7 +97,7 @@ export default function WhepVideo({ url }: { url: string }) {
         position: "relative",
         // A calm cap on wide screens; full-bleed within the layout gutters
         // on narrow ones.
-        maxWidth: 960,
+        maxWidth: 720,
         bgcolor: "black",
         border: 1,
         borderColor: "divider",
@@ -142,55 +142,29 @@ export default function WhepVideo({ url }: { url: string }) {
           }}
         />
       ) : (
-        // The dimming veil doubles as the status surface: it hides the
-        // empty video frame while connecting and carries the offline
-        // message plus Retry. Fixed white-on-black styling reads on the
-        // veil under both color schemes.
-        <Box
-          sx={{
-            position: "absolute",
-            inset: 0,
-            display: "flex",
-            flexDirection: "column",
-            alignItems: "center",
-            justifyContent: "center",
-            gap: 2,
-            bgcolor: "rgba(0, 0, 0, 0.55)",
-          }}
-        >
-          {status === "connecting" ? (
-            <>
-              <CircularProgress size={32} sx={{ color: "common.white" }} />
-              <Typography variant="body2" sx={{ color: "common.white" }}>
-                {t("live.connecting")}
-              </Typography>
-            </>
-          ) : (
-            <>
-              <Typography
-                variant="body2"
-                sx={{ color: "common.white", textAlign: "center", px: 2 }}
-              >
-                {t("live.offline")}
-              </Typography>
-              <Button
-                variant="outlined"
-                size="small"
-                onClick={() => setAttempt((a) => a + 1)}
-                sx={{
-                  color: "common.white",
-                  borderColor: "rgba(255, 255, 255, 0.5)",
-                  "&:hover": {
-                    borderColor: "common.white",
-                    bgcolor: "rgba(255, 255, 255, 0.08)",
-                  },
-                }}
-              >
-                {t("live.retry")}
-              </Button>
-            </>
-          )}
-        </Box>
+        status === "offline" && (
+          // The offline veil: the stream is unreachable right now. The
+          // retry loop keeps probing in the background; a successful
+          // reconnect lifts the veil by itself, so the veil carries no
+          // controls of its own.
+          <Box
+            sx={{
+              position: "absolute",
+              inset: 0,
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              bgcolor: "rgba(0, 0, 0, 0.55)",
+            }}
+          >
+            <Typography
+              variant="body2"
+              sx={{ color: "common.white", textAlign: "center", px: 2 }}
+            >
+              {t("live.offline")}
+            </Typography>
+          </Box>
+        )
       )}
     </Box>
   );

@@ -39,12 +39,10 @@
   },
   "live": {
     "title": "Live",
-    "subtitle": "A live stream, served over WebRTC (WHEP).",
+    "subtitle": "A live stream setup by WebRTC (WHEP).",
     "loadFailed": "Failed to load the live stream configuration.",
     "badge": "LIVE",
-    "connecting": "Connecting…",
-    "offline": "The stream is offline — check back later, or retry now.",
-    "retry": "Retry",
+    "offline": "The stream is offline",
     "videoLabel": "Live stream video"
   },
   "about": {
