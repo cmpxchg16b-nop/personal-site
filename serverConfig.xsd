@@ -72,6 +72,18 @@
           minOccurs="0"
           maxOccurs="unbounded"
         />
+        <!-- The WHEP (WebRTC HTTP Egress Protocol) endpoint of the live
+             stream the home page's Live section plays (see
+             pkg/api/homelive): the frontend fetches the URL from
+             GET /api/homeLiveWHEPURL and reads the stream from it with a
+             recvonly WebRTC peer connection — e.g. a MediaMTX path's
+             "http://host:8889/mystream/whep". When the element is absent,
+             the home page shows no Live section at all. -->
+        <xsd:element
+          name="homeLiveWHEPURL"
+          type="homeLiveWHEPURLType"
+          minOccurs="0"
+        />
         <!-- The built-in echo bot: an echo-purpose headless RTC peer
              (pkg/rtc/echobot on pkg/rtc's HeadlessRTCClient) living in
              the server process as a plain signalling client of the
@@ -144,6 +156,12 @@
       use="optional"
       default=""
     />
+  </xsd:complexType>
+
+  <!-- The home page's live stream WHEP endpoint; see the homeLiveWHEPURL
+       element above. -->
+  <xsd:complexType name="homeLiveWHEPURLType">
+    <xsd:attribute name="url" type="xsd:string" use="required" />
   </xsd:complexType>
 
   <!-- A single bot client configuration (echo bot, music bot); see the

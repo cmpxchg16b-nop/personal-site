@@ -24,6 +24,14 @@ fetch `GET /api/dyn/posts`, `GET /api/dyn/projects`, and `GET
 /api/dyn/authorcontacts` from the Go backend, which re-reads the
 `<dynBlogData/>` section of `serverConfig.xml` on every request.
 
+The home page's Live section reads the owner's live stream over WHEP
+(WebRTC HTTP Egress Protocol): its endpoint is runtime configuration
+too — the `<homeLiveWHEPURL/>` element of `serverConfig.xml`, fetched
+from `GET /api/homeLiveWHEPURL` (see `src/hooks/useHomeLiveWHEPURL`); a
+document without the element shows no Live section at all. The WHEP
+client (`src/api/whep.ts`) is independent of the chat subsystem's
+peer-to-peer WebRTC.
+
 ## Building
 
 ```sh

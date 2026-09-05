@@ -125,6 +125,14 @@
   />
   -->
 
+  <!-- The WHEP (WebRTC HTTP Egress Protocol) endpoint of the live stream
+       the home page's Live section plays (optional), served to the
+       frontend by GET /api/homeLiveWHEPURL (see pkg/api/homelive); the
+       page reads the stream from it over WebRTC. Absent, the home page
+       shows no Live section.
+  <homeLiveWHEPURL url="http://localhost:8889/mystream/whep" />
+  -->
+
   <!-- The built-in echo bot (optional): an echo-purpose headless RTC peer
        (pkg/rtc/echobot) living in the server process as a plain signalling
        client of the WebSocket endpoint url points at — typically this

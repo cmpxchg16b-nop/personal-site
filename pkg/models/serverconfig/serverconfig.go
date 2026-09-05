@@ -36,6 +36,10 @@ type ServerConfigXML struct {
 	// IceServers holds every <iceServer/> entry of the document: the ICE
 	// server sets served by GET /api/iceServers (see pkg/api/iceservers).
 	IceServers []IceServerXML `xml:"iceServer"`
+	// HomeLiveWHEPURL is nil when the document has no <homeLiveWHEPURL/>
+	// element; the home page's Live section (GET /api/homeLiveWHEPURL, see
+	// pkg/api/homelive) is served only when the element is present.
+	HomeLiveWHEPURL *HomeLiveWHEPURLXML `xml:"homeLiveWHEPURL"`
 	// EchoBot is nil when the document has no <echoBot/> element; the
 	// built-in echo bot is wired only when the element is present and
 	// carries a url and a jwt (see cmd/server).
@@ -245,6 +249,14 @@ func decodeBase64Text(s string) ([]byte, error) {
 type IceServerXML struct {
 	URLs          string `xml:"urls,attr"`
 	AllowedOrigin string `xml:"allowedOrigin,attr"`
+}
+
+// HomeLiveWHEPURLXML mirrors the <homeLiveWHEPURL/> element of
+// serverConfig.xml: the WHEP endpoint of the live stream the home page's
+// Live section plays, served to the frontend as JSON by GET
+// /api/homeLiveWHEPURL (see pkg/api/homelive).
+type HomeLiveWHEPURLXML struct {
+	URL string `xml:"url,attr"`
 }
 
 // LoadServerConfig parses the global server configuration XML document.

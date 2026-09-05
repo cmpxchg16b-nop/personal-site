@@ -13,6 +13,7 @@ import (
 	personalsite "personal-site"
 	pkgapicomments "personal-site/pkg/api/comments"
 	pkgapidyn "personal-site/pkg/api/dyn"
+	pkgapihomelive "personal-site/pkg/api/homelive"
 	pkgapiiceservers "personal-site/pkg/api/iceservers"
 	pkgapilinks "personal-site/pkg/api/links"
 	pkgapiloginoauth2github "personal-site/pkg/api/login/oauth2/github"
@@ -194,6 +195,17 @@ func (cmd *ServeCmd) Run(cli *CLI) error {
 	}
 	muxHandlerDyn.Handle("GET /api/iceServers", pkgapiiceservers.NewIceServersHandler(iceServerEntries))
 
+	// The home page's live stream endpoint serves the <homeLiveWHEPURL/>
+	// element of the configuration document: the Live section reads its
+	// stream over WHEP from that URL. Registered unconditionally — an empty
+	// URL when unconfigured, which hides the section — and reachable without
+	// a session (it is on the JWT whitelist below).
+	homeLiveWHEPURL := ""
+	if serverCfg != nil && serverCfg.HomeLiveWHEPURL != nil {
+		homeLiveWHEPURL = serverCfg.HomeLiveWHEPURL.URL
+	}
+	muxHandlerDyn.Handle("GET /api/homeLiveWHEPURL", pkgapihomelive.NewHomeLiveHandler(homeLiveWHEPURL))
+
 	// /api/logout is on the JWT whitelist below, so the handler also runs for
 	// requests whose token is already expired or invalid — clearing cookies
 	// must never depend on a still-valid session.
@@ -348,6 +360,7 @@ func (cmd *ServeCmd) Run(cli *CLI) error {
 		"/api/logout",
 		"/api/healthz",
 		"GET /api/iceServers",
+		"GET /api/homeLiveWHEPURL",
 		"/api/dyn",
 		"/api/dyn/",
 		"GET /api/comments",

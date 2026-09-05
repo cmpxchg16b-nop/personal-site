@@ -37,6 +37,16 @@
     "ctaPosts": "Read my posts",
     "ctaContact": "Get in touch"
   },
+  "live": {
+    "title": "Live",
+    "subtitle": "A live stream, served over WebRTC (WHEP).",
+    "loadFailed": "Failed to load the live stream configuration.",
+    "badge": "LIVE",
+    "connecting": "Connecting…",
+    "offline": "The stream is offline — check back later, or retry now.",
+    "retry": "Retry",
+    "videoLabel": "Live stream video"
+  },
   "about": {
     "title": "About"
   },

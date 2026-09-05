@@ -37,6 +37,16 @@
     "ctaPosts": "阅读我的文章",
     "ctaContact": "联系我"
   },
+  "live": {
+    "title": "直播",
+    "subtitle": "通过 WebRTC（WHEP）传输的直播流。",
+    "loadFailed": "加载直播配置失败。",
+    "badge": "直播中",
+    "connecting": "连接中…",
+    "offline": "当前未在直播——稍后再来看看吧，或立即重试。",
+    "retry": "重试",
+    "videoLabel": "直播画面"
+  },
   "about": {
     "title": "关于"
   },

@@ -1,5 +1,6 @@
 import { Box } from "@mui/material";
 import HeroSection from "@/components/HeroSection";
+import LiveSection from "@/components/LiveSection";
 import AboutSection from "@/components/AboutSection";
 import PostsSection from "@/components/PostsSection";
 import ProjectsSection from "@/components/ProjectsSection";
@@ -13,6 +14,7 @@ export default function Home() {
   return (
     <Box>
       <HeroSection />
+      <LiveSection />
       <AboutSection />
       <PostsSection />
       <ProjectsSection />

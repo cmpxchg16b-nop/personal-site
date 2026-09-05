@@ -5,9 +5,9 @@ My personal site and blog, built with simplicity and brevity in mind.
 ## What it is
 
 - **A purely client-rendered web app.** The frontend in `web/site/` is a
-  Next.js static export: hero, about, posts, projects, and contact sections,
-  all with placeholder copy ("My Name", example descriptions, example
-  contacts) ready to be replaced.
+  Next.js static export: hero, live, about, posts, projects, and contact
+  sections, all with placeholder copy ("My Name", example descriptions,
+  example contacts) ready to be replaced.
 - **Dark mode.** Light and dark themes that follow your system setting, or
   flip between them yourself with the toggle in the top bar.
 - **Bilingual.** English and 中文 out of the box, with a language switcher in
@@ -16,7 +16,8 @@ My personal site and blog, built with simplicity and brevity in mind.
   the static export, and answers the site's API endpoints: `GET
 /api/profile` (the caller's identity, from its JWT session), `GET
 /api/healthz`, the dynamic blog data under `/api/dyn/` (see below), and
-  short-link redirects under `/links/` (see below).
+  short-link redirects under `/links/` (see below), and the live stream's
+  WHEP endpoint at `GET /api/homeLiveWHEPURL` (see below).
 
 ## Sign-in and sessions
 
@@ -24,7 +25,8 @@ The backend carries a JWT-based login system: a login endpoint issues a
 signed session token into an HttpOnly cookie, and a whitelist middleware
 (`pkg/auth`) requires a valid token for every `/api/` path except the
 public ones (`/api/login/...`, `/api/logout`, `/api/healthz`, `/api/dyn/`,
-and `GET /api/comments/` — reads are open, appends need a session).
+`GET /api/iceServers`, `GET /api/homeLiveWHEPURL`, and
+`GET /api/comments/` — reads are open, appends need a session).
 
 - **Visitor login.** `GET /api/login/visitor` (`pkg/api/login/visitor`)
   signs an anonymous `visitor:`-prefixed session, paced by a shared ticket
@@ -182,6 +184,22 @@ version:
   tokens are issued with the `sign` subcommand (see _Sign-in and
   sessions_).
 
+## Live streaming
+
+The home page carries a Live section under the hero: a video element
+reading the owner's live stream over WHEP (WebRTC HTTP Egress Protocol)
+from a stream server — MediaMTX, for instance, serves a path's stream at
+`http://host:8889/<path>/whep`. The endpoint is public bootstrap data
+from the global configuration document: its `<homeLiveWHEPURL/>`
+element is served by `GET /api/homeLiveWHEPURL` (`pkg/api/homelive`, on
+the JWT whitelist), and a document without the element simply has no
+Live section. The browser client (`web/site/src/api/whep.ts`) POSTs a
+recvonly SDP offer to the endpoint, takes the answer and the session
+Location back, trickles its ICE candidates by PATCH and tears the
+session down by DELETE; while the stream is offline it reconnects on its
+own. It shares no code or configuration with the chat subsystem's
+peer-to-peer WebRTC.
+
 ## Layout
 
 - `cmd/server/` — the Go server entrypoint: the `serve` subcommand
@@ -278,6 +296,9 @@ container, e.g. `-v "$PWD/serverConfig.xml:/app/serverConfig.xml"` and
   `serverConfig.xml`, served live under `/api/dyn/`.
 - Short links: the `<shortlink/>` entries of that same section, served live
   under `/links/`.
+- The home page's live stream: the `<homeLiveWHEPURL/>` element of
+  `serverConfig.xml`, served by `GET /api/homeLiveWHEPURL`; like the login
+  options it is read at startup, so a server restart applies an edit.
 - The hard-coded visitor identity: `pkg/session`
   (`StaticVisitorSessionManager`).
 - The favicons: `web/site/public/logo-light.png` and `logo-dark.png`.
@@ -292,3 +313,4 @@ container, e.g. `-v "$PWD/serverConfig.xml:/app/serverConfig.xml"` and
 
 1. Audio-inline message
 2. Message unreads display
+3. LLM chat bot integration
