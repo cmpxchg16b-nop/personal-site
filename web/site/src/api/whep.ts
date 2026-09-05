@@ -69,8 +69,15 @@ export class WhepClient {
   ) {
     // Resolve once, up front: the POST response's Location header (the
     // session resource the trickle PATCHes and the DELETE go to) may
-    // itself be relative, and resolving it needs an absolute base.
-    this.url = new URL(url, window.location.href).toString();
+    // itself be relative, and resolving it needs an absolute base. An
+    // unresolvable endpoint is kept verbatim: the handshake fetch then
+    // rejects with it and the caller surfaces the offline state, instead
+    // of the constructor throwing into the render tree.
+    try {
+      this.url = new URL(url, window.location.href).toString();
+    } catch {
+      this.url = url;
+    }
   }
 
   /**
