@@ -197,8 +197,10 @@ Live section. The browser client (`web/site/src/api/whep.ts`) POSTs a
 recvonly SDP offer to the endpoint, takes the answer and the session
 Location back, trickles its ICE candidates by PATCH and tears the
 session down by DELETE; while the stream is offline it reconnects on its
-own. It shares no code or configuration with the chat subsystem's
-peer-to-peer WebRTC.
+own. The configured URL may be relative (`/mystream/whep`): the frontend
+resolves it against the site's own origin, for deployments that proxy the
+stream server behind it. The client shares no code or configuration with
+the chat subsystem's peer-to-peer WebRTC.
 
 ## Layout
 

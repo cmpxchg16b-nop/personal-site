@@ -28,6 +28,10 @@ const nextConfig = (phase: string): NextConfig => {
         source: "/links/:path*",
         destination: "http://localhost:8080/links/:path*",
       },
+      {
+        source: "/mystream/whep",
+        destination: "http://localhost:8889/mystream/whep",
+      },
     ];
   }
 

@@ -55,11 +55,23 @@ export class WhepClient {
   private sessionUrl: string | null = null;
   private queuedCandidates: RTCIceCandidate[] = [];
   private closed = false;
+  private readonly url: string;
 
+  /**
+   * @param url the WHEP endpoint, absolute
+   * ("http://host:8889/mystream/whep") or relative to the document's
+   * origin ("/mystream/whep") — the relative form suits deployments that
+   * proxy the stream server behind the site's own origin.
+   */
   constructor(
-    private readonly url: string,
+    url: string,
     private readonly callbacks: WhepClientCallbacks = {},
-  ) {}
+  ) {
+    // Resolve once, up front: the POST response's Location header (the
+    // session resource the trickle PATCHes and the DELETE go to) may
+    // itself be relative, and resolving it needs an absolute base.
+    this.url = new URL(url, window.location.href).toString();
+  }
 
   /**
    * Runs the handshake: OPTIONS (ICE servers) → recvonly offer → POST →
@@ -103,9 +115,10 @@ export class WhepClient {
     }
     // Location identifies the session resource for the trickle PATCHes and
     // the final DELETE; it may be relative, so resolve it against the
-    // endpoint. If a CORS policy hides the header, fall back to the
-    // endpoint itself — MediaMTX pins the session by the fragment's ICE
-    // credentials, so its resource URL is the endpoint URL anyway.
+    // endpoint (absolute by construction). If a CORS policy hides the
+    // header, fall back to the endpoint itself — MediaMTX pins the session
+    // by the fragment's ICE credentials, so its resource URL is the
+    // endpoint URL anyway.
     const location = res.headers.get("Location");
     this.sessionUrl =
       location !== null ? new URL(location, this.url).toString() : this.url;

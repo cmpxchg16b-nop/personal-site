@@ -77,8 +77,11 @@
              pkg/api/homelive): the frontend fetches the URL from
              GET /api/homeLiveWHEPURL and reads the stream from it with a
              recvonly WebRTC peer connection — e.g. a MediaMTX path's
-             "http://host:8889/mystream/whep". When the element is absent,
-             the home page shows no Live section at all. -->
+             "http://host:8889/mystream/whep". A relative url (e.g.
+             "/mystream/whep") is resolved against the site's own origin,
+             for deployments that proxy the stream server behind it. When
+             the element is absent, the home page shows no Live section
+             at all. -->
         <xsd:element
           name="homeLiveWHEPURL"
           type="homeLiveWHEPURLType"

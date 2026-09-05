@@ -128,8 +128,9 @@
   <!-- The WHEP (WebRTC HTTP Egress Protocol) endpoint of the live stream
        the home page's Live section plays (optional), served to the
        frontend by GET /api/homeLiveWHEPURL (see pkg/api/homelive); the
-       page reads the stream from it over WebRTC. Absent, the home page
-       shows no Live section.
+       page reads the stream from it over WebRTC. A relative url resolves
+       against the site's own origin (a stream server proxied behind it).
+       Absent, the home page shows no Live section.
   <homeLiveWHEPURL url="http://localhost:8889/mystream/whep" />
   -->
 
