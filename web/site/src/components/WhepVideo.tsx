@@ -142,7 +142,7 @@ export default function WhepVideo({ url }: { url: string }) {
           }}
         />
       ) : (
-        status === "offline" && (
+        (status === "offline" || status === "connecting") && (
           // The offline veil: the stream is unreachable right now. The
           // retry loop keeps probing in the background; a successful
           // reconnect lifts the veil by itself, so the veil carries no
