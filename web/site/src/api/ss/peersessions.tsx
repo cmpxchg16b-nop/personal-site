@@ -394,8 +394,6 @@ export function usePeerSessions(
   // reconcile effect below then rebuilds from the current listing.
   useEffect(() => {
     const sessions = sessionsRef.current;
-    const channelWaiters = channelWaitersRef.current;
-    const resetHandlers = resetHandlersRef.current;
     return () => {
       for (const session of sessions.values()) {
         session.close();
@@ -403,13 +401,13 @@ export function usePeerSessions(
       sessions.clear();
       // Anything still waiting on a channel is released, and the
       // consumers are told every session is gone.
-      for (const byLabel of channelWaiters.values()) {
+      for (const byLabel of channelWaitersRef.current.values()) {
         for (const waiters of byLabel.values()) {
           for (const resolve of waiters) resolve(null);
         }
       }
-      channelWaiters.clear();
-      for (const cb of resetHandlers) cb(null);
+      channelWaitersRef.current.clear();
+      for (const cb of resetHandlersRef.current) cb(null);
       setConnectionStates({});
     };
   }, [proxy, me]);
