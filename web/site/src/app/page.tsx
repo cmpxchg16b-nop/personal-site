@@ -1,4 +1,5 @@
 import { Box } from "@mui/material";
+import SatelliteBackground from "@/components/satellite/SatelliteBackground";
 import HeroSection from "@/components/HeroSection";
 import LiveSection from "@/components/LiveSection";
 import AboutSection from "@/components/AboutSection";
@@ -13,6 +14,11 @@ import CommentZone from "@/components/CommentZone";
 export default function Home() {
   return (
     <Box>
+      {/* Fixed three.js backdrop: Earth seen from a satellite flying a
+          configurable orbit, painted behind the whole page (z-index -1).
+          Trajectory, attitude, camera offset, spin and lighting are all
+          props — see src/components/satellite/types.ts. */}
+      <SatelliteBackground />
       <HeroSection />
       <LiveSection />
       <AboutSection />
