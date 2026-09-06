@@ -2,6 +2,11 @@
 bin/
 .env
 .env.local
-serverConfig.xml
+/serverConfig.xml
 signing/key.pem
 coverage.out
+/mediamtx.yml
+/mediamtx
+/auto.crt
+/auto.key
+/server
