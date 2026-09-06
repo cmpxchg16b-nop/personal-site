@@ -115,6 +115,36 @@ export interface LightingConfig {
   ambientIntensity: number;
 }
 
+/**
+ * All scene colors in one place, so the dark and bright schemes can diverge
+ * structurally — not just in hue. The bright scheme drops layers that only
+ * read on a dark backdrop: deep space goes transparent (the page's own
+ * background shows through), continents become stroked outlines over a light
+ * grey fill, and the white-on-white layers (ice fills, clouds) drop out.
+ */
+export interface ScenePalette {
+  /** Deep-space backdrop color; null = transparent canvas. */
+  background: string | null;
+  /** Ocean sphere color (sun-lit, so it shades toward the night side). */
+  ocean: string;
+  /** Ocean specular-highlight tint. */
+  oceanSpecular: string;
+  /** Land polygon fill color; null = stroked outlines only, no fill. */
+  land: string | null;
+  /** Ice-cap polygon fill color; null = stroked outlines only, no fill. */
+  ice: string | null;
+  /** Coastline and ice-boundary stroke color. */
+  coastline: string;
+  /** Cloud-wisp color; null hides the cloud layer. */
+  clouds: string | null;
+  /** Atmosphere limb-glow color; null hides the glow. */
+  atmosphere: string | null;
+  /** "r, g, b" triplet for the readability scrim laid over the scene. */
+  scrimColor: string;
+  /** Scheme-default lighting; an explicit `lighting` prop overrides it. */
+  lighting: LightingConfig;
+}
+
 export interface SatelliteBackgroundProps {
   /** Orbit shape and timing (partial; defaults are filled in). */
   trajectory?: Partial<TrajectoryConfig>;
@@ -134,9 +164,14 @@ export interface SatelliteBackgroundProps {
   pauseOnReducedMotion?: boolean;
   /** Exponential slerp rate (per simulated second) damping attitude changes. Higher = snappier. */
   attitudeResponsiveness?: number;
-  /** Deep-space backdrop color. Space itself is rendered flat and dark. */
-  backgroundColor?: string;
-  /** Opacity of a black scrim laid over the scene so foreground text stays readable. 0 disables. */
+  /**
+   * Pin the scene palette to a scheme instead of following the site's MUI
+   * color scheme (useful outside the themed app). Default: follow the site.
+   */
+  colorScheme?: "dark" | "light";
+  /** Override individual palette entries over the active scheme's palette. */
+  palette?: Partial<ScenePalette>;
+  /** Opacity of a scrim laid over the scene so foreground text stays readable (its color follows the palette). 0 disables. */
   scrim?: number;
   /** Cap for renderer.setPixelRatio (default 2). */
   maxPixelRatio?: number;
@@ -210,6 +245,54 @@ export const DEFAULT_LIGHTING: LightingConfig = {
 
 export const DEFAULT_SCRIM = 0.22;
 
+/** GitHub-dark blues: the original look. */
+export const DARK_PALETTE: ScenePalette = {
+  background: "#010409",
+  ocean: "#0d1b33",
+  oceanSpecular: "#2c4a70",
+  land: "#2c5d9b",
+  ice: "#a8cdf0",
+  coastline: "#79c0ff",
+  clouds: "#b8cfe2",
+  atmosphere: "#4a90ff",
+  scrimColor: "0, 0, 0",
+  lighting: DEFAULT_LIGHTING,
+};
+
+/**
+ * GitHub-light: deep space is transparent (the page's white background shows
+ * through), the ocean is a white sun-shaded sphere, and continents are
+ * stroked slate outlines over a light grey fill. Ice caps render as
+ * outline-only and clouds are hidden — white-on-white layers would only dirty
+ * the globe. The atmosphere becomes a soft blue halo that reads against the
+ * page background.
+ */
+export const BRIGHT_PALETTE: ScenePalette = {
+  background: null,
+  // Pure white ocean under strong, neutral light: the day side saturates to
+  // white (the bright-scheme globe should read WHITE, not grey), the night
+  // side stays a light neutral grey for volume. All tints are hue-free — any
+  // blue in the lighting or specular reads as a blue haze on white.
+  ocean: "#ffffff",
+  oceanSpecular: "#d9dee6",
+  land: "#edf0f4",
+  ice: null,
+  // GitHub light-theme muted foreground: dark enough to carry the outlines.
+  coastline: "#57606a",
+  clouds: null,
+  // The additive limb glow only reads on a dark backdrop; on white it hazes
+  // the whole surface blue, so the bright scheme drops it entirely.
+  atmosphere: null,
+  scrimColor: "255, 255, 255",
+  lighting: {
+    ...DEFAULT_LIGHTING,
+    sunColor: "#ffffff",
+    sunIntensity: 1.85,
+    ambientColor: "#efefef",
+    ambientIntensity: 1.15,
+  },
+};
+
 /** Everything resolveSettings fills in — what the render loop consumes. */
 export interface ResolvedSettings {
   trajectory: TrajectoryConfig;
@@ -221,13 +304,22 @@ export interface ResolvedSettings {
   paused: boolean;
   pauseOnReducedMotion: boolean;
   attitudeResponsiveness: number;
-  backgroundColor: string;
+  palette: ScenePalette;
   scrim: number;
   maxPixelRatio: number;
 }
 
 /** Merge partial props over the defaults, clamping values that would break the sim. */
-export function resolveSettings(p: SatelliteBackgroundProps): ResolvedSettings {
+export function resolveSettings(
+  p: SatelliteBackgroundProps,
+  mode: "dark" | "light",
+): ResolvedSettings {
+  const basePalette = mode === "light" ? BRIGHT_PALETTE : DARK_PALETTE;
+  const palette: ScenePalette = {
+    ...basePalette,
+    ...p.palette,
+    lighting: { ...basePalette.lighting, ...p.palette?.lighting },
+  };
   const trajectory = { ...DEFAULT_TRAJECTORY, ...p.trajectory };
   return {
     trajectory: {
@@ -245,13 +337,13 @@ export function resolveSettings(p: SatelliteBackgroundProps): ResolvedSettings {
       offsetDeg: { ...DEFAULT_CAMERA.offsetDeg, ...p.camera?.offsetDeg },
     },
     earth: { ...DEFAULT_EARTH, ...p.earth },
-    lighting: { ...DEFAULT_LIGHTING, ...p.lighting },
+    // An explicit lighting prop wins over the palette's scheme default.
+    lighting: { ...palette.lighting, ...p.lighting },
+    palette,
     speed: p.speed ?? 1,
     paused: p.paused ?? false,
     pauseOnReducedMotion: p.pauseOnReducedMotion ?? true,
     attitudeResponsiveness: Math.max(0, p.attitudeResponsiveness ?? 5),
-    // GitHub-darkest blue-black for deep space.
-    backgroundColor: p.backgroundColor ?? "#010409",
     scrim: Math.min(1, Math.max(0, p.scrim ?? DEFAULT_SCRIM)),
     maxPixelRatio: Math.max(0.5, p.maxPixelRatio ?? 2),
   };

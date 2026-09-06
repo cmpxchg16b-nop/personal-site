@@ -2,6 +2,7 @@
 
 import { useEffect, useRef } from "react";
 import { Box } from "@mui/material";
+import { useColorScheme } from "@mui/material/styles";
 import * as THREE from "three";
 import { LineSegments2 } from "three/examples/jsm/lines/LineSegments2.js";
 import { LineSegmentsGeometry } from "three/examples/jsm/lines/LineSegmentsGeometry.js";
@@ -17,7 +18,6 @@ import {
   type SatelliteState,
 } from "./trajectory";
 import {
-  DEFAULT_SCRIM,
   resolveSettings,
   type ResolvedSettings,
   type SatelliteBackgroundProps,
@@ -176,13 +176,12 @@ function applySurfaceSet(engine: Engine, surface: EarthSurfaceSet): void {
     engine.cloudMaterial.map = surface.clouds;
     engine.cloudMaterial.needsUpdate = true;
   }
-  engine.cloudMesh.visible =
-    engine.settings.earth.clouds && surface.clouds !== null;
 
   // Continents and ice caps are flat-color polygon meshes; coastline strokes
   // are vector lines. All rebuilt per set so layers stay aligned.
   setSurfaceGeometry(engine.landMesh, surface.land);
   setSurfaceGeometry(engine.iceMesh, surface.ice);
+  syncLayerVisibility(engine);
 
   if (engine.coast) {
     engine.earthMesh.remove(engine.coast);
@@ -251,6 +250,20 @@ function startSurfaceJob(engine: Engine): void {
   scheduleStep();
 }
 
+/** Apply palette-driven layer visibility (filled, stroke-only, or hidden). */
+function syncLayerVisibility(engine: Engine): void {
+  const palette = engine.settings.palette;
+  const surface = engine.surface;
+  engine.landMesh.visible = palette.land !== null && surface?.land != null;
+  engine.iceMesh.visible = palette.ice !== null && surface?.ice != null;
+  engine.cloudMesh.visible =
+    palette.clouds !== null &&
+    engine.settings.earth.clouds &&
+    surface?.clouds != null;
+  engine.atmosphere.visible =
+    palette.atmosphere !== null && engine.settings.earth.atmosphere;
+}
+
 /** Push resolved React props into the live scene. Cheap enough to run every render. */
 function applySettings(engine: Engine, settings: ResolvedSettings): void {
   engine.settings = settings;
@@ -282,8 +295,33 @@ function applySettings(engine: Engine, settings: ResolvedSettings): void {
     ),
   );
 
-  // Deep space: a flat dark backdrop color.
-  (engine.scene.background as THREE.Color).set(settings.backgroundColor);
+  // Deep space: a flat color in the dark scheme; transparent in the bright
+  // scheme so the page background shows through (the renderer has alpha).
+  const background = settings.palette.background;
+  if (background === null) {
+    engine.scene.background = null;
+    engine.renderer.setClearAlpha(0);
+  } else {
+    let bgColor = engine.scene.background as THREE.Color | null;
+    if (!bgColor) {
+      bgColor = new THREE.Color();
+      engine.scene.background = bgColor;
+    }
+    bgColor.set(background);
+    engine.renderer.setClearAlpha(1);
+  }
+
+  // Palette: layer colors, then which layers render at all.
+  const palette = settings.palette;
+  engine.oceanMaterial.color.set(palette.ocean);
+  engine.oceanMaterial.specular.set(palette.oceanSpecular);
+  engine.landMaterial.color.set(palette.land ?? palette.coastline);
+  engine.iceMaterial.color.set(palette.ice ?? palette.coastline);
+  engine.coastMaterial.color.set(palette.coastline);
+  engine.cloudMaterial.color.set(palette.clouds ?? "#ffffff");
+  (engine.atmosphereMaterial.uniforms.uColor.value as THREE.Color).set(
+    palette.atmosphere ?? "#000000",
+  );
 
   // Sun + ambient.
   const sunDir = new THREE.Vector3(...settings.lighting.sunDirection);
@@ -295,19 +333,17 @@ function applySettings(engine: Engine, settings: ResolvedSettings): void {
   engine.ambient.color.set(settings.lighting.ambientColor);
   engine.ambient.intensity = settings.lighting.ambientIntensity;
 
-  // Atmosphere shell tracks the sun direction and the config flag.
+  // Atmosphere shell tracks the sun direction.
   const uLightDir = engine.atmosphereMaterial.uniforms.uLightDir
     .value as THREE.Vector3;
   uLightDir.copy(sunDir);
-  engine.atmosphere.visible = settings.earth.atmosphere;
 
   // Axial tilt as a quaternion about world Z, wrapping the spinning meshes.
   engine.earthGroup.quaternion.setFromAxisAngle(
     AXIS_Z,
     THREE.MathUtils.degToRad(settings.earth.axialTiltDeg),
   );
-  engine.cloudMesh.visible =
-    settings.earth.clouds && engine.surface?.clouds != null;
+  syncLayerVisibility(engine);
 
   const pixelRatio = Math.min(
     window.devicePixelRatio || 1,
@@ -383,18 +419,31 @@ function frame(engine: Engine, timer: THREE.Timer): void {
 export default function SatelliteBackground(props: SatelliteBackgroundProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const engineRef = useRef<Engine | null>(null);
-  const settingsRef = useRef<ResolvedSettings | null>(null);
-  if (settingsRef.current === null) {
-    settingsRef.current = resolveSettings(props);
-  }
-  const scrim = props.scrim ?? DEFAULT_SCRIM;
+
+  // Follow the site's MUI color scheme unless the prop pins one. The scheme
+  // is undefined during SSR and the hydration render; the site default
+  // (InitColorSchemeScript in app/layout.tsx) is dark.
+  const { mode: schemeMode, systemMode } = useColorScheme();
+  const mode: "dark" | "light" =
+    props.colorScheme ??
+    (schemeMode === "system" ? systemMode : schemeMode) ??
+    "dark";
+
+  // Re-resolved on every render (a cheap object assembly); the sync effect
+  // below pushes it into the live scene, so toggling the site's color scheme
+  // re-themes the background without a remount. The ref only hands the FIRST
+  // render's settings to the mount effect for scene construction (writing
+  // refs during render is not allowed).
+  const settings = resolveSettings(props, mode);
+  const settingsRef = useRef<ResolvedSettings>(settings);
+  const scrim = settings.scrim;
 
   // Scene construction (mount only). Declared before the settings sync effect
   // below so the engine exists by the time props are first applied.
   useEffect(() => {
     const container = containerRef.current;
     const initialSettings = settingsRef.current;
-    if (!container || !initialSettings) return;
+    if (!container) return;
 
     const width = Math.max(1, container.clientWidth);
     const height = Math.max(1, container.clientHeight);
@@ -402,6 +451,8 @@ export default function SatelliteBackground(props: SatelliteBackgroundProps) {
     const renderer = new THREE.WebGLRenderer({
       antialias: true,
       powerPreference: "high-performance",
+      // Alpha so the bright scheme can leave deep space transparent.
+      alpha: true,
     });
     renderer.setPixelRatio(
       Math.min(window.devicePixelRatio || 1, initialSettings.maxPixelRatio),
@@ -414,7 +465,9 @@ export default function SatelliteBackground(props: SatelliteBackgroundProps) {
     container.appendChild(renderer.domElement);
 
     const scene = new THREE.Scene();
-    scene.background = new THREE.Color(initialSettings.backgroundColor);
+    scene.background = new THREE.Color(
+      initialSettings.palette.background ?? "#000000",
+    );
 
     const camera = new THREE.PerspectiveCamera(
       initialSettings.camera.fovDeg,
@@ -601,10 +654,9 @@ export default function SatelliteBackground(props: SatelliteBackgroundProps) {
     };
   }, []);
 
-  // Controlled props: re-resolve and push into the live scene on every render.
+  // Controlled props: push the current settings into the live scene on every
+  // render (the mount effect above reads settingsRef for scene construction).
   useEffect(() => {
-    const settings = resolveSettings(props);
-    settingsRef.current = settings;
     const engine = engineRef.current;
     if (engine) applySettings(engine, settings);
   });
@@ -628,7 +680,10 @@ export default function SatelliteBackground(props: SatelliteBackgroundProps) {
         zIndex: -1,
         overflow: "hidden",
         pointerEvents: "none",
-        bgcolor: "#000",
+        // Only a pre-mount fallback: the canvas covers the container. Dark in
+        // the dark scheme; transparent in the bright scheme, where both the
+        // canvas's deep space and this layer let the page background through.
+        bgcolor: mode === "light" ? "transparent" : "#000",
       }}
       style={props.style}
     >
@@ -641,9 +696,10 @@ export default function SatelliteBackground(props: SatelliteBackgroundProps) {
             right: 0,
             bottom: 0,
             // Positioned above the statically-placed canvas so foreground copy
-            // stays readable without hiding the scene.
+            // stays readable without hiding the scene. Color follows the
+            // palette: black in the dark scheme, white in the bright one.
             zIndex: 1,
-            bgcolor: `rgba(0, 0, 0, ${scrim})`,
+            bgcolor: `rgba(${settings.palette.scrimColor}, ${scrim})`,
           }}
         />
       ) : null}

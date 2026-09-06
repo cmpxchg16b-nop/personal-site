@@ -20,10 +20,7 @@ import { fileURLToPath } from "node:url";
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const CACHE_DIR = join(ROOT, "scripts", ".cache");
 const CACHE_FILE = join(CACHE_DIR, "ne_110m_land.geojson");
-const OUT_FILE = join(
-  ROOT,
-  "web/site/src/components/satellite/landRings.ts",
-);
+const OUT_FILE = join(ROOT, "web/site/src/components/satellite/landRings.ts");
 const SOURCE_URL =
   "https://raw.githubusercontent.com/nvkelso/natural-earth-vector/master/geojson/ne_110m_land.geojson";
 
@@ -147,19 +144,32 @@ console.log(
 );
 
 const lines = [];
-lines.push("// ---------------------------------------------------------------------------");
+lines.push(
+  "// ---------------------------------------------------------------------------",
+);
 lines.push("// GENERATED FILE — do not edit by hand. Rebuild with:");
 lines.push("//   node scripts/build-land-rings.mjs");
 lines.push("//");
-lines.push("// Real Earth coastlines from Natural Earth 110m land (public domain:");
-lines.push("// https://www.naturalearthdata.com). Each entry is one closed polygon ring as");
-lines.push("// flat [lon, lat, lon, lat, ...] degrees, simplified to ~0.05 deg and");
-lines.push("// quantized to 0.01 deg. Exterior rings and hole rings (e.g. the Caspian Sea)");
-lines.push("// are mixed; the consumer fills with the even-odd rule. No ring crosses the");
+lines.push(
+  "// Real Earth coastlines from Natural Earth 110m land (public domain:",
+);
+lines.push(
+  "// https://www.naturalearthdata.com). Each entry is one closed polygon ring as",
+);
+lines.push(
+  "// flat [lon, lat, lon, lat, ...] degrees, simplified to ~0.05 deg and",
+);
+lines.push(
+  "// quantized to 0.01 deg. Exterior rings and hole rings (e.g. the Caspian Sea)",
+);
+lines.push(
+  "// are mixed; the consumer fills with the even-odd rule. No ring crosses the",
+);
 lines.push("// antimeridian (source data is cut at +/-180 deg).");
-lines.push("// ---------------------------------------------------------------------------");
+lines.push(
+  "// ---------------------------------------------------------------------------",
+);
 lines.push("");
-lines.push("/* eslint-disable */");
 lines.push("export const LAND_RINGS: readonly number[][] = [");
 for (const ring of rings) {
   const flat = [];

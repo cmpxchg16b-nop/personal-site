@@ -1,6 +1,5 @@
 "use client";
 
-import { useEffect } from "react";
 import { useAudioGraph } from "@/api/audio/audiograph";
 import {
   newChatControlDCMsg,
