@@ -18,12 +18,6 @@ import { useProfile } from "@/hooks/useProfile";
 import { useLogout } from "@/hooks/useLogout";
 import { useTranslation } from "react-i18next";
 
-// PROFILE_POLL_INTERVAL_MS is how often ProfileMenu re-fetches GET
-// /api/profile. Polling keeps the top bar in sync with the session: a login
-// or logout in another tab — or a JWT that expired mid-session — is picked
-// up here within one interval instead of on the next full page load.
-const PROFILE_POLL_INTERVAL_MS = 5000;
-
 // avatarHue hashes the subject id to a stable hue (0–359), so each user gets
 // a consistent avatar color without the server assigning one.
 function avatarHue(subjectId: string): number {
@@ -48,7 +42,7 @@ function avatarHue(subjectId: string): number {
 // affordance.
 export default function ProfileMenu() {
   const { t } = useTranslation();
-  const { data, isPending, isError } = useProfile(PROFILE_POLL_INTERVAL_MS);
+  const { data, isPending, isError } = useProfile();
   const logout = useLogout();
   const pathname = usePathname();
   const [anchorEl, setAnchorEl] = useState<HTMLElement | null>(null);
