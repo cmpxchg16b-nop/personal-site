@@ -1,7 +1,8 @@
-// Package dyn serves the site's dynamic blog data — the project and
-// author-contact lists — to the frontend as JSON under /api/dyn/. The data
-// comes from a pkg/models/dyn DynBlogDataProvider, typically re-read from
-// the <dynBlogData/> section of the server configuration document on every
+// Package dyn serves the site's dynamic blog data — the post metadata,
+// project and author-contact lists, and the entertain page's media shelves —
+// to the frontend as JSON under /api/dyn/. The data comes from a
+// pkg/models/dyn DynBlogDataProvider, typically re-read from the
+// <dynBlogData/> section of the server configuration document on every
 // request.
 package dyn
 
@@ -22,6 +23,9 @@ import (
 //	                             without downloading the whole list
 //	GET /api/dyn/projects        the project list
 //	GET /api/dyn/authorcontacts  the author-contact list
+//	GET /api/dyn/entertain       the entertain page's media shelves (live,
+//	                             videos, music)
+//	GET /api/dyn/menu            the top bar's navigation drawer entries
 //
 // The handler asks its provider for the data on every request, so a provider
 // that re-reads its source (e.g. FSBasedDynBlogData) serves edits without a
@@ -32,8 +36,9 @@ type DynamicBlogDataHandler struct {
 }
 
 // NewDynamicBlogDataHandler constructs a DynamicBlogDataHandler serving the
-// data from provider. A nil provider serves empty JSON arrays, and 404 for
-// every post id.
+// data from provider. A nil provider serves empty JSON arrays (an
+// all-shelves-empty object for /api/dyn/entertain), and 404 for every post
+// id.
 func NewDynamicBlogDataHandler(provider pkgmodelsdyn.DynBlogDataProvider) *DynamicBlogDataHandler {
 	h := &DynamicBlogDataHandler{provider: provider}
 	mux := http.NewServeMux()
@@ -41,6 +46,8 @@ func NewDynamicBlogDataHandler(provider pkgmodelsdyn.DynBlogDataProvider) *Dynam
 	mux.HandleFunc("GET /api/dyn/posts/{id}", h.handlePostById)
 	mux.HandleFunc("GET /api/dyn/projects", h.handleProjects)
 	mux.HandleFunc("GET /api/dyn/authorcontacts", h.handleAuthorContacts)
+	mux.HandleFunc("GET /api/dyn/entertain", h.handleEntertain)
+	mux.HandleFunc("GET /api/dyn/menu", h.handleMenu)
 	h.mux = mux
 	return h
 }
@@ -115,6 +122,39 @@ func (h *DynamicBlogDataHandler) handleAuthorContacts(w http.ResponseWriter, r *
 		contacts = []pkgmodelsdyn.AuthorContact{}
 	}
 	writeJSON(w, contacts)
+}
+
+func (h *DynamicBlogDataHandler) handleEntertain(w http.ResponseWriter, r *http.Request) {
+	data, err := h.getDynBlogData()
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	entertain := data.Entertain
+	// Never serialize a nil slice: every shelf stays a JSON array.
+	if entertain.Live == nil {
+		entertain.Live = []pkgmodelsdyn.Media{}
+	}
+	if entertain.Videos == nil {
+		entertain.Videos = []pkgmodelsdyn.Media{}
+	}
+	if entertain.Music == nil {
+		entertain.Music = []pkgmodelsdyn.Media{}
+	}
+	writeJSON(w, entertain)
+}
+
+func (h *DynamicBlogDataHandler) handleMenu(w http.ResponseWriter, r *http.Request) {
+	data, err := h.getDynBlogData()
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	menu := data.Menu
+	if menu == nil {
+		menu = []pkgmodelsdyn.MenuEntry{}
+	}
+	writeJSON(w, menu)
 }
 
 func writeJSON(w http.ResponseWriter, v any) {

@@ -31,6 +31,21 @@ var testData = &pkgmodelsdyn.DynBlogData{
 	AuthorContacts: []pkgmodelsdyn.AuthorContact{
 		{Id: "c1", Kind: "email", Label: "you@example.com", URL: "mailto:you@example.com"},
 	},
+	Entertain: pkgmodelsdyn.Entertain{
+		Live: []pkgmodelsdyn.Media{
+			{Id: "mystream", Name: "mystream", DisplayName: "My Stream", Description: "The site's own live stream.", Thumbnail: "https://example.com/thumb.png", Href: "http://localhost:8889/mystream/whep"},
+		},
+		Videos: []pkgmodelsdyn.Media{
+			{Id: "v1", Name: "clip-1", DisplayName: "Clip One", Description: "The first clip.", Href: "/entertain#v1"},
+		},
+		Music: []pkgmodelsdyn.Media{
+			{Id: "m1", Name: "track-1", DisplayName: "Track One", Description: "The first track.", Href: "/entertain#m1"},
+		},
+	},
+	Menu: []pkgmodelsdyn.MenuEntry{
+		{Id: "6ce7ecbd-3ddc-4d58-b2f6-4828a50b7e85", Name: "home", DisplayName: "Home", I18nDisplayNames: map[string]string{"en": "Home", "zh": "首页"}, Description: "The site's home page.", IconClassName: "home"},
+		{Id: "d7c2a874-622a-4ff0-8515-f5b028555edf", Name: "entertain", DisplayName: "Entertain", Description: "Live streams, videos, and music.", IconClassName: "musicNote"},
+	},
 }
 
 func TestDynamicBlogDataHandler_ServesPosts(t *testing.T) {
@@ -129,10 +144,63 @@ func TestDynamicBlogDataHandler_ServesAuthorContacts(t *testing.T) {
 	}
 }
 
+func TestDynamicBlogDataHandler_ServesEntertain(t *testing.T) {
+	h := NewDynamicBlogDataHandler(stubProvider{data: testData})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/dyn/entertain", nil))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status: got %d, want %d", rec.Code, http.StatusOK)
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
+		t.Fatalf("Content-Type: got %q, want application/json", ct)
+	}
+
+	var got pkgmodelsdyn.Entertain
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("response is not a JSON object: %v", err)
+	}
+	if len(got.Live) != 1 || got.Live[0].Id != "mystream" || got.Live[0].Thumbnail != "https://example.com/thumb.png" {
+		t.Fatalf("unexpected live shelf: %+v", got.Live)
+	}
+	if len(got.Videos) != 1 || got.Videos[0].Id != "v1" {
+		t.Fatalf("unexpected videos shelf: %+v", got.Videos)
+	}
+	if len(got.Music) != 1 || got.Music[0].Id != "m1" {
+		t.Fatalf("unexpected music shelf: %+v", got.Music)
+	}
+}
+
+func TestDynamicBlogDataHandler_ServesMenu(t *testing.T) {
+	h := NewDynamicBlogDataHandler(stubProvider{data: testData})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/dyn/menu", nil))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status: got %d, want %d", rec.Code, http.StatusOK)
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
+		t.Fatalf("Content-Type: got %q, want application/json", ct)
+	}
+
+	var got []pkgmodelsdyn.MenuEntry
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("response is not a JSON array: %v", err)
+	}
+	if len(got) != 2 || got[0].Id != "6ce7ecbd-3ddc-4d58-b2f6-4828a50b7e85" || got[0].IconClassName != "home" || got[1].Name != "entertain" {
+		t.Fatalf("unexpected menu payload: %+v", got)
+	}
+	if got[0].I18nDisplayNames["zh"] != "首页" {
+		t.Fatalf("i18nDisplayNames: got %v, want a zh caption", got[0].I18nDisplayNames)
+	}
+}
+
 func TestDynamicBlogDataHandler_NilProviderServesEmptyArrays(t *testing.T) {
 	h := NewDynamicBlogDataHandler(nil)
 
-	for _, path := range []string{"/api/dyn/posts", "/api/dyn/projects", "/api/dyn/authorcontacts"} {
+	for _, path := range []string{"/api/dyn/posts", "/api/dyn/projects", "/api/dyn/authorcontacts", "/api/dyn/menu"} {
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
 
@@ -149,6 +217,16 @@ func TestDynamicBlogDataHandler_NilProviderServesEmptyArrays(t *testing.T) {
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/dyn/posts/post-1", nil))
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("GET /api/dyn/posts/post-1: status: got %d, want %d", rec.Code, http.StatusNotFound)
+	}
+
+	// The entertain endpoint answers an all-shelves-empty object.
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/dyn/entertain", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /api/dyn/entertain: status: got %d, want %d", rec.Code, http.StatusOK)
+	}
+	if body := rec.Body.String(); body != "{\"live\":[],\"videos\":[],\"music\":[]}\n" {
+		t.Fatalf("GET /api/dyn/entertain: body: got %q, want an all-shelves-empty object", body)
 	}
 }
 

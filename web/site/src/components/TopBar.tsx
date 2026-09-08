@@ -5,13 +5,15 @@ import { AppBar, Box, Toolbar } from "@mui/material";
 import BreadcrumbNav from "./BreadcrumbNav";
 import ColorModeToggle from "./ColorModeToggle";
 import LanguageSwitcher from "./LanguageSwitcher";
+import NavDrawer from "./NavDrawer";
 import ProfileMenu from "./ProfileMenu";
 import { TopBarActionsHost } from "./TopBarActions";
 
-// TopBar groups the breadcrumb trail (left) and the color-mode toggle
-// (right) into one sticky bar above the page content. The bar always
-// renders — even where BreadcrumbNav hides itself (single-level pages and
-// the login page) — so the toggle stays reachable everywhere.
+// TopBar groups the site menu and breadcrumb trail (left) and the account,
+// language and color-mode controls (right) into one sticky bar above the
+// page content. The bar always renders — even where BreadcrumbNav hides
+// itself (single-level pages and the login page) — so the controls stay
+// reachable everywhere.
 export default function TopBar() {
   return (
     <AppBar
@@ -36,8 +38,9 @@ export default function TopBar() {
       <Toolbar
         variant="dense"
         disableGutters
-        sx={{ px: { xs: 2, sm: 3, md: 4 } }}
+        sx={{ px: { xs: 1, sm: 2, md: 2 } }}
       >
+        <NavDrawer />
         {/* useSearchParams inside BreadcrumbNav needs its own Suspense
             boundary so statically prerendered routes don't bail out of
             SSG. */}

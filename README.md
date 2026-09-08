@@ -78,13 +78,26 @@ document, so they can be edited without rebuilding the frontend:
   optional `lastModified` — all dates ISO `YYYY-MM-DD` — and optional
   comma-separated `tags`), `<project/>` (`id`, `name`, `description`, `url`,
   optional comma-separated `tech`), and `<authorContact/>` (`id`, `kind`,
-  `label`, `url`). Every entry carries a unique `id`.
+  `label`, `url`). Every entry carries a unique `id`. An optional
+  `<entertain/>` element carries the entertain page's media shelves —
+  `<live/>`, `<video/>`, and `<music/>` card entries (`id`, `name`,
+  `displayName`, `description`, optional `thumbnail` — a data URL, an
+  absolute URL, or a site-relative URL — and `href`). An optional `<menu/>`
+  element carries the top bar's navigation drawer entries — `<menuEntry/>`
+  elements (`id`, `name` — the route slug: `/` for `home`, otherwise
+  `/<name>` — `displayName` — the fallback caption — optional `description`,
+  and `iconClassName`, which picks the icon from the frontend's icon map),
+  each with optional `<i18nDisplayName key="…" value="…"/>` children
+  overriding the caption per language (the key matches the frontend's
+  `i18n.language`).
 - **Served under `/api/dyn/`.** `DynamicBlogDataHandler` in `pkg/api/dyn`
   routes the subtree internally: `GET /api/dyn/posts`, `GET
 /api/dyn/posts/{id}` (a single post's metadata, 404 when the id is
   unknown — post pages query it instead of downloading the whole list),
-  `GET /api/dyn/projects`, and `GET /api/dyn/authorcontacts`. The list
-  endpoints return JSON arrays.
+  `GET /api/dyn/projects`, `GET /api/dyn/authorcontacts`, `GET
+/api/dyn/entertain` (the entertain page's Live, Video, and Music shelves in
+  one object), and `GET /api/dyn/menu` (the navigation drawer entries). The
+  list endpoints return JSON arrays.
 - **Read on the fly.** The handler asks a `DynBlogDataProvider`
   (`pkg/models/dyn`) for the data on every request. The shipped
   implementation, `FSBasedDynBlogData`, keeps only the configuration file's
@@ -93,9 +106,10 @@ document, so they can be edited without rebuilding the frontend:
 - **Wired unconditionally.** `main.go` mounts the handler at `/api/dyn/`
   even without `--config-xml`; the endpoints then serve empty lists.
 
-The frontend's Posts, Projects, and Contact sections fetch these endpoints
-at runtime, so editing `serverConfig.xml` updates the rendered page with no
-frontend rebuild and no server restart.
+The frontend's Posts, Projects, and Contact sections, the `/entertain`
+page, and the top bar's navigation drawer fetch these endpoints at runtime,
+so editing `serverConfig.xml` updates the rendered page with no frontend
+rebuild and no server restart.
 
 ## Short links
 

@@ -147,10 +147,11 @@ func (cmd *ServeCmd) Run(cli *CLI) error {
 	muxHandlerDyn.Handle("/api/profile", pkgapiprofile.NewProfileHandler(sm))
 
 	// The dynamic blog data endpoints serve the <dynBlogData/> section of the
-	// server configuration document (projects, author contacts). The provider
-	// re-reads the document on every request, so edits apply without a
-	// restart. Registered unconditionally — with no --config-xml the handler
-	// serves empty lists — so the frontend can always rely on it.
+	// server configuration document (projects, author contacts, entertain
+	// media shelves). The provider re-reads the document on every request, so
+	// edits apply without a restart. Registered unconditionally — with no
+	// --config-xml the handler serves empty lists — so the frontend can
+	// always rely on it.
 	var dynProvider pkgmodelsdyn.DynBlogDataProvider
 	if cmd.ConfigXML != "" {
 		dynProvider = pkgmodelsdyn.NewFSBasedDynBlogData(cmd.ConfigXML)

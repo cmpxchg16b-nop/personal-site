@@ -437,7 +437,9 @@
   <!-- The <dynBlogData/> section; holds zero or more <postMetadata/>
        entries followed by zero or more <project/> entries, followed by zero
        or more <authorContact/> entries, followed by zero or more
-       <shortlink/> entries. -->
+       <shortlink/> entries, followed by an optional <entertain/> element
+       carrying the entertain page's media shelves, followed by an optional
+       <menu/> element carrying the top bar's navigation drawer entries. -->
   <xsd:complexType name="dynBlogDataType">
     <xsd:sequence>
       <xsd:element
@@ -464,6 +466,8 @@
         minOccurs="0"
         maxOccurs="unbounded"
       />
+      <xsd:element name="entertain" type="entertainType" minOccurs="0" />
+      <xsd:element name="menu" type="menuType" minOccurs="0" />
     </xsd:sequence>
   </xsd:complexType>
 
@@ -518,6 +522,109 @@
   <xsd:complexType name="shortlinkType">
     <xsd:attribute name="id" type="xsd:string" use="required" />
     <xsd:attribute name="href" type="xsd:string" use="required" />
+  </xsd:complexType>
+
+  <!-- The entertain page's media shelves (see the /entertain page): a Live
+       shelf followed by a Video shelf followed by a Music shelf, each a list
+       of media card entries. The whole element is optional; so is every
+       shelf. Served as JSON by GET /api/dyn/entertain (see pkg/api/dyn). -->
+  <xsd:complexType name="entertainType">
+    <xsd:sequence>
+      <xsd:element
+        name="live"
+        type="mediaType"
+        minOccurs="0"
+        maxOccurs="unbounded"
+      />
+      <xsd:element
+        name="video"
+        type="mediaType"
+        minOccurs="0"
+        maxOccurs="unbounded"
+      />
+      <xsd:element
+        name="music"
+        type="mediaType"
+        minOccurs="0"
+        maxOccurs="unbounded"
+      />
+    </xsd:sequence>
+  </xsd:complexType>
+
+  <!-- A single media card entry of an <entertain/> shelf (<live/>, <video/>,
+       or <music/>). id uniquely identifies the entry; name is the media's
+       slug-like handle (e.g. "mystream"); displayName and description are
+       shown on the card. thumbnail is the card's cover image — a data URL,
+       an absolute URL, or a site-relative URL; optional, the card renders a
+       placeholder tile without one. href is where clicking the card
+       navigates — a site-relative path or an absolute URL. -->
+  <xsd:complexType name="mediaType">
+    <xsd:attribute name="id" type="xsd:string" use="required" />
+    <xsd:attribute name="name" type="xsd:string" use="required" />
+    <xsd:attribute name="displayName" type="xsd:string" use="required" />
+    <xsd:attribute name="description" type="xsd:string" use="required" />
+    <xsd:attribute
+      name="thumbnail"
+      type="xsd:string"
+      use="optional"
+      default=""
+    />
+    <xsd:attribute name="href" type="xsd:string" use="required" />
+  </xsd:complexType>
+
+  <!-- The top bar's navigation drawer entries (see the frontend's
+       NavDrawer): the <menuEntry/> elements in display order. The whole
+       <menu/> element is optional; without it the drawer is empty. Served
+       as JSON by GET /api/dyn/menu (see pkg/api/dyn). -->
+  <xsd:complexType name="menuType">
+    <xsd:sequence>
+      <xsd:element
+        name="menuEntry"
+        type="menuEntryType"
+        minOccurs="0"
+        maxOccurs="unbounded"
+      />
+    </xsd:sequence>
+  </xsd:complexType>
+
+  <!-- A single <menuEntry/> of <menu/>: one entry of the top bar's
+       navigation drawer. id uniquely identifies the entry; name is the
+       page's route slug — the drawer navigates to "/<name>", with the
+       special name "home" mapping to "/"; displayName is the entry's
+       caption — the fallback when no <i18nDisplayName/> child matches the
+       active language. description, optional, is the entry's secondary
+       line. iconClassName picks the entry's icon from the frontend's icon
+       map (e.g. "home", "musicNote"); an unknown value falls back to a
+       generic link icon. -->
+  <xsd:complexType name="menuEntryType">
+    <xsd:sequence>
+      <xsd:element
+        name="i18nDisplayName"
+        type="i18nDisplayNameType"
+        minOccurs="0"
+        maxOccurs="unbounded"
+      />
+    </xsd:sequence>
+    <xsd:attribute name="id" type="xsd:string" use="required" />
+    <xsd:attribute name="name" type="xsd:string" use="required" />
+    <xsd:attribute name="displayName" type="xsd:string" use="required" />
+    <xsd:attribute
+      name="description"
+      type="xsd:string"
+      use="optional"
+      default=""
+    />
+    <xsd:attribute name="iconClassName" type="xsd:string" use="required" />
+  </xsd:complexType>
+
+  <!-- A single <i18nDisplayName/> child of <menuEntry/>: the entry's caption
+       in one language. key is the i18n language code (the frontend's
+       i18n.language — "en", "zh", …); value is the caption shown when that
+       language is active. A language without a matching child falls back to
+       the entry's displayName attribute. -->
+  <xsd:complexType name="i18nDisplayNameType">
+    <xsd:attribute name="key" type="xsd:string" use="required" />
+    <xsd:attribute name="value" type="xsd:string" use="required" />
   </xsd:complexType>
 
 </xsd:schema>

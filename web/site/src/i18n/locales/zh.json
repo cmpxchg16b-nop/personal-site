@@ -4,7 +4,8 @@
   },
   "nav": {
     "breadcrumb": "面包屑",
-    "home": "首页"
+    "home": "首页",
+    "menu": "菜单"
   },
   "profile": {
     "visitor": "访客",
@@ -44,6 +45,20 @@
     "badge": "直播中",
     "offline": "当前未在直播",
     "videoLabel": "直播画面"
+  },
+  "entertain": {
+    "title": "娱乐",
+    "loadFailed": "加载媒体列表失败。",
+    "empty": "这里还空着。",
+    "live": {
+      "title": "直播"
+    },
+    "video": {
+      "title": "视频"
+    },
+    "music": {
+      "title": "音乐"
+    }
   },
   "about": {
     "title": "关于"

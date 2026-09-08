@@ -43,6 +43,65 @@
     />
     <shortlink id="gh" href="https://github.com/your-handle" />
     <shortlink id="first-post" href="/posts/your-first-post" />
+    <!-- The entertain page's media shelves (optional): <live/>, <video/>,
+         and <music/> card entries, served by GET /api/dyn/entertain. name is
+         the media's slug-like handle, displayName and description what the
+         card shows; thumbnail is the card's cover image (a data URL, an
+         absolute URL, or a site-relative URL — optional, a placeholder tile
+         renders without one); href is where clicking the card navigates (a
+         site-relative path or an absolute URL). Every entry carries a
+         unique id. -->
+    <entertain>
+      <live
+        id="mystream"
+        name="mystream"
+        displayName="My Stream"
+        description="The site's own live stream."
+        href="http://localhost:8889/mystream/whep"
+      />
+      <video
+        id="clip-one"
+        name="clip-one"
+        displayName="Clip One"
+        description="A short description of the video goes here."
+        thumbnail="https://example.com/clip-one.png"
+        href="https://example.com/clip-one.mp4"
+      />
+      <music
+        id="track-one"
+        name="track-one"
+        displayName="Track One"
+        description="A short description of the track goes here."
+        href="https://example.com/track-one.mp3"
+      />
+    </entertain>
+    <!-- The top bar's navigation drawer entries (optional), served by GET
+         /api/dyn/menu: name is the route slug ("/" for "home", otherwise
+         "/<name>"); displayName is the entry's caption — the fallback when
+         no <i18nDisplayName/> child matches the active language;
+         description (optional) is the entry's secondary line; iconClassName
+         picks the icon from the frontend's icon map ("home", "musicNote",
+         …). Every entry carries a unique id. -->
+    <menu>
+      <menuEntry
+        id="6ce7ecbd-3ddc-4d58-b2f6-4828a50b7e85"
+        name="home"
+        displayName="Home"
+        iconClassName="home"
+      >
+        <i18nDisplayName key="en" value="Home" />
+        <i18nDisplayName key="zh" value="首页" />
+      </menuEntry>
+      <menuEntry
+        id="d7c2a874-622a-4ff0-8515-f5b028555edf"
+        name="entertain"
+        displayName="Entertain"
+        iconClassName="musicNote"
+      >
+        <i18nDisplayName key="en" value="Entertain" />
+        <i18nDisplayName key="zh" value="娱乐" />
+      </menuEntry>
+    </menu>
   </dynBlogData>
 
   <!-- Generic OIDC login providers (optional), consumed by the generic OIDC

@@ -3,6 +3,7 @@ package dyn
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"testing"
 )
@@ -30,6 +31,18 @@ func TestFSBasedDynBlogData_GetDynBlogData(t *testing.T) {
     <project id="p1" name="Project One" description="First." url="https://example.com/one" tech="Go, Next.js ,"/>
     <project id="p2" name="Project Two" description="Second." url="https://example.com/two"/>
     <authorContact id="c1" kind="email" label="you@example.com" url="mailto:you@example.com"/>
+    <entertain>
+      <live id="mystream" name="mystream" displayName="My Stream" description="The site's own live stream." thumbnail="https://example.com/thumb.png" href="http://localhost:8889/mystream/whep"/>
+      <video id="v1" name="clip-1" displayName="Clip One" description="The first clip." href="/entertain#v1"/>
+      <music id="m1" name="track-1" displayName="Track One" description="The first track." href="/entertain#m1"/>
+    </entertain>
+    <menu>
+      <menuEntry id="6ce7ecbd-3ddc-4d58-b2f6-4828a50b7e85" name="home" displayName="Home" description="The site's home page." iconClassName="home">
+        <i18nDisplayName key="en" value="Home"/>
+        <i18nDisplayName key="zh" value="首页"/>
+      </menuEntry>
+      <menuEntry id="d7c2a874-622a-4ff0-8515-f5b028555edf" name="entertain" displayName="Entertain" iconClassName="musicNote"/>
+    </menu>
   `)
 
 	data, err := NewFSBasedDynBlogData(path).GetDynBlogData()
@@ -79,6 +92,49 @@ func TestFSBasedDynBlogData_GetDynBlogData(t *testing.T) {
 	c1 := data.AuthorContacts[0]
 	if c1.Id != "c1" || c1.Kind != "email" || c1.Label != "you@example.com" || c1.URL != "mailto:you@example.com" {
 		t.Fatalf("unexpected author contact payload: %+v", c1)
+	}
+
+	if len(data.Entertain.Live) != 1 {
+		t.Fatalf("live count: got %d, want 1", len(data.Entertain.Live))
+	}
+	live1 := data.Entertain.Live[0]
+	if live1.Id != "mystream" || live1.Name != "mystream" || live1.DisplayName != "My Stream" || live1.Description != "The site's own live stream." || live1.Href != "http://localhost:8889/mystream/whep" {
+		t.Fatalf("unexpected live payload: %+v", live1)
+	}
+	if live1.Thumbnail != "https://example.com/thumb.png" {
+		t.Fatalf("thumbnail: got %q, want https://example.com/thumb.png", live1.Thumbnail)
+	}
+	if len(data.Entertain.Videos) != 1 || data.Entertain.Videos[0].Id != "v1" {
+		t.Fatalf("unexpected videos payload: %+v", data.Entertain.Videos)
+	}
+	if len(data.Entertain.Music) != 1 || data.Entertain.Music[0].Id != "m1" {
+		t.Fatalf("unexpected music payload: %+v", data.Entertain.Music)
+	}
+	// thumbnail is optional: absent means empty.
+	if data.Entertain.Videos[0].Thumbnail != "" {
+		t.Fatalf("thumbnail without attribute: got %q, want empty", data.Entertain.Videos[0].Thumbnail)
+	}
+
+	if len(data.Menu) != 2 {
+		t.Fatalf("menu count: got %d, want 2", len(data.Menu))
+	}
+	home := data.Menu[0]
+	if home.Id != "6ce7ecbd-3ddc-4d58-b2f6-4828a50b7e85" || home.Name != "home" || home.DisplayName != "Home" || home.Description != "The site's home page." || home.IconClassName != "home" {
+		t.Fatalf("unexpected menu entry payload: %+v", home)
+	}
+	if !reflect.DeepEqual(home.I18nDisplayNames, map[string]string{"en": "Home", "zh": "首页"}) {
+		t.Fatalf("i18nDisplayNames: got %v, want map[en:Home zh:首页]", home.I18nDisplayNames)
+	}
+	if data.Menu[1].Name != "entertain" || data.Menu[1].IconClassName != "musicNote" {
+		t.Fatalf("unexpected menu entry payload: %+v", data.Menu[1])
+	}
+	// description is optional: absent means empty.
+	if data.Menu[1].Description != "" {
+		t.Fatalf("description without attribute: got %q, want empty", data.Menu[1].Description)
+	}
+	// i18nDisplayName children are optional: absent means a nil map.
+	if data.Menu[1].I18nDisplayNames != nil {
+		t.Fatalf("i18nDisplayNames without children: got %v, want nil", data.Menu[1].I18nDisplayNames)
 	}
 }
 

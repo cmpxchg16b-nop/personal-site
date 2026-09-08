@@ -1,6 +1,7 @@
-// Package dyn models the site's dynamic blog data — the project and
-// author-contact lists the frontend renders — and how that data is provided
-// to the API layer (see pkg/api/dyn, which serves it under /api/dyn/).
+// Package dyn models the site's dynamic blog data — the post metadata,
+// project and author-contact lists, and the entertain page's media shelves
+// the frontend renders — and how that data is provided to the API layer (see
+// pkg/api/dyn, which serves it under /api/dyn/).
 //
 // The data is authored in the <dynBlogData/> section of the global server
 // configuration document (serverConfig.xml, validated against
@@ -47,12 +48,57 @@ type AuthorContact struct {
 	URL   string `json:"url"`
 }
 
+// Media is one media card entry of the entertain page's Live, Video, or
+// Music shelf. Id uniquely identifies the entry; Name is the media's
+// slug-like handle (e.g. "mystream"); DisplayName and Description are shown
+// on the card. Thumbnail is the card's cover image — a data URL, an absolute
+// URL, or a site-relative URL; empty renders a placeholder tile. Href is
+// where clicking the card navigates — a site-relative path or an absolute
+// URL.
+type Media struct {
+	Id          string `json:"id"`
+	Name        string `json:"name"`
+	DisplayName string `json:"displayName"`
+	Description string `json:"description"`
+	Thumbnail   string `json:"thumbnail,omitempty"`
+	Href        string `json:"href"`
+}
+
+// Entertain is the entertain page's dynamic content: the Live, Video, and
+// Music media shelves, served by GET /api/dyn/entertain.
+type Entertain struct {
+	Live   []Media `json:"live"`
+	Videos []Media `json:"videos"`
+	Music  []Media `json:"music"`
+}
+
+// MenuEntry is one entry of the top bar's navigation drawer. Id uniquely
+// identifies the entry; Name is the page's route slug — the drawer navigates
+// to "/<name>", with the special name "home" mapping to "/"; DisplayName
+// is the entry's caption — the fallback when I18nDisplayNames carries no
+// caption for the active language. Description, optional, is the entry's
+// secondary line (empty when the entry defines none). IconClassName picks
+// the entry's icon from the frontend's icon map (e.g. "home",
+// "musicNote").
+type MenuEntry struct {
+	Id          string `json:"id"`
+	Name        string `json:"name"`
+	DisplayName string `json:"displayName"`
+	// I18nDisplayNames maps an i18n language code ("en", "zh", …) to the
+	// entry's caption in that language; nil when the entry defines none.
+	I18nDisplayNames map[string]string `json:"i18nDisplayNames,omitempty"`
+	Description      string            `json:"description,omitempty"`
+	IconClassName    string            `json:"iconClassName"`
+}
+
 // DynBlogData is the whole of the site's dynamic blog data: everything the
 // <dynBlogData/> section of the server configuration document carries.
 type DynBlogData struct {
 	Posts          []PostMetadata  `json:"posts"`
 	Projects       []Project       `json:"projects"`
 	AuthorContacts []AuthorContact `json:"authorContacts"`
+	Entertain      Entertain       `json:"entertain"`
+	Menu           []MenuEntry     `json:"menu"`
 }
 
 // DynBlogDataProvider supplies the site's dynamic blog data to the API
@@ -98,6 +144,8 @@ type dynBlogDataXML struct {
 	Posts          []postMetadataXML  `xml:"postMetadata"`
 	Projects       []projectXML       `xml:"project"`
 	AuthorContacts []authorContactXML `xml:"authorContact"`
+	Entertain      entertainXML       `xml:"entertain"`
+	Menu           []menuEntryXML     `xml:"menu>menuEntry"`
 }
 
 // postMetadataXML mirrors a single <postMetadata/> entry of the
@@ -135,11 +183,55 @@ type authorContactXML struct {
 	URL   string `xml:"url,attr"`
 }
 
+// entertainXML mirrors the <entertain/> element of the <dynBlogData/>
+// section of serverConfig.xml: the entertain page's three media shelves.
+type entertainXML struct {
+	Live   []mediaXML `xml:"live"`
+	Videos []mediaXML `xml:"video"`
+	Music  []mediaXML `xml:"music"`
+}
+
+// mediaXML mirrors a single <live/>, <video/>, or <music/> entry of the
+// <entertain/> element of serverConfig.xml.
+type mediaXML struct {
+	Id          string `xml:"id,attr"`
+	Name        string `xml:"name,attr"`
+	DisplayName string `xml:"displayName,attr"`
+	Description string `xml:"description,attr"`
+	Thumbnail   string `xml:"thumbnail,attr"`
+	Href        string `xml:"href,attr"`
+}
+
+// menuEntryXML mirrors a single <menuEntry/> entry of the <menu/> element of
+// serverConfig.xml.
+type menuEntryXML struct {
+	Id               string               `xml:"id,attr"`
+	Name             string               `xml:"name,attr"`
+	DisplayName      string               `xml:"displayName,attr"`
+	Description      string               `xml:"description,attr"`
+	IconClassName    string               `xml:"iconClassName,attr"`
+	I18nDisplayNames []i18nDisplayNameXML `xml:"i18nDisplayName"`
+}
+
+// i18nDisplayNameXML mirrors a single <i18nDisplayName/> child of a
+// <menuEntry/> element of serverConfig.xml: Key is the i18n language code
+// ("en", "zh", …), Value the entry's caption in that language.
+type i18nDisplayNameXML struct {
+	Key   string `xml:"key,attr"`
+	Value string `xml:"value,attr"`
+}
+
 func (x dynBlogDataXML) toDynBlogData() *DynBlogData {
 	data := &DynBlogData{
 		Posts:          make([]PostMetadata, 0, len(x.Posts)),
 		Projects:       make([]Project, 0, len(x.Projects)),
 		AuthorContacts: make([]AuthorContact, 0, len(x.AuthorContacts)),
+		Entertain: Entertain{
+			Live:   make([]Media, 0, len(x.Entertain.Live)),
+			Videos: make([]Media, 0, len(x.Entertain.Videos)),
+			Music:  make([]Media, 0, len(x.Entertain.Music)),
+		},
+		Menu: make([]MenuEntry, 0, len(x.Menu)),
 	}
 	for _, p := range x.Posts {
 		data.Posts = append(data.Posts, PostMetadata{
@@ -169,7 +261,47 @@ func (x dynBlogDataXML) toDynBlogData() *DynBlogData {
 			URL:   c.URL,
 		})
 	}
+	for _, m := range x.Entertain.Live {
+		data.Entertain.Live = append(data.Entertain.Live, m.toMedia())
+	}
+	for _, m := range x.Entertain.Videos {
+		data.Entertain.Videos = append(data.Entertain.Videos, m.toMedia())
+	}
+	for _, m := range x.Entertain.Music {
+		data.Entertain.Music = append(data.Entertain.Music, m.toMedia())
+	}
+	for _, e := range x.Menu {
+		data.Menu = append(data.Menu, e.toMenuEntry())
+	}
 	return data
+}
+
+func (m mediaXML) toMedia() Media {
+	return Media{
+		Id:          m.Id,
+		Name:        m.Name,
+		DisplayName: m.DisplayName,
+		Description: m.Description,
+		Thumbnail:   m.Thumbnail,
+		Href:        m.Href,
+	}
+}
+
+func (e menuEntryXML) toMenuEntry() MenuEntry {
+	entry := MenuEntry{
+		Id:            e.Id,
+		Name:          e.Name,
+		DisplayName:   e.DisplayName,
+		Description:   e.Description,
+		IconClassName: e.IconClassName,
+	}
+	if len(e.I18nDisplayNames) > 0 {
+		entry.I18nDisplayNames = make(map[string]string, len(e.I18nDisplayNames))
+		for _, d := range e.I18nDisplayNames {
+			entry.I18nDisplayNames[d.Key] = d.Value
+		}
+	}
+	return entry
 }
 
 // parseCommaSeparated parses a comma-separated attribute (a project's tech,

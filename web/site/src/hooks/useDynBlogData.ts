@@ -3,10 +3,10 @@
 import { useQuery } from "@tanstack/react-query";
 
 // Wire types mirroring the JSON served by the Go backend's pkg/api/dyn:
-// GET /api/dyn/posts, GET /api/dyn/posts/{id}, GET /api/dyn/projects, and
-// GET /api/dyn/authorcontacts, sourced from the <dynBlogData/> section of
-// the server configuration document and re-read on every request
-// server-side.
+// GET /api/dyn/posts, GET /api/dyn/posts/{id}, GET /api/dyn/projects,
+// GET /api/dyn/authorcontacts, and GET /api/dyn/entertain, sourced from the
+// <dynBlogData/> section of the server configuration document and re-read on
+// every request server-side.
 export type DynPost = {
   id: string;
   href: string;
@@ -32,6 +32,41 @@ export type DynAuthorContact = {
   kind: string;
   label: string;
   url: string;
+};
+
+// One media card of the entertain page's Live, Video, or Music shelf.
+// thumbnail is the card's cover image (a data URL, an absolute URL, or a
+// site-relative URL; absent renders a placeholder tile); href is where
+// clicking the card navigates.
+export type DynMedia = {
+  id: string;
+  name: string;
+  displayName: string;
+  description: string;
+  thumbnail?: string;
+  href: string;
+};
+
+// The entertain page's three media shelves.
+export type DynEntertain = {
+  live: DynMedia[];
+  videos: DynMedia[];
+  music: DynMedia[];
+};
+
+// One entry of the top bar's navigation drawer. name is the page's route
+// slug ("/" for "home", otherwise "/<name>"); displayName is the caption's
+// fallback, overridden by i18nDisplayNames[i18n.language] when the active
+// language has an entry; description, when present, is the entry's
+// secondary line; iconClassName picks the entry's icon from NavDrawer's
+// icon map ("home", "musicNote", …).
+export type DynMenuEntry = {
+  id: string;
+  name: string;
+  displayName: string;
+  i18nDisplayNames?: Record<string, string>;
+  description?: string;
+  iconClassName: string;
 };
 
 async function fetchJson<T>(path: string): Promise<T> {
@@ -86,5 +121,23 @@ export function useDynAuthorContacts() {
   return useQuery({
     queryKey: ["dyn", "authorcontacts"],
     queryFn: () => fetchJson<DynAuthorContact[]>("/api/dyn/authorcontacts"),
+  });
+}
+
+// useDynEntertain fetches GET /api/dyn/entertain: the entertain page's Live,
+// Video, and Music media shelves in one round trip.
+export function useDynEntertain() {
+  return useQuery({
+    queryKey: ["dyn", "entertain"],
+    queryFn: () => fetchJson<DynEntertain>("/api/dyn/entertain"),
+  });
+}
+
+// useDynMenu fetches GET /api/dyn/menu: the top bar's navigation drawer
+// entries, in display order.
+export function useDynMenu() {
+  return useQuery({
+    queryKey: ["dyn", "menu"],
+    queryFn: () => fetchJson<DynMenuEntry[]>("/api/dyn/menu"),
   });
 }

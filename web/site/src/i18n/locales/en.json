@@ -4,7 +4,8 @@
   },
   "nav": {
     "breadcrumb": "breadcrumb",
-    "home": "Home"
+    "home": "Home",
+    "menu": "Menu"
   },
   "profile": {
     "visitor": "Visitor",
@@ -44,6 +45,20 @@
     "badge": "LIVE",
     "offline": "The stream is offline",
     "videoLabel": "Live stream video"
+  },
+  "entertain": {
+    "title": "Entertain",
+    "loadFailed": "Failed to load the media lists.",
+    "empty": "Nothing here yet.",
+    "live": {
+      "title": "Live"
+    },
+    "video": {
+      "title": "Video"
+    },
+    "music": {
+      "title": "Music"
+    }
   },
   "about": {
     "title": "About"
