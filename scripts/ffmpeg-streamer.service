@@ -1,0 +1,32 @@
+# systemd unit for ffmpeg-streamer.
+# Generated from scripts/ffmpeg-streamer.service by
+# scripts/install-ffmpeg-streamer-service.sh; edit the template, then re-run
+# the installer instead of modifying the installed copy.
+
+[Unit]
+Description=ffmpeg-streamer - loop list.txt into mediamtx as an RTSP test stream
+Documentation=https://ffmpeg.org/ffmpeg.html
+Requires=@MEDIAMTX_UNIT@
+After=network-online.target @MEDIAMTX_UNIT@
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@SERVICE_USER@
+WorkingDirectory=@PROJECT_DIR@
+ExecStart=@FFMPEG_BIN@ -re -stream_loop -1 \
+	-f concat -i list.txt \
+	-c:v copy \
+	-c:a opus -strict -2 -ar 48000 -ac 2 -b:a 320k \
+	-f rtsp rtsp://localhost:8554/mystream
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+
+# Requires=@MEDIAMTX_UNIT@ makes systemd activate mediamtx before this unit
+# and stop this unit when mediamtx is stopped, so the streamer never runs
+# standalone. list.txt is relative to WorkingDirectory and is re-read on each
+# loop iteration, but adding/removing entries needs a service restart.
+
+[Install]
+WantedBy=multi-user.target
