@@ -4,9 +4,10 @@ import { useQuery } from "@tanstack/react-query";
 
 // Wire types mirroring the JSON served by the Go backend's pkg/api/dyn:
 // GET /api/dyn/posts, GET /api/dyn/posts/{id}, GET /api/dyn/projects,
-// GET /api/dyn/authorcontacts, and GET /api/dyn/entertain, sourced from the
-// <dynBlogData/> section of the server configuration document and re-read on
-// every request server-side.
+// GET /api/dyn/authorcontacts, GET /api/dyn/entertain, and
+// GET /api/dyn/playables/{mediaId}, sourced from the <dynBlogData/> section
+// of the server configuration document and re-read on every request
+// server-side.
 export type DynPost = {
   id: string;
   href: string;
@@ -36,15 +37,27 @@ export type DynAuthorContact = {
 
 // One media card of the entertain page's Live, Video, or Music shelf.
 // thumbnail is the card's cover image (a data URL, an absolute URL, or a
-// site-relative URL; absent renders a placeholder tile); href is where
-// clicking the card navigates.
+// site-relative URL; absent renders a placeholder tile); href, optional, is
+// where clicking the card navigates — without one the card links to the
+// play page (/play?mediaId=<id>), which plays the media's playable sources.
 export type DynMedia = {
   id: string;
   name: string;
   displayName: string;
   description: string;
   thumbnail?: string;
-  href: string;
+  href?: string;
+};
+
+// One playable source of a media entry: the protocol-typed endpoint the
+// play page plays the media from. mediaId is the media entry's id — several
+// playables may share one (e.g. a WHEP and an HLS variant of the same
+// stream).
+export type DynPlayable = {
+  id: string;
+  mediaId: string;
+  type: "whep" | "hls";
+  url: string;
 };
 
 // The entertain page's three media shelves.
@@ -139,5 +152,17 @@ export function useDynMenu() {
   return useQuery({
     queryKey: ["dyn", "menu"],
     queryFn: () => fetchJson<DynMenuEntry[]>("/api/dyn/menu"),
+  });
+}
+
+// useDynPlayables fetches GET /api/dyn/playables/{mediaId} — the
+// getPlayableByMediaId operation: the playable sources of one media entry
+// (an empty array when the media defines none). enabled gates the fetch
+// (default true): pass false when no media id is available.
+export function useDynPlayables(mediaId: string, enabled = true) {
+  return useQuery({
+    queryKey: ["dyn", "playables", mediaId],
+    queryFn: () => fetchJson<DynPlayable[]>(`/api/dyn/playables/${mediaId}`),
+    enabled,
   });
 }

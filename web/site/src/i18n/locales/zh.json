@@ -60,6 +60,14 @@
       "title": "音乐"
     }
   },
+  "play": {
+    "title": "播放",
+    "unplayable": "当前媒体不可播放。",
+    "loadFailed": "加载媒体的播放源失败。",
+    "videoLabel": "媒体播放画面",
+    "retrying": "播放失败，正在重试…",
+    "unsupported": "当前浏览器不支持播放 HLS 流。"
+  },
   "about": {
     "title": "关于"
   },

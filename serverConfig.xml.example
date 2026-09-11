@@ -48,16 +48,17 @@
          the media's slug-like handle, displayName and description what the
          card shows; thumbnail is the card's cover image (a data URL, an
          absolute URL, or a site-relative URL — optional, a placeholder tile
-         renders without one); href is where clicking the card navigates (a
-         site-relative path or an absolute URL). Every entry carries a
-         unique id. -->
+         renders without one); href (optional) is where clicking the card
+         navigates (a site-relative path or an absolute URL) — without one
+         the card links to the site's play page (/play?mediaId=<id>), which
+         plays the entry's <playable/> sources below. Every entry carries a
+         unique id: the media id. -->
     <entertain>
       <live
         id="mystream"
         name="mystream"
         displayName="My Stream"
         description="The site's own live stream."
-        href="http://localhost:8889/mystream/whep"
       />
       <video
         id="clip-one"
@@ -75,6 +76,25 @@
         href="https://example.com/track-one.mp3"
       />
     </entertain>
+    <!-- The playable sources of the media entries above (optional), served
+         by the getPlayableByMediaId operation — GET
+         /api/dyn/playables/{mediaId}: the play page resolves the media id of
+         an href-less card through them. mediaId is the media entry's id —
+         several playables may share one (e.g. a WHEP and an HLS variant of
+         the same stream); type is the protocol url speaks ("whep" or
+         "hls"). Every entry carries a unique id. -->
+    <playable
+      id="mystream-whep"
+      mediaId="mystream"
+      type="whep"
+      url="http://localhost:8889/mystream/whep"
+    />
+    <playable
+      id="mystream-hls"
+      mediaId="mystream"
+      type="hls"
+      url="http://localhost:8889/mystream/index.m3u8"
+    />
     <!-- The top bar's navigation drawer entries (optional), served by GET
          /api/dyn/menu: name is the route slug ("/" for "home", otherwise
          "/<name>"); displayName is the entry's caption — the fallback when

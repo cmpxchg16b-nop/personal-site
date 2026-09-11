@@ -17,15 +17,21 @@ import (
 // DynamicBlogDataHandler is an http.Handler that serves the site's dynamic
 // blog data, routing the /api/dyn/ subtree internally:
 //
-//	GET /api/dyn/posts           the blog post metadata list
-//	GET /api/dyn/posts/{id}      a single post's metadata (404 when the id is
-//	                             unknown) — lets post pages query one post
-//	                             without downloading the whole list
-//	GET /api/dyn/projects        the project list
-//	GET /api/dyn/authorcontacts  the author-contact list
-//	GET /api/dyn/entertain       the entertain page's media shelves (live,
-//	                             videos, music)
-//	GET /api/dyn/menu            the top bar's navigation drawer entries
+//	GET /api/dyn/posts                  the blog post metadata list
+//	GET /api/dyn/posts/{id}             a single post's metadata (404 when
+//	                                    the id is unknown) — lets post pages
+//	                                    query one post without downloading the
+//	                                    whole list
+//	GET /api/dyn/projects               the project list
+//	GET /api/dyn/authorcontacts         the author-contact list
+//	GET /api/dyn/entertain              the entertain page's media shelves
+//	                                    (live, videos, music)
+//	GET /api/dyn/menu                   the top bar's navigation drawer
+//	                                    entries
+//	GET /api/dyn/playables/{mediaId}    the getPlayableByMediaId operation:
+//	                                    the playable sources of one media
+//	                                    entry (an empty array when the media
+//	                                    has none)
 //
 // The handler asks its provider for the data on every request, so a provider
 // that re-reads its source (e.g. FSBasedDynBlogData) serves edits without a
@@ -48,6 +54,7 @@ func NewDynamicBlogDataHandler(provider pkgmodelsdyn.DynBlogDataProvider) *Dynam
 	mux.HandleFunc("GET /api/dyn/authorcontacts", h.handleAuthorContacts)
 	mux.HandleFunc("GET /api/dyn/entertain", h.handleEntertain)
 	mux.HandleFunc("GET /api/dyn/menu", h.handleMenu)
+	mux.HandleFunc("GET /api/dyn/playables/{mediaId}", h.handlePlayablesByMediaId)
 	h.mux = mux
 	return h
 }
@@ -155,6 +162,28 @@ func (h *DynamicBlogDataHandler) handleMenu(w http.ResponseWriter, r *http.Reque
 		menu = []pkgmodelsdyn.MenuEntry{}
 	}
 	writeJSON(w, menu)
+}
+
+// handlePlayablesByMediaId serves the playable sources of one media entry —
+// the getPlayableByMediaId operation: every playable whose mediaId matches
+// the {mediaId} path segment, in document order. A media id with no
+// playables (or no media at all) answers an empty array, not 404: having no
+// playable sources is a normal state, not an unknown resource.
+func (h *DynamicBlogDataHandler) handlePlayablesByMediaId(w http.ResponseWriter, r *http.Request) {
+	data, err := h.getDynBlogData()
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	mediaId := r.PathValue("mediaId")
+	// Never serialize a nil slice: the response stays a JSON array.
+	playables := []pkgmodelsdyn.Playable{}
+	for _, p := range data.Playables {
+		if p.MediaId == mediaId {
+			playables = append(playables, p)
+		}
+	}
+	writeJSON(w, playables)
 }
 
 func writeJSON(w http.ResponseWriter, v any) {

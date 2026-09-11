@@ -46,6 +46,10 @@ var testData = &pkgmodelsdyn.DynBlogData{
 		{Id: "6ce7ecbd-3ddc-4d58-b2f6-4828a50b7e85", Name: "home", DisplayName: "Home", I18nDisplayNames: map[string]string{"en": "Home", "zh": "首页"}, Description: "The site's home page.", IconClassName: "home"},
 		{Id: "d7c2a874-622a-4ff0-8515-f5b028555edf", Name: "entertain", DisplayName: "Entertain", Description: "Live streams, videos, and music.", IconClassName: "musicNote"},
 	},
+	Playables: []pkgmodelsdyn.Playable{
+		{Id: "mystream-whep", MediaId: "mystream", Type: pkgmodelsdyn.PlayableTypeWHEP, URL: "http://localhost:8889/mystream/whep"},
+		{Id: "mystream-hls", MediaId: "mystream", Type: pkgmodelsdyn.PlayableTypeHLS, URL: "http://localhost:8889/mystream/index.m3u8"},
+	},
 }
 
 func TestDynamicBlogDataHandler_ServesPosts(t *testing.T) {
@@ -197,10 +201,42 @@ func TestDynamicBlogDataHandler_ServesMenu(t *testing.T) {
 	}
 }
 
+func TestDynamicBlogDataHandler_ServesPlayablesByMediaId(t *testing.T) {
+	h := NewDynamicBlogDataHandler(stubProvider{data: testData})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/dyn/playables/mystream", nil))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status: got %d, want %d", rec.Code, http.StatusOK)
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
+		t.Fatalf("Content-Type: got %q, want application/json", ct)
+	}
+
+	var got []pkgmodelsdyn.Playable
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("response is not a JSON array: %v", err)
+	}
+	if len(got) != 2 || got[0].Id != "mystream-whep" || got[0].Type != pkgmodelsdyn.PlayableTypeWHEP || got[1].Id != "mystream-hls" || got[1].URL != "http://localhost:8889/mystream/index.m3u8" {
+		t.Fatalf("unexpected playables payload: %+v", got)
+	}
+
+	// A media id with no playables answers an empty array, not 404.
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/dyn/playables/nope", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unknown media id: status: got %d, want %d", rec.Code, http.StatusOK)
+	}
+	if body := rec.Body.String(); body != "[]\n" {
+		t.Fatalf("unknown media id: body: got %q, want %q", body, "[]\n")
+	}
+}
+
 func TestDynamicBlogDataHandler_NilProviderServesEmptyArrays(t *testing.T) {
 	h := NewDynamicBlogDataHandler(nil)
 
-	for _, path := range []string{"/api/dyn/posts", "/api/dyn/projects", "/api/dyn/authorcontacts", "/api/dyn/menu"} {
+	for _, path := range []string{"/api/dyn/posts", "/api/dyn/projects", "/api/dyn/authorcontacts", "/api/dyn/menu", "/api/dyn/playables/mystream"} {
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
 
@@ -233,7 +269,7 @@ func TestDynamicBlogDataHandler_NilProviderServesEmptyArrays(t *testing.T) {
 func TestDynamicBlogDataHandler_ProviderError(t *testing.T) {
 	h := NewDynamicBlogDataHandler(stubProvider{err: errors.New("boom")})
 
-	for _, path := range []string{"/api/dyn/projects", "/api/dyn/posts/post-1"} {
+	for _, path := range []string{"/api/dyn/projects", "/api/dyn/posts/post-1", "/api/dyn/playables/mystream"} {
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
 

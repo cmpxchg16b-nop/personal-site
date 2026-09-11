@@ -34,8 +34,10 @@ func TestFSBasedDynBlogData_GetDynBlogData(t *testing.T) {
     <entertain>
       <live id="mystream" name="mystream" displayName="My Stream" description="The site's own live stream." thumbnail="https://example.com/thumb.png" href="http://localhost:8889/mystream/whep"/>
       <video id="v1" name="clip-1" displayName="Clip One" description="The first clip." href="/entertain#v1"/>
-      <music id="m1" name="track-1" displayName="Track One" description="The first track." href="/entertain#m1"/>
+      <music id="m1" name="track-1" displayName="Track One" description="The first track."/>
     </entertain>
+    <playable id="mystream-whep" mediaId="mystream" type="whep" url="http://localhost:8889/mystream/whep"/>
+    <playable id="mystream-hls" mediaId="mystream" type="hls" url="http://localhost:8889/mystream/index.m3u8"/>
     <menu>
       <menuEntry id="6ce7ecbd-3ddc-4d58-b2f6-4828a50b7e85" name="home" displayName="Home" description="The site's home page." iconClassName="home">
         <i18nDisplayName key="en" value="Home"/>
@@ -113,6 +115,21 @@ func TestFSBasedDynBlogData_GetDynBlogData(t *testing.T) {
 	// thumbnail is optional: absent means empty.
 	if data.Entertain.Videos[0].Thumbnail != "" {
 		t.Fatalf("thumbnail without attribute: got %q, want empty", data.Entertain.Videos[0].Thumbnail)
+	}
+	// href is optional: absent means empty.
+	if data.Entertain.Music[0].Href != "" {
+		t.Fatalf("href without attribute: got %q, want empty", data.Entertain.Music[0].Href)
+	}
+
+	if len(data.Playables) != 2 {
+		t.Fatalf("playables count: got %d, want 2", len(data.Playables))
+	}
+	whep := data.Playables[0]
+	if whep.Id != "mystream-whep" || whep.MediaId != "mystream" || whep.Type != PlayableTypeWHEP || whep.URL != "http://localhost:8889/mystream/whep" {
+		t.Fatalf("unexpected playable payload: %+v", whep)
+	}
+	if data.Playables[1].Id != "mystream-hls" || data.Playables[1].Type != PlayableTypeHLS {
+		t.Fatalf("unexpected playable payload: %+v", data.Playables[1])
 	}
 
 	if len(data.Menu) != 2 {

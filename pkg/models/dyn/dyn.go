@@ -49,19 +49,43 @@ type AuthorContact struct {
 }
 
 // Media is one media card entry of the entertain page's Live, Video, or
-// Music shelf. Id uniquely identifies the entry; Name is the media's
-// slug-like handle (e.g. "mystream"); DisplayName and Description are shown
-// on the card. Thumbnail is the card's cover image — a data URL, an absolute
-// URL, or a site-relative URL; empty renders a placeholder tile. Href is
-// where clicking the card navigates — a site-relative path or an absolute
-// URL.
+// Music shelf. Id uniquely identifies the entry — the media id; Name is the
+// media's slug-like handle (e.g. "mystream"); DisplayName and Description
+// are shown on the card. Thumbnail is the card's cover image — a data URL,
+// an absolute URL, or a site-relative URL; empty renders a placeholder
+// tile. Href, optional, is where clicking the card navigates — a
+// site-relative path or an absolute URL; without one the frontend links the
+// card to the site's play page (/play?mediaId=<id>), which plays the
+// media's Playable sources.
 type Media struct {
 	Id          string `json:"id"`
 	Name        string `json:"name"`
 	DisplayName string `json:"displayName"`
 	Description string `json:"description"`
 	Thumbnail   string `json:"thumbnail,omitempty"`
-	Href        string `json:"href"`
+	Href        string `json:"href,omitempty"`
+}
+
+// PlayableType is the streaming protocol a Playable's URL speaks:
+// PlayableTypeWHEP (WebRTC HTTP Egress Protocol) or PlayableTypeHLS.
+type PlayableType string
+
+const (
+	PlayableTypeWHEP PlayableType = "whep"
+	PlayableTypeHLS  PlayableType = "hls"
+)
+
+// Playable is one playable source of a media entry — a <live/>, <video/>,
+// or <music/> entry of the entertain page's shelves. Id uniquely identifies
+// the entry; MediaId is the media id of the entry it plays — several
+// playables may share a media id (e.g. a WHEP and an HLS variant of the
+// same stream); Type is the protocol URL speaks; URL is the endpoint to
+// play from.
+type Playable struct {
+	Id      string       `json:"id"`
+	MediaId string       `json:"mediaId"`
+	Type    PlayableType `json:"type"`
+	URL     string       `json:"url"`
 }
 
 // Entertain is the entertain page's dynamic content: the Live, Video, and
@@ -99,6 +123,7 @@ type DynBlogData struct {
 	AuthorContacts []AuthorContact `json:"authorContacts"`
 	Entertain      Entertain       `json:"entertain"`
 	Menu           []MenuEntry     `json:"menu"`
+	Playables      []Playable      `json:"playables"`
 }
 
 // DynBlogDataProvider supplies the site's dynamic blog data to the API
@@ -145,6 +170,7 @@ type dynBlogDataXML struct {
 	Projects       []projectXML       `xml:"project"`
 	AuthorContacts []authorContactXML `xml:"authorContact"`
 	Entertain      entertainXML       `xml:"entertain"`
+	Playables      []playableXML      `xml:"playable"`
 	Menu           []menuEntryXML     `xml:"menu>menuEntry"`
 }
 
@@ -202,6 +228,15 @@ type mediaXML struct {
 	Href        string `xml:"href,attr"`
 }
 
+// playableXML mirrors a single <playable/> entry of the <dynBlogData/>
+// section of serverConfig.xml.
+type playableXML struct {
+	Id      string `xml:"id,attr"`
+	MediaId string `xml:"mediaId,attr"`
+	Type    string `xml:"type,attr"`
+	URL     string `xml:"url,attr"`
+}
+
 // menuEntryXML mirrors a single <menuEntry/> entry of the <menu/> element of
 // serverConfig.xml.
 type menuEntryXML struct {
@@ -231,7 +266,8 @@ func (x dynBlogDataXML) toDynBlogData() *DynBlogData {
 			Videos: make([]Media, 0, len(x.Entertain.Videos)),
 			Music:  make([]Media, 0, len(x.Entertain.Music)),
 		},
-		Menu: make([]MenuEntry, 0, len(x.Menu)),
+		Menu:      make([]MenuEntry, 0, len(x.Menu)),
+		Playables: make([]Playable, 0, len(x.Playables)),
 	}
 	for _, p := range x.Posts {
 		data.Posts = append(data.Posts, PostMetadata{
@@ -273,6 +309,9 @@ func (x dynBlogDataXML) toDynBlogData() *DynBlogData {
 	for _, e := range x.Menu {
 		data.Menu = append(data.Menu, e.toMenuEntry())
 	}
+	for _, p := range x.Playables {
+		data.Playables = append(data.Playables, p.toPlayable())
+	}
 	return data
 }
 
@@ -284,6 +323,15 @@ func (m mediaXML) toMedia() Media {
 		Description: m.Description,
 		Thumbnail:   m.Thumbnail,
 		Href:        m.Href,
+	}
+}
+
+func (p playableXML) toPlayable() Playable {
+	return Playable{
+		Id:      p.Id,
+		MediaId: p.MediaId,
+		Type:    PlayableType(p.Type),
+		URL:     p.URL,
 	}
 }
 

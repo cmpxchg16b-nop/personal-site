@@ -80,9 +80,14 @@ document, so they can be edited without rebuilding the frontend:
   optional comma-separated `tech`), and `<authorContact/>` (`id`, `kind`,
   `label`, `url`). Every entry carries a unique `id`. An optional
   `<entertain/>` element carries the entertain page's media shelves —
-  `<live/>`, `<video/>`, and `<music/>` card entries (`id`, `name`,
-  `displayName`, `description`, optional `thumbnail` — a data URL, an
-  absolute URL, or a site-relative URL — and `href`). An optional `<menu/>`
+  `<live/>`, `<video/>`, and `<music/>` card entries (`id` — the media id —
+  `name`, `displayName`, `description`, optional `thumbnail` — a data URL,
+  an absolute URL, or a site-relative URL — and optional `href`: without
+  one the card links to the site's play page). Zero or more `<playable/>`
+  entries carry the media entries' playable sources (`id`, `mediaId` — the
+  media entry's id; several playables may share one, e.g. a WHEP and an HLS
+  variant of the same stream — `type` (`"whep"` or `"hls"`), and `url`,
+  the endpoint to play from). An optional `<menu/>`
   element carries the top bar's navigation drawer entries — `<menuEntry/>`
   elements (`id`, `name` — the route slug: `/` for `home`, otherwise
   `/<name>` — `displayName` — the fallback caption — optional `description`,
@@ -96,7 +101,9 @@ document, so they can be edited without rebuilding the frontend:
   unknown — post pages query it instead of downloading the whole list),
   `GET /api/dyn/projects`, `GET /api/dyn/authorcontacts`, `GET
 /api/dyn/entertain` (the entertain page's Live, Video, and Music shelves in
-  one object), and `GET /api/dyn/menu` (the navigation drawer entries). The
+  one object), `GET /api/dyn/menu` (the navigation drawer entries), and
+  `GET /api/dyn/playables/{mediaId}` — the getPlayableByMediaId operation:
+  a media entry's playable sources (an empty array when it has none). The
   list endpoints return JSON arrays.
 - **Read on the fly.** The handler asks a `DynBlogDataProvider`
   (`pkg/models/dyn`) for the data on every request. The shipped

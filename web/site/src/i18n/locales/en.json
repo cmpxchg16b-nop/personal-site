@@ -60,6 +60,14 @@
       "title": "Music"
     }
   },
+  "play": {
+    "title": "Play",
+    "unplayable": "The current media is unplayable.",
+    "loadFailed": "Failed to load the media's playable sources.",
+    "videoLabel": "Media player",
+    "retrying": "Playback failed — retrying…",
+    "unsupported": "This browser cannot play HLS streams."
+  },
   "about": {
     "title": "About"
   },

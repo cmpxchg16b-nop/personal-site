@@ -438,8 +438,10 @@
        entries followed by zero or more <project/> entries, followed by zero
        or more <authorContact/> entries, followed by zero or more
        <shortlink/> entries, followed by an optional <entertain/> element
-       carrying the entertain page's media shelves, followed by an optional
-       <menu/> element carrying the top bar's navigation drawer entries. -->
+       carrying the entertain page's media shelves, followed by zero or more
+       <playable/> entries carrying the media entries' playable sources,
+       followed by an optional <menu/> element carrying the top bar's
+       navigation drawer entries. -->
   <xsd:complexType name="dynBlogDataType">
     <xsd:sequence>
       <xsd:element
@@ -467,6 +469,12 @@
         maxOccurs="unbounded"
       />
       <xsd:element name="entertain" type="entertainType" minOccurs="0" />
+      <xsd:element
+        name="playable"
+        type="playableType"
+        minOccurs="0"
+        maxOccurs="unbounded"
+      />
       <xsd:element name="menu" type="menuType" minOccurs="0" />
     </xsd:sequence>
   </xsd:complexType>
@@ -552,12 +560,14 @@
   </xsd:complexType>
 
   <!-- A single media card entry of an <entertain/> shelf (<live/>, <video/>,
-       or <music/>). id uniquely identifies the entry; name is the media's
-       slug-like handle (e.g. "mystream"); displayName and description are
-       shown on the card. thumbnail is the card's cover image — a data URL,
-       an absolute URL, or a site-relative URL; optional, the card renders a
-       placeholder tile without one. href is where clicking the card
-       navigates — a site-relative path or an absolute URL. -->
+       or <music/>). id uniquely identifies the entry — the media id; name is
+       the media's slug-like handle (e.g. "mystream"); displayName and
+       description are shown on the card. thumbnail is the card's cover image
+       — a data URL, an absolute URL, or a site-relative URL; optional, the
+       card renders a placeholder tile without one. href, optional, is where
+       clicking the card navigates — a site-relative path or an absolute URL;
+       without one the card links to the site's play page
+       (/play?mediaId=<id>), which plays the media's <playable/> sources. -->
   <xsd:complexType name="mediaType">
     <xsd:attribute name="id" type="xsd:string" use="required" />
     <xsd:attribute name="name" type="xsd:string" use="required" />
@@ -569,7 +579,29 @@
       use="optional"
       default=""
     />
-    <xsd:attribute name="href" type="xsd:string" use="required" />
+    <xsd:attribute name="href" type="xsd:string" use="optional" default="" />
+  </xsd:complexType>
+
+  <!-- A single playable source of a media entry of the <entertain/> shelves:
+       where and how to actually play the media. id uniquely identifies the
+       entry; mediaId is the media id of the <live/>, <video/>, or <music/>
+       entry it plays — several playables may share a media id (e.g. a WHEP
+       and an HLS variant of the same stream); type is the protocol url
+       speaks; url is the endpoint to play from. Served by the
+       getPlayableByMediaId operation — GET /api/dyn/playables/{mediaId}
+       (see pkg/api/dyn). -->
+  <xsd:complexType name="playableType">
+    <xsd:attribute name="id" type="xsd:string" use="required" />
+    <xsd:attribute name="mediaId" type="xsd:string" use="required" />
+    <xsd:attribute name="type" use="required">
+      <xsd:simpleType>
+        <xsd:restriction base="xsd:string">
+          <xsd:enumeration value="whep" />
+          <xsd:enumeration value="hls" />
+        </xsd:restriction>
+      </xsd:simpleType>
+    </xsd:attribute>
+    <xsd:attribute name="url" type="xsd:string" use="required" />
   </xsd:complexType>
 
   <!-- The top bar's navigation drawer entries (see the frontend's

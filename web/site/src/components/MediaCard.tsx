@@ -13,9 +13,11 @@ import type { DynMedia } from "@/hooks/useDynBlogData";
 // MediaCard renders one entry of the entertain page's media shelves: a cover
 // thumbnail (or a placeholder tile carrying the shelf's icon when the entry
 // configures none), the display name, and a two-line clamped description.
-// The whole card is the link: site-relative hrefs navigate with Next.js,
-// absolute ones open in a new tab — the same convention as the Posts
-// section's Read button.
+// The whole card is the link: the entry's own href when it configures one —
+// site-relative hrefs navigate with Next.js, absolute ones open in a new
+// tab, the same convention as the Posts section's Read button — and the
+// site's play page (/play?mediaId=<id>), playing the entry's playable
+// sources, when it configures none.
 export default function MediaCard({
   media,
   placeholderIcon,
@@ -23,13 +25,14 @@ export default function MediaCard({
   media: DynMedia;
   placeholderIcon: React.ReactNode;
 }) {
-  const external = media.href.startsWith("http");
+  const href = media.href || `/play?mediaId=${encodeURIComponent(media.id)}`;
+  const external = href.startsWith("http");
 
   return (
     <Card>
       <CardActionArea
         component={external ? "a" : NextLink}
-        href={media.href}
+        href={href}
         target={external ? "_blank" : undefined}
         rel={external ? "noreferrer" : undefined}
         aria-label={media.displayName}

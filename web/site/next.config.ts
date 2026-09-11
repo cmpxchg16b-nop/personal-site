@@ -6,6 +6,19 @@ const nextConfig = (phase: string): NextConfig => {
     /* config options here */
     output: "export",
     images: { unoptimized: true },
+    headers() {
+      return [
+        {
+          source: "/hls/:path*",
+          headers: [
+            {
+              key: "X-Accel-Buffering",
+              value: "no",
+            },
+          ],
+        },
+      ];
+    },
   };
 
   // Dev-only proxy: forward /api/* to the Go server so the frontend's relative
@@ -31,6 +44,10 @@ const nextConfig = (phase: string): NextConfig => {
       {
         source: "/mystream/whep",
         destination: "http://localhost:8889/mystream/whep",
+      },
+      {
+        source: "/hls/:path*",
+        destination: "http://localhost:8401/hls/:path*",
       },
     ];
   }
