@@ -146,6 +146,24 @@
              audioSourceType); wired only when url and jwt are
              non-empty. -->
         <xsd:element name="musicBot" type="musicBotType" minOccurs="0" />
+        <!-- The built-in sip bot: a session border controller
+             (pkg/rtc/sipbot) between the chat's WebRTC phone sessions
+             and an external SIP network — a back-to-back user agent
+             living in the server process exactly like the echo bot
+             above (the shared attributes are the same). Its chat is a
+             CLI — /help, /register <user@host> <password>, /unregister,
+             /call <user@host>, /hangup — with which a chat user
+             registers their own SIP credential and phones arbitrary
+             subscribers of the SIP network; media crosses the bot
+             transcoded only when the two legs' codecs differ (opus on
+             the WebRTC leg, opus preferred then PCMU/PCMA on the SIP
+             leg). Wired only when url and jwt are non-empty.
+
+             testSIPContact: the SIP address the CLI's /test-call
+                   command dials (e.g. "9664@192.168.1.2") — a known-
+                   good callee on the SIP network the deployment tests
+                   against; empty disables /test-call. -->
+        <xsd:element name="sipBot" type="sipBotType" minOccurs="0" />
       </xsd:sequence>
     </xsd:complexType>
   </xsd:element>
@@ -200,6 +218,15 @@
             maxOccurs="unbounded"
           />
         </xsd:sequence>
+      </xsd:extension>
+    </xsd:complexContent>
+  </xsd:complexType>
+
+  <!-- The sip bot's configuration; see the sipBot element above. -->
+  <xsd:complexType name="sipBotType">
+    <xsd:complexContent>
+      <xsd:extension base="botClientType">
+        <xsd:attribute name="testSIPContact" type="xsd:string" use="optional" />
       </xsd:extension>
     </xsd:complexContent>
   </xsd:complexType>

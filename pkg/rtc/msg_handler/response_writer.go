@@ -23,6 +23,8 @@ import (
 // and withdraw local media tracks on the pair's peer connection — the
 // caller-side counterpart of Accept's track offer, once the outgoing call
 // was accepted — and OnTrack registers for the peer's inbound media.
+// Cancel and Bye terminate one of the bot's own outgoing calls — the
+// dialog's CANCEL while it still rings, its BYE once established.
 //
 // Media rides the pair's existing peer connection, the way the browser's
 // useCallMedia attaches the microphone to it: the tracks offered with
@@ -74,6 +76,21 @@ type ResponseWriter interface {
 	// peer's messaging channel is not up.
 	Reject(code int, phrase string) error
 
+	// Cancel aborts one of the bot's own still-ringing outgoing calls
+	// (the dialog's CANCEL); callId is the id the call's Invite returned.
+	// The INVITE's logged UI status folds to cancelled — the Server's
+	// caller-side duty, exactly as for an inbound CANCEL. ErrNoCallId is
+	// returned for an empty call id, ErrNoMessagingChannel when the peer's
+	// messaging channel is not up.
+	Cancel(callId string) error
+
+	// Bye ends one of the bot's own established outgoing calls (the
+	// dialog's BYE); callId is the id the call's Invite returned. The
+	// INVITE's logged UI status folds to ended. ErrNoCallId is returned
+	// for an empty call id, ErrNoMessagingChannel when the peer's
+	// messaging channel is not up.
+	Bye(callId string) error
+
 	// AttachMedia offers the given local media tracks to the peer on the
 	// pair's peer connection, answering nothing — the caller-side attach
 	// once the peer accepted the bot's INVITE (200 OK), where Accept
@@ -110,6 +127,11 @@ var (
 	// MediaVoice or MediaVideo — anything else would be silently dropped
 	// by the peer's codec validation.
 	ErrInvalidMediaKind = errors.New("msg_handler: invalid media kind")
+
+	// ErrNoCallId is returned by Cancel and Bye for an empty call id —
+	// the termination verbs are meaningful only against a dialog Invite
+	// opened.
+	ErrNoCallId = errors.New("msg_handler: empty call id")
 
 	// errEncode is returned when the (fixed-shape) outbound message could
 	// not be encoded — in practice unreachable.
@@ -232,6 +254,36 @@ func (w *responseWriter) Reject(code int, phrase string) error {
 		Response: &dcSipResponse{Code: code, Phrase: phrase},
 	}
 	return w.server.sendText(w.dc, msg.encode())
+}
+
+// Cancel implements ResponseWriter.
+func (w *responseWriter) Cancel(callId string) error {
+	return w.terminate(callId, sipMethodCancel, callStatusCancelled)
+}
+
+// Bye implements ResponseWriter.
+func (w *responseWriter) Bye(callId string) error {
+	return w.terminate(callId, sipMethodBye, callStatusEnded)
+}
+
+// terminate sends a termination verb for one of the bot's own outgoing
+// calls and folds the call's logged status — the caller-side amend duty
+// stays the Server's, the same fold an inbound termination drives.
+func (w *responseWriter) terminate(callId, method, status string) error {
+	if callId == "" {
+		return ErrNoCallId
+	}
+	if w.dc == nil {
+		return ErrNoMessagingChannel
+	}
+	msg := newDCMsgOut(w.channelId, w.self, w.peer)
+	msg.MimeType = dcMsgMimeSip
+	msg.Sip = &dcSipBody{CallId: callId, Method: method}
+	if err := w.server.sendText(w.dc, msg.encode()); err != nil {
+		return err
+	}
+	w.server.serviceChan <- sipDialogNote{peer: w.peer, callId: callId, established: status}
+	return nil
 }
 
 // AttachMedia implements ResponseWriter.

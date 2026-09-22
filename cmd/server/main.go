@@ -35,6 +35,7 @@ import (
 	"personal-site/pkg/rtc"
 	"personal-site/pkg/rtc/echobot"
 	"personal-site/pkg/rtc/musicbot"
+	"personal-site/pkg/rtc/sipbot"
 	pkgsession "personal-site/pkg/session"
 
 	"github.com/alecthomas/kong"
@@ -324,8 +325,9 @@ func (cmd *ServeCmd) Run(cli *CLI) error {
 	jwtValidator := pkgauth.NewStaticKeyJWTValidator(keyProvider, blProvider, cmd.RejectVisitor)
 
 	// The built-in bots: headless RTC peers (pkg/rtc/echobot,
-	// pkg/rtc/musicbot) living in this process as plain signalling
-	// clients of the WebSocket endpoint their <echoBot/> or <musicBot/>
+	// pkg/rtc/musicbot, pkg/rtc/sipbot) living in this process as plain
+	// signalling clients of the WebSocket endpoint their <echoBot/>,
+	// <musicBot/> or <sipBot/>
 	// configuration points at — typically this server's own /api/ss/ws.
 	// Wired only when the element carries a url and a jwt (so a sample
 	// element with empty values can ship in the document unused); the
@@ -344,6 +346,12 @@ func (cmd *ServeCmd) Run(cli *CLI) error {
 		serverCfg.MusicBot.URL != "" && serverCfg.MusicBot.JWT != "" {
 		if err := startMusicBot(ctx, serverCfg.MusicBot, filepath.Dir(cmd.ConfigXML)); err != nil {
 			return fmt.Errorf("music bot: %w", err)
+		}
+	}
+	if serverCfg != nil && serverCfg.SipBot != nil &&
+		serverCfg.SipBot.URL != "" && serverCfg.SipBot.JWT != "" {
+		if err := startSipBot(ctx, serverCfg.SipBot); err != nil {
+			return fmt.Errorf("sip bot: %w", err)
 		}
 	}
 
@@ -435,6 +443,17 @@ func startMusicBot(ctx context.Context, cfg *pkgmodelsserverconfig.MusicBotXML, 
 	}
 	return startBotClient(ctx, "music bot", &cfg.BotClientXML, stereoOpusPCFactory(pkgapiiceservers.ParseURLs(cfg.IceServers)), func(client *rtc.HeadlessRTCClient) {
 		musicbot.New(client, musicbot.Configuration{Logger: logger, AudioSources: sources})
+	})
+}
+
+// startSipBot wires the built-in sip bot (pkg/rtc/sipbot): the session
+// border controller between the chat's WebRTC phone sessions and an
+// external SIP network. Its user sessions (the SIP credentials the chat
+// users /register) live in an on-memory store for the process lifetime;
+// the element's testSIPContact is the CLI /test-call command's callee.
+func startSipBot(ctx context.Context, cfg *pkgmodelsserverconfig.SipBotXML) error {
+	return startBotClient(ctx, "sip bot", &cfg.BotClientXML, stereoOpusPCFactory(pkgapiiceservers.ParseURLs(cfg.IceServers)), func(client *rtc.HeadlessRTCClient) {
+		sipbot.New(client, sipbot.NewOnMemoryUserSessionStorage(), sipbot.Configuration{Logger: logger, TestSIPContact: cfg.TestSIPContact})
 	})
 }
 

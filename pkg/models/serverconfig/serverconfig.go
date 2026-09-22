@@ -49,6 +49,10 @@ type ServerConfigXML struct {
 	// carries a url and a jwt (see cmd/server). Its audioSource children
 	// are the bot's songbook.
 	MusicBot *MusicBotXML `xml:"musicBot"`
+	// SipBot is nil when the document has no <sipBot/> element; the
+	// built-in sip bot is wired only when the element is present and
+	// carries a url and a jwt (see cmd/server).
+	SipBot *SipBotXML `xml:"sipBot"`
 }
 
 // OIDCLoginOptionsXML mirrors the <oidcLoginOptions/> section of
@@ -147,6 +151,18 @@ type BotClientXML struct {
 type MusicBotXML struct {
 	BotClientXML
 	AudioSources []AudioSourceXML `xml:"audioSource"`
+}
+
+// SipBotXML mirrors the <sipBot/> section of serverConfig.xml: a bot
+// client (the embedded BotClientXML attributes) carrying the sip bot's
+// test callee.
+type SipBotXML struct {
+	BotClientXML
+	// TestSIPContact is the raw testSIPContact attribute: the SIP
+	// address the bot CLI's /test-call command dials (e.g.
+	// "9664@192.168.1.2") — a known-good callee on the SIP network the
+	// deployment tests against. Empty disables /test-call.
+	TestSIPContact string `xml:"testSIPContact,attr"`
 }
 
 // AudioSourceXML mirrors a single <audioSource/> entry of the
