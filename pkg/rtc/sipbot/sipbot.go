@@ -46,6 +46,9 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/emiago/diago"
@@ -65,15 +68,19 @@ type Configuration struct {
 	// The sip-leg's transport: the template every account's SIP client
 	// is opened from. Transport is the SIP network transport ("udp",
 	// "tcp"); empty selects "udp". BindHost/BindPort say where each
-	// account's socket listens; zero values select all interfaces and an
-	// ephemeral port per account — a fixed BindPort admits one
-	// registered user at a time. An empty bind host MUST NOT reach
-	// diago's transport as-is: it never resolves an advertised address
-	// then, and the Contact goes out host-less (a registrar answers
-	// "400 Bad Contact Header"). ExternalHost, when set, is the address
-	// the bot advertises in its SIP Contact and SDP — for hosts where
-	// the bind address is not the address the SIP network should dial
-	// back (the simple NAT case).
+	// account's socket listens. An empty BindHost — the default — selects
+	// the per-account source address of the route to the account's
+	// registrar, so the Contact and SDP advertise the address the
+	// registrar already sees the bot's packets come from, in the
+	// registrar's address family — an IPv4 socket cannot write to an
+	// IPv6 registrar. An explicit BindHost is used verbatim for every
+	// account, its address family then constraining which registrars are
+	// reachable. A zero BindPort selects an ephemeral port per account —
+	// a fixed one admits one registered user at a time. ExternalHost,
+	// when set, is the address the bot advertises in its SIP Contact and
+	// SDP — for hosts where the bind address is not the address the SIP
+	// network should dial back (the simple NAT case); being one value,
+	// it fits deployments whose accounts share one address family.
 	Transport    string
 	BindHost     string
 	BindPort     int
@@ -107,13 +114,6 @@ func New(client *rtc.HeadlessRTCClient, storage UserSessionStorage, pool *SIPCre
 	if transport == "" {
 		transport = "udp"
 	}
-	// An empty bind host means all interfaces; diago resolves the
-	// advertised address from the routing table then (see the
-	// Configuration doc).
-	bindHost := config.BindHost
-	if bindHost == "" {
-		bindHost = "0.0.0.0"
-	}
 	expiry := config.RegisterExpiry
 	if expiry == 0 {
 		expiry = 300
@@ -122,7 +122,7 @@ func New(client *rtc.HeadlessRTCClient, storage UserSessionStorage, pool *SIPCre
 	stack := sipStack{
 		logger:       logger,
 		transport:    transport,
-		bindHost:     bindHost,
+		bindHost:     config.BindHost,
 		bindPort:     config.BindPort,
 		externalHost: config.ExternalHost,
 	}
@@ -142,24 +142,25 @@ type sipStack struct {
 	externalHost string
 }
 
-// open materializes one user's SIP client: a diago whose UA is named
-// for the user's SIP username — the Contact's user part and the
+// open materializes one account's SIP client: a diago whose UA is named
+// for the account's SIP username — the Contact's user part and the
 // INVITE's callback address then carry the user's name, never the
-// bot's — with a transport socket of the account's own. The client is
-// already serving when open returns (responses to its transactions
-// arrive on its socket; inbound INVITEs — someone calling a registered
-// AOR — have no routing policy in this outbound-only SBC and are
-// declined). The client dies with ctx: the account stops it once the
-// de-REGISTER left.
-func (s sipStack) open(ctx context.Context, username string) (*diago.Diago, error) {
-	ua, err := sipgo.NewUA(sipgo.WithUserAgent(username))
+// bot's — with a transport socket of the account's own, bound to the
+// route's source address toward the registrar (see bindHostFor — the
+// address-family answer too). The client is already serving when open
+// returns (responses to its transactions arrive on its
+// socket; inbound INVITEs — someone calling a registered AOR — have no
+// routing policy in this outbound-only SBC and are declined). The client
+// dies with ctx: the account stops it once the de-REGISTER left.
+func (s sipStack) open(ctx context.Context, session UserSession) (*diago.Diago, error) {
+	ua, err := sipgo.NewUA(sipgo.WithUserAgent(session.Username))
 	if err != nil {
 		return nil, err
 	}
 	dg := diago.NewDiago(ua,
 		diago.WithTransport(diago.Transport{
 			Transport:    s.transport,
-			BindHost:     s.bindHost,
+			BindHost:     s.bindHostFor(session),
 			BindPort:     s.bindPort,
 			ExternalHost: s.externalHost,
 		}),
@@ -186,4 +187,44 @@ func (s sipStack) open(ctx context.Context, username string) (*diago.Diago, erro
 		return nil, fmt.Errorf("the SIP client failed to start: %w", err)
 	}
 	return dg, nil
+}
+
+// bindHostFor picks the account socket's bind address: the configured
+// BindHost verbatim when one is set (the operator's choice, its address
+// family included); otherwise the source address the route to the
+// registrar would use — so the account's socket binds, and the Contact
+// and SDP advertise, exactly the address the registrar already sees the
+// bot's packets come from. A UDP dial sends nothing; it just answers the
+// routing question. This is also what makes IPv6 work: an IPv4 socket
+// cannot write to an IPv6 registrar (the kernel's "non-IPv4 address"
+// write error), and diago's own interface resolution picks a link-local
+// IPv6 on hosts without a global one — the route lookup gets the right
+// family and the right address in one step.
+func (s sipStack) bindHostFor(session UserSession) string {
+	if s.bindHost != "" {
+		return s.bindHost
+	}
+	// sipgo's URI parser keeps a bracketed IPv6 literal's brackets in the
+	// Host; the net package wants the bare address.
+	host := strings.TrimPrefix(strings.TrimSuffix(session.Host, "]"), "[")
+	port := session.Port
+	if port == 0 {
+		port = 5060
+	}
+	raddr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(host, strconv.Itoa(port)))
+	if err != nil || raddr.IP == nil {
+		return "0.0.0.0" // unresolvable — the registration will say why
+	}
+	if conn, err := net.DialUDP("udp", nil, raddr); err == nil {
+		source := conn.LocalAddr().(*net.UDPAddr).IP.String()
+		_ = conn.Close()
+		return source
+	}
+	// No route (yet): at least match the family, so a resolvable but
+	// unrouted IPv6 registrar fails with a routing error rather than the
+	// misleading "non-IPv4 address".
+	if raddr.IP.To4() == nil {
+		return "::"
+	}
+	return "0.0.0.0"
 }

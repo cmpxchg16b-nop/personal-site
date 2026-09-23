@@ -126,6 +126,21 @@ func TestSIPCredentialPoolNil(t *testing.T) {
 	pool.Release(UserSession{AddressOfRecord: "1001@sip.example.com"})
 }
 
+// TestSIPCredentialPoolIPv6Range covers a range on an IPv6 server: the
+// accounts materialize with the bracketed host and the port, ready to
+// register against the v6 registrar.
+func TestSIPCredentialPoolIPv6Range(t *testing.T) {
+	pool, err := NewSIPCredentialPool(nil, []SIPCredentialRange{{UsernameRange: "1101-1102", Password: "p", SIPServer: "[2a0a:4cc0::1]:5061"}})
+	if err != nil {
+		t.Fatalf("NewSIPCredentialPool: %v", err)
+	}
+	c, ok := pool.Allocate()
+	want := UserSession{AddressOfRecord: "1101@[2a0a:4cc0::1]:5061", Username: "1101", Host: "[2a0a:4cc0::1]", Port: 5061, Password: "p", Pooled: true}
+	if !ok || c != want {
+		t.Fatalf("Allocate = %+v, %v; want %+v", c, ok, want)
+	}
+}
+
 // TestSIPCredentialPoolConcurrency hammers Allocate and Release from
 // many goroutines under -race: the whole pool can be loaned out
 // concurrently, every loan distinct; the churn phase mixes allocations

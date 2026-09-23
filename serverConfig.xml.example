@@ -311,7 +311,9 @@
        its password — then zero or more <sipCredentialRange/> entries —
        every username in usernameRange ("<integer>-<integer>", both ends
        inclusive; "1101-1120" is the twenty accounts 1101-1120) sharing
-       the password and registering on sipServer (host[:port]).
+       the password and registering on sipServer (host[:port]). IPv6
+       literals are bracketed, as in a SIP URI (e.g.
+       sipServer="[2a0a:4cc0::1]:5060").
   <sipBot
     url="wss://example.com/api/ss/ws"
     jwt=""

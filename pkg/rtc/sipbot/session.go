@@ -25,7 +25,9 @@ type UserSession struct {
 	// Username is the digest-auth username (the AOR's user part).
 	Username string
 	// Host is the registrar the AOR registers against (the AOR's host
-	// part, without a port); Port is its port, zero for the default.
+	// part, without a port); Port is its port, zero for the default. An
+	// IPv6 literal keeps its brackets ("[2a0a:4cc0::1]", the form
+	// sipgo's parser keeps and renders).
 	Host string
 	Port int
 	// Password is the digest-auth password, kept as plain data because

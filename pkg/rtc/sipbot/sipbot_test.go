@@ -21,6 +21,7 @@ import (
 	"net"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -192,12 +193,27 @@ func startClient(t *testing.T, net *clientTestNet, name string, configure func(*
 // net.
 func startBot(t *testing.T, net *clientTestNet, name string, id ss.SubscriberId, testContact string, pool *SIPCredentialPool) *rtc.HeadlessRTCClient {
 	t.Helper()
+	return startBotOn(t, net, name, id, testContact, pool, "127.0.0.1")
+}
+
+// startBotAuto is startBot without the IPv4-loopback pin: the accounts'
+// sockets take their registrars' own address families (the production
+// default), which the IPv6 test needs.
+func startBotAuto(t *testing.T, net *clientTestNet, name string, id ss.SubscriberId, testContact string, pool *SIPCredentialPool) *rtc.HeadlessRTCClient {
+	t.Helper()
+	return startBotOn(t, net, name, id, testContact, pool, "")
+}
+
+// startBotOn builds a client with the sip bot attached, with the given
+// SIP bind host ("": the per-account family selection).
+func startBotOn(t *testing.T, net *clientTestNet, name string, id ss.SubscriberId, testContact string, pool *SIPCredentialPool, bindHost string) *rtc.HeadlessRTCClient {
+	t.Helper()
 	c, _ := startClient(t, net, name, func(c *rtc.RTCClientConfiguration) {
 		c.SubscriberId = id
 	})
 	New(c, NewOnMemoryUserSessionStorage(), pool, Configuration{
 		Logger:         testLogger(t),
-		BindHost:       "127.0.0.1",
+		BindHost:       bindHost,
 		TestSIPContact: testContact,
 	})
 	return c
@@ -554,7 +570,10 @@ func isCallStatusAmend(inviteMsgId ss.MsgId, callId, status string) func(*rawMsg
 // and one UDP socket streaming and recording real RTP. Everything it
 // receives is recorded for the test's assertions.
 type fakePBX struct {
-	addr string // its SIP address, 127.0.0.1:port
+	addr    string // its SIP address, host:port (an IPv6 one is bracketed)
+	ip      string // its bare IP (the SDP connection address)
+	sipHost string // its IP in SIP-URI form (an IPv6 literal bracketed)
+	v6      bool   // the IPv6 loopback variant
 
 	answerCode int  // the final response to an INVITE (200, 486, …)
 	opus       bool // the SDP answer's codec: opus (96) when set, PCMU (0) otherwise
@@ -595,27 +614,51 @@ type registration struct {
 	source  string // the datagram's source address (the account's socket)
 }
 
-// newFakePBX starts a fake PBX answering INVITEs with answerCode. The
-// SIP socket is a reserved loopback port (freed before binding, the
-// small race every test accepts); the media socket stays bound.
+// newFakePBX starts a fake PBX answering INVITEs with answerCode, on the
+// IPv4 loopback. The SIP socket is a reserved loopback port (freed before
+// binding, the small race every test accepts); the media socket stays
+// bound.
 func newFakePBX(t *testing.T, answerCode int, opus bool) *fakePBX {
 	t.Helper()
-	rsv, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	return newFakePBXOn(t, "127.0.0.1", answerCode, opus)
+}
+
+// newFakePBX6 starts the fake PBX on the IPv6 loopback; the test skips
+// when the host has no IPv6 loopback.
+func newFakePBX6(t *testing.T, answerCode int, opus bool) *fakePBX {
+	t.Helper()
+	return newFakePBXOn(t, "::1", answerCode, opus)
+}
+
+// newFakePBXOn starts a fake PBX on the given loopback address —
+// "127.0.0.1" or "::1".
+func newFakePBXOn(t *testing.T, ip string, answerCode int, opus bool) *fakePBX {
+	t.Helper()
+	listenIP := net.ParseIP(ip)
+	rsv, err := net.ListenUDP("udp", &net.UDPAddr{IP: listenIP, Port: 0})
 	if err != nil {
-		t.Fatalf("reserve a SIP port: %v", err)
+		t.Skipf("no %s loopback on this host: %v", ip, err)
 	}
 	port := rsv.LocalAddr().(*net.UDPAddr).Port
 	if err := rsv.Close(); err != nil {
 		t.Fatalf("release the reserved port: %v", err)
 	}
-	rtpConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	rtpConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: listenIP, Port: 0})
 	if err != nil {
 		t.Fatalf("bind the media socket: %v", err)
 	}
 	t.Cleanup(func() { rtpConn.Close() })
 
+	v6 := listenIP.To4() == nil
+	sipHost := ip
+	if v6 {
+		sipHost = "[" + ip + "]" // a SIP URI brackets an IPv6 literal
+	}
 	f := &fakePBX{
-		addr:       fmt.Sprintf("127.0.0.1:%d", port),
+		addr:       net.JoinHostPort(ip, strconv.Itoa(port)),
+		ip:         ip,
+		sipHost:    sipHost,
+		v6:         v6,
 		answerCode: answerCode,
 		opus:       opus,
 		rtp:        rtpConn,
@@ -636,7 +679,7 @@ func newFakePBX(t *testing.T, answerCode int, opus bool) *fakePBX {
 		t.Fatalf("sipgo.NewClient: %v", err)
 	}
 	dialogs := sipgo.NewDialogServerCache(client, sip.ContactHeader{
-		Address: sip.Uri{User: "pbx", Host: "127.0.0.1", Port: port},
+		Address: sip.Uri{User: "pbx", Host: f.sipHost, Port: port},
 	})
 
 	srv.OnRegister(func(req *sip.Request, tx sip.ServerTransaction) {
@@ -807,12 +850,15 @@ func between(s, left, right string) string {
 // negotiated codec alone (plus telephone-event, as PBXs do).
 func (f *fakePBX) sdpAnswer() []byte {
 	port := f.rtp.LocalAddr().(*net.UDPAddr).Port
-	if f.opus {
-		return []byte(fmt.Sprintf("v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=fakepbx\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n"+
-			"m=audio %d RTP/AVP 96 101\r\na=rtpmap:96 opus/48000/2\r\na=rtpmap:101 telephone-event/8000\r\n", port))
+	family := "IP4"
+	if f.v6 {
+		family = "IP6"
 	}
-	return []byte(fmt.Sprintf("v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=fakepbx\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n"+
-		"m=audio %d RTP/AVP 0 101\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:101 telephone-event/8000\r\n", port))
+	sdp := fmt.Sprintf("v=0\r\no=- 0 0 IN %s %s\r\ns=fakepbx\r\nc=IN %s %s\r\nt=0 0\r\n", family, f.ip, family, f.ip)
+	if f.opus {
+		return []byte(sdp + fmt.Sprintf("m=audio %d RTP/AVP 96 101\r\na=rtpmap:96 opus/48000/2\r\na=rtpmap:101 telephone-event/8000\r\n", port))
+	}
+	return []byte(sdp + fmt.Sprintf("m=audio %d RTP/AVP 0 101\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:101 telephone-event/8000\r\n", port))
 }
 
 // parseSDPMediaAddr extracts the media address (the c= line's IP, the
@@ -825,6 +871,9 @@ func parseSDPMediaAddr(t *testing.T, body []byte) *net.UDPAddr {
 		line = strings.TrimRight(line, "\r\n")
 		if strings.HasPrefix(line, "c=IN IP4 ") {
 			ip = strings.TrimPrefix(line, "c=IN IP4 ")
+		}
+		if strings.HasPrefix(line, "c=IN IP6 ") {
+			ip = strings.TrimPrefix(line, "c=IN IP6 ")
 		}
 		if strings.HasPrefix(line, "m=audio ") {
 			fields := strings.Fields(line)
@@ -1556,4 +1605,47 @@ func TestSipBotPoolSessionEndReleases(t *testing.T) {
 	_, bobId := pairUp(t, bot, bob)
 	bobCall := chat(bobProbe, bobId, "/call 1002@"+pbx.addr)
 	waitBotMessage(t, bobProbe, botId, "bob's pooled registration line", isChatReply(bobCall, "Registered as sip:1101@"))
+}
+
+// TestSipBotIPv6 covers the sip leg over IPv6: an account's socket takes
+// its registrar's address family — a pooled account (an IPv6 sipServer in
+// the pool) and a user's own /register alike register against an IPv6
+// registrar and dial through it, the wire identity the account's own.
+// Skipped when the host has no IPv6 loopback.
+func TestSipBotIPv6(t *testing.T) {
+	net := newClientTestNet(t, ss.DefaultSubscriberAging)
+	pbx := newFakePBX6(t, 486, true) // busy: the calls need never complete
+	pool, err := NewSIPCredentialPool(nil, []SIPCredentialRange{{UsernameRange: "1101-1102", Password: "poolpass", SIPServer: pbx.addr}})
+	if err != nil {
+		t.Fatalf("NewSIPCredentialPool: %v", err)
+	}
+	bot := startBotAuto(t, net, "bot", "2-bot", "", pool)
+	user, probe, _, _ := startUserProbe(t, net, "user", "1-user")
+	botId, userId := pairUp(t, bot, user)
+
+	dc := probe.waitDC(t, botId, msg_handler.DataChannelLabelMessages)
+	chat := func(text string) ss.MsgId {
+		t.Helper()
+		m := baseMsg(ss.WellKnownChIdMain, userId, botId)
+		m["plaintext"] = text
+		if err := dc.SendText(mustJSON(t, m)); err != nil {
+			t.Fatalf("SendText: %v", err)
+		}
+		return ss.MsgId(m["msgId"].(string))
+	}
+
+	// The pooled account registers against the IPv6 registrar and dials.
+	callMsg := chat("/call 1001@" + pbx.addr)
+	waitBotMessage(t, probe, botId, "the pooled registration line", isChatReply(callMsg, "Registered as sip:1101@"+pbx.addr))
+	pbx.waitForPBX(t, "the pooled account's REGISTER over IPv6", func() bool {
+		return len(pbx.registrations) == 1 && pbx.registrations[0].from == "1101"
+	})
+	pbx.waitForPBX(t, "the INVITE over IPv6", func() bool {
+		return pbx.invites == 1 && pbx.inviteFrom == "1101" && pbx.inviteTo == "1001"
+	})
+
+	// The manual path takes the same family-aware socket.
+	registerMsg := chat("/register 2001@" + pbx.addr + " s3cret")
+	waitBotMessage(t, probe, botId, "the manual registered reply over IPv6", isChatReply(registerMsg, "Registered as sip:2001@"+pbx.addr))
+	pbx.waitForPBX(t, "the manual REGISTER over IPv6", func() bool { return pbx.registers == 2 })
 }

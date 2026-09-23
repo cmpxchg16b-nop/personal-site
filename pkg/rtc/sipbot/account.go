@@ -71,7 +71,7 @@ func newAccount(ctx context.Context, logger *slog.Logger, stack sipStack, sessio
 	// registration loop by the de-REGISTER's round trip.
 	stackCtx, stackStop := context.WithCancel(context.Background())
 	a.stackStop = stackStop
-	dg, err := stack.open(stackCtx, session.Username)
+	dg, err := stack.open(stackCtx, session)
 	if err != nil {
 		a.cancel()
 		stackStop()
@@ -225,6 +225,9 @@ func parseAddressOfRecord(arg, password string) (UserSession, error) {
 	}
 	uri := sip.Uri{}
 	if err := sip.ParseUri(withSipScheme(to), &uri); err != nil {
+		if strings.Contains(to, "::") {
+			return UserSession{}, fmt.Errorf("bad address %q: %w (an IPv6 literal needs brackets, e.g. 1005@[2a0a:4cc0::1])", arg, err)
+		}
 		return UserSession{}, fmt.Errorf("bad address %q: %w", arg, err)
 	}
 	if uri.User == "" {
@@ -241,7 +244,9 @@ func parseAddressOfRecord(arg, password string) (UserSession, error) {
 }
 
 // hostPort is the address's host part in text form, with the port when
-// one was given — the form a bare /call user is completed with.
+// one was given — the form a bare /call user is completed with. An IPv6
+// literal keeps its brackets (the form sipgo's parser keeps), so it
+// renders back into a valid URI.
 func (s UserSession) hostPort() string {
 	if s.Port > 0 {
 		return fmt.Sprintf("%s:%d", s.Host, s.Port)

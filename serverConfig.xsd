@@ -283,7 +283,8 @@
        both ends inclusive ("1101-1120" is the twenty accounts
        1101...1120; the integer is the username, so leading zeros are not
        preserved); password is the accounts' shared password; sipServer
-       is the registrar as host[:port] — optional in the schema so a
+       is the registrar as host[:port] — an IPv6 literal bracketed, as in
+       a SIP URI ("[2a0a:4cc0::1]:5060") — optional in the schema so a
        range can be sketched without it, but the wiring rejects an empty
        one at startup. -->
   <xsd:complexType name="sipCredentialRangeType">

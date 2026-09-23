@@ -181,7 +181,10 @@ and one server: `usernameRange` is a range expression,
 accounts 1101…1120; the integer is the username, so leading zeros are
 not preserved), and `sipServer` is the registrar as `host[:port]` (the
 schema marks it optional so a range can be sketched without it; the
-wiring rejects an empty one at startup, like any invalid entry).
+wiring rejects an empty one at startup, like any invalid entry). IPv6
+literals are written bracketed, as in a SIP URI: `sipServer="[2a0a:4cc0::1]:5060"`
+— the same form holds for a `<sipCredential/>`'s `sipUri`, the
+`testSIPContact`, and the CLI's addresses.
 
 The pool is **lazy**: a range is kept as its descriptor (from, to,
 password, server) and a username is materialized into a `UserSession`
@@ -481,12 +484,20 @@ pool, cfg)` and reusing `stereoOpusPCFactory` (the webrtc leg negotiates
   `/test-call` command dials (e.g. `9664@192.168.1.2`) — a known-good
   callee for deployment smoke tests; empty disables the command.
 - `sipbot.Configuration`: `Logger`, `TestSIPContact`, and the sip-leg
-  knobs — `Transport` (default `udp`), `BindHost`/`BindPort` (default
-  all-interfaces, ephemeral), `ExternalHost` (default empty; the
+  knobs — `Transport` (default `udp`), `ExternalHost` (default empty; the
   SDP/RTP address the PBX sees, for hosts where the bind address is
   wrong), `RegisterExpiry` (default 300 s). Each registered account
   binds its own diago transport — a dedicated socket per user — so keep
-  `BindPort` at 0: a fixed port admits one account at a time.
+  `BindPort` at 0: a fixed port admits one account at a time. An empty
+  `BindHost` (the default) binds each account to the source address of
+  the route to its registrar — the Contact and SDP advertise the address
+  the registrar already sees, in the registrar's own address family, so
+  IPv6 registrars work (an IPv4 socket cannot write to one); an explicit
+  `BindHost` is used verbatim for every account, its family constraining
+  which registrars are reachable. Either way an account's family is its
+  registrar's: a `/call` to a literal address of the other family (a v6
+  literal from a v4-registrar account) cannot cross — dial those through
+  the registrar.
 - The `<sipBot/>` element's optional `<sipCredentialPool/>` child is
   the credential pool (§5): `<sipCredential/>` entries and
   `<sipCredentialRange/>` spans, mirrored in `serverconfig.go` by
