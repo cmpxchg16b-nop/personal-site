@@ -15,6 +15,7 @@ import (
 	"encoding/hex"
 	"log/slog"
 
+	"personal-site/pkg/models/ss"
 	"personal-site/pkg/rtc/msg_handler"
 )
 
@@ -71,4 +72,15 @@ func (h *echoHandler) HandleCalling(_ context.Context, sip *msg_handler.SipMessa
 	if err := w.Reject(msg_handler.SipCodeDecline, msg_handler.SipPhraseDecline); err != nil {
 		h.logger.Warn("echobot: call decline not sent", "peer", sip.From, "err", err)
 	}
+}
+
+// HandlePeerSessionStart implements msg_handler.BotMessageHandler. The
+// echo bot keeps no per-peer state, so a session's lifecycle needs no
+// bookkeeping.
+func (h *echoHandler) HandlePeerSessionStart(_ context.Context, _ ss.SubscriberId) {
+}
+
+// HandlePeerSessionEnd implements msg_handler.BotMessageHandler; a no-op,
+// like its start counterpart.
+func (h *echoHandler) HandlePeerSessionEnd(_ context.Context, _ ss.SubscriberId) {
 }

@@ -15,7 +15,8 @@ import (
 )
 
 // UserSession is one chat user's SIP identity as the bot keeps it: the
-// credential of the user's /register. Plain data, safe to copy — an
+// credential of the user's /register, or a loan from the bot's
+// SIPCredentialPool. Plain data, safe to copy — an
 // implementation may serialize sessions freely.
 type UserSession struct {
 	// AddressOfRecord is the SIP AOR exactly as /register gave it —
@@ -30,6 +31,11 @@ type UserSession struct {
 	// Password is the digest-auth password, kept as plain data because
 	// SIP digest authentication needs the password itself.
 	Password string
+	// Pooled is true when the credential is a loan from the bot's
+	// credential pool: the loan returns to the pool when the session
+	// leaves the store (/unregister, a replacing /register, the peer
+	// session's end).
+	Pooled bool
 }
 
 // UserSessionStorage is the bot's user-session store: a key/value

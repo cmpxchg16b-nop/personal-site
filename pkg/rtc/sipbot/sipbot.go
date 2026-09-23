@@ -25,7 +25,8 @@
 // From is the user's AOR, the Contact's user part is the username, the
 // digest credential is the user's own: the user brings their own SIP
 // credential with /register <user@host> <password> (kept in the
-// injected UserSessionStorage), phones a callee with /call <user@host>,
+// injected UserSessionStorage) — or is loaned an account from the
+// injected SIPCredentialPool — phones a callee with /call <user@host>,
 // and ends the call with /hangup or the browser's hangup button. The
 // client dies with the account; the bot's own identity never appears on
 // the wire.
@@ -91,11 +92,13 @@ type Configuration struct {
 // client's two well-known data channels with the sip-purpose
 // BotMessageHandler as their message policy. storage is the bot's
 // user-session store (the shipped wiring passes
-// NewOnMemoryUserSessionStorage()); the SIP clients the registrations
-// and calls run on are opened per account (see sipStack). It panics
-// when a label is already taken, mirroring the client's
-// HandleDataChannel. The bot needs no further driving.
-func New(client *rtc.HeadlessRTCClient, storage UserSessionStorage, config Configuration) {
+// NewOnMemoryUserSessionStorage()); pool is the shared SIP credential
+// pool the bot loans accounts from (nil: no pool — a /call without a
+// registration always answers with the /register hint); the SIP clients
+// the registrations and calls run on are opened per account (see
+// sipStack). It panics when a label is already taken, mirroring the
+// client's HandleDataChannel. The bot needs no further driving.
+func New(client *rtc.HeadlessRTCClient, storage UserSessionStorage, pool *SIPCredentialPool, config Configuration) {
 	logger := config.Logger
 	if logger == nil {
 		logger = slog.Default()
@@ -123,7 +126,7 @@ func New(client *rtc.HeadlessRTCClient, storage UserSessionStorage, config Confi
 		bindPort:     config.BindPort,
 		externalHost: config.ExternalHost,
 	}
-	msg_handler.NewServer(client, newSipHandler(logger, storage, stack, time.Duration(expiry)*time.Second, config.TestSIPContact), msg_handler.Configuration{Logger: logger})
+	msg_handler.NewServer(client, newSipHandler(logger, storage, pool, stack, time.Duration(expiry)*time.Second, config.TestSIPContact), msg_handler.Configuration{Logger: logger})
 }
 
 // sipStack is the per-account SIP client factory: the bot's sip-leg

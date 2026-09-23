@@ -94,18 +94,23 @@ type serverNote interface{ isServerNote() }
 
 // peerUpNote registers a session's messaging channel under its peer,
 // replacing a previous invocation's (a glare rebuild re-invokes the
-// handler with a fresh channel on the same session).
+// handler with a fresh channel on the same session). A peer with no
+// live record is a genuine session start: the handler's
+// HandlePeerSessionStart hook fires.
 type peerUpNote struct {
 	peer  ss.SubscriberId
 	dcmsg *webrtc.DataChannel
+	ctx   context.Context // the session's context, for the start hook
 }
 
 // peerDownNote drops a session's registration as the session ends —
 // unless a rebuilt session's has already replaced it (the messaging
-// channel's identity tells the two apart).
+// channel's identity tells the two apart). A drop that happens is a
+// genuine session end: the handler's HandlePeerSessionEnd hook fires.
 type peerDownNote struct {
 	peer  ss.SubscriberId
 	dcmsg *webrtc.DataChannel
+	ctx   context.Context // the session's context (canceled), for the end hook
 }
 
 // announceNote records a peer's file-transfer announcement, keyed by
@@ -239,12 +244,21 @@ func (s *Server) hub() {
 	for note := range s.serviceChan {
 		switch n := note.(type) {
 		case peerUpNote:
+			if _, ok := peers[n.peer]; !ok {
+				// No live record: a genuine session start (a rebuild
+				// replaces the record of a live session and fires nothing).
+				s.handler.HandlePeerSessionStart(n.ctx, n.peer)
+			}
 			peers[n.peer] = &peerRecord{dcmsg: n.dcmsg, announced: make(map[string]*FileAnnouncement)}
 		case peerDownNote:
 			if entry, ok := peers[n.peer]; ok && entry.dcmsg == n.dcmsg {
 				delete(peers, n.peer)
 				delete(onTracks, n.peer)
 				delete(outCalls, n.peer)
+				// The registration really went away: a genuine session end
+				// (a stale invocation's note, recognized by the channel's
+				// identity, fires nothing).
+				s.handler.HandlePeerSessionEnd(n.ctx, n.peer)
 			}
 		case announceNote:
 			if entry, ok := peers[n.peer]; ok && entry.dcmsg == n.dcmsg {
@@ -459,12 +473,12 @@ func sipMessageOf(msg *dcMsgIn) *SipMessage {
 // distilled messages to the BotMessageHandler.
 func (s *Server) serveMessages(ctx context.Context, channelId ss.ChannelId, peer ss.SubscriberId, dc *webrtc.DataChannel) {
 	self := s.client.SubscriberId()
-	s.serviceChan <- peerUpNote{peer: peer, dcmsg: dc}
+	s.serviceChan <- peerUpNote{peer: peer, dcmsg: dc, ctx: ctx}
 	// The session ends with ctx (a glare rebuild replaces the registration
 	// first): drop it unless it has already been replaced.
 	go func() {
 		<-ctx.Done()
-		s.serviceChan <- peerDownNote{peer: peer, dcmsg: dc}
+		s.serviceChan <- peerDownNote{peer: peer, dcmsg: dc, ctx: ctx}
 	}()
 	dc.OnMessage(func(raw webrtc.DataChannelMessage) {
 		if !raw.IsString {

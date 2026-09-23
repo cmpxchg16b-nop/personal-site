@@ -155,7 +155,7 @@ type MusicBotXML struct {
 
 // SipBotXML mirrors the <sipBot/> section of serverConfig.xml: a bot
 // client (the embedded BotClientXML attributes) carrying the sip bot's
-// test callee.
+// test callee and its credential pool.
 type SipBotXML struct {
 	BotClientXML
 	// TestSIPContact is the raw testSIPContact attribute: the SIP
@@ -163,6 +163,42 @@ type SipBotXML struct {
 	// "9664@192.168.1.2") — a known-good callee on the SIP network the
 	// deployment tests against. Empty disables /test-call.
 	TestSIPContact string `xml:"testSIPContact,attr"`
+	// CredentialPool is nil when the element carries no
+	// <sipCredentialPool/> child; the sip bot then has no accounts to
+	// lend, and a /call from a user without a registration always
+	// answers with the register hint.
+	CredentialPool *SipCredentialPoolXML `xml:"sipCredentialPool"`
+}
+
+// SipCredentialPoolXML mirrors the <sipCredentialPool/> child of the
+// <sipBot/> section: the pool of SIP accounts the bot lends to chat
+// users who bring no credential of their own — zero or more
+// <sipCredential/> entries, then zero or more <sipCredentialRange/>
+// entries. Converted to the bot's pool with sipbot.NewSIPCredentialPool
+// at wiring time (see cmd/server).
+type SipCredentialPoolXML struct {
+	Credentials []SipCredentialXML      `xml:"sipCredential"`
+	Ranges      []SipCredentialRangeXML `xml:"sipCredentialRange"`
+}
+
+// SipCredentialXML mirrors one <sipCredential/> entry: one SIP account,
+// the full URI (sipUri, e.g. "sip:1001@sip.example.com") and its
+// password.
+type SipCredentialXML struct {
+	URI      string `xml:"sipUri,attr"`
+	Password string `xml:"password,attr"`
+}
+
+// SipCredentialRangeXML mirrors one <sipCredentialRange/> entry: every
+// username in usernameRange ("<integer>-<integer>", both ends inclusive
+// — "1101-1120" is the twenty accounts 1101…1120) registering on
+// sipServer (host[:port]) with the shared password. The schema marks
+// sipServer optional so a range can be sketched without it; the wiring
+// rejects an empty one at startup.
+type SipCredentialRangeXML struct {
+	UsernameRange string `xml:"usernameRange,attr"`
+	Password      string `xml:"password,attr"`
+	SIPServer     string `xml:"sipServer,attr"`
 }
 
 // AudioSourceXML mirrors a single <audioSource/> entry of the

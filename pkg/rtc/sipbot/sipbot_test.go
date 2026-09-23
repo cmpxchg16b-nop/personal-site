@@ -158,8 +158,9 @@ func (net *clientTestNet) connect(name string) (toSS chan<- *ss.SignallingEvent,
 
 // startClient builds a HeadlessRTCClient, connects it to the net, and
 // Runs it; configure may adjust the configuration (e.g. a fixed
-// subscriber id).
-func startClient(t *testing.T, net *clientTestNet, name string, configure func(*rtc.RTCClientConfiguration)) *rtc.HeadlessRTCClient {
+// subscriber id). The returned cancel stops the client mid-test (a
+// subscriber dropout); cleanup cancels anyway.
+func startClient(t *testing.T, net *clientTestNet, name string, configure func(*rtc.RTCClientConfiguration)) (*rtc.HeadlessRTCClient, context.CancelFunc) {
 	t.Helper()
 	toSS, fromSS := net.connect(name)
 	config := rtc.RTCClientConfiguration{
@@ -182,18 +183,19 @@ func startClient(t *testing.T, net *clientTestNet, name string, configure func(*
 			t.Errorf("client %s: Run: %v", name, err)
 		}
 	}()
-	return c
+	return c, cancel
 }
 
 // startBot builds a client with the sip bot attached (on the loopback
-// SIP transport, with the given /test-call contact — empty disables it)
-// and Runs it on the net.
-func startBot(t *testing.T, net *clientTestNet, name string, id ss.SubscriberId, testContact string) *rtc.HeadlessRTCClient {
+// SIP transport, with the given /test-call contact — empty disables it —
+// and the given credential pool — nil means none) and Runs it on the
+// net.
+func startBot(t *testing.T, net *clientTestNet, name string, id ss.SubscriberId, testContact string, pool *SIPCredentialPool) *rtc.HeadlessRTCClient {
 	t.Helper()
-	c := startClient(t, net, name, func(c *rtc.RTCClientConfiguration) {
+	c, _ := startClient(t, net, name, func(c *rtc.RTCClientConfiguration) {
 		c.SubscriberId = id
 	})
-	New(c, NewOnMemoryUserSessionStorage(), Configuration{
+	New(c, NewOnMemoryUserSessionStorage(), pool, Configuration{
 		Logger:         testLogger(t),
 		BindHost:       "127.0.0.1",
 		TestSIPContact: testContact,
@@ -309,17 +311,19 @@ func (p *trackProbe) waitTrack(t *testing.T, n int) *webrtc.TrackRemote {
 }
 
 // startUserProbe Runs a plain client with a wireProbe on the messaging
-// label and a trackProbe on its media.
-func startUserProbe(t *testing.T, net *clientTestNet, name string, id ss.SubscriberId) (*rtc.HeadlessRTCClient, *wireProbe, *trackProbe) {
+// label and a trackProbe on its media. The returned cancel stops the
+// client mid-test (a subscriber dropout); the tests that need it take
+// it, the rest ignore it (cleanup cancels anyway).
+func startUserProbe(t *testing.T, net *clientTestNet, name string, id ss.SubscriberId) (*rtc.HeadlessRTCClient, *wireProbe, *trackProbe, context.CancelFunc) {
 	t.Helper()
-	user := startClient(t, net, name, func(c *rtc.RTCClientConfiguration) {
+	user, stop := startClient(t, net, name, func(c *rtc.RTCClientConfiguration) {
 		c.SubscriberId = id
 	})
 	probe := newWireProbe()
 	probe.register(t, user)
 	tprobe := newTrackProbe()
 	tprobe.register(t, user)
-	return user, probe, tprobe
+	return user, probe, tprobe, stop
 }
 
 // readOneRTP reads one packet off a remote track, failing the test when
@@ -562,6 +566,10 @@ type fakePBX struct {
 	registers    int    // authenticated REGISTERs
 	unregistered bool   // a de-REGISTER (Expires 0) arrived
 	authedUser   string // the Authorization header's username on the last authenticated request
+	// refuseRegisterUser, when non-empty, makes the registrar answer 403
+	// to an authenticated REGISTER carrying this digest username — a
+	// registrar that refuses one account (a bad pooled credential).
+	refuseRegisterUser string
 	// registrations records each authenticated REGISTER's identity: the
 	// From and Contact URI users (both must be the registering user's,
 	// never the bot's) and the source address (each account's own
@@ -570,9 +578,9 @@ type fakePBX struct {
 	invites       int
 	inviteFrom    string
 	inviteTo      string
-	byes         int
-	rtpReceived  int
-	rtpPayloads  [][]byte
+	byes          int
+	rtpReceived   int
+	rtpPayloads   [][]byte
 
 	dialogs    chan *sipgo.DialogServerSession // established dialogs (after ACK)
 	rtpStart   chan struct{}                   // closed when the first dialog's media is up
@@ -634,6 +642,15 @@ func newFakePBX(t *testing.T, answerCode int, opus bool) *fakePBX {
 	srv.OnRegister(func(req *sip.Request, tx sip.ServerTransaction) {
 		if !f.authenticated(req) {
 			f.challenge(req, tx)
+			return
+		}
+		f.mu.Lock()
+		refused := f.refuseRegisterUser != "" && f.refuseRegisterUser == f.authedUser
+		f.mu.Unlock()
+		if refused {
+			if err := tx.Respond(sip.NewResponseFromRequest(req, 403, "Forbidden", nil)); err != nil {
+				t.Errorf("REGISTER 403: %v", err)
+			}
 			return
 		}
 		if exp := req.GetHeader("Expires"); exp != nil && strings.TrimSpace(exp.Value()) == "0" {
@@ -737,6 +754,15 @@ func newFakePBX(t *testing.T, answerCode int, opus bool) *fakePBX {
 		}
 	}()
 	return f
+}
+
+// refuseRegister makes the registrar answer 403 to an authenticated
+// REGISTER carrying user's digest username — a registrar that refuses
+// one account (a bad pooled credential).
+func (f *fakePBX) refuseRegister(user string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.refuseRegisterUser = user
 }
 
 // authenticated reports whether the request carries a digest answer and
@@ -907,8 +933,8 @@ func (f *fakePBX) waitForPBX(t *testing.T, what string, pred func() bool) {
 // /test-call without a configured contact, /hangup with no call).
 func TestSipBotCLIAndGuards(t *testing.T) {
 	net := newClientTestNet(t, ss.DefaultSubscriberAging)
-	bot := startBot(t, net, "bot", "2-bot", "")
-	user, probe, _ := startUserProbe(t, net, "user", "1-user") // polite: creates the channels
+	bot := startBot(t, net, "bot", "2-bot", "", nil)
+	user, probe, _, _ := startUserProbe(t, net, "user", "1-user") // polite: creates the channels
 	botId, userId := pairUp(t, bot, user)
 
 	dc := probe.waitDC(t, botId, msg_handler.DataChannelLabelMessages)
@@ -953,8 +979,8 @@ func TestSipBotCLIAndGuards(t *testing.T) {
 // 603 (the bot is an outbound SBC).
 func TestSipBotDeclinesIncomingCalls(t *testing.T) {
 	net := newClientTestNet(t, ss.DefaultSubscriberAging)
-	bot := startBot(t, net, "bot", "2-bot", "")
-	user, probe, _ := startUserProbe(t, net, "user", "1-user")
+	bot := startBot(t, net, "bot", "2-bot", "", nil)
+	user, probe, _, _ := startUserProbe(t, net, "user", "1-user")
 	botId, userId := pairUp(t, bot, user)
 
 	dc := probe.waitDC(t, botId, msg_handler.DataChannelLabelMessages)
@@ -978,8 +1004,8 @@ func TestSipBotDeclinesIncomingCalls(t *testing.T) {
 // registration down with a de-REGISTER (Expires 0).
 func TestSipBotRegisterUnregister(t *testing.T) {
 	net := newClientTestNet(t, ss.DefaultSubscriberAging)
-	bot := startBot(t, net, "bot", "2-bot", "")
-	user, probe, _ := startUserProbe(t, net, "user", "1-user")
+	bot := startBot(t, net, "bot", "2-bot", "", nil)
+	user, probe, _, _ := startUserProbe(t, net, "user", "1-user")
 	botId, userId := pairUp(t, bot, user)
 	pbx := newFakePBX(t, 200, true)
 
@@ -1021,9 +1047,9 @@ func TestSipBotRegisterUnregister(t *testing.T) {
 // part), never the bot's and never each other's.
 func TestSipBotPerUserStacks(t *testing.T) {
 	net := newClientTestNet(t, ss.DefaultSubscriberAging)
-	bot := startBot(t, net, "bot", "2-bot", "")
-	alice, aliceProbe, _ := startUserProbe(t, net, "alice", "1-alice")
-	bob, bobProbe, _ := startUserProbe(t, net, "bob", "1-bob")
+	bot := startBot(t, net, "bot", "2-bot", "", nil)
+	alice, aliceProbe, _, _ := startUserProbe(t, net, "alice", "1-alice")
+	bob, bobProbe, _, _ := startUserProbe(t, net, "bob", "1-bob")
 	botId, aliceId := pairUp(t, bot, alice)
 	_, bobId := pairUp(t, bot, bob)
 	pbx := newFakePBX(t, 200, true)
@@ -1066,8 +1092,8 @@ func TestSipBotPerUserStacks(t *testing.T) {
 // the browser's side too (BYE, the chat line, the ended amend).
 func TestSipBotCallEndToEnd(t *testing.T) {
 	net := newClientTestNet(t, ss.DefaultSubscriberAging)
-	bot := startBot(t, net, "bot", "2-bot", "")
-	user, probe, tprobe := startUserProbe(t, net, "user", "1-user")
+	bot := startBot(t, net, "bot", "2-bot", "", nil)
+	user, probe, tprobe, _ := startUserProbe(t, net, "user", "1-user")
 	botId, userId := pairUp(t, bot, user)
 	pbx := newFakePBX(t, 200, true)
 
@@ -1212,8 +1238,8 @@ func TestSipBotCallEndToEnd(t *testing.T) {
 // CANCEL, the chat line says why, the log settles cancelled.
 func TestSipBotCallBusy(t *testing.T) {
 	net := newClientTestNet(t, ss.DefaultSubscriberAging)
-	bot := startBot(t, net, "bot", "2-bot", "")
-	user, probe, _ := startUserProbe(t, net, "user", "1-user")
+	bot := startBot(t, net, "bot", "2-bot", "", nil)
+	user, probe, _, _ := startUserProbe(t, net, "user", "1-user")
 	botId, userId := pairUp(t, bot, user)
 	pbx := newFakePBX(t, 486, true)
 
@@ -1245,8 +1271,8 @@ func TestSipBotCallBusy(t *testing.T) {
 // the browser leg gets the bot's BYE, the sip-leg's dialog its own.
 func TestSipBotHangupCommand(t *testing.T) {
 	net := newClientTestNet(t, ss.DefaultSubscriberAging)
-	bot := startBot(t, net, "bot", "2-bot", "")
-	user, probe, _ := startUserProbe(t, net, "user", "1-user")
+	bot := startBot(t, net, "bot", "2-bot", "", nil)
+	user, probe, _, _ := startUserProbe(t, net, "user", "1-user")
 	botId, userId := pairUp(t, bot, user)
 	pbx := newFakePBX(t, 200, true)
 
@@ -1295,8 +1321,8 @@ func TestSipBotHangupCommand(t *testing.T) {
 func TestSipBotTestCall(t *testing.T) {
 	net := newClientTestNet(t, ss.DefaultSubscriberAging)
 	pbx := newFakePBX(t, 200, true)
-	bot := startBot(t, net, "bot", "2-bot", "9664@"+pbx.addr)
-	user, probe, _ := startUserProbe(t, net, "user", "1-user")
+	bot := startBot(t, net, "bot", "2-bot", "9664@"+pbx.addr, nil)
+	user, probe, _, _ := startUserProbe(t, net, "user", "1-user")
 	botId, userId := pairUp(t, bot, user)
 
 	dc := probe.waitDC(t, botId, msg_handler.DataChannelLabelMessages)
@@ -1333,4 +1359,201 @@ func TestSipBotTestCall(t *testing.T) {
 	sip(map[string]any{"callId": callId, "response": map[string]any{"code": 603, "phrase": "Decline"}})
 	waitBotMessage(t, probe, botId, "the declined line", isChatReply(testCallMsg, "Call declined."))
 	pbx.waitForPBX(t, "the callee's BYE", func() bool { return pbx.byes == 1 })
+}
+
+// TestSipBotPoolCall covers the pool's happy path: a user with no
+// /register /calls — the bot loans an account from the pool, registers
+// it (the REGISTER carries the pooled identity, digest and all), says
+// so, and dials the callee with it; /unregister returns the loan (the
+// de-REGISTER goes out), and the pool hands the same account out again
+// to the next /call.
+func TestSipBotPoolCall(t *testing.T) {
+	net := newClientTestNet(t, ss.DefaultSubscriberAging)
+	pbx := newFakePBX(t, 200, true)
+	pool, err := NewSIPCredentialPool([]SIPCredential{{URI: "sip:1101@" + pbx.addr, Password: "poolpass"}}, nil)
+	if err != nil {
+		t.Fatalf("NewSIPCredentialPool: %v", err)
+	}
+	bot := startBot(t, net, "bot", "2-bot", "", pool)
+	user, probe, _, _ := startUserProbe(t, net, "user", "1-user")
+	botId, userId := pairUp(t, bot, user)
+
+	dc := probe.waitDC(t, botId, msg_handler.DataChannelLabelMessages)
+	chat := func(text string) ss.MsgId {
+		t.Helper()
+		m := baseMsg(ss.WellKnownChIdMain, userId, botId)
+		m["plaintext"] = text
+		if err := dc.SendText(mustJSON(t, m)); err != nil {
+			t.Fatalf("SendText: %v", err)
+		}
+		return ss.MsgId(m["msgId"].(string))
+	}
+
+	// The /call loans the pool's account, registers it, says so, dials.
+	callMsg := chat("/call 1001@" + pbx.addr)
+	waitBotMessage(t, probe, botId, "the pooled registration line", isChatReply(callMsg, "Registered as sip:1101@"+pbx.addr+" (an account from the bot's pool)"))
+	waitBotMessage(t, probe, botId, "the calling line", isChatReply(callMsg, "Calling 1001@"))
+	pbx.waitForPBX(t, "the pooled account's REGISTER, its own socket and identity", func() bool {
+		return len(pbx.registrations) == 1 &&
+			pbx.registrations[0].from == "1101" && pbx.registrations[0].contact == "1101"
+	})
+	pbx.waitForPBX(t, "the callee's INVITE with the pooled identity", func() bool {
+		return pbx.invites == 1 && pbx.inviteFrom == "1101" && pbx.inviteTo == "1001"
+	})
+	pbx.waitForPBX(t, "the pooled digest username", func() bool { return pbx.authedUser == "1101" })
+
+	// /unregister returns the loan (the de-REGISTER goes out)…
+	unregisterMsg := chat("/unregister")
+	waitBotMessage(t, probe, botId, "the unregistered reply", isChatReply(unregisterMsg, "Unregistered."))
+	pbx.waitForPBX(t, "the pooled account's de-REGISTER", func() bool { return pbx.unregistered })
+
+	// …and the pool hands the same account out again to the next /call.
+	callMsg2 := chat("/call 1002@" + pbx.addr)
+	waitBotMessage(t, probe, botId, "the second pooled registration line", isChatReply(callMsg2, "Registered as sip:1101@"))
+	pbx.waitForPBX(t, "the re-loaned account's REGISTER", func() bool { return pbx.registers == 2 })
+}
+
+// TestSipBotPoolExhausted covers the pool's limits: one account, two
+// users — the second user's /call answers with the pool-empty reply and
+// the /register hint; the manual path is unaffected; and once the first
+// user /unregisters, the returned loan serves a /call again.
+func TestSipBotPoolExhausted(t *testing.T) {
+	net := newClientTestNet(t, ss.DefaultSubscriberAging)
+	pbx := newFakePBX(t, 486, true) // busy: the calls need never complete
+	pool, err := NewSIPCredentialPool(nil, []SIPCredentialRange{{UsernameRange: "1101-1101", Password: "poolpass", SIPServer: pbx.addr}})
+	if err != nil {
+		t.Fatalf("NewSIPCredentialPool: %v", err)
+	}
+	bot := startBot(t, net, "bot", "2-bot", "", pool)
+	alice, aliceProbe, _, _ := startUserProbe(t, net, "alice", "1-alice")
+	bob, bobProbe, _, _ := startUserProbe(t, net, "bob", "1-bob")
+	botId, aliceId := pairUp(t, bot, alice)
+	_, bobId := pairUp(t, bot, bob)
+
+	chat := func(probe *wireProbe, userId ss.SubscriberId, text string) ss.MsgId {
+		t.Helper()
+		dc := probe.waitDC(t, botId, msg_handler.DataChannelLabelMessages)
+		m := baseMsg(ss.WellKnownChIdMain, userId, botId)
+		m["plaintext"] = text
+		if err := dc.SendText(mustJSON(t, m)); err != nil {
+			t.Fatalf("SendText: %v", err)
+		}
+		return ss.MsgId(m["msgId"].(string))
+	}
+
+	// Alice loans the pool's only account (a range's single member).
+	aliceCall := chat(aliceProbe, aliceId, "/call 1001@"+pbx.addr)
+	waitBotMessage(t, aliceProbe, botId, "alice's pooled registration line", isChatReply(aliceCall, "Registered as sip:1101@"))
+
+	// Bob's /call finds the pool empty and says so, pointing at /register;
+	// his own /register is unaffected.
+	bobCall := chat(bobProbe, bobId, "/call 1001@"+pbx.addr)
+	waitBotMessage(t, bobProbe, botId, "the pool-empty reply", isChatReply(bobCall, "pool of SIP accounts is empty"))
+	bobRegister := chat(bobProbe, bobId, "/register 2001@"+pbx.addr+" s3cret")
+	waitBotMessage(t, bobProbe, botId, "bob's registered reply", isChatReply(bobRegister, "Registered as sip:2001@"))
+
+	// Alice's /unregister returns the loan; once bob drops his own
+	// credential, his next /call loans it.
+	aliceUnregister := chat(aliceProbe, aliceId, "/unregister")
+	waitBotMessage(t, aliceProbe, botId, "alice's unregistered reply", isChatReply(aliceUnregister, "Unregistered."))
+	bobUnregister := chat(bobProbe, bobId, "/unregister")
+	waitBotMessage(t, bobProbe, botId, "bob's unregistered reply", isChatReply(bobUnregister, "Unregistered."))
+	bobCall2 := chat(bobProbe, bobId, "/call 1002@"+pbx.addr)
+	waitBotMessage(t, bobProbe, botId, "bob's pooled registration line", isChatReply(bobCall2, "Registered as sip:1101@"))
+	pbx.waitForPBX(t, "the account's second loan's REGISTER", func() bool {
+		n := 0
+		for _, r := range pbx.registrations {
+			if r.from == "1101" {
+				n++
+			}
+		}
+		return n == 2
+	})
+}
+
+// TestSipBotPoolRegistrationFails covers the registrar refusing the
+// pooled account: the /call answers with the failure and the /register
+// hint, the loan returns to the pool (the next /call tries an account
+// again — here the same one, the pool's only), and the manual path is
+// unaffected.
+func TestSipBotPoolRegistrationFails(t *testing.T) {
+	net := newClientTestNet(t, ss.DefaultSubscriberAging)
+	pbx := newFakePBX(t, 200, true)
+	pbx.refuseRegister("1101") // the registrar refuses the pooled account
+	pool, err := NewSIPCredentialPool([]SIPCredential{{URI: "sip:1101@" + pbx.addr, Password: "badpass"}}, nil)
+	if err != nil {
+		t.Fatalf("NewSIPCredentialPool: %v", err)
+	}
+	bot := startBot(t, net, "bot", "2-bot", "", pool)
+	user, probe, _, _ := startUserProbe(t, net, "user", "1-user")
+	botId, userId := pairUp(t, bot, user)
+
+	dc := probe.waitDC(t, botId, msg_handler.DataChannelLabelMessages)
+	chat := func(text string) ss.MsgId {
+		t.Helper()
+		m := baseMsg(ss.WellKnownChIdMain, userId, botId)
+		m["plaintext"] = text
+		if err := dc.SendText(mustJSON(t, m)); err != nil {
+			t.Fatalf("SendText: %v", err)
+		}
+		return ss.MsgId(m["msgId"].(string))
+	}
+
+	callMsg := chat("/call 1001@" + pbx.addr)
+	waitBotMessage(t, probe, botId, "the pooled-registration failure", isChatReply(callMsg, "could not be registered"))
+	// The reply names the account and points at /register.
+	waitBotMessage(t, probe, botId, "the failure's detail", isChatReply(callMsg, "sip:1101@"+pbx.addr))
+
+	// The loan returned to the pool: the next /call tries it again (and
+	// fails the same way — it is not lost, not stuck).
+	callMsg2 := chat("/call 1001@" + pbx.addr)
+	waitBotMessage(t, probe, botId, "the second try fails the same way", isChatReply(callMsg2, "could not be registered"))
+
+	// The manual path is unaffected.
+	registerMsg := chat("/register 2001@" + pbx.addr + " s3cret")
+	waitBotMessage(t, probe, botId, "the manual registered reply", isChatReply(registerMsg, "Registered as sip:2001@"))
+}
+
+// TestSipBotPoolSessionEndReleases covers the lifecycle hook: the user's
+// chat session ends (the subscriber drops out and ages out), and the
+// bot's session-end teardown runs — the pooled loan's de-REGISTER goes
+// out and the account returns to the pool, to serve the next user's
+// /call. A shorter subscriber aging makes the dropout observable.
+func TestSipBotPoolSessionEndReleases(t *testing.T) {
+	net := newClientTestNet(t, 300*time.Millisecond)
+	pbx := newFakePBX(t, 486, true)
+	pool, err := NewSIPCredentialPool(nil, []SIPCredentialRange{{UsernameRange: "1101-1101", Password: "poolpass", SIPServer: pbx.addr}})
+	if err != nil {
+		t.Fatalf("NewSIPCredentialPool: %v", err)
+	}
+	bot := startBot(t, net, "bot", "2-bot", "", pool)
+	alice, aliceProbe, _, aliceStop := startUserProbe(t, net, "alice", "1-alice")
+	botId, aliceId := pairUp(t, bot, alice)
+
+	chat := func(probe *wireProbe, userId ss.SubscriberId, text string) ss.MsgId {
+		t.Helper()
+		dc := probe.waitDC(t, botId, msg_handler.DataChannelLabelMessages)
+		m := baseMsg(ss.WellKnownChIdMain, userId, botId)
+		m["plaintext"] = text
+		if err := dc.SendText(mustJSON(t, m)); err != nil {
+			t.Fatalf("SendText: %v", err)
+		}
+		return ss.MsgId(m["msgId"].(string))
+	}
+
+	aliceCall := chat(aliceProbe, aliceId, "/call 1001@"+pbx.addr)
+	waitBotMessage(t, aliceProbe, botId, "alice's pooled registration line", isChatReply(aliceCall, "Registered as sip:1101@"))
+	pbx.waitForPBX(t, "the pooled account's REGISTER", func() bool { return pbx.registers == 1 })
+
+	// Alice drops out: her registration ages out, the bot's session with
+	// her ends, and the hook returns the loan — the de-REGISTER goes out.
+	aliceStop()
+	pbx.waitForPBX(t, "the pooled account's de-REGISTER on the session's end", func() bool { return pbx.unregistered })
+
+	// Bob's /call loans the returned account — a pool that kept the loan
+	// would answer "empty".
+	bob, bobProbe, _, _ := startUserProbe(t, net, "bob", "1-bob")
+	_, bobId := pairUp(t, bot, bob)
+	bobCall := chat(bobProbe, bobId, "/call 1002@"+pbx.addr)
+	waitBotMessage(t, bobProbe, botId, "bob's pooled registration line", isChatReply(bobCall, "Registered as sip:1101@"))
 }

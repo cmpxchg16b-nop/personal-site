@@ -154,6 +154,18 @@ func (h *musicHandler) HandleCalling(ctx context.Context, sip *msg_handler.SipMe
 	}
 }
 
+// HandlePeerSessionStart implements msg_handler.BotMessageHandler. The
+// music bot's per-peer state is created on demand (a /play, an answered
+// call), so a session's start needs no bookkeeping.
+func (h *musicHandler) HandlePeerSessionStart(_ context.Context, _ ss.SubscriberId) {
+}
+
+// HandlePeerSessionEnd implements msg_handler.BotMessageHandler. The
+// call's own session watcher (startCall) already stops the music when
+// the session ends, so the hook has nothing to add.
+func (h *musicHandler) HandlePeerSessionEnd(_ context.Context, _ ss.SubscriberId) {
+}
+
 // handleInvite answers an incoming call: video is declined, voice is
 // accepted and answered with the song.
 func (h *musicHandler) handleInvite(ctx context.Context, sip *msg_handler.SipMessage, w msg_handler.ResponseWriter) {

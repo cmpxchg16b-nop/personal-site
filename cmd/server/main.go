@@ -450,11 +450,38 @@ func startMusicBot(ctx context.Context, cfg *pkgmodelsserverconfig.MusicBotXML, 
 // border controller between the chat's WebRTC phone sessions and an
 // external SIP network. Its user sessions (the SIP credentials the chat
 // users /register) live in an on-memory store for the process lifetime;
-// the element's testSIPContact is the CLI /test-call command's callee.
+// the element's testSIPContact is the CLI /test-call command's callee;
+// its optional <sipCredentialPool/> child is the pool of SIP accounts
+// the bot lends to users who bring no credential of their own — an
+// entry the pool rejects (a malformed sipUri or usernameRange, an empty
+// sipServer) fails the startup, the music bot's audioSource discipline.
 func startSipBot(ctx context.Context, cfg *pkgmodelsserverconfig.SipBotXML) error {
+	pool, err := sipCredentialPoolOf(cfg.CredentialPool)
+	if err != nil {
+		return err
+	}
 	return startBotClient(ctx, "sip bot", &cfg.BotClientXML, stereoOpusPCFactory(pkgapiiceservers.ParseURLs(cfg.IceServers)), func(client *rtc.HeadlessRTCClient) {
-		sipbot.New(client, sipbot.NewOnMemoryUserSessionStorage(), sipbot.Configuration{Logger: logger, TestSIPContact: cfg.TestSIPContact})
+		sipbot.New(client, sipbot.NewOnMemoryUserSessionStorage(), pool, sipbot.Configuration{Logger: logger, TestSIPContact: cfg.TestSIPContact})
 	})
+}
+
+// sipCredentialPoolOf converts the element's <sipCredentialPool/> child
+// into the bot's pool — nil when the element carries none (the bot then
+// lends nothing, and a /call without a registration answers with the
+// /register hint).
+func sipCredentialPoolOf(x *pkgmodelsserverconfig.SipCredentialPoolXML) (*sipbot.SIPCredentialPool, error) {
+	if x == nil {
+		return nil, nil
+	}
+	credentials := make([]sipbot.SIPCredential, 0, len(x.Credentials))
+	for _, c := range x.Credentials {
+		credentials = append(credentials, sipbot.SIPCredential{URI: c.URI, Password: c.Password})
+	}
+	ranges := make([]sipbot.SIPCredentialRange, 0, len(x.Ranges))
+	for _, r := range x.Ranges {
+		ranges = append(ranges, sipbot.SIPCredentialRange{UsernameRange: r.UsernameRange, Password: r.Password, SIPServer: r.SIPServer})
+	}
+	return sipbot.NewSIPCredentialPool(credentials, ranges)
 }
 
 // stereoOpusPCFactory builds the music bot's peer-connection factory:

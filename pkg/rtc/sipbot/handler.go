@@ -54,12 +54,14 @@ const (
 		"/unregister — drop the registration and the stored credential\n" +
 		"/call <user@host> — phone a SIP subscriber (a bare user keeps your account's domain)\n" +
 		"/test-call — phone the bot's configured test callee\n" +
-		"/hangup — end the current call"
+		"/hangup — end the current call\n" +
+		"No account of your own? Just /call — when the bot's pool has a free account, it lends you one."
 	attachmentRefusal = "Attachments are not supported — I'm a SIP bot. Try /help."
 	unknownCommand    = "Unrecognized command — try /help."
 	registerUsage     = "Usage: /register <user@host> <password> — e.g. /register 2001@sip.example.com passW_0rd."
 	callUsage         = "Usage: /call <user@host> — e.g. /call 1001@sip.example.com."
 	notRegistered     = "Not registered — /register <user@host> <password> first."
+	poolExhausted     = "The bot's pool of SIP accounts is empty — /register <user@host> <password> to use your own account."
 	testUnavailable   = "Test call unavailable — the bot has no testSIPContact configured."
 )
 
@@ -86,6 +88,9 @@ var voiceTrackCodec = webrtc.RTPCodecCapability{
 type sipHandler struct {
 	logger  *slog.Logger
 	storage UserSessionStorage
+	// pool is the bot's pool of SIP accounts (nil: no pool), loaned to a
+	// user who /calls without a credential of their own.
+	pool *SIPCredentialPool
 	// stack opens each account's own SIP client — one per registered
 	// user, never a client shared across users.
 	stack  sipStack
@@ -104,8 +109,8 @@ type sipHandler struct {
 
 var _ msg_handler.BotMessageHandler = (*sipHandler)(nil)
 
-func newSipHandler(logger *slog.Logger, storage UserSessionStorage, stack sipStack, expiry time.Duration, testContact string) *sipHandler {
-	return &sipHandler{logger: logger, storage: storage, stack: stack, expiry: expiry, testContact: testContact}
+func newSipHandler(logger *slog.Logger, storage UserSessionStorage, pool *SIPCredentialPool, stack sipStack, expiry time.Duration, testContact string) *sipHandler {
+	return &sipHandler{logger: logger, storage: storage, pool: pool, stack: stack, expiry: expiry, testContact: testContact}
 }
 
 // HandleChatMessage is the CLI: parse the line, answer it.
@@ -155,6 +160,45 @@ func (h *sipHandler) HandleCalling(ctx context.Context, sip *msg_handler.SipMess
 		h.handleResponse(sip, w)
 	case sip.Method == msg_handler.SipMethodBye || sip.Method == msg_handler.SipMethodCancel:
 		h.handleHangup(ctx, sip, w)
+	}
+}
+
+// HandlePeerSessionStart is a deliberate no-op: allocation from the
+// credential pool is on-demand (at /call), never at session start — the
+// bot holds a peer session with every online channel member, and
+// presence alone must not loan accounts to lurkers who never dial.
+func (h *sipHandler) HandlePeerSessionStart(_ context.Context, _ ss.SubscriberId) {
+}
+
+// HandlePeerSessionEnd is the bot's session-end teardown — the
+// framework's lifecycle hook, replacing what used to be a per-call and
+// a per-account ctx-watcher goroutine: the call in progress ends (the
+// callee's dialog gets its BYE; the browser leg is gone with the
+// session, so there is nothing to tell it), the account stops (its own
+// ctx teardown sends the de-REGISTER), and a pooled credential — a loan
+// whose scope is the session — is dropped from the store and returned
+// to the pool. A manual credential survives in the store by design: the
+// next session's /call revives it. Runs on the Server's hub goroutine:
+// all of it is fast bookkeeping (the dialog's BYE is sent on its own
+// goroutine, as everywhere).
+func (h *sipHandler) HandlePeerSessionEnd(_ context.Context, peer ss.SubscriberId) {
+	if v, ok := h.calls.Load(peer); ok {
+		c := v.(*peerCall)
+		if dialog, _, ok := c.end(); ok {
+			h.calls.CompareAndDelete(peer, c)
+			h.hangupDialog(dialog)
+			h.logger.Info("sipbot: the session's end ended the call", "peer", peer, "callId", c.callId)
+		}
+	}
+	if v, ok := h.accounts.Load(peer); ok {
+		a := v.(*account)
+		a.stop()
+		h.accounts.CompareAndDelete(peer, a)
+	}
+	if session, ok := h.storage.Load(peer); ok && session.Pooled {
+		h.storage.Delete(peer)
+		h.pool.Release(session)
+		h.logger.Info("sipbot: the pooled account is back in the pool", "peer", peer, "aor", session.AddressOfRecord)
 	}
 }
 
@@ -255,7 +299,12 @@ func (h *sipHandler) register(ctx context.Context, msg *msg_handler.ChatMessage,
 		h.say(peer, w, fmt.Sprintf("Registration failed: %v.", err))
 		return
 	}
-	h.setAccount(ctx, peer, a)
+	h.setAccount(peer, a)
+	// A replaced pool loan returns to the pool; the new credential is the
+	// user's own.
+	if old, ok := h.storage.Load(peer); ok && old.Pooled {
+		h.pool.Release(old)
+	}
 	h.storage.Store(peer, session)
 	h.say(peer, w, fmt.Sprintf("Registered as sip:%s.", session.AddressOfRecord))
 }
@@ -273,9 +322,12 @@ func (h *sipHandler) unregister(ctx context.Context, msg *msg_handler.ChatMessag
 		a.stop()
 		h.accounts.CompareAndDelete(peer, a)
 	}
-	if _, ok := h.storage.Delete(peer); !ok {
+	if session, ok := h.storage.Delete(peer); !ok {
 		h.say(peer, w, notRegistered)
 		return
+	} else if session.Pooled {
+		// The loan returns to the pool with its store entry.
+		h.pool.Release(session)
 	}
 	h.say(peer, w, "Unregistered.")
 }
@@ -293,10 +345,15 @@ func (h *sipHandler) call(ctx context.Context, msg *msg_handler.ChatMessage, w m
 		h.say(peer, w, "Already in a call — /hangup first.")
 		return
 	}
-	a, err := h.ensureAccount(ctx, peer)
+	a, pooled, err := h.ensureAccount(ctx, peer)
 	if err != nil {
 		h.say(peer, w, err.Error())
 		return
+	}
+	if pooled {
+		// The user is phoning with a loaned account — they should know
+		// which identity the callee sees.
+		h.say(peer, w, fmt.Sprintf("Registered as sip:%s (an account from the bot's pool).", a.session.AddressOfRecord))
 	}
 	track, err := webrtc.NewTrackLocalStaticSample(voiceTrackCodec, "sip-voice", "sipbot")
 	if err != nil {
@@ -320,17 +377,10 @@ func (h *sipHandler) call(ctx context.Context, msg *msg_handler.ChatMessage, w m
 	}
 	c.callId = callId
 	h.say(peer, w, fmt.Sprintf("Calling %s…", args[0]))
-	// The session's end ends the call (the peer dropped out): the sip-leg
-	// dialog is hung up, silently — there is no browser leg left to tell.
-	go func() {
-		<-ctx.Done()
-		if dialog, _, ok := c.end(); ok {
-			h.calls.CompareAndDelete(peer, c)
-			h.hangupDialog(dialog)
-		}
-	}()
 	// The dial runs on its own goroutine: ringing the PSTN takes
-	// seconds, and the peer's channel goroutine never waits on it.
+	// seconds, and the peer's channel goroutine never waits on it. The
+	// session's end ends the call — the lifecycle hook
+	// (HandlePeerSessionEnd) owns that teardown.
 	go h.dial(a, peer, c, dialCtx)
 }
 
@@ -502,44 +552,62 @@ func (h *sipHandler) detachLater(ctx context.Context, c *peerCall) {
 	}()
 }
 
-// ensureAccount answers the peer's live registration, reviving it from
-// the stored credential when the keepalive died (or the peer's earlier
-// session ended it): the credential is what makes /call possible, the
-// account merely its live form. The revive's first REGISTER is
-// synchronous and bounded, like /register's.
-func (h *sipHandler) ensureAccount(ctx context.Context, peer ss.SubscriberId) (*account, error) {
+// ensureAccount answers the peer's live registration: the account in
+// the map when it is believed registered; else a revival of the stored
+// credential; else — for a user who never /registered — a loan from the
+// bot's credential pool, registered and stored exactly like a
+// /register's outcome (the pooled flag tells the caller to announce it).
+// The revive's and the loan's first REGISTER are synchronous and
+// bounded, like /register's. The errors are the user-facing answers,
+// each pointing at /register: no credential at all (no pool
+// configured), an exhausted pool, or a failed registration — a pooled
+// account that fails to register returns to the pool.
+func (h *sipHandler) ensureAccount(ctx context.Context, peer ss.SubscriberId) (*account, bool, error) {
 	if v, ok := h.accounts.Load(peer); ok {
 		a := v.(*account)
 		if a.registered.Load() {
-			return a, nil
+			return a, false, nil
 		}
 	}
 	session, ok := h.storage.Load(peer)
+	pooled := false
 	if !ok {
-		return nil, errors.New(notRegistered)
+		if h.pool == nil {
+			return nil, false, errors.New(notRegistered)
+		}
+		session, ok = h.pool.Allocate()
+		if !ok {
+			h.logger.Warn("sipbot: the credential pool is exhausted", "peer", peer)
+			return nil, false, errors.New(poolExhausted)
+		}
+		pooled = true
+		h.logger.Info("sipbot: loaned a pooled account", "peer", peer, "aor", session.AddressOfRecord)
 	}
 	a, err := newAccount(ctx, h.logger, h.stack, session, h.expiry)
 	if err != nil {
-		return nil, fmt.Errorf("registration failed: %w", err)
+		if pooled {
+			h.pool.Release(session)
+			return nil, false, fmt.Errorf("the bot's pooled account sip:%s could not be registered (%v) — /register <user@host> <password> to use your own account", session.AddressOfRecord, err)
+		}
+		return nil, false, fmt.Errorf("registration failed: %w", err)
 	}
-	h.setAccount(ctx, peer, a)
-	return a, nil
+	h.setAccount(peer, a)
+	if pooled {
+		h.storage.Store(peer, session)
+	}
+	return a, pooled, nil
 }
 
-// setAccount publishes a fresh account, stopping the one it replaces,
-// and arms the session watcher that takes it down with the peer's
-// session (the credential in the store survives — the next session's
-// /call revives it).
-func (h *sipHandler) setAccount(ctx context.Context, peer ss.SubscriberId, a *account) {
+// setAccount publishes a fresh account, stopping the one it replaces.
+// The account's ctx is the peer session's, and the session-end hook
+// (HandlePeerSessionEnd) drops it from the map when the session ends —
+// the credential in the store survives a manual one, a pooled one
+// returns to the pool there.
+func (h *sipHandler) setAccount(peer ss.SubscriberId, a *account) {
 	if old, ok := h.accounts.Load(peer); ok {
 		old.(*account).stop()
 	}
 	h.accounts.Store(peer, a)
-	go func() {
-		<-ctx.Done()
-		a.stop()
-		h.accounts.CompareAndDelete(peer, a)
-	}()
 }
 
 // onMic is the inbound-media callback: the browser's mic track joins

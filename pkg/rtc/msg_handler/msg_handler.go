@@ -29,7 +29,11 @@
 // through the ResponseWriter it is handed.
 package msg_handler
 
-import "context"
+import (
+	"context"
+
+	"personal-site/pkg/models/ss"
+)
 
 // BotMessageHandler handles a bot's messages — the counterpart of
 // http.Handler for the messages a Server distills from a pair's data
@@ -75,4 +79,23 @@ type BotMessageHandler interface {
 	// the bot's own INVITE. Dialog messages are never bounced, so the
 	// handler sees them exactly once.
 	HandleCalling(ctx context.Context, sip *SipMessage, w ResponseWriter)
+
+	// HandlePeerSessionStart handles the start of the peer's session at
+	// this layer: the pair's messaging channel came up for a peer that
+	// had no live session. HandlePeerSessionEnd handles the genuine end
+	// of the peer's session. The two are the session's lifecycle as the
+	// Server's hub sees it: a glare rebuild — the session's channel
+	// handler re-invoked with a fresh channel on a live session — fires
+	// neither.
+	//
+	// Unlike the message methods above, the hooks are invoked
+	// synchronously on the Server's hub goroutine (not the peer's
+	// channel goroutine) and receive no ResponseWriter: they are
+	// bookkeeping, not messaging — a start has no message to answer, and
+	// at an end the peer is gone. An implementation must be fast and
+	// must not call back into the Server: the hub serves every peer. The
+	// end hook's ctx is the session's, already canceled — it carries the
+	// session's values, not a cancellable lifetime.
+	HandlePeerSessionStart(ctx context.Context, peer ss.SubscriberId)
+	HandlePeerSessionEnd(ctx context.Context, peer ss.SubscriberId)
 }

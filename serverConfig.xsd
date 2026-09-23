@@ -162,7 +162,14 @@
              testSIPContact: the SIP address the CLI's /test-call
                    command dials (e.g. "9664@192.168.1.2") — a known-
                    good callee on the SIP network the deployment tests
-                   against; empty disables /test-call. -->
+                   against; empty disables /test-call.
+
+             The optional sipCredentialPool child is the bot's pool of
+             SIP accounts, lent to chat users who bring no credential of
+             their own: a /call from such a user loans a free account
+             from the pool and registers it (the reply says so); the
+             loan returns on /unregister, on a replacing /register, or
+             at the session's end. See sipCredentialPoolType. -->
         <xsd:element name="sipBot" type="sipBotType" minOccurs="0" />
       </xsd:sequence>
     </xsd:complexType>
@@ -226,9 +233,74 @@
   <xsd:complexType name="sipBotType">
     <xsd:complexContent>
       <xsd:extension base="botClientType">
+        <xsd:sequence>
+          <xsd:element
+            name="sipCredentialPool"
+            type="sipCredentialPoolType"
+            minOccurs="0"
+          />
+        </xsd:sequence>
         <xsd:attribute name="testSIPContact" type="xsd:string" use="optional" />
       </xsd:extension>
     </xsd:complexContent>
+  </xsd:complexType>
+
+  <!-- The sip bot's pool of SIP accounts (see the sipBot element above):
+       accounts the bot lends to chat users who bring no credential of
+       their own — a /call from such a user loans a free account from the
+       pool and registers it, and the loan returns when the user
+       /unregisters, a /register supersedes it, or the user's session
+       ends. Holds zero or more sipCredential entries, then zero or more
+       sipCredentialRange entries. Duplicates are tolerated, not detected
+       (SIP allows concurrent registrations of one account); whoever
+       authors the configuration owns the consequence. -->
+  <xsd:complexType name="sipCredentialPoolType">
+    <xsd:sequence>
+      <xsd:element
+        name="sipCredential"
+        type="sipCredentialType"
+        minOccurs="0"
+        maxOccurs="unbounded"
+      />
+      <xsd:element
+        name="sipCredentialRange"
+        type="sipCredentialRangeType"
+        minOccurs="0"
+        maxOccurs="unbounded"
+      />
+    </xsd:sequence>
+  </xsd:complexType>
+
+  <!-- One SIP account of the pool: the full SIP URI (e.g.
+       "sip:1001@sip.example.com") and its password. -->
+  <xsd:complexType name="sipCredentialType">
+    <xsd:attribute name="sipUri" type="xsd:string" use="required" />
+    <xsd:attribute name="password" type="xsd:string" use="required" />
+  </xsd:complexType>
+
+  <!-- A span of SIP accounts of the pool sharing one password and one
+       server: usernameRange is a range expression "<integer>-<integer>",
+       both ends inclusive ("1101-1120" is the twenty accounts
+       1101...1120; the integer is the username, so leading zeros are not
+       preserved); password is the accounts' shared password; sipServer
+       is the registrar as host[:port] — optional in the schema so a
+       range can be sketched without it, but the wiring rejects an empty
+       one at startup. -->
+  <xsd:complexType name="sipCredentialRangeType">
+    <xsd:attribute name="usernameRange" use="required">
+      <xsd:simpleType>
+        <xsd:restriction base="xsd:string">
+          <xsd:pattern value="[0-9]+-[0-9]+" />
+        </xsd:restriction>
+      </xsd:simpleType>
+    </xsd:attribute>
+    <xsd:attribute name="password" type="xsd:string" use="required" />
+    <xsd:attribute
+      name="sipServer"
+      type="xsd:string"
+      use="optional"
+      default=""
+    />
   </xsd:complexType>
 
   <!-- A single song of the music bot's songbook: one audio source as
