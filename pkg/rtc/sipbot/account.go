@@ -36,8 +36,10 @@ const registerTimeout = 5 * time.Second
 // error); diago's own default.
 const registerRetry = 5 * time.Second
 
-// account is one chat user's SIP runtime: its registration keepalive
-// and its dial-out identity on the bot's shared diago instance.
+// account is one chat user's SIP runtime: its own SIP client (the
+// registration keepalive and the dial-out identity run on a diago of
+// the account's own — never a client shared with other users, each user
+// brings their own credential).
 type account struct {
 	logger  *slog.Logger
 	dg      *diago.Diago
@@ -46,6 +48,10 @@ type account struct {
 
 	ctx    context.Context
 	cancel context.CancelFunc
+	// stackStop tears down the account's SIP client. It must outlive the
+	// keepalive by the de-REGISTER's round trip: the keepalive's teardown
+	// calls it once that left, never before.
+	stackStop context.CancelFunc
 
 	// registered says whether the registration is believed live — set by
 	// the first REGISTER's success, cleared when the keepalive loop dies
@@ -53,14 +59,25 @@ type account struct {
 	registered atomic.Bool
 }
 
-// newAccount registers session's AOR against its registrar: the first
-// REGISTER runs synchronously (bounded by registerTimeout) so its
-// outcome answers the /register command; the keepalive then re-registers
-// in the background until the account's ctx ends, which also sends the
-// de-REGISTER.
-func newAccount(ctx context.Context, logger *slog.Logger, dg *diago.Diago, session UserSession, expiry time.Duration) (*account, error) {
-	a := &account{logger: logger, dg: dg, session: session, expiry: expiry}
+// newAccount opens the session's own SIP client and registers its AOR
+// against its registrar: the first REGISTER runs synchronously (bounded
+// by registerTimeout) so its outcome answers the /register command; the
+// keepalive then re-registers in the background until the account's ctx
+// ends, which also sends the de-REGISTER.
+func newAccount(ctx context.Context, logger *slog.Logger, stack sipStack, session UserSession, expiry time.Duration) (*account, error) {
+	a := &account{logger: logger, session: session, expiry: expiry}
 	a.ctx, a.cancel = context.WithCancel(ctx)
+	// The client's ctx is NOT the account's: the socket must outlive the
+	// registration loop by the de-REGISTER's round trip.
+	stackCtx, stackStop := context.WithCancel(context.Background())
+	a.stackStop = stackStop
+	dg, err := stack.open(stackCtx, session.Username)
+	if err != nil {
+		a.cancel()
+		stackStop()
+		return nil, err
+	}
+	a.dg = dg
 	recipient := sip.Uri{User: session.Username, Host: session.Host, Port: session.Port}
 	t, err := dg.RegisterTransaction(a.ctx, recipient, diago.RegisterOptions{
 		Username: session.Username,
@@ -69,12 +86,29 @@ func newAccount(ctx context.Context, logger *slog.Logger, dg *diago.Diago, sessi
 	})
 	if err != nil {
 		a.cancel()
+		stackStop()
 		return nil, err
 	}
+	// diago builds the REGISTER bare — From/To/Via are added at send
+	// time, and the From sipgo would add is the socket's own address,
+	// not the AOR the credential belongs to. Stamp the user's identity:
+	// the From IS the AOR (with the tag sipgo adds only to Froms of its
+	// own making), pre-set so the send-time build leaves it alone. The
+	// Contact's user part is the account UA's name already, so the
+	// registrar sees one consistent identity: AOR, Contact user, and
+	// digest username are all the user's.
+	from := &sip.FromHeader{
+		Address: sip.Uri{User: session.Username, Host: session.Host},
+		Params:  sip.NewParams(),
+	}
+	from.Params.Add("tag", sip.GenerateTagN(16))
+	t.Origin.AppendHeader(from)
+
 	regCtx, stop := context.WithTimeout(a.ctx, registerTimeout)
 	defer stop()
 	if err := t.Register(regCtx); err != nil {
 		a.cancel()
+		stackStop()
 		return nil, fmt.Errorf("REGISTER rejected: %w", err)
 	}
 	a.registered.Store(true)
@@ -93,6 +127,8 @@ func (a *account) keepalive(t *diago.RegisterTransaction) {
 		if err := t.Unregister(ctx); err != nil && !errors.Is(err, context.Canceled) {
 			a.logger.Warn("sipbot: the de-REGISTER failed", "aor", a.session.AddressOfRecord, "err", err)
 		}
+		// The de-REGISTER left — the account's SIP client can go now.
+		a.stackStop()
 	}()
 	for {
 		err := t.QualifyLoop(a.ctx)

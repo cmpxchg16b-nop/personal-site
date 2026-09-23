@@ -42,7 +42,7 @@ graph TD
     A["sipHandler<br/>pkg/rtc/sipbot/handler.go<br/>message policy: CLI, registration<br/>lifecycle, call policy"] --> B["msg_handler.Server<br/>data-channel layer: dcmsg/dcbin decoding,<br/>echo rule, call-log amends"]
     B --> C["HeadlessRTCClient<br/>pkg/rtc: signalling, peer sessions,<br/>perfect negotiation, AddTrack/RemoveTrack"]
     C --> D["Signalling Server (WS relay)<br/>+ pion PeerConnection per peer"]
-    A --> E["account / register loop + diago UAC<br/>github.com/emiago/diago on sipgo"]
+    A --> E["per-user account: register loop + diago UAC<br/>(one SIP client per registered user)<br/>github.com/emiago/diago on sipgo"]
     E --> F["SIP network<br/>registrar / proxy / callee"]
     G["UserSessionStorage<br/>(OnMemoryUserSessionStorage)"] -.-> A
 ```
@@ -53,14 +53,19 @@ graph TD
   connection; the in-band dialog verbs (`INVITE`/`200 OK`/`CANCEL`/`BYE`)
   ride `dcmsg`. No new connection is ever created — "a call" is the pair's
   connection gaining an m-line, plus a SIP dialog on the other leg.
-- **sip-leg**: one **shared** `diago.Diago` transaction user per bot
-  process — one UDP socket, one sipgo UAC — on which every chat user's
-  registration (a `diago.Register` loop) and every outbound call (a
-  `diago.Invite` → `DialogClientSession`) is a separate SIP transaction
-  stamped with that user's own identity (`From` + digest credentials).
-  The codec toward the SIP network is **whatever the SDP negotiation
-  settles on**; the bot offers, in preference order, **opus, PCMU, PCMA**
-  (plus telephone-event, which the media relay ignores — see §10).
+- **sip-leg**: one `diago.Diago` transaction user **per registered chat
+  user** — each `/register` opens a dedicated SIP client (its own sipgo
+  UA, named for the user's SIP username, and its own UDP socket) that
+  lives as long as the account. The registration (a `diago.Register`
+  loop) and every outbound call (a `diago.Invite` →
+  `DialogClientSession`) run on the account's own client, so the wire
+  identity is that user's alone: the `From` is the AOR, the `Contact`'s
+  user part is the username, the digest credential is the user's — the
+  bot's own identity never appears, and no user's credential ever rides
+  another user's transport. The codec toward the SIP network is
+  **whatever the SDP negotiation settles on**; the bot offers, in
+  preference order, **opus, PCMU, PCMA** (plus telephone-event, which
+  the media relay ignores — see §10).
 
 The two legs meet only inside the bot: signalling state is relayed by the
 handler (§6), media by a per-call **relay** (§7).
@@ -71,7 +76,7 @@ Chat lines, exactly like the music bot's commands:
 
 | Command                              | Effect                                                                                                                                                                                                                  |
 | ------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `/help`                              | print the help/usage text                                                                                                                                                                                               |
+| `/help`                              | print the help text — what the bot is and does, then the command list                                                                                                                                                   |
 | `/register <user@host> <password>`   | associate the chat user with the SIP credential, REGISTER the AOR `sip:user@host` against its host, and keep the registration alive (§5). A later `/register` re-registers (replaces the credential).                   |
 | `/unregister`                        | cancel the registration (a SIP de-REGISTER goes out), drop the stored credential, and end any call in progress                                                                                                          |
 | `/call <user@host>` (or bare `user`) | phone the callee through the SIP network and the user through the browser; one active call per chat user. A bare `user` is completed with the registered account's domain.                                              |
@@ -156,13 +161,19 @@ Host, Password}`.
    previous registration loop, after hanging up any call in progress).
 3. **First REGISTER synchronously, with a timeout** (~5 s, ctx-scoped):
    `diago.RegisterTransaction(...).Register(ctx)` performs the
-   digest-authenticated transaction. The handler replies from the actual
-   outcome — `Registered as sip:2001@sip.example.com.` or the failure
-   (`Registration failed: 401 Unauthorized`) — because a bot has no
-   unsolicited-send path outside a handler invocation (the ResponseWriter
-   is per-message), and a wrong password must be told to the user, not
-   just logged. The bounded network round trip on the channel goroutine
-   is the same trade the music bot's lazy song opens already make.
+   digest-authenticated transaction — on the account's own client (§2),
+   the request stamped with the user's identity: the `From` is the AOR
+   (diago would default it to the socket's own address), the `Contact`'s
+   user part is the username (the account UA's name), the digest
+   credential is the user's. A registrar matching the identity against
+   the credential sees one consistent user, never the bot. The handler
+   replies from the actual outcome — `Registered as
+sip:2001@sip.example.com.` or the failure (`Registration failed: 401
+Unauthorized`) — because a bot has no unsolicited-send path outside a
+   handler invocation (the ResponseWriter is per-message), and a wrong
+   password must be told to the user, not just logged. The bounded
+   network round trip on the channel goroutine is the same trade the
+   music bot's lazy song opens already make.
 4. **Re-registration in the background**: the same goroutine then loops
    re-REGISTERing before expiry (diago's qualify loop semantics;
    `Expiry` default 300 s, `RetryInterval` on transient failures). Its
@@ -321,8 +332,9 @@ cfg)` and reusing `stereoOpusPCFactory` (the webrtc leg negotiates
   knobs — `Transport` (default `udp`), `BindHost`/`BindPort` (default
   all-interfaces, ephemeral), `ExternalHost` (default empty; the
   SDP/RTP address the PBX sees, for hosts where the bind address is
-  wrong), `RegisterExpiry` (default 300 s). One shared diago transport
-  for the process.
+  wrong), `RegisterExpiry` (default 300 s). Each registered account
+  binds its own diago transport — a dedicated socket per user — so keep
+  `BindPort` at 0: a fixed port admits one account at a time.
 
 ## 10. Concerns and caveats
 
@@ -395,15 +407,15 @@ where a choice had to be made:
 
 `pkg/rtc/sipbot/`:
 
-| file                         | contents                                                                                                      |
-| ---------------------------- | ------------------------------------------------------------------------------------------------------------- |
-| `sipbot.go`                  | package doc, `Configuration`, `New` (wires the msg_handler.Server, owns the shared diago instance)            |
-| `session.go`                 | `UserSession`, `UserSessionStorage`, `OnMemoryUserSessionStorage`                                             |
-| `handler.go`                 | `sipHandler` — the `BotMessageHandler`: CLI dispatch, registration lifecycle, call policy, hangup matrix      |
-| `account.go`                 | per-user SIP account runtime: the register loop and the diago `Invite` dial path                              |
-| `call.go`                    | per-call state + the relay: the two pump goroutines, track/dialog wiring, teardown                            |
-| `transcode.go`               | the codec matrix: passthrough, G.711↔PCM↔opus paths, resamplers, the sample accumulator, opus TOC durations   |
-| `opus_codec.go` / `_stub.go` | libopus encode+decode behind the `cgo` tag; the pure-Go stub fails G.711-leg calls with the explanatory error |
+| file                         | contents                                                                                                            |
+| ---------------------------- | ------------------------------------------------------------------------------------------------------------------- |
+| `sipbot.go`                  | package doc, `Configuration`, `New` (wires the msg_handler.Server), `sipStack` (the per-account SIP client factory) |
+| `session.go`                 | `UserSession`, `UserSessionStorage`, `OnMemoryUserSessionStorage`                                                   |
+| `handler.go`                 | `sipHandler` — the `BotMessageHandler`: CLI dispatch, registration lifecycle, call policy, hangup matrix            |
+| `account.go`                 | per-user SIP account runtime: the register loop and the diago `Invite` dial path                                    |
+| `call.go`                    | per-call state + the relay: the two pump goroutines, track/dialog wiring, teardown                                  |
+| `transcode.go`               | the codec matrix: passthrough, G.711↔PCM↔opus paths, resamplers, the sample accumulator, opus TOC durations         |
+| `opus_codec.go` / `_stub.go` | libopus encode+decode behind the `cgo` tag; the pure-Go stub fails G.711-leg calls with the explanatory error       |
 
 Tests mirror the existing suites' disciplines: `OnMemoryUserSessionStorage`
 concurrency; the transcoder round trips (G.711 encode/decode against

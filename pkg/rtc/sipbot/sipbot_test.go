@@ -562,9 +562,14 @@ type fakePBX struct {
 	registers    int    // authenticated REGISTERs
 	unregistered bool   // a de-REGISTER (Expires 0) arrived
 	authedUser   string // the Authorization header's username on the last authenticated request
-	invites      int
-	inviteFrom   string
-	inviteTo     string
+	// registrations records each authenticated REGISTER's identity: the
+	// From and Contact URI users (both must be the registering user's,
+	// never the bot's) and the source address (each account's own
+	// socket).
+	registrations []registration
+	invites       int
+	inviteFrom    string
+	inviteTo      string
 	byes         int
 	rtpReceived  int
 	rtpPayloads  [][]byte
@@ -572,6 +577,14 @@ type fakePBX struct {
 	dialogs    chan *sipgo.DialogServerSession // established dialogs (after ACK)
 	rtpStart   chan struct{}                   // closed when the first dialog's media is up
 	rtpStartDo sync.Once
+}
+
+// registration is one authenticated REGISTER's identity as the fake saw
+// it on the wire.
+type registration struct {
+	from    string // the From URI's user
+	contact string // the Contact URI's user
+	source  string // the datagram's source address (the account's socket)
 }
 
 // newFakePBX starts a fake PBX answering INVITEs with answerCode. The
@@ -628,8 +641,13 @@ func newFakePBX(t *testing.T, answerCode int, opus bool) *fakePBX {
 			f.unregistered = true
 			f.mu.Unlock()
 		} else {
+			reg := registration{from: req.From().Address.User, source: req.Source()}
+			if c := req.Contact(); c != nil {
+				reg.contact = c.Address.User
+			}
 			f.mu.Lock()
 			f.registers++
+			f.registrations = append(f.registrations, reg)
 			f.mu.Unlock()
 		}
 		if err := tx.Respond(sip.NewResponseFromRequest(req, 200, "OK", nil)); err != nil {
@@ -980,6 +998,12 @@ func TestSipBotRegisterUnregister(t *testing.T) {
 	waitBotMessage(t, probe, botId, "the registered reply", isChatReply(registerMsg, "Registered as sip:2001@"+pbx.addr))
 	pbx.waitForPBX(t, "the authenticated REGISTER", func() bool { return pbx.registers == 1 })
 	pbx.waitForPBX(t, "the REGISTER's digest username", func() bool { return pbx.authedUser == "2001" })
+	// The identity on the wire is the user's, never the bot's: the From
+	// is the AOR and the Contact's user part is the username.
+	pbx.waitForPBX(t, "the REGISTER's From and Contact", func() bool {
+		return len(pbx.registrations) == 1 &&
+			pbx.registrations[0].from == "2001" && pbx.registrations[0].contact == "2001"
+	})
 
 	unregisterMsg := chat("/unregister")
 	waitBotMessage(t, probe, botId, "the unregistered reply", isChatReply(unregisterMsg, "Unregistered."))
@@ -988,6 +1012,51 @@ func TestSipBotRegisterUnregister(t *testing.T) {
 	// The credential is gone: the next /call says so.
 	callMsg := chat("/call 1001@" + pbx.addr)
 	waitBotMessage(t, probe, botId, "the not-registered answer", isChatReply(callMsg, "Not registered"))
+}
+
+// TestSipBotPerUserStacks proves every registered user gets a SIP
+// client of their own: two users register against the same registrar,
+// and the wire shows two REGISTERs — each from a distinct socket, each
+// stamped with its own user's identity (the From and the Contact's user
+// part), never the bot's and never each other's.
+func TestSipBotPerUserStacks(t *testing.T) {
+	net := newClientTestNet(t, ss.DefaultSubscriberAging)
+	bot := startBot(t, net, "bot", "2-bot", "")
+	alice, aliceProbe, _ := startUserProbe(t, net, "alice", "1-alice")
+	bob, bobProbe, _ := startUserProbe(t, net, "bob", "1-bob")
+	botId, aliceId := pairUp(t, bot, alice)
+	_, bobId := pairUp(t, bot, bob)
+	pbx := newFakePBX(t, 200, true)
+
+	register := func(probe *wireProbe, userId ss.SubscriberId, aor, password string) ss.MsgId {
+		t.Helper()
+		dc := probe.waitDC(t, botId, msg_handler.DataChannelLabelMessages)
+		m := baseMsg(ss.WellKnownChIdMain, userId, botId)
+		m["plaintext"] = fmt.Sprintf("/register %s@%s %s", aor, pbx.addr, password)
+		if err := dc.SendText(mustJSON(t, m)); err != nil {
+			t.Fatalf("SendText: %v", err)
+		}
+		return ss.MsgId(m["msgId"].(string))
+	}
+	aliceMsg := register(aliceProbe, aliceId, "2001", "passW_0rd")
+	bobMsg := register(bobProbe, bobId, "2002", "s3cret")
+	waitBotMessage(t, aliceProbe, botId, "alice's registered reply", isChatReply(aliceMsg, "Registered as sip:2001@"+pbx.addr))
+	waitBotMessage(t, bobProbe, botId, "bob's registered reply", isChatReply(bobMsg, "Registered as sip:2002@"+pbx.addr))
+
+	pbx.waitForPBX(t, "both users' REGISTERs, each on its own socket with its own identity", func() bool {
+		if len(pbx.registrations) != 2 {
+			return false
+		}
+		byUser := map[string]registration{}
+		for _, r := range pbx.registrations {
+			byUser[r.from] = r
+		}
+		alice, ok1 := byUser["2001"]
+		bob, ok2 := byUser["2002"]
+		return ok1 && ok2 &&
+			alice.contact == "2001" && bob.contact == "2002" &&
+			alice.source != bob.source
+	})
 }
 
 // TestSipBotCallEndToEnd covers the whole B2BUA: /register, /call —

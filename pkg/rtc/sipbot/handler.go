@@ -47,7 +47,8 @@ import (
 
 // The CLI's answer texts.
 const (
-	helpText = "SIP bot commands:\n" +
+	helpText = "I bridge this chat into the SIP telephone network: register your own SIP account, then phone any SIP subscriber — the call rings here, in your browser.\n" +
+		"Commands:\n" +
 		"/help — show this help\n" +
 		"/register <user@host> <password> — register your SIP account (e.g. /register 2001@sip.example.com passW_0rd)\n" +
 		"/unregister — drop the registration and the stored credential\n" +
@@ -85,8 +86,10 @@ var voiceTrackCodec = webrtc.RTPCodecCapability{
 type sipHandler struct {
 	logger  *slog.Logger
 	storage UserSessionStorage
-	dg      *diago.Diago
-	expiry  time.Duration
+	// stack opens each account's own SIP client — one per registered
+	// user, never a client shared across users.
+	stack  sipStack
+	expiry time.Duration
 
 	// testContact is the CLI /test-call command's SIP callee (the
 	// Configuration's TestSIPContact); empty disables the command.
@@ -101,8 +104,8 @@ type sipHandler struct {
 
 var _ msg_handler.BotMessageHandler = (*sipHandler)(nil)
 
-func newSipHandler(logger *slog.Logger, storage UserSessionStorage, dg *diago.Diago, expiry time.Duration, testContact string) *sipHandler {
-	return &sipHandler{logger: logger, storage: storage, dg: dg, expiry: expiry, testContact: testContact}
+func newSipHandler(logger *slog.Logger, storage UserSessionStorage, stack sipStack, expiry time.Duration, testContact string) *sipHandler {
+	return &sipHandler{logger: logger, storage: storage, stack: stack, expiry: expiry, testContact: testContact}
 }
 
 // HandleChatMessage is the CLI: parse the line, answer it.
@@ -247,7 +250,7 @@ func (h *sipHandler) register(ctx context.Context, msg *msg_handler.ChatMessage,
 		h.endCall(ctx, peer, v.(*peerCall))
 		h.say(peer, w, "The call in progress was ended.")
 	}
-	a, err := newAccount(ctx, h.logger, h.dg, session, h.expiry)
+	a, err := newAccount(ctx, h.logger, h.stack, session, h.expiry)
 	if err != nil {
 		h.say(peer, w, fmt.Sprintf("Registration failed: %v.", err))
 		return
@@ -515,7 +518,7 @@ func (h *sipHandler) ensureAccount(ctx context.Context, peer ss.SubscriberId) (*
 	if !ok {
 		return nil, errors.New(notRegistered)
 	}
-	a, err := newAccount(ctx, h.logger, h.dg, session, h.expiry)
+	a, err := newAccount(ctx, h.logger, h.stack, session, h.expiry)
 	if err != nil {
 		return nil, fmt.Errorf("registration failed: %w", err)
 	}
