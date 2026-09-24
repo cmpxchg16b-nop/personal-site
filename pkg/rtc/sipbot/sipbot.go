@@ -27,9 +27,12 @@
 // credential with /register <user@host> <password> (kept in the
 // injected UserSessionStorage) — or is loaned an account from the
 // injected SIPCredentialPool — phones a callee with /call <user@host>,
-// and ends the call with /hangup or the browser's hangup button. The
-// client dies with the account; the bot's own identity never appears on
-// the wire.
+// learns their callable address with /my-number, and ends the call with
+// /hangup or the browser's hangup button. The same client is the UAS of
+// the reverse direction: a SIP subscriber's INVITE to the registered
+// AOR rings the user's browser, and the user's accept joins the legs
+// (inbound.go). The client dies with the account; the bot's own
+// identity never appears on the wire.
 //
 // The bot terminates both signalling planes and both media planes and
 // relays each into the other: dialog events cross as the handler's
@@ -132,7 +135,11 @@ func New(client *rtc.HeadlessRTCClient, storage UserSessionStorage, pool *SIPCre
 		bindPort:     config.BindPort,
 		externalHost: config.ExternalHost,
 	}
-	msg_handler.NewServer(client, newSipHandler(logger, storage, pool, stack, time.Duration(expiry)*time.Second, config.TestSIPContact, config.YellowPage), msg_handler.Configuration{Logger: logger})
+	h := newSipHandler(logger, storage, pool, stack, time.Duration(expiry)*time.Second, config.TestSIPContact, config.YellowPage)
+	// The unsolicited-send path (the inbound call's ring) is the Server's
+	// WriterFor — a wiring-time assignment: no handler invocation can
+	// precede the client's Run, which the caller starts after New returns.
+	h.writers = msg_handler.NewServer(client, h, msg_handler.Configuration{Logger: logger})
 }
 
 // sipStack is the per-account SIP client factory: the bot's sip-leg
@@ -154,11 +161,12 @@ type sipStack struct {
 // bot's — with a transport socket of the account's own, bound to the
 // route's source address toward the registrar (see bindHostFor — the
 // address-family answer too). The client is already serving when open
-// returns (responses to its transactions arrive on its
-// socket; inbound INVITEs — someone calling a registered AOR — have no
-// routing policy in this outbound-only SBC and are declined). The client
-// dies with ctx: the account stops it once the de-REGISTER left.
-func (s sipStack) open(ctx context.Context, session UserSession) (*diago.Diago, error) {
+// returns (responses to its transactions arrive on its socket); an
+// inbound INVITE — someone calling the registered AOR — is handed to
+// onInbound, which owns the dialog from then on and blocks until it
+// ends (diago's serve-handler lifetime discipline). The client dies
+// with ctx: the account stops it once the de-REGISTER left.
+func (s sipStack) open(ctx context.Context, session UserSession, onInbound func(inDialog *diago.DialogServerSession)) (*diago.Diago, error) {
 	ua, err := sipgo.NewUA(sipgo.WithUserAgent(session.Username))
 	if err != nil {
 		return nil, err
@@ -183,13 +191,7 @@ func (s sipStack) open(ctx context.Context, session UserSession) (*diago.Diago, 
 			},
 		}),
 	)
-	if err := dg.ServeBackground(ctx, func(inDialog *diago.DialogServerSession) {
-		s.logger.Info("sipbot: declining an inbound SIP call",
-			"from", inDialog.FromUser(), "to", inDialog.ToUser())
-		if err := inDialog.Respond(603, "Decline", nil); err != nil {
-			s.logger.Warn("sipbot: inbound-call decline not sent", "err", err)
-		}
-	}); err != nil {
+	if err := dg.ServeBackground(ctx, onInbound); err != nil {
 		return nil, fmt.Errorf("the SIP client failed to start: %w", err)
 	}
 	return dg, nil

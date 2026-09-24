@@ -19,15 +19,18 @@ networks that share nothing but this host:
 
 In SIP terms the bot is a **B2BUA (back-to-back user agent)**: it
 terminates both signalling planes and both media planes and relays each
-into the other. It is a UAC toward the SIP network (REGISTER + INVITE)
-and a headless bot peer toward the browser (the third policy bot on the
-three-layer bot stack). The user in the browser can thus phone an
-arbitrary SIP subscriber:
+into the other. Toward the SIP network it is a UAC (REGISTER + INVITE)
+and a UAS (inbound INVITEs to a registered AOR); toward the browser it
+is a headless bot peer (the third policy bot on the three-layer bot
+stack). The user in the browser can thus phone an arbitrary SIP
+subscriber — and a SIP subscriber who dials the user's registered AOR
+rings the user's browser (§7.2):
 
 ```
 browser ──(WebRTC: SRTP, opus)──▶ SIP BOT ──(SIP/RTP: negotiated)──▶ PBX ──▶ callee
-         dcmsg SIP-subset dialog            real SIP: REGISTER, INVITE,
-         + renegotiated m-line              BYE; plain RTP media
+       ◀──                        ◀──(SIP INVITE to a registered AOR)──── caller
+dcmsg SIP-subset dialog            real SIP: REGISTER, INVITE (both
++ renegotiated m-line              directions), BYE; plain RTP media
 ```
 
 Like the music bot and the echo bot, the bot is hosted by the server
@@ -61,12 +64,16 @@ graph TD
   loop) and every outbound call (a `diago.Invite` →
   `DialogClientSession`) run on the account's own client, so the wire
   identity is that user's alone: the `From` is the AOR, the `Contact`'s
+  `From` is the AOR, the `Contact`'s
   user part is the username, the digest credential is the user's — the
   bot's own identity never appears, and no user's credential ever rides
-  another user's transport. The codec toward the SIP network is
-  **whatever the SDP negotiation settles on**; the bot offers, in
-  preference order, **opus, PCMU, PCMA** (plus telephone-event, which
-  the media relay ignores — see §11).
+  another user's transport. The same client is the UAS for inbound
+  calls: an INVITE arriving on the account's socket is routed to the
+  account's owner and rings their browser (§7.2). The codec toward the
+  SIP network is **whatever the SDP negotiation settles on**; the bot
+  offers, in preference order, **opus, PCMU, PCMA** (plus
+  telephone-event, which the media relay ignores — see §11), in both
+  directions.
 
 The two legs meet only inside the bot: signalling state is relayed by the
 handler (§7), media by a per-call **relay** (§8).
@@ -80,6 +87,7 @@ Chat lines, exactly like the music bot's commands:
 | `/help`                              | print the help text — what the bot is and does, then the command list                                                                                                                                                                                                                                                                                                              |
 | `/register <user@host> <password>`   | associate the chat user with the SIP credential, REGISTER the AOR `sip:user@host` against its host, and keep the registration alive (§6). A later `/register` re-registers (replaces the credential).                                                                                                                                                                              |
 | `/unregister`                        | cancel the registration (a SIP de-REGISTER goes out), drop the stored credential, and end any call in progress                                                                                                                                                                                                                                                                     |
+| `/my-number`                         | print the user's currently registered SIP address — the number others can dial to ring this chat (§7.2) — or answer that the user is not registered to a SIP registrar yet. Reads the LIVE registration: a stored credential whose registration died (or has not run yet) is not callable and reads as not-registered. A number loaned from the credential pool is marked as such. |
 | `/call <user@host>` (or bare `user`) | phone the callee through the SIP network and the user through the browser; one active call per chat user. A bare `user` is completed with the registered account's domain. Without a registration the bot loans an account from the credential pool when one is configured and has one free (§5), and says so; when the pool is empty (or absent), the answer points at /register. |
 | `/yellow-page`                       | print the yellow page — the phone book of example callable numbers from the configuration (the <sipBot/> element's <yellowPage/> child, §10), grouped by section: who to call, without memorizing numbers                                                                                                                                                                          |
 | `/test-call`                         | phone the configured test callee (the `<sipBot/>` element's `testSIPContact`, e.g. `9664@192.168.1.2`) — a known-good subscriber of the SIP network the deployment tests against; answers unavailable when unconfigured                                                                                                                                                            |
@@ -88,10 +96,11 @@ Chat lines, exactly like the music bot's commands:
 Every command answers with a chat reply (`Reply`), threaded on the
 command. Unknown commands and attachments are answered like the music
 bot's (`Unrecognized command — try /help.`, an attachment refusal).
-Incoming **video** calls are declined with 603 exactly like the music
-bot; incoming **voice** calls (the browser phoning the bot) are declined
-too in v1 — the bot is an outbound SBC, and accepting an inbound browser
-call has no SIP meaning without a registered routing target (see §11).
+Incoming **browser** calls (a chat user phoning the bot directly, voice
+and video alike) are declined with 603: a browser-originated call to
+the bot has no routing target (see §11). The reverse direction — a SIP
+subscriber phoning the user's registered AOR — is accepted and rings
+the browser (§7.2).
 
 Prompt-deficiency note: the request's "`/registered` command" is read as
 the `/register` command defined alongside it; there is no separate
@@ -293,7 +302,9 @@ Unauthorized`) — because a bot has no unsolicited-send path outside a
    pool cannot provide an account, or the pooled account fails to
    register, does the command answer with the `/register` hint.
 
-## 7. Call flow — `/call 1001@sip.example.com`
+## 7. Call flows
+
+### Outbound — `/call 1001@sip.example.com`
 
 The bot opens **both** legs and relays each leg's events into the other.
 The SIP INVITE can take seconds (ringing), so it runs on its own
@@ -347,6 +358,79 @@ The reverse-propagation cases:
 Mid-call `/call` (a second one) is refused while a call stands; `/play`-style
 switching has no meaning here.
 
+### Inbound — a SIP subscriber phones the user
+
+The reverse direction: someone on the SIP network dials the AOR a user
+registered (their own credential, or a loaned pool account while the
+loan lasts), the registrar routes the INVITE to the account's socket,
+and the bot rings the user's browser. The browser needs nothing new —
+an inbound call is a bot-originated INVITE on the webrtc-leg, exactly
+the verb `/call` already uses: the answer popup, the accept (whose mic
+attach precedes the bot's media, §11.13), the decline, the hangup are
+usePhoneCalls' generic incoming-call path.
+
+```mermaid
+sequenceDiagram
+    participant P as SIP network (caller)
+    participant H as sipHandler
+    participant R as relay (media)
+    participant U as User (browser)
+
+    P->>H: INVITE on the account's socket (diago UAS)
+    Note over H: one call per user, either direction:<br/>busy → 486 Busy Here; no live session →<br/>480 (the Invite fails)
+    H->>P: 180 Ringing
+    H->>U: w.Invite(voice) — the browser rings<br/>(Server.WriterFor — §9's unsolicited path)
+    H->>U: "Incoming call from <caller>…"
+    Note over H: ring timeout (60 s) arms: 480 to the caller,<br/>CANCEL to the browser
+    U->>H: 200 OK (user clicked accept)
+    H->>R: AttachMedia(track) → renegotiation
+    H->>P: 200 OK + SDP answer (diago Answer, ACK-awaited)<br/>→ codec known → relay arms (§8)
+    Note over R: both pumps run: caller's RTP → opus → track,<br/>mic → sip-leg writer
+    P->>H: BYE (the caller hangs up)
+    H->>U: w.Bye(callId) — the browser leg ends
+```
+
+The SIP side of an inbound call is diago's `DialogServerSession`, the
+UAS counterpart of the outbound dial's client session. The mechanics
+discovered in its (and sipgo's) source, on which the flow rests:
+
+- **The serve handler owns the dialog's lifetime**: diago's OnInvite
+  wrapper hangs up and closes the dialog the moment the serve callback
+  returns, so the inbound handler blocks on the dialog's
+  `Context().Done()` until the call is over, whichever side ended it.
+- **The dialog's ctx is the one "the SIP side ended" signal**: sipgo's
+  ReadInvite wires the INVITE transaction's OnCancel into the dialog —
+  a caller's CANCEL of a still-ringing call ends the ctx — and BYE, the
+  bot's own final response, and the SIP server's shutdown end it too.
+  The inbound call arms its watcher on it at creation (outbound arms
+  only after the answer: a client dialog's ctx does not exist before),
+  and the end relayed to the browser is a CANCEL while it rings, a BYE
+  once answered — the same `tellBrowserEnded` as outbound.
+- **`Hangup` speaks the dialog's own state**: diago's server-side
+  Hangup is a BYE on a confirmed dialog and a 480 Temporarily
+  Unavailable on a still-ringing one — so every generic termination
+  (the browser's CANCEL/BYE, /hangup, /unregister, a replacing
+  /register, the session's end, the ring timeout) calls it without
+  tracking whether the 200 OK has gone out. The one exception is the
+  user's explicit decline (the browser's 603), mirrored to the caller
+  as a 603 Decline.
+- **`Answer` is the 200 OK**: it builds the media session from the
+  account's codec list (the same opus-first preference the outbound
+  offers), sends the SDP answer, and blocks until the caller's ACK (64·T1
+  bound) — so it runs on its own goroutine when the browser's 200 OK
+  arrives, and its success binds the relay through the outbound path's
+  exact-once discipline (a call that ended while Answer blocked gets
+  its just-answered dialog BYEd by the answerer itself).
+- The relay and the codec matrix are direction-blind (§8): the dialog's
+  payload reader/writer is the DialogMedia both session types embed.
+
+Inbound calls are to a **registered** identity: the INVITE arrives on
+the account's socket, so the account exists by construction. A pooled
+loan rings its borrower while the loan lasts; once the session ends,
+the loan and its socket are gone (§5). The registrar's own screening
+aside, the bot does not digest-authenticate inbound INVITEs (diago has
+no UAS auth) — §11 owns that tradeoff.
+
 ## 8. The media plane: relay + codec matrix
 
 Each established call owns a **relay**: the webrtc-leg opus track
@@ -399,7 +483,7 @@ no codec) and refuses a call whose sip-leg negotiated G.711, with the
 explanatory error — the music bot's stub discipline, extended to a
 decoder.
 
-## 9. Framework extensions: bot-originated `Cancel`/`Bye`, and session lifecycle hooks
+## 9. Framework extensions: bot-originated `Cancel`/`Bye`, the unsolicited-send path, and session lifecycle hooks
 
 An SBC terminates signalling: when the **callee** ends or refuses the
 call, the **browser's** dialog must end too. Today the
@@ -424,6 +508,37 @@ status exactly as it does for inbound dialog messages — the caller-side
 log duty stays the Server's, never the handler's. No handler-visible
 state changes; the echo bot and the music bot are untouched (the
 interface grows, no signature changes).
+
+### The unsolicited-send path: `Server.WriterFor`
+
+An inbound SIP call arrives on the account's socket goroutine — not
+inside a handler invocation — but the ResponseWriter is per-message:
+the bot had no way to ring a browser that said nothing. The Server
+gains the spontaneous counterpart:
+
+```go
+// WriterFor returns a ResponseWriter bound to the peer's current
+// session — the unsolicited-send path, for answering an event that is
+// not one of the peer's messages. The writer threads on no message and
+// is bound to no call; a peer with no live session yields a writer
+// whose sends all fail with ErrNoMessagingChannel.
+func (s *Server) WriterFor(peer ss.SubscriberId) ResponseWriter
+```
+
+The implementation is the hub's existing per-report lookup: the peer
+record (and its up-note) gains the session's channel id, the
+messaging-channel query's reply carries it, and WriterFor builds the
+writer on whatever the registry currently holds — a glare rebuild's
+channel swap is invisible to it, exactly as for the binary side's chunk
+queries. The writer is otherwise the ordinary one: `Invite` posts the
+same `inviteSentNote`, so the caller-side status amends of an inbound
+SIP call's webrtc-leg are the Server's own conditioning, unchanged.
+
+The sip bot keeps the Server in a handler field set by `New` right
+after `NewServer` returns — a wiring-time assignment: no handler
+invocation can precede the client's Run, which the caller starts after
+`New`. The field is an interface (`WriterFor(peer)`), so tests can
+substitute it.
 
 ### The session lifecycle hooks
 
@@ -543,10 +658,15 @@ where a choice had to be made:
    session-scoped (§5), so a reconnect re-allocates and the caller
    identity may change between sessions — harmless for an outbound-only
    SBC.
-3. **Outbound-only SBC.** An inbound SIP call to a registered AOR (the
-   callee becomes caller) has no routing policy in v1 — the diago serve
-   handler declines INVITEs with 603. Inbound browser calls are declined
-   likewise (§3).
+3. **Inbound SIP calls are not authenticated.** The UAS side answers
+   any INVITE that reaches a registered account's socket (diago's serve
+   handler has no digest auth) — the registrar's own screening and the
+   socket's ephemeral port are the only gatekeepers, so a direct-to-
+   socket INVITE bypasses whatever the SIP network would have filtered.
+   One call per user gates the SIP side too: a second inbound call
+   while one stands gets 486 Busy Here. Inbound **browser** calls (a
+   chat user phoning the bot directly) are still declined with 603 —
+   they have no routing target (§3).
 4. **One call per chat user** at a time; no hold, transfer, conferencing,
    or blind/attended REFER. The SIP `REFER`/`re-INVITE` surfaces diago
    offers are left unwired.
@@ -604,6 +724,20 @@ where a choice had to be made:
     holds until the process restarts (and the account may register
     concurrently with a re-loaned twin, which SIP tolerates — §5's
     duplication note). Narrow, self-limiting, and not worth a lock.
+16. **The inbound ring timeout is the bot's own** (60 s): a browser
+    left ringing (the user walked away) is CANCELLed and the caller
+    gets a 480; the timeout loses a same-instant-answer race
+    deliberately (the end is gated on the call still ringing). A
+    caller's CANCEL is NOT what bounds the ring — sipgo wires it into
+    the dialog's ctx, so it is relayed to the browser the moment it
+    arrives.
+17. **An inbound answer's ACK is awaited out of band**: diago's UAS
+    `Answer` blocks until the caller's ACK (64·T1 bound), so it runs on
+    its own goroutine; a hangup landing inside that window terminates
+    an early (unconfirmed) dialog with a BYE — not RFC-orthodox (a UAS
+    should CANCEL an early dialog it answered... it cannot; only the
+    UAC can), but sipgo sends it and every tested stack tolerates it.
+    The window is the ACK's round trip, not the ring.
 
 ## 12. Package layout and testing
 
@@ -615,9 +749,10 @@ where a choice had to be made:
 | `session.go`                 | `UserSession`, `UserSessionStorage`, `OnMemoryUserSessionStorage`                                                                                                             |
 | `pool.go`                    | `SIPCredentialPool` (+ the `SIPCredential`/`SIPCredentialRange` config shapes): the lazy, mutex-free account pool — the atomic cursor, the release channel, the range parsing |
 | `yellowpage.go`              | the yellow page: the YellowPageSection/YellowPageContact config shapes and the /yellow-page listing's rendering                                                               |
-| `handler.go`                 | `sipHandler` — the `BotMessageHandler`: CLI dispatch, registration lifecycle, call policy, hangup matrix                                                                      |
-| `account.go`                 | per-user SIP account runtime: the register loop and the diago `Invite` dial path                                                                                              |
-| `call.go`                    | per-call state + the relay: the two pump goroutines, track/dialog wiring, teardown                                                                                            |
+| `handler.go`                 | `sipHandler` — the `BotMessageHandler`: CLI dispatch (/my-number reads the live registration), registration lifecycle, call policy, hangup matrix                             |
+| `inbound.go`                 | the inbound call: the account socket's INVITE → the browser's ring → the 200 OK relay-arming; the ring timeout, the dialog watcher, the UAS-side termination verbs            |
+| `account.go`                 | per-user SIP account runtime: the register loop, the diago `Invite` dial path, and the inbound-INVITE routing callback the client is opened with                              |
+| `call.go`                    | per-call state + the relay: the two pump goroutines, the `sipLeg` interface over both dialog types, track/dialog wiring, teardown                                             |
 | `transcode.go`               | the codec matrix: passthrough, G.711↔PCM↔opus paths, resamplers, the sample accumulator, opus TOC durations                                                                   |
 | `opus_codec.go` / `_stub.go` | libopus encode+decode behind the `cgo` tag; the pure-Go stub fails G.711-leg calls with the explanatory error                                                                 |
 
@@ -640,4 +775,12 @@ exhaustion and registration-failure replies, and the release points —
 the harness's subscriber aging). The yellow page adds its rendering's
 unit tests (sections, descriptions, the empty page) and a CLI
 integration test: `/yellow-page` answers with the configured sections
-and contacts, threaded on the command.
+and contacts, threaded on the command. `/my-number` adds its three
+answers (not registered / registered / a pooled loan). Inbound calling
+adds a UAC side to the fake PBX (a sipgo `DialogUA` INVITE to the
+contact the registrar recorded, `WaitAnswer`'s ctx-cancel as the
+caller's CANCEL) and its integration tests: end to end (the browser
+rings, the 180 and the 200 + SDP cross, media flows both ways, the
+caller's BYE ends the browser leg), the browser's decline crossing as
+603, the caller's CANCEL crossing as the browser's CANCEL, and the
+busy-at-the-browser inbound call's 486.

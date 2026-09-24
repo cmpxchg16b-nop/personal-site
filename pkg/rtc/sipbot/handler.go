@@ -6,15 +6,17 @@ package sipbot
 // lives a layer down, in msg_handler's Server; what lives here is what
 // the messages MEAN to a session border controller:
 //
-//   - chat is the bot's CLI (/help, /register, /unregister, /call,
-//     /hangup),
+//   - chat is the bot's CLI (/help, /register, /unregister,
+//     /my-number, /call, /yellow-page, /test-call, /hangup),
 //   - attachments are refused with a chat reply,
-//   - an incoming call from the browser is declined (the bot is an
-//     outbound SBC: a browser-originated call has no SIP meaning),
+//   - an incoming call from the browser is declined (a browser-
+//     originated call to the bot has no SIP routing target),
 //   - /call opens both legs of a B2BUA: it phones the user on the
 //     webrtc-leg (the bot's own INVITE over dcmsg) and phones the callee
 //     on the sip-leg (a diago INVITE), then relays the two legs'
-//     signalling and media (see call.go).
+//     signalling and media (see call.go),
+//   - an inbound SIP call to the user's registered AOR does the same in
+//     reverse: it rings the user's browser (see inbound.go).
 //
 // State discipline: per-peer accounts and calls live in sync.Maps keyed
 // by the peer. Handler invocations for one peer's dcmsg channel are
@@ -38,7 +40,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/emiago/diago"
 	"github.com/pion/webrtc/v4"
 
 	"personal-site/pkg/models/ss"
@@ -47,11 +48,12 @@ import (
 
 // The CLI's answer texts.
 const (
-	helpText = "I bridge this chat into the SIP telephone network: register your own SIP account, then phone any SIP subscriber — the call rings here, in your browser.\n" +
+	helpText = "I bridge this chat into the SIP telephone network: register your own SIP account, then phone any SIP subscriber — and be phoned back on your number. The call rings here, in your browser.\n" +
 		"Commands:\n" +
 		"/help — show this help\n" +
 		"/register <user@host> <password> — register your SIP account (e.g. /register 2001@sip.example.com passW_0rd)\n" +
 		"/unregister — drop the registration and the stored credential\n" +
+		"/my-number — show your registered SIP number — the one others can call you on\n" +
 		"/call <user@host> — phone a SIP subscriber (a bare user keeps your account's domain)\n" +
 		"/yellow-page — list the phone book: the example numbers you can call\n" +
 		"/test-call — phone the bot's configured test callee\n" +
@@ -62,6 +64,8 @@ const (
 	registerUsage     = "Usage: /register <user@host> <password> — e.g. /register 2001@sip.example.com passW_0rd."
 	callUsage         = "Usage: /call <user@host> — e.g. /call 1001@sip.example.com."
 	notRegistered     = "Not registered — /register <user@host> <password> first."
+	noNumber          = "Not registered to a SIP registrar yet — /register <user@host> <password> to get a number."
+	noNumberPoolHint  = " Or just /call — when the bot's pool has a free account, it lends you one."
 	poolExhausted     = "The bot's pool of SIP accounts is empty — /register <user@host> <password> to use your own account."
 	testUnavailable   = "Test call unavailable — the bot has no testSIPContact configured."
 )
@@ -110,6 +114,19 @@ type sipHandler struct {
 	// goroutines; the values' own synchronization is theirs.
 	accounts sync.Map // ss.SubscriberId → *account
 	calls    sync.Map // ss.SubscriberId → *peerCall
+
+	// writers is the unsolicited-send path (the msg_handler.Server's
+	// WriterFor): a ResponseWriter for a peer outside any message — the
+	// inbound SIP call's way to ring the browser. Set by New at wiring
+	// time (before the client serves), read-only after.
+	writers writerSource
+}
+
+// writerSource is the handler's unsolicited-send path — the
+// msg_handler.Server's WriterFor, behind an interface so tests can
+// substitute it.
+type writerSource interface {
+	WriterFor(peer ss.SubscriberId) msg_handler.ResponseWriter
 }
 
 var _ msg_handler.BotMessageHandler = (*sipHandler)(nil)
@@ -132,6 +149,8 @@ func (h *sipHandler) HandleChatMessage(ctx context.Context, msg *msg_handler.Cha
 		h.register(ctx, msg, w, fields[1:])
 	case "/unregister":
 		h.unregister(ctx, msg, w)
+	case "/my-number":
+		h.myNumber(msg, w)
 	case "/call":
 		h.call(ctx, msg, w, fields[1:])
 	case "/yellow-page":
@@ -209,9 +228,10 @@ func (h *sipHandler) HandlePeerSessionEnd(_ context.Context, peer ss.SubscriberI
 	}
 }
 
-// handleInvite declines an incoming call, voice and video alike: the
-// bot is an outbound SBC — a browser-originated call has no SIP meaning
-// without a routing target.
+// handleInvite declines an incoming call, voice and video alike: a
+// browser-originated call to the bot has no SIP routing target. (The
+// reverse direction — a SIP subscriber calling the user's registered
+// AOR — is inbound.go's, and rings the browser.)
 func (h *sipHandler) handleInvite(sip *msg_handler.SipMessage, w msg_handler.ResponseWriter) {
 	h.logger.Info("sipbot: declining an incoming call", "peer", sip.From, "media", sip.Media, "callId", sip.CallId)
 	if err := w.Reject(msg_handler.SipCodeDecline, msg_handler.SipPhraseDecline); err != nil {
@@ -244,6 +264,11 @@ func (h *sipHandler) handleResponse(sip *msg_handler.SipMessage, w msg_handler.R
 			return
 		}
 		h.logger.Info("sipbot: the browser answered; the track is on the wire", "peer", peer, "callId", c.callId)
+		if c.inbound {
+			// The SIP caller gets his 200 OK now: Answer builds the media
+			// session and awaits the ACK, so it runs on its own goroutine.
+			go h.answerInbound(peer, c)
+		}
 		return
 	}
 	dialog, _, ok := c.end()
@@ -251,7 +276,13 @@ func (h *sipHandler) handleResponse(sip *msg_handler.SipMessage, w msg_handler.R
 		return
 	}
 	h.calls.CompareAndDelete(peer, c)
-	h.hangupDialog(dialog)
+	if c.inbound {
+		// The user's own decline, mirrored to the caller in the
+		// webrtc-leg's vocabulary (a generic termination would be a 480).
+		h.declineInbound(c.serverDialog)
+	} else {
+		h.hangupDialog(dialog)
+	}
 	h.logger.Info("sipbot: call declined by the user", "peer", peer, "callId", c.callId)
 	h.sayp(c, "Call declined.")
 }
@@ -301,7 +332,7 @@ func (h *sipHandler) register(ctx context.Context, msg *msg_handler.ChatMessage,
 		h.endCall(ctx, peer, v.(*peerCall))
 		h.say(peer, w, "The call in progress was ended.")
 	}
-	a, err := newAccount(ctx, h.logger, h.stack, session, h.expiry)
+	a, err := newAccount(ctx, h.logger, h.stack, session, h.expiry, h.inboundServe(peer))
 	if err != nil {
 		h.say(peer, w, fmt.Sprintf("Registration failed: %v.", err))
 		return
@@ -339,6 +370,32 @@ func (h *sipHandler) unregister(ctx context.Context, msg *msg_handler.ChatMessag
 	h.say(peer, w, "Unregistered.")
 }
 
+// myNumber is the /my-number command: the user's currently registered
+// SIP address — the number others can dial to ring this chat (the
+// inbound path, inbound.go) — or the not-registered answer. The answer
+// reads the LIVE registration (the account's own flag), not the
+// credential store: a stored credential whose registration died or has
+// not run yet is not callable, so it reads as not-registered.
+func (h *sipHandler) myNumber(msg *msg_handler.ChatMessage, w msg_handler.ResponseWriter) {
+	peer := msg.From
+	if v, ok := h.accounts.Load(peer); ok {
+		a := v.(*account)
+		if a.registered.Load() {
+			if a.session.Pooled {
+				h.say(peer, w, fmt.Sprintf("Your number is sip:%s (an account from the bot's pool).", a.session.AddressOfRecord))
+			} else {
+				h.say(peer, w, fmt.Sprintf("Your number is sip:%s.", a.session.AddressOfRecord))
+			}
+			return
+		}
+	}
+	hint := noNumber
+	if h.pool != nil {
+		hint += noNumberPoolHint
+	}
+	h.say(peer, w, hint)
+}
+
 // call is the /call command: with a registration in place and no call
 // standing, the bot phones the user on the webrtc-leg and the callee on
 // the sip-leg, and joins them.
@@ -368,8 +425,16 @@ func (h *sipHandler) call(ctx context.Context, msg *msg_handler.ChatMessage, w m
 		return
 	}
 	dialCtx, dialCancel := context.WithCancel(ctx)
-	c := &peerCall{target: args[0], track: track, w: w, dialCancel: dialCancel}
-	h.calls.Store(peer, c)
+	c := &peerCall{target: args[0], track: track, w: w, pendingCancel: dialCancel}
+	// The store, not the early check above, is the one-call gate: an
+	// inbound ring (its own goroutine) can slip in between the two, so
+	// the check IS the store here — the loser of the race backs out
+	// before anything rings.
+	if _, loaded := h.calls.LoadOrStore(peer, c); loaded {
+		dialCancel()
+		h.say(peer, w, "Already in a call — /hangup first.")
+		return
+	}
 	// Register for the browser's mic before the INVITE goes out, so no
 	// early track is missed (the music bot's discipline).
 	w.OnTrack(func(remote *webrtc.TrackRemote, _ *webrtc.RTPReceiver) {
@@ -526,10 +591,12 @@ func (h *sipHandler) tellBrowserEnded(c *peerCall, phase callPhase) {
 	h.detachLater(context.Background(), c)
 }
 
-// hangupDialog sends the answered dialog's BYE without blocking the
-// caller; a nil dialog (the dial never answered) needs none — its
+// hangupDialog sends the dialog's termination without blocking the
+// caller — diago's Hangup speaks the dialog's own state on either leg
+// (the BYE of an established dialog, the 480 of a still-ringing inbound
+// one). A nil dialog (the outbound dial never answered) needs none — its
 // transaction died with the dial's ctx.
-func (h *sipHandler) hangupDialog(dialog *diago.DialogClientSession) {
+func (h *sipHandler) hangupDialog(dialog sipLeg) {
 	if dialog == nil {
 		return
 	}
@@ -590,7 +657,7 @@ func (h *sipHandler) ensureAccount(ctx context.Context, peer ss.SubscriberId) (*
 		pooled = true
 		h.logger.Info("sipbot: loaned a pooled account", "peer", peer, "aor", session.AddressOfRecord)
 	}
-	a, err := newAccount(ctx, h.logger, h.stack, session, h.expiry)
+	a, err := newAccount(ctx, h.logger, h.stack, session, h.expiry, h.inboundServe(peer))
 	if err != nil {
 		if pooled {
 			h.pool.Release(session)
@@ -649,7 +716,8 @@ func (h *sipHandler) say(peer ss.SubscriberId, w msg_handler.ResponseWriter, tex
 }
 
 // sayp answers on the call's captured writer — the SIP leg's async news
-// (progress, answer, hangup, failure), threaded on the /call command.
+// (progress, answer, hangup, failure): threaded on the /call command for
+// an outbound call, unthreaded (the WriterFor writer) for an inbound one.
 func (h *sipHandler) sayp(c *peerCall, text string) {
 	if _, err := c.w.Reply(text); err != nil {
 		h.logger.Warn("sipbot: reply not sent", "err", err)

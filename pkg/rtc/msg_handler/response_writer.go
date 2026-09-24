@@ -13,7 +13,9 @@ import (
 // the counterpart of http.ResponseWriter: the Server hands one to every
 // BotMessageHandler invocation, bound to that message (its peer, its
 // messaging channel, its threading anchor, its call id), and the handler
-// answers through it — or not at all.
+// answers through it — or not at all. The Server's WriterFor is the
+// unsolicited counterpart: a writer bound to a peer but to no message,
+// for answering an event that is not one of the peer's messages.
 //
 // Which methods are meaningful depends on the message: Reply and Amend
 // send chat-channel messages. The call methods work with a phone call:

@@ -581,17 +581,24 @@ func isCallStatusAmend(inviteMsgId ss.MsgId, callId, status string) func(*rawMsg
 // ---------------------------------------------------------------------------
 
 // fakePBX is the suite's SIP network: a registrar that digest-challenges
-// REGISTER and INVITE, a callee that answers with a hand-written SDP,
-// and one UDP socket streaming and recording real RTP. Everything it
-// receives is recorded for the test's assertions.
+// REGISTER and INVITE, a callee that answers with a hand-written SDP, a
+// caller (the inbound-call tests' UAC side) that INVITEs a registrant's
+// recorded contact, and one UDP socket streaming and recording real RTP.
+// Everything it receives is recorded for the test's assertions.
 type fakePBX struct {
 	addr    string // its SIP address, host:port (an IPv6 one is bracketed)
 	ip      string // its bare IP (the SDP connection address)
 	sipHost string // its IP in SIP-URI form (an IPv6 literal bracketed)
+	port    int    // its SIP port
 	v6      bool   // the IPv6 loopback variant
 
 	answerCode int  // the final response to an INVITE (200, 486, …)
 	opus       bool // the SDP answer's codec: opus (96) when set, PCMU (0) otherwise
+
+	// The UAC side: the client and its dialog cache (a BYE of one of the
+	// fake's own outbound calls routes to it — see OnBye).
+	client        *sipgo.Client
+	clientDialogs *sipgo.DialogClientCache
 
 	rtp     *net.UDPConn // its media socket
 	rtpPeer *net.UDPAddr // the bot's media address, parsed from the INVITE's SDP
@@ -673,6 +680,7 @@ func newFakePBXOn(t *testing.T, ip string, answerCode int, opus bool) *fakePBX {
 		addr:       net.JoinHostPort(ip, strconv.Itoa(port)),
 		ip:         ip,
 		sipHost:    sipHost,
+		port:       port,
 		v6:         v6,
 		answerCode: answerCode,
 		opus:       opus,
@@ -695,6 +703,10 @@ func newFakePBXOn(t *testing.T, ip string, answerCode int, opus bool) *fakePBX {
 	}
 	dialogs := sipgo.NewDialogServerCache(client, sip.ContactHeader{
 		Address: sip.Uri{User: "pbx", Host: f.sipHost, Port: port},
+	})
+	f.client = client
+	f.clientDialogs = sipgo.NewDialogClientCache(client, sip.ContactHeader{
+		Address: sip.Uri{User: "caller", Host: f.sipHost, Port: port},
 	})
 
 	srv.OnRegister(func(req *sip.Request, tx sip.ServerTransaction) {
@@ -758,7 +770,7 @@ func newFakePBXOn(t *testing.T, ip string, answerCode int, opus bool) *fakePBX {
 			}
 			return
 		}
-		if err := dialog.RespondSDP(f.sdpAnswer()); err != nil {
+		if err := dialog.RespondSDP(f.sdpBody()); err != nil {
 			t.Errorf("RespondSDP: %v", err)
 			return
 		}
@@ -774,6 +786,14 @@ func newFakePBXOn(t *testing.T, ip string, answerCode int, opus bool) *fakePBX {
 		f.mu.Lock()
 		f.byes++
 		f.mu.Unlock()
+		// A BYE of one of the fake's own outbound calls (the inbound-call
+		// tests) belongs to a client dialog; a callee's BYE to a server one.
+		if cd, err := f.clientDialogs.MatchRequestDialog(req); err == nil {
+			if err := cd.ReadBye(req, tx); err != nil {
+				t.Errorf("the caller dialog's ReadBye: %v", err)
+			}
+			return
+		}
 		if err := dialogs.ReadBye(req, tx); err != nil {
 			_ = tx.Respond(sip.NewResponseFromRequest(req, 481, "Call/Transaction Does Not Exist", nil))
 		}
@@ -861,9 +881,9 @@ func between(s, left, right string) string {
 	return s[:j]
 }
 
-// sdpAnswer is the callee's media answer: the fake's media socket, the
-// negotiated codec alone (plus telephone-event, as PBXs do).
-func (f *fakePBX) sdpAnswer() []byte {
+// sdpBody is the fake's SDP, offer or answer alike: its media socket,
+// the codec the test configured (plus telephone-event, as PBXs do).
+func (f *fakePBX) sdpBody() []byte {
 	port := f.rtp.LocalAddr().(*net.UDPAddr).Port
 	family := "IP4"
 	if f.v6 {
@@ -939,6 +959,196 @@ func (f *fakePBX) streamOpus(ctx context.Context, payloads [][]byte) {
 			return
 		}
 		if _, err := f.rtp.WriteToUDP(data, peer); err != nil {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+}
+
+// ---- The fake as a caller: the inbound-call tests' UAC side ----
+
+// fakeCall is one of the fake PBX's own outbound calls: an INVITE to a
+// registrant's recorded contact, driven per test (wait the ring, take the
+// answer, CANCEL the ring, BYE the answered call).
+type fakeCall struct {
+	t *testing.T
+	f *fakePBX
+
+	dlg *sipgo.DialogClientSession
+
+	// answerCtx scopes the WaitAnswer; cancelling it is the caller's
+	// CANCEL (sipgo's WaitAnswer sends one — once a provisional arrived,
+	// hence cancel() waits the ring).
+	answerCtx    context.Context
+	answerCancel context.CancelFunc
+
+	mu       sync.Mutex
+	ringing  bool          // a 180 arrived
+	res      *sip.Response // the final response (nil until WaitAnswer returned)
+	peer     *net.UDPAddr  // the bot's media address, off the 200 OK's SDP
+	answered bool          // the 200 OK arrived and its ACK went out
+}
+
+// call rings the registrant user: an INVITE to the contact the
+// registration came from, carrying the fake's SDP (the same body its
+// answers carry). The INVITE is on the wire when call returns; the
+// call's waits drive it from there.
+func (f *fakePBX) call(t *testing.T, user string) *fakeCall {
+	t.Helper()
+	f.mu.Lock()
+	source := ""
+	for _, r := range f.registrations {
+		if r.from == user {
+			source = r.source
+		}
+	}
+	f.mu.Unlock()
+	if source == "" {
+		t.Fatalf("the fake PBX holds no registration for %s", user)
+	}
+	host, portText, err := net.SplitHostPort(source)
+	if err != nil {
+		t.Fatalf("the registrant's source %q: %v", source, err)
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil {
+		t.Fatalf("the registrant's source %q: %v", source, err)
+	}
+	if strings.Contains(host, ":") {
+		host = "[" + host + "]" // an IPv6 literal is bracketed in a SIP URI
+	}
+	from := &sip.FromHeader{
+		Address: sip.Uri{User: "caller", Host: f.sipHost, Port: f.port},
+		Params:  sip.NewParams(),
+	}
+	from.Params.Add("tag", sip.GenerateTagN(16))
+
+	fc := &fakeCall{t: t, f: f}
+	fc.answerCtx, fc.answerCancel = context.WithCancel(context.Background())
+	t.Cleanup(fc.answerCancel)
+	dlg, err := f.clientDialogs.Invite(fc.answerCtx, sip.Uri{User: user, Host: host, Port: port}, f.sdpBody(),
+		sip.NewHeader("Content-Type", "application/sdp"), from)
+	if err != nil {
+		t.Fatalf("the fake's INVITE: %v", err)
+	}
+	fc.dlg = dlg
+	go fc.waitAnswer()
+	return fc
+}
+
+// waitAnswer collects the call's responses: the provisionals (the ring),
+// then the final, recorded for the test's waits.
+func (fc *fakeCall) waitAnswer() {
+	err := fc.dlg.WaitAnswer(fc.answerCtx, sipgo.AnswerOptions{
+		OnResponse: func(res *sip.Response) error {
+			if res.StatusCode == 180 {
+				fc.mu.Lock()
+				fc.ringing = true
+				fc.mu.Unlock()
+			}
+			return nil
+		},
+	})
+	fc.mu.Lock()
+	defer fc.mu.Unlock()
+	if err != nil {
+		var resErr *sipgo.ErrDialogResponse
+		if errors.As(err, &resErr) {
+			fc.res = resErr.Res
+		}
+		// Otherwise the CANCEL's context.Canceled — res stays nil.
+		return
+	}
+	fc.res = fc.dlg.InviteResponse
+}
+
+// waitRinging waits for the caller's 180 Ringing.
+func (fc *fakeCall) waitRinging() {
+	fc.t.Helper()
+	waitFor(fc.t, "the caller's 180 Ringing", func() bool {
+		fc.mu.Lock()
+		defer fc.mu.Unlock()
+		return fc.ringing
+	})
+}
+
+// waitAnswered waits for the 200 OK, takes the bot's media address off
+// its SDP, and sends the ACK — the bot's Answer returns on it.
+func (fc *fakeCall) waitAnswered() {
+	fc.t.Helper()
+	waitFor(fc.t, "the caller's 200 OK", func() bool {
+		fc.mu.Lock()
+		defer fc.mu.Unlock()
+		return fc.res != nil && fc.res.StatusCode == 200
+	})
+	fc.mu.Lock()
+	res := fc.res
+	fc.mu.Unlock()
+	peer := parseSDPMediaAddr(fc.t, res.Body())
+	if err := fc.dlg.Ack(context.Background()); err != nil {
+		fc.t.Fatalf("the caller's ACK: %v", err)
+	}
+	fc.mu.Lock()
+	fc.peer = peer
+	fc.answered = true
+	fc.mu.Unlock()
+}
+
+// waitFailed waits for the call's final response and asserts its code.
+func (fc *fakeCall) waitFailed(code int) {
+	fc.t.Helper()
+	waitFor(fc.t, fmt.Sprintf("the caller's %d", code), func() bool {
+		fc.mu.Lock()
+		defer fc.mu.Unlock()
+		return fc.res != nil
+	})
+	fc.mu.Lock()
+	defer fc.mu.Unlock()
+	if fc.res.StatusCode != code {
+		fc.t.Fatalf("the inbound call's final response is %d %s, want %d", fc.res.StatusCode, fc.res.Reason, code)
+	}
+}
+
+// cancel hangs the ring up — the caller's CANCEL (which the wire shape
+// needs a provisional for, hence the ring wait first).
+func (fc *fakeCall) cancel() {
+	fc.t.Helper()
+	fc.waitRinging()
+	fc.answerCancel()
+}
+
+// bye hangs the answered call up — the caller's BYE.
+func (fc *fakeCall) bye() {
+	fc.t.Helper()
+	if err := fc.dlg.Bye(context.Background()); err != nil {
+		fc.t.Fatalf("the caller's BYE: %v", err)
+	}
+}
+
+// stream plays the caller's voice: the payloads as opus RTP to the bot's
+// media address, one packet per 20 ms, until ctx ends. It runs only once
+// the answer was taken (the media address comes from it).
+func (fc *fakeCall) stream(ctx context.Context, payloads [][]byte) {
+	fc.mu.Lock()
+	peer := fc.peer
+	fc.mu.Unlock()
+	if peer == nil {
+		return
+	}
+	for i := 0; ; i++ {
+		pkt := &rtp.Packet{
+			Header:  rtp.Header{Version: 2, PayloadType: 96, SequenceNumber: uint16(i), Timestamp: uint32(i * 960), SSRC: 0xCA11E1},
+			Payload: payloads[i%len(payloads)],
+		}
+		data, err := pkt.Marshal()
+		if err != nil {
+			return
+		}
+		if _, err := fc.f.rtp.WriteToUDP(data, peer); err != nil {
 			return
 		}
 		select {
@@ -1698,4 +1908,389 @@ func TestSipBotIPv6(t *testing.T) {
 	registerMsg := chat("/register 2001@" + pbx.addr + " s3cret")
 	waitBotMessage(t, probe, botId, "the manual registered reply over IPv6", isChatReply(registerMsg, "Registered as sip:2001@"+pbx.addr))
 	pbx.waitForPBX(t, "the manual REGISTER over IPv6", func() bool { return pbx.registers == 2 })
+}
+
+// TestSipBotMyNumber covers /my-number's three answers: the not-
+// registered hint when nothing is registered, the AOR once registered,
+// and the not-registered answer again after /unregister.
+func TestSipBotMyNumber(t *testing.T) {
+	net := newClientTestNet(t, ss.DefaultSubscriberAging)
+	bot := startBot(t, net, "bot", "2-bot", "", nil)
+	user, probe, _, _ := startUserProbe(t, net, "user", "1-user")
+	botId, userId := pairUp(t, bot, user)
+	pbx := newFakePBX(t, 200, true)
+
+	dc := probe.waitDC(t, botId, msg_handler.DataChannelLabelMessages)
+	chat := func(text string) ss.MsgId {
+		t.Helper()
+		m := baseMsg(ss.WellKnownChIdMain, userId, botId)
+		m["plaintext"] = text
+		if err := dc.SendText(mustJSON(t, m)); err != nil {
+			t.Fatalf("SendText: %v", err)
+		}
+		return ss.MsgId(m["msgId"].(string))
+	}
+
+	// No registration yet.
+	m := chat("/my-number")
+	waitBotMessage(t, probe, botId, "the not-registered answer", isChatReply(m, "Not registered to a SIP registrar yet"))
+
+	// Registered: the number is the AOR.
+	reg := chat("/register 2001@" + pbx.addr + " passW_0rd")
+	waitBotMessage(t, probe, botId, "the registered reply", isChatReply(reg, "Registered as"))
+	m = chat("/my-number")
+	waitBotMessage(t, probe, botId, "the number", isChatReply(m, "Your number is sip:2001@"+pbx.addr+"."))
+
+	// Unregistered again.
+	un := chat("/unregister")
+	waitBotMessage(t, probe, botId, "the unregistered reply", isChatReply(un, "Unregistered."))
+	m = chat("/my-number")
+	waitBotMessage(t, probe, botId, "the not-registered answer again", isChatReply(m, "Not registered to a SIP registrar yet"))
+}
+
+// TestSipBotMyNumberPooled covers the pooled variant: no number before
+// the first /call loans an account (the answer then carries the pool
+// hint), and the loaned number — marked as the pool's — after.
+func TestSipBotMyNumberPooled(t *testing.T) {
+	net := newClientTestNet(t, ss.DefaultSubscriberAging)
+	pbx := newFakePBX(t, 200, true)
+	pool, err := NewSIPCredentialPool([]SIPCredential{{URI: "sip:1101@" + pbx.addr, Password: "poolpass"}}, nil)
+	if err != nil {
+		t.Fatalf("NewSIPCredentialPool: %v", err)
+	}
+	bot := startBot(t, net, "bot", "2-bot", "", pool)
+	user, probe, _, _ := startUserProbe(t, net, "user", "1-user")
+	botId, userId := pairUp(t, bot, user)
+
+	dc := probe.waitDC(t, botId, msg_handler.DataChannelLabelMessages)
+	chat := func(text string) ss.MsgId {
+		t.Helper()
+		m := baseMsg(ss.WellKnownChIdMain, userId, botId)
+		m["plaintext"] = text
+		if err := dc.SendText(mustJSON(t, m)); err != nil {
+			t.Fatalf("SendText: %v", err)
+		}
+		return ss.MsgId(m["msgId"].(string))
+	}
+
+	m := chat("/my-number")
+	waitBotMessage(t, probe, botId, "the not-registered answer with the pool hint", func(got *rawMsg) bool {
+		return isChatReply(m, "Not registered to a SIP registrar yet")(got) && strings.Contains(got.plaintext, "pool")
+	})
+
+	// The /call loans the pool's account; /my-number then shows it,
+	// marked as the pool's.
+	callMsg := chat("/call 1001@" + pbx.addr)
+	waitBotMessage(t, probe, botId, "the pooled registration line", isChatReply(callMsg, "Registered as sip:1101@"))
+	m = chat("/my-number")
+	waitBotMessage(t, probe, botId, "the pooled number", isChatReply(m, "Your number is sip:1101@"+pbx.addr+" (an account from the bot's pool)."))
+
+	hangupMsg := chat("/hangup")
+	waitBotMessage(t, probe, botId, "the hung-up reply", isChatReply(hangupMsg, "Hung up."))
+}
+
+// TestSipBotInboundCallEndToEnd covers the reverse direction: a SIP
+// caller dials the registered number, the browser rings, the user
+// accepts, and the call joins — media both ways, then the caller's BYE
+// ends the browser leg.
+func TestSipBotInboundCallEndToEnd(t *testing.T) {
+	net := newClientTestNet(t, ss.DefaultSubscriberAging)
+	bot := startBot(t, net, "bot", "2-bot", "", nil)
+	user, probe, tprobe, _ := startUserProbe(t, net, "user", "1-user")
+	botId, userId := pairUp(t, bot, user)
+	pbx := newFakePBX(t, 200, true)
+
+	dc := probe.waitDC(t, botId, msg_handler.DataChannelLabelMessages)
+	chat := func(text string) ss.MsgId {
+		t.Helper()
+		m := baseMsg(ss.WellKnownChIdMain, userId, botId)
+		m["plaintext"] = text
+		if err := dc.SendText(mustJSON(t, m)); err != nil {
+			t.Fatalf("SendText: %v", err)
+		}
+		return ss.MsgId(m["msgId"].(string))
+	}
+	sip := func(body map[string]any) {
+		t.Helper()
+		m := baseMsg(ss.WellKnownChIdMain, userId, botId)
+		m["mimeType"] = wireMimeSip
+		m["sip"] = body
+		if err := dc.SendText(mustJSON(t, m)); err != nil {
+			t.Fatalf("SendText: %v", err)
+		}
+	}
+
+	registerMsg := chat("/register 2001@" + pbx.addr + " passW_0rd")
+	waitBotMessage(t, probe, botId, "the registered reply", isChatReply(registerMsg, "Registered as"))
+
+	// Someone on the SIP network dials the registered number.
+	call := pbx.call(t, "2001")
+
+	// The browser rings: the bot's INVITE, the chat line; the caller
+	// hears the 180.
+	invite := waitBotMessage(t, probe, botId, "the bot's INVITE", func(m *rawMsg) bool {
+		return isSipInvite(m) && m.sip.XMedia == "voice" && m.sip.XCallStatus == "inviting"
+	})
+	callId, inviteMsgId := invite.sip.CallId, invite.msgId
+	waitBotMessage(t, probe, botId, "the incoming-call line", func(m *rawMsg) bool {
+		return m.mimeType == wireMimePlaintext && strings.Contains(m.plaintext, "Incoming call from caller@")
+	})
+	call.waitRinging()
+
+	// The user picks up. The accept's shape mirrors the browser's: the
+	// mic goes on the connection FIRST — a fresh m-line on the quiet
+	// connection — and the 200 OK then flies.
+	micTrack, err := webrtc.NewTrackLocalStaticSample(
+		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus, ClockRate: 48000, Channels: 2}, "mic", "probe")
+	if err != nil {
+		t.Fatalf("the mic track: %v", err)
+	}
+	if _, err := user.AddTrack(botId, micTrack); err != nil {
+		t.Fatalf("attach the mic: %v", err)
+	}
+	spoken := make([][]byte, 5)
+	for i := range spoken {
+		p := make([]byte, 30)
+		p[0] = 0xF8
+		for j := 1; j < len(p); j++ {
+			p[j] = byte(i*53 + j*17)
+		}
+		spoken[i] = p
+	}
+	micCtx, stopMic := context.WithCancel(context.Background())
+	t.Cleanup(stopMic)
+	go func() {
+		for i := 0; ; i++ {
+			if err := micTrack.WriteSample(pionmedia.Sample{Data: spoken[i%len(spoken)], Duration: 20 * time.Millisecond}); err != nil {
+				return
+			}
+			select {
+			case <-micCtx.Done():
+				return
+			case <-time.After(20 * time.Millisecond):
+			}
+		}
+	}()
+	// Let the mic's offer/answer settle before the 200 OK triggers the
+	// bot's own attach offer, so the two renegotiations never meet in
+	// flight.
+	time.Sleep(300 * time.Millisecond)
+	sip(map[string]any{"callId": callId, "response": map[string]any{"code": 200, "phrase": "OK"}})
+
+	// The caller gets his 200 OK + SDP; his ACK arms the relay.
+	call.waitAnswered()
+
+	// The caller speaks: the opus packets cross to the browser byte for
+	// byte. The stream runs ahead of the track's wait — the probe's
+	// OnTrack fires only once media actually arrives.
+	streamCtx, stopStream := context.WithCancel(context.Background())
+	t.Cleanup(stopStream)
+	voice := opusVoice(5)
+	go call.stream(streamCtx, voice)
+	track := tprobe.waitTrack(t, 1)
+	waitBotMessage(t, probe, botId, "the accepted amend", isCallStatusAmend(inviteMsgId, callId, "accepted"))
+	heardVoice := map[string]bool{}
+	for len(heardVoice) < len(voice) {
+		pkt := readOneRTP(t, track)
+		heardVoice[string(pkt.Payload)] = true
+	}
+	for _, want := range voice {
+		if !heardVoice[string(want)] {
+			t.Fatalf("a streamed packet never reached the browser (the passthrough changed or lost it)")
+		}
+	}
+
+	// The user speaks: the mic's opus packets cross to the caller byte
+	// for byte.
+	heard := map[string]bool{}
+	deadline := time.Now().Add(testTimeout)
+	for {
+		for _, got := range pbx.waitRTP(t, 1) {
+			heard[string(got)] = true
+		}
+		all := true
+		for _, p := range spoken {
+			if !heard[string(p)] {
+				all = false
+			}
+		}
+		if all {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the caller heard %d of the %d distinct mic packets", len(heard), len(spoken))
+		}
+	}
+
+	// The caller hangs up: the browser leg is ended by the bot (BYE, the
+	// chat line, the ended amend).
+	call.bye()
+	waitBotMessage(t, probe, botId, "the bot's BYE", isSipRequest(callId, "BYE"))
+	waitBotMessage(t, probe, botId, "the caller-hung-up line", func(m *rawMsg) bool {
+		return m.mimeType == wireMimePlaintext && strings.Contains(m.plaintext, "Caller hung up.")
+	})
+	waitBotMessage(t, probe, botId, "the ended amend", isCallStatusAmend(inviteMsgId, callId, "ended"))
+}
+
+// TestSipBotInboundCallDeclined covers the user's decline: the caller's
+// INVITE is answered 603 and the call settles as rejected.
+func TestSipBotInboundCallDeclined(t *testing.T) {
+	net := newClientTestNet(t, ss.DefaultSubscriberAging)
+	bot := startBot(t, net, "bot", "2-bot", "", nil)
+	user, probe, _, _ := startUserProbe(t, net, "user", "1-user")
+	botId, userId := pairUp(t, bot, user)
+	pbx := newFakePBX(t, 200, true)
+
+	dc := probe.waitDC(t, botId, msg_handler.DataChannelLabelMessages)
+	chat := func(text string) ss.MsgId {
+		t.Helper()
+		m := baseMsg(ss.WellKnownChIdMain, userId, botId)
+		m["plaintext"] = text
+		if err := dc.SendText(mustJSON(t, m)); err != nil {
+			t.Fatalf("SendText: %v", err)
+		}
+		return ss.MsgId(m["msgId"].(string))
+	}
+	sip := func(body map[string]any) {
+		t.Helper()
+		m := baseMsg(ss.WellKnownChIdMain, userId, botId)
+		m["mimeType"] = wireMimeSip
+		m["sip"] = body
+		if err := dc.SendText(mustJSON(t, m)); err != nil {
+			t.Fatalf("SendText: %v", err)
+		}
+	}
+
+	registerMsg := chat("/register 2001@" + pbx.addr + " passW_0rd")
+	waitBotMessage(t, probe, botId, "the registered reply", isChatReply(registerMsg, "Registered as"))
+
+	call := pbx.call(t, "2001")
+	invite := waitBotMessage(t, probe, botId, "the bot's INVITE", isSipInvite)
+	call.waitRinging()
+
+	// The user declines: the caller gets the 603, the chat says so, the
+	// log entry settles rejected.
+	sip(map[string]any{"callId": invite.sip.CallId, "response": map[string]any{"code": 603, "phrase": "Decline"}})
+	call.waitFailed(603)
+	waitBotMessage(t, probe, botId, "the declined line", func(m *rawMsg) bool {
+		return m.mimeType == wireMimePlaintext && strings.Contains(m.plaintext, "Call declined.")
+	})
+	waitBotMessage(t, probe, botId, "the rejected amend", isCallStatusAmend(invite.msgId, invite.sip.CallId, "rejected"))
+}
+
+// TestSipBotInboundCallCancelled covers the caller giving up while the
+// browser rings: the bot CANCELS the browser leg.
+func TestSipBotInboundCallCancelled(t *testing.T) {
+	net := newClientTestNet(t, ss.DefaultSubscriberAging)
+	bot := startBot(t, net, "bot", "2-bot", "", nil)
+	user, probe, _, _ := startUserProbe(t, net, "user", "1-user")
+	botId, userId := pairUp(t, bot, user)
+	pbx := newFakePBX(t, 200, true)
+
+	dc := probe.waitDC(t, botId, msg_handler.DataChannelLabelMessages)
+	chat := func(text string) ss.MsgId {
+		t.Helper()
+		m := baseMsg(ss.WellKnownChIdMain, userId, botId)
+		m["plaintext"] = text
+		if err := dc.SendText(mustJSON(t, m)); err != nil {
+			t.Fatalf("SendText: %v", err)
+		}
+		return ss.MsgId(m["msgId"].(string))
+	}
+
+	registerMsg := chat("/register 2001@" + pbx.addr + " passW_0rd")
+	waitBotMessage(t, probe, botId, "the registered reply", isChatReply(registerMsg, "Registered as"))
+
+	call := pbx.call(t, "2001")
+	invite := waitBotMessage(t, probe, botId, "the bot's INVITE", isSipInvite)
+
+	// The caller gives up while the browser rings: the ring stops (the
+	// bot's CANCEL), the chat says so, the log entry settles cancelled.
+	call.cancel()
+	waitBotMessage(t, probe, botId, "the bot's CANCEL", isSipRequest(invite.sip.CallId, "CANCEL"))
+	waitBotMessage(t, probe, botId, "the caller-gave-up line", func(m *rawMsg) bool {
+		return m.mimeType == wireMimePlaintext && strings.Contains(m.plaintext, "Caller gave up.")
+	})
+	waitBotMessage(t, probe, botId, "the cancelled amend", isCallStatusAmend(invite.msgId, invite.sip.CallId, "cancelled"))
+}
+
+// TestSipBotInboundCallBusy covers the one-call-per-user gate from the
+// SIP side: while an outbound call stands, an inbound call gets a 486.
+func TestSipBotInboundCallBusy(t *testing.T) {
+	net := newClientTestNet(t, ss.DefaultSubscriberAging)
+	bot := startBot(t, net, "bot", "2-bot", "", nil)
+	user, probe, _, _ := startUserProbe(t, net, "user", "1-user")
+	botId, userId := pairUp(t, bot, user)
+	pbx := newFakePBX(t, 200, true)
+
+	dc := probe.waitDC(t, botId, msg_handler.DataChannelLabelMessages)
+	chat := func(text string) ss.MsgId {
+		t.Helper()
+		m := baseMsg(ss.WellKnownChIdMain, userId, botId)
+		m["plaintext"] = text
+		if err := dc.SendText(mustJSON(t, m)); err != nil {
+			t.Fatalf("SendText: %v", err)
+		}
+		return ss.MsgId(m["msgId"].(string))
+	}
+
+	registerMsg := chat("/register 2001@" + pbx.addr + " passW_0rd")
+	waitBotMessage(t, probe, botId, "the registered reply", isChatReply(registerMsg, "Registered as"))
+
+	// An outbound call stands (the callee answered).
+	callMsg := chat("/call 1001@" + pbx.addr)
+	waitBotMessage(t, probe, botId, "the calling line", isChatReply(callMsg, "Calling 1001@"))
+	pbx.waitForPBX(t, "the callee's INVITE", func() bool { return pbx.invites == 1 })
+
+	// A second caller dials the number: busy.
+	inbound := pbx.call(t, "2001")
+	inbound.waitFailed(486)
+
+	hangupMsg := chat("/hangup")
+	waitBotMessage(t, probe, botId, "the hung-up reply", isChatReply(hangupMsg, "Hung up."))
+}
+
+// TestSipBotInboundCallUserHangsUp covers the user hanging up an
+// answered inbound call: the caller's dialog gets the BYE.
+func TestSipBotInboundCallUserHangsUp(t *testing.T) {
+	net := newClientTestNet(t, ss.DefaultSubscriberAging)
+	bot := startBot(t, net, "bot", "2-bot", "", nil)
+	user, probe, _, _ := startUserProbe(t, net, "user", "1-user")
+	botId, userId := pairUp(t, bot, user)
+	pbx := newFakePBX(t, 200, true)
+
+	dc := probe.waitDC(t, botId, msg_handler.DataChannelLabelMessages)
+	chat := func(text string) ss.MsgId {
+		t.Helper()
+		m := baseMsg(ss.WellKnownChIdMain, userId, botId)
+		m["plaintext"] = text
+		if err := dc.SendText(mustJSON(t, m)); err != nil {
+			t.Fatalf("SendText: %v", err)
+		}
+		return ss.MsgId(m["msgId"].(string))
+	}
+	sip := func(body map[string]any) {
+		t.Helper()
+		m := baseMsg(ss.WellKnownChIdMain, userId, botId)
+		m["mimeType"] = wireMimeSip
+		m["sip"] = body
+		if err := dc.SendText(mustJSON(t, m)); err != nil {
+			t.Fatalf("SendText: %v", err)
+		}
+	}
+
+	registerMsg := chat("/register 2001@" + pbx.addr + " passW_0rd")
+	waitBotMessage(t, probe, botId, "the registered reply", isChatReply(registerMsg, "Registered as"))
+
+	call := pbx.call(t, "2001")
+	invite := waitBotMessage(t, probe, botId, "the bot's INVITE", isSipInvite)
+	call.waitRinging()
+	sip(map[string]any{"callId": invite.sip.CallId, "response": map[string]any{"code": 200, "phrase": "OK"}})
+	call.waitAnswered()
+
+	// The user hangs up: the caller's dialog gets the BYE, the log entry
+	// settles ended.
+	sip(map[string]any{"callId": invite.sip.CallId, "method": "BYE"})
+	pbx.waitForPBX(t, "the BYE at the caller", func() bool { return pbx.byes == 1 })
+	waitBotMessage(t, probe, botId, "the ended amend", isCallStatusAmend(invite.msgId, invite.sip.CallId, "ended"))
 }

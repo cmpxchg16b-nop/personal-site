@@ -5,8 +5,10 @@ package sipbot
 //   - the webrtc-leg — the in-band dialog toward the browser (the
 //     callId) and the bot's opus track, attached to the pair's peer
 //     connection when the browser answers;
-//   - the sip-leg — the diago INVITE dialog toward the callee, and the
-//     negotiated codec its answer settles;
+//   - the sip-leg — the SIP dialog toward the network (outbound: the
+//     diago INVITE's client session; inbound: the pending server session
+//     the call was created from), and the negotiated codec its answer
+//     settles;
 //
 // and relays media between them with two pump goroutines — one per
 // direction — each a read → (maybe transcode) → write loop (the codec
@@ -26,6 +28,7 @@ package sipbot
 import (
 	"context"
 	"errors"
+	"io"
 	"sync"
 	"time"
 
@@ -51,22 +54,50 @@ const (
 // peerCall is one chat user's call state.
 type peerCall struct {
 	// Set before the state is published, read-only after.
-	target string
-	track  *webrtc.TrackLocalStaticSample // the bot's opus track toward the browser
-	w      msg_handler.ResponseWriter     // the /call invocation's writer, captured for the SIP leg's async answers (threaded on the command)
-	callId string                         // the webrtc-leg dialog's id
+	//
+	// target is the remote party: outbound — the dial target as /call gave
+	// it; inbound — the caller's user@host. inbound says which direction
+	// the call came from; an inbound call's dialog (a server session) is
+	// set here at creation — the pending INVITE IS the sip-leg — where an
+	// outbound one's (a client session) lands under mu when the callee
+	// answers.
+	target  string
+	inbound bool
+	// serverDialog is the inbound call's concrete server session — the
+	// pending INVITE diago handed the serve callback (nil for an outbound
+	// call). dialog below carries the same value (as the interface) from
+	// creation; the concrete handle is for the verbs only a server dialog
+	// speaks: Answer, and the decline's 603.
+	serverDialog *diago.DialogServerSession
+	track        *webrtc.TrackLocalStaticSample // the bot's opus track toward the browser
+	w            msg_handler.ResponseWriter     // the invocation's writer, captured for the SIP leg's async answers (the /call command outbound; the inbound ring's unsolicited WriterFor)
+	callId       string                         // the webrtc-leg dialog's id
 
-	// dialCancel aborts an unanswered diago INVITE (the user hung up
-	// first, /unregister replaced the account, the session ended).
-	dialCancel context.CancelFunc
+	// pendingCancel aborts the call's still-pending phase: outbound — the
+	// unanswered diago INVITE (the user hung up first, /unregister
+	// replaced the account, the session ended); inbound — the ring
+	// timeout's clock.
+	pendingCancel context.CancelFunc
 
 	mu     sync.Mutex
 	phase  callPhase
-	dialog *diago.DialogClientSession // nil until the callee answers
-	relay  *relay                     // nil until the callee answers
-	mic    *webrtc.TrackRemote        // nil until the browser's mic arrives
-	micOn  bool                       // the browser→SIP pump is running
-	ended  bool                       // an end path ran; later ones no-op
+	dialog sipLeg              // outbound: nil until the callee answers; inbound: the pending dialog from the start
+	relay  *relay              // nil until the SIP side is answered
+	mic    *webrtc.TrackRemote // nil until the browser's mic arrives
+	micOn  bool                // the browser→SIP pump is running
+	ended  bool                // an end path ran; later ones no-op
+}
+
+// sipLeg is the call's SIP side as the relay and the teardown see it: the
+// encoded-payload reader/writer both diago dialog types embed (their
+// DialogMedia), the dialog's lifetime, and its termination verb —
+// diago's Hangup speaks the dialog's own state on either type: the BYE of
+// an established dialog, the 480 of a still-ringing server one.
+type sipLeg interface {
+	AudioReader(opts ...diago.AudioReaderOption) (io.Reader, error)
+	AudioWriter(opts ...diago.AudioWriterOption) (io.Writer, error)
+	Context() context.Context
+	Hangup(ctx context.Context) error
 }
 
 // relay is the call's media bridge: the two transcoders and the pumps'
@@ -78,7 +109,7 @@ type relay struct {
 	toBrowser *toBrowserBridge
 	toSIP     *toSIPBridge
 
-	dialog   *diago.DialogClientSession
+	dialog   sipLeg
 	track    *webrtc.TrackLocalStaticSample
 	stopCh   chan struct{}
 	stopOnce sync.Once
@@ -101,11 +132,28 @@ func (c *peerCall) setDialog(dialog *diago.DialogClientSession) error {
 	if c.ended {
 		return errCallEnded
 	}
-	r, err := newRelay(dialog, c.track)
+	return c.armLocked(dialog)
+}
+
+// armRelay is setDialog's inbound twin: the dialog was created with the
+// call (the pending INVITE), so answering only arms the relay on it.
+func (c *peerCall) armRelay() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.ended {
+		return errCallEnded
+	}
+	return c.armLocked(c.dialog)
+}
+
+// armLocked builds the relay on leg and starts the SIP→browser pump (and
+// the browser→SIP one when the mic already arrived). mu held.
+func (c *peerCall) armLocked(leg sipLeg) error {
+	r, err := newRelay(leg, c.track)
 	if err != nil {
 		return err
 	}
-	c.dialog = dialog
+	c.dialog = leg
 	c.relay = r
 	go r.pumpSIPToBrowser()
 	if c.mic != nil {
@@ -144,35 +192,41 @@ func (c *peerCall) activate() bool {
 }
 
 // end runs the call's end exactly once, answering its snapshot for the
-// caller's follow-up (which legs to tell, what to hang up): the dial is
-// aborted, the relay stopped, the state marked. The dialog's own BYE is
-// the caller's — it knows the context (and must not block on it).
-func (c *peerCall) end() (dialog *diago.DialogClientSession, phase callPhase, ok bool) {
+// caller's follow-up (which legs to tell, what to hang up): the pending
+// phase is aborted, the relay stopped, the state marked. The dialog's
+// own termination verb is the caller's — it knows the context (and must
+// not block on it).
+func (c *peerCall) end() (dialog sipLeg, phase callPhase, ok bool) {
+	return c.endIf(func() bool { return true })
+}
+
+// endRinging is the ring timeout's end — the call's end, but only while
+// the webrtc-leg still rings: an answered call is not the timeout's to
+// end, and a same-instant answer wins.
+func (c *peerCall) endRinging() (dialog sipLeg, phase callPhase, ok bool) {
+	return c.endIf(func() bool { return c.phase == phaseRinging })
+}
+
+// endIf runs the call's end exactly once when allow (read under the
+// lock) permits; the end's own bookkeeping is end's.
+func (c *peerCall) endIf(allow func() bool) (dialog sipLeg, phase callPhase, ok bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.ended {
+	if c.ended || !allow() {
 		return nil, 0, false
 	}
 	c.ended = true
-	c.dialCancel()
+	c.pendingCancel()
 	if c.relay != nil {
 		c.relay.stop()
 	}
 	return c.dialog, c.phase, true
 }
 
-// snapshot reports the call's current phase and dialog — for end paths
-// deciding which termination verb each leg speaks.
-func (c *peerCall) snapshot() (dialog *diago.DialogClientSession, phase callPhase) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.dialog, c.phase
-}
-
 // newRelay builds the media bridge for the answered dialog: the
 // negotiated codec read off the dialog's media properties, the two
 // transcoders.
-func newRelay(dialog *diago.DialogClientSession, track *webrtc.TrackLocalStaticSample) (*relay, error) {
+func newRelay(dialog sipLeg, track *webrtc.TrackLocalStaticSample) (*relay, error) {
 	props := diago.MediaProps{}
 	if _, err := dialog.AudioReader(diago.WithAudioReaderMediaProps(&props)); err != nil {
 		return nil, err

@@ -79,12 +79,14 @@ type Server struct {
 }
 
 // peerRecord is the hub's record of a live session: the session's
-// messaging channel (replaced when a glare rebuild re-invokes the
-// handler) and the peer's file-transfer announcements, keyed by canonical
-// file id — the metadata a file's chunks and attachment are correlated
-// with. Owned by the hub goroutine; never touched elsewhere.
+// messaging channel and its channel id (replaced when a glare rebuild
+// re-invokes the handler) and the peer's file-transfer announcements,
+// keyed by canonical file id — the metadata a file's chunks and
+// attachment are correlated with. Owned by the hub goroutine; never
+// touched elsewhere.
 type peerRecord struct {
 	dcmsg     *webrtc.DataChannel
+	channelId ss.ChannelId
 	announced map[string]*FileAnnouncement
 }
 
@@ -98,9 +100,10 @@ type serverNote interface{ isServerNote() }
 // live record is a genuine session start: the handler's
 // HandlePeerSessionStart hook fires.
 type peerUpNote struct {
-	peer  ss.SubscriberId
-	dcmsg *webrtc.DataChannel
-	ctx   context.Context // the session's context, for the start hook
+	peer      ss.SubscriberId
+	dcmsg     *webrtc.DataChannel
+	channelId ss.ChannelId
+	ctx       context.Context // the session's context, for the start hook
 }
 
 // peerDownNote drops a session's registration as the session ends —
@@ -136,6 +139,7 @@ type messagingNote struct {
 // no live session whose messaging channel came up.
 type messagingReply struct {
 	dcmsg        *webrtc.DataChannel
+	channelId    ss.ChannelId
 	announcement *FileAnnouncement
 }
 
@@ -249,7 +253,7 @@ func (s *Server) hub() {
 				// replaces the record of a live session and fires nothing).
 				s.handler.HandlePeerSessionStart(n.ctx, n.peer)
 			}
-			peers[n.peer] = &peerRecord{dcmsg: n.dcmsg, announced: make(map[string]*FileAnnouncement)}
+			peers[n.peer] = &peerRecord{dcmsg: n.dcmsg, channelId: n.channelId, announced: make(map[string]*FileAnnouncement)}
 		case peerDownNote:
 			if entry, ok := peers[n.peer]; ok && entry.dcmsg == n.dcmsg {
 				delete(peers, n.peer)
@@ -267,7 +271,7 @@ func (s *Server) hub() {
 		case messagingNote:
 			var reply messagingReply
 			if entry, ok := peers[n.peer]; ok {
-				reply = messagingReply{dcmsg: entry.dcmsg, announcement: entry.announced[n.fileId]}
+				reply = messagingReply{dcmsg: entry.dcmsg, channelId: entry.channelId, announcement: entry.announced[n.fileId]}
 			}
 			n.reply <- reply
 		case onTrackNote:
@@ -302,6 +306,29 @@ func (s *Server) messagingChannel(peer ss.SubscriberId, fileId string) (*webrtc.
 	s.serviceChan <- messagingNote{peer: peer, fileId: fileId, reply: reply}
 	r := <-reply
 	return r.dcmsg, r.announcement
+}
+
+// WriterFor returns a ResponseWriter bound to the peer's current session —
+// the unsolicited-send path: the handler's way to answer an event that is
+// not one of the peer's messages (a SIP-network event, a timer), where no
+// message-bound writer exists. The writer threads on no message (Reply's
+// InReplyTo is empty) and is bound to no call (Accept/Reject answer
+// ErrNotACall); Invite, the media verbs, and the termination verbs work
+// exactly as on a message-bound writer. The channel is the registry's
+// current one — a glare rebuild's swap is invisible to the holder — and a
+// peer with no live session yields a writer whose every send fails with
+// ErrNoMessagingChannel.
+func (s *Server) WriterFor(peer ss.SubscriberId) ResponseWriter {
+	reply := make(chan messagingReply, 1)
+	s.serviceChan <- messagingNote{peer: peer, reply: reply}
+	r := <-reply
+	return &responseWriter{
+		server:    s,
+		dc:        r.dcmsg,
+		channelId: r.channelId,
+		self:      s.client.SubscriberId(),
+		peer:      peer,
+	}
 }
 
 // setOnTrack registers fn for the peer's inbound media tracks (a
@@ -473,7 +500,7 @@ func sipMessageOf(msg *dcMsgIn) *SipMessage {
 // distilled messages to the BotMessageHandler.
 func (s *Server) serveMessages(ctx context.Context, channelId ss.ChannelId, peer ss.SubscriberId, dc *webrtc.DataChannel) {
 	self := s.client.SubscriberId()
-	s.serviceChan <- peerUpNote{peer: peer, dcmsg: dc, ctx: ctx}
+	s.serviceChan <- peerUpNote{peer: peer, dcmsg: dc, channelId: channelId, ctx: ctx}
 	// The session ends with ctx (a glare rebuild replaces the registration
 	// first): drop it unless it has already been replaced.
 	go func() {
