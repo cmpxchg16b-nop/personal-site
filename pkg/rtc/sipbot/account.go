@@ -19,6 +19,7 @@ import (
 	"log/slog"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"time"
 	"unicode"
 
@@ -30,6 +31,14 @@ import (
 // handler answers from its outcome, so the wait must not stall the
 // peer's channel goroutine longer than this.
 const registerTimeout = 5 * time.Second
+
+// registerBindRetries / registerBindRetryBackoff bound the first
+// REGISTER's tolerance of the diago startup race (see newAccount): the
+// listener whose pool entry the first transaction needs appears a few
+// instructions after diago reports readiness, so a spurious bind
+// conflict gets a handful of cheap retries inside registerTimeout.
+const registerBindRetries = 5
+const registerBindRetryBackoff = 20 * time.Millisecond
 
 // registerRetry is how long the keepalive loop waits before retrying a
 // re-REGISTER that failed transiently (a network wobble, a 5xx-less
@@ -81,37 +90,57 @@ func newAccount(ctx context.Context, logger *slog.Logger, stack sipStack, sessio
 	}
 	a.dg = dg
 	recipient := sip.Uri{User: session.Username, Host: session.Host, Port: session.Port}
-	t, err := dg.RegisterTransaction(a.ctx, recipient, diago.RegisterOptions{
-		Username: session.Username,
-		Password: session.Password,
-		Expiry:   expiry,
-	})
-	if err != nil {
-		a.cancel()
-		stackStop()
-		return nil, err
-	}
-	// diago builds the REGISTER bare — From/To/Via are added at send
-	// time, and the From sipgo would add is the socket's own address,
-	// not the AOR the credential belongs to. Stamp the user's identity:
-	// the From IS the AOR (with the tag sipgo adds only to Froms of its
-	// own making), pre-set so the send-time build leaves it alone. The
-	// Contact's user part is the account UA's name already, so the
-	// registrar sees one consistent identity: AOR, Contact user, and
-	// digest username are all the user's.
-	from := &sip.FromHeader{
-		Address: sip.Uri{User: session.Username, Host: session.Host},
-		Params:  sip.NewParams(),
-	}
-	from.Params.Add("tag", sip.GenerateTagN(16))
-	t.Origin.AppendHeader(from)
-
 	regCtx, stop := context.WithTimeout(a.ctx, registerTimeout)
 	defer stop()
-	if err := t.Register(regCtx); err != nil {
-		a.cancel()
-		stackStop()
-		return nil, fmt.Errorf("REGISTER rejected: %w", err)
+
+	// The first REGISTER races diago's own startup: ServeBackground
+	// reports the transport ready — and re-pins the client's connection
+	// address to the listener's just-bound port — a few instructions
+	// BEFORE sipgo pools the listener connection, so the first
+	// transaction's pool lookup can still miss and its connection create
+	// can try to bind the account's own port (EADDRINUSE). The listener
+	// is pooled almost immediately, so the spurious conflict gets a few
+	// retries; any other failure is the registrar's real answer.
+	var t *diago.RegisterTransaction
+	for attempt := 0; ; attempt++ {
+		t, err = dg.RegisterTransaction(a.ctx, recipient, diago.RegisterOptions{
+			Username: session.Username,
+			Password: session.Password,
+			Expiry:   expiry,
+		})
+		if err == nil {
+			// diago builds the REGISTER bare — From/To/Via are added at send
+			// time, and the From sipgo would add is the socket's own address,
+			// not the AOR the credential belongs to. Stamp the user's identity:
+			// the From IS the AOR (with the tag sipgo adds only to Froms of its
+			// own making), pre-set so the send-time build leaves it alone. The
+			// Contact's user part is the account UA's name already, so the
+			// registrar sees one consistent identity: AOR, Contact user, and
+			// digest username are all the user's.
+			from := &sip.FromHeader{
+				Address: sip.Uri{User: session.Username, Host: session.Host},
+				Params:  sip.NewParams(),
+			}
+			from.Params.Add("tag", sip.GenerateTagN(16))
+			t.Origin.AppendHeader(from)
+			err = t.Register(regCtx)
+		}
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, syscall.EADDRINUSE) || attempt+1 >= registerBindRetries {
+			a.cancel()
+			stackStop()
+			return nil, fmt.Errorf("REGISTER rejected: %w", err)
+		}
+		a.logger.Warn("sipbot: the first REGISTER hit the SIP client's startup race; retrying", "aor", session.AddressOfRecord, "err", err)
+		select {
+		case <-regCtx.Done():
+			a.cancel()
+			stackStop()
+			return nil, fmt.Errorf("REGISTER rejected: %w", err)
+		case <-time.After(registerBindRetryBackoff):
+		}
 	}
 	a.registered.Store(true)
 	go a.keepalive(t)

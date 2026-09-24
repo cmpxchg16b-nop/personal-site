@@ -289,7 +289,9 @@ Unauthorized`) — because a bot has no unsolicited-send path outside a
    handler invocation (the ResponseWriter is per-message), and a wrong
    password must be told to the user, not just logged. The bounded
    network round trip on the channel goroutine is the same trade the
-   music bot's lazy song opens already make.
+   music bot's lazy song opens already make. The one spurious failure
+   this step absorbs silently is diago's startup race (caveat 18): the
+   first transaction's bind conflict is retried, never reported.
 4. **Re-registration in the background**: the same goroutine then loops
    re-REGISTERing before expiry (diago's qualify loop semantics;
    `Expiry` default 300 s, `RetryInterval` on transient failures). Its
@@ -738,6 +740,16 @@ where a choice had to be made:
     should CANCEL an early dialog it answered... it cannot; only the
     UAC can), but sipgo sends it and every tested stack tolerates it.
     The window is the ACK's round trip, not the ring.
+18. **diago's startup race**: `ServeBackground` reports the transport
+    ready — and re-pins the client's connection address to the
+    listener's just-bound port — a few instructions BEFORE sipgo pools
+    the listener connection, so the account's first REGISTER can still
+    miss the pool lookup and try to bind the account's own port
+    (`EADDRINUSE`). `newAccount` retries exactly that error a handful
+    of times inside the 5 s REGISTER budget (the listener is pooled
+    almost immediately); any other failure is the registrar's real
+    answer. The race is every account's first-transaction-only, so the
+    keepalive and the dial paths never see it.
 
 ## 12. Package layout and testing
 
@@ -783,4 +795,10 @@ caller's CANCEL) and its integration tests: end to end (the browser
 rings, the 180 and the 200 + SDP cross, media flows both ways, the
 caller's BYE ends the browser leg), the browser's decline crossing as
 603, the caller's CANCEL crossing as the browser's CANCEL, and the
-busy-at-the-browser inbound call's 486.
+busy-at-the-browser inbound call's 486. Two harness disciplines keep
+the suite's flakes diagnosable and its teardown clean: a message wait
+that times out dumps everything the probe recorded (a bot failure reply
+the predicate did not expect is visible without a rerun), and the
+fake's handler errors are dropped once teardown begins — a de-REGISTER
+arriving mid-shutdown fails its response on a closing server, and a
+t.Errorf from sipgo's goroutine after the test completed would panic.

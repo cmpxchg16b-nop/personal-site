@@ -24,6 +24,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -510,20 +511,27 @@ func botMessages(frames []string) []*rawMsg {
 // waitBotMessage waits until the bot sends peer a message matching pred —
 // correlated by the protocol's own keys: a reply's inReplyTo, a dialog
 // message's callId, an amend's targetMessageId — never by arrival order.
-// Returns the matched message.
+// Returns the matched message. A timeout dumps everything the probe
+// recorded: a mismatch (the bot answered with a failure the predicate
+// does not expect) is then visible without a rerun.
 func waitBotMessage(t *testing.T, probe *wireProbe, peer ss.SubscriberId, what string, pred func(*rawMsg) bool) *rawMsg {
 	t.Helper()
-	var found *rawMsg
-	waitFor(t, what, func() bool {
+	deadline := time.Now().Add(testTimeout)
+	for {
 		for _, m := range botMessages(probe.textsFrom(peer)) {
 			if pred(m) {
-				found = m
-				return true
+				return m
 			}
 		}
-		return false
-	})
-	return found
+		if time.Now().After(deadline) {
+			var dump strings.Builder
+			for i, frame := range probe.textsFrom(peer) {
+				fmt.Fprintf(&dump, "\n  [%d] %s", i, frame)
+			}
+			t.Fatalf("timed out waiting for %s; the probe recorded:%s", what, dump.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 // countBotMessages counts the bot's messages to peer matching pred.
@@ -626,6 +634,23 @@ type fakePBX struct {
 	dialogs    chan *sipgo.DialogServerSession // established dialogs (after ACK)
 	rtpStart   chan struct{}                   // closed when the first dialog's media is up
 	rtpStartDo sync.Once
+
+	// tornDown is set when the test's teardown begins. The fake's handlers
+	// run on sipgo's goroutines, where a t.Errorf after the test completed
+	// panics; a message that arrives mid-teardown (an account's de-REGISTER
+	// outliving its test, the socket's close lagging the cleanup) failing
+	// is expected, not an error.
+	tornDown atomic.Bool
+}
+
+// errf reports a fake-PBX handler failure on the test — unless teardown
+// has begun, where a late message's failure is shutdown noise and a
+// t.Errorf could fire after the test completed (which panics).
+func (f *fakePBX) errf(t *testing.T, format string, args ...any) {
+	if f.tornDown.Load() {
+		return
+	}
+	t.Errorf(format, args...)
 }
 
 // registration is one authenticated REGISTER's identity as the fake saw
@@ -711,7 +736,7 @@ func newFakePBXOn(t *testing.T, ip string, answerCode int, opus bool) *fakePBX {
 
 	srv.OnRegister(func(req *sip.Request, tx sip.ServerTransaction) {
 		if !f.authenticated(req) {
-			f.challenge(req, tx)
+			f.challenge(t, req, tx)
 			return
 		}
 		f.mu.Lock()
@@ -719,7 +744,7 @@ func newFakePBXOn(t *testing.T, ip string, answerCode int, opus bool) *fakePBX {
 		f.mu.Unlock()
 		if refused {
 			if err := tx.Respond(sip.NewResponseFromRequest(req, 403, "Forbidden", nil)); err != nil {
-				t.Errorf("REGISTER 403: %v", err)
+				f.errf(t, "REGISTER 403: %v", err)
 			}
 			return
 		}
@@ -738,12 +763,12 @@ func newFakePBXOn(t *testing.T, ip string, answerCode int, opus bool) *fakePBX {
 			f.mu.Unlock()
 		}
 		if err := tx.Respond(sip.NewResponseFromRequest(req, 200, "OK", nil)); err != nil {
-			t.Errorf("REGISTER 200: %v", err)
+			f.errf(t, "REGISTER 200: %v", err)
 		}
 	})
 	srv.OnInvite(func(req *sip.Request, tx sip.ServerTransaction) {
 		if !f.authenticated(req) {
-			f.challenge(req, tx)
+			f.challenge(t, req, tx)
 			return
 		}
 		f.mu.Lock()
@@ -757,28 +782,28 @@ func newFakePBXOn(t *testing.T, ip string, answerCode int, opus bool) *fakePBX {
 		f.mu.Unlock()
 		dialog, err := dialogs.ReadInvite(req, tx)
 		if err != nil {
-			t.Errorf("ReadInvite: %v", err)
+			f.errf(t, "ReadInvite: %v", err)
 			_ = tx.Respond(sip.NewResponseFromRequest(req, 500, "Server Error", nil))
 			return
 		}
 		if err := dialog.Respond(180, "Ringing", nil); err != nil {
-			t.Errorf("180: %v", err)
+			f.errf(t, "180: %v", err)
 		}
 		if f.answerCode != 200 {
 			if err := dialog.Respond(f.answerCode, "Busy Here", nil); err != nil {
-				t.Errorf("final response: %v", err)
+				f.errf(t, "final response: %v", err)
 			}
 			return
 		}
 		if err := dialog.RespondSDP(f.sdpBody()); err != nil {
-			t.Errorf("RespondSDP: %v", err)
+			f.errf(t, "RespondSDP: %v", err)
 			return
 		}
 		f.dialogs <- dialog
 	})
 	srv.OnAck(func(req *sip.Request, tx sip.ServerTransaction) {
 		if err := dialogs.ReadAck(req, tx); err != nil {
-			t.Logf("ReadAck: %v", err)
+			f.errf(t, "ReadAck: %v", err)
 		}
 		f.rtpStartDo.Do(func() { close(f.rtpStart) })
 	})
@@ -790,7 +815,7 @@ func newFakePBXOn(t *testing.T, ip string, answerCode int, opus bool) *fakePBX {
 		// tests) belongs to a client dialog; a callee's BYE to a server one.
 		if cd, err := f.clientDialogs.MatchRequestDialog(req); err == nil {
 			if err := cd.ReadBye(req, tx); err != nil {
-				t.Errorf("the caller dialog's ReadBye: %v", err)
+				f.errf(t, "the caller dialog's ReadBye: %v", err)
 			}
 			return
 		}
@@ -808,10 +833,13 @@ func newFakePBXOn(t *testing.T, ip string, answerCode int, opus bool) *fakePBX {
 	t.Cleanup(cancel)
 	go func() {
 		if err := srv.ListenAndServe(ctx, "udp", f.addr); err != nil && !errors.Is(err, context.Canceled) {
-			t.Errorf("the fake PBX stopped: %v", err)
+			f.errf(t, "the fake PBX stopped: %v", err)
 		}
 	}()
 	t.Cleanup(func() { _ = srv.Close() })
+	// Registered last, so it runs FIRST of the fake's cleanups: handler
+	// failures from then on are teardown noise (see errf).
+	t.Cleanup(func() { f.tornDown.Store(true) })
 
 	// The media receive loop: record every RTP payload the bot relays.
 	go func() {
@@ -859,11 +887,11 @@ func (f *fakePBX) authenticated(req *sip.Request) bool {
 }
 
 // challenge answers 401 with the digest challenge.
-func (f *fakePBX) challenge(req *sip.Request, tx sip.ServerTransaction) {
+func (f *fakePBX) challenge(t *testing.T, req *sip.Request, tx sip.ServerTransaction) {
 	res := sip.NewResponseFromRequest(req, 401, "Unauthorized", nil)
 	res.AppendHeader(sip.NewHeader("WWW-Authenticate", `Digest realm="pbx", nonce="0123456789abcdef", algorithm=MD5`))
 	if err := tx.Respond(res); err != nil {
-		panic(err)
+		f.errf(t, "REGISTER 401: %v", err)
 	}
 }
 
