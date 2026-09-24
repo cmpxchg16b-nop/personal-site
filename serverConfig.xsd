@@ -152,7 +152,7 @@
              living in the server process exactly like the echo bot
              above (the shared attributes are the same). Its chat is a
              CLI — /help, /register <user@host> <password>, /unregister,
-             /call <user@host>, /hangup — with which a chat user
+             /call <user@host>, /yellow-page, /hangup — with which a chat user
              registers their own SIP credential and phones arbitrary
              subscribers of the SIP network; media crosses the bot
              transcoded only when the two legs' codecs differ (opus on
@@ -169,7 +169,12 @@
              their own: a /call from such a user loans a free account
              from the pool and registers it (the reply says so); the
              loan returns on /unregister, on a replacing /register, or
-             at the session's end. See sipCredentialPoolType. -->
+             at the session's end. See sipCredentialPoolType.
+
+             The optional yellowPage child is the bot's phone book: the
+             deployment's example callable numbers, printed into the chat
+             by the CLI's /yellow-page command so a user can pick a
+             callee without memorizing numbers. See yellowPageType. -->
         <xsd:element name="sipBot" type="sipBotType" minOccurs="0" />
       </xsd:sequence>
     </xsd:complexType>
@@ -239,6 +244,7 @@
             type="sipCredentialPoolType"
             minOccurs="0"
           />
+          <xsd:element name="yellowPage" type="yellowPageType" minOccurs="0" />
         </xsd:sequence>
         <xsd:attribute name="testSIPContact" type="xsd:string" use="optional" />
       </xsd:extension>
@@ -298,6 +304,57 @@
     <xsd:attribute name="password" type="xsd:string" use="required" />
     <xsd:attribute
       name="sipServer"
+      type="xsd:string"
+      use="optional"
+      default=""
+    />
+  </xsd:complexType>
+
+  <!-- The sip bot's yellow page (see the sipBot element above): the
+       deployment's phone book of example callable numbers, printed into
+       the chat by the CLI's /yellow-page command — zero or more
+       sections, each a named group of contacts. -->
+  <xsd:complexType name="yellowPageType">
+    <xsd:sequence>
+      <xsd:element
+        name="section"
+        type="yellowPageSectionType"
+        minOccurs="0"
+        maxOccurs="unbounded"
+      />
+    </xsd:sequence>
+  </xsd:complexType>
+
+  <!-- One section of the yellow page: a named group of contacts. id is
+       an opaque string uniquely identifying the section in the document;
+       name is the display caption the /yellow-page listing prints. -->
+  <xsd:complexType name="yellowPageSectionType">
+    <xsd:sequence>
+      <xsd:element
+        name="contact"
+        type="yellowPageContactType"
+        minOccurs="0"
+        maxOccurs="unbounded"
+      />
+    </xsd:sequence>
+    <xsd:attribute name="id" type="xsd:string" use="required" />
+    <xsd:attribute name="name" type="xsd:string" use="required" />
+  </xsd:complexType>
+
+  <!-- One contact of a yellow-page section: one example callable number.
+       id is an opaque string uniquely identifying the contact in the
+       document; name is the display name; aor is the dial target —
+       anything the bot CLI's /call accepts (a bare user "9196",
+       user@host, or a full SIP URI), deliberately not validated by the
+       schema: a bad one simply fails when someone /calls it; description
+       (optional) is a one-line note the listing prints beside the
+       entry. -->
+  <xsd:complexType name="yellowPageContactType">
+    <xsd:attribute name="id" type="xsd:string" use="required" />
+    <xsd:attribute name="name" type="xsd:string" use="required" />
+    <xsd:attribute name="aor" type="xsd:string" use="required" />
+    <xsd:attribute
+      name="description"
       type="xsd:string"
       use="optional"
       default=""

@@ -219,6 +219,21 @@ func startBotOn(t *testing.T, net *clientTestNet, name string, id ss.SubscriberI
 	return c
 }
 
+// startBotWithPage builds a client with the sip bot attached, carrying
+// the given yellow page.
+func startBotWithPage(t *testing.T, net *clientTestNet, name string, id ss.SubscriberId, yellowPage []YellowPageSection) *rtc.HeadlessRTCClient {
+	t.Helper()
+	c, _ := startClient(t, net, name, func(c *rtc.RTCClientConfiguration) {
+		c.SubscriberId = id
+	})
+	New(c, NewOnMemoryUserSessionStorage(), nil, Configuration{
+		Logger:     testLogger(t),
+		BindHost:   "127.0.0.1",
+		YellowPage: yellowPage,
+	})
+	return c
+}
+
 // pairUp waits for both clients to be registered and to hold a session
 // with each other, returning their subscriber ids.
 func pairUp(t *testing.T, a, b *rtc.HeadlessRTCClient) (aId, bId ss.SubscriberId) {
@@ -1005,7 +1020,7 @@ func TestSipBotCLIAndGuards(t *testing.T) {
 	hangupMsg := send("/hangup")
 
 	help := waitBotMessage(t, probe, botId, "the /help reply", isChatReply(helpMsg, "/help"))
-	for _, cmd := range []string{"/help", "/register", "/unregister", "/call", "/test-call", "/hangup"} {
+	for _, cmd := range []string{"/help", "/register", "/unregister", "/call", "/yellow-page", "/test-call", "/hangup"} {
 		if !strings.Contains(help.plaintext, cmd) {
 			t.Fatalf("the help text lacks %q: %q", cmd, help.plaintext)
 		}
@@ -1020,6 +1035,41 @@ func TestSipBotCLIAndGuards(t *testing.T) {
 	time.Sleep(300 * time.Millisecond)
 	if n := countBotMessages(probe, botId, isSipInvite); n != 0 {
 		t.Fatalf("the guarded commands produced %d INVITEs", n)
+	}
+}
+
+// TestSipBotYellowPage covers /yellow-page: the bot answers with its
+// configured phone book — the section captions, the contacts' names,
+// dial targets, and descriptions — threaded on the command.
+func TestSipBotYellowPage(t *testing.T) {
+	net := newClientTestNet(t, ss.DefaultSubscriberAging)
+	bot := startBotWithPage(t, net, "bot", "2-bot", []YellowPageSection{
+		{ID: "sec-local", Name: "local", Contacts: []YellowPageContact{
+			{ID: "echo", Name: "echo test", AOR: "9196"},
+			{ID: "echo-delayed", Name: "delayed echo test", AOR: "9195", Description: "echoes back after 250ms"},
+			{ID: "moh", Name: "music on hold", AOR: "9664"},
+		}},
+	})
+	user, probe, _, _ := startUserProbe(t, net, "user", "1-user")
+	botId, userId := pairUp(t, bot, user)
+
+	dc := probe.waitDC(t, botId, msg_handler.DataChannelLabelMessages)
+	m := baseMsg(ss.WellKnownChIdMain, userId, botId)
+	m["plaintext"] = "/yellow-page"
+	if err := dc.SendText(mustJSON(t, m)); err != nil {
+		t.Fatalf("SendText: %v", err)
+	}
+	reply := waitBotMessage(t, probe, botId, "the /yellow-page reply", isChatReply(ss.MsgId(m["msgId"].(string)), "Yellow page"))
+	for _, want := range []string{"local", "echo test", "9196", "delayed echo test", "9195", "echoes back after 250ms", "music on hold", "9664", "/call"} {
+		if !strings.Contains(reply.plaintext, want) {
+			t.Fatalf("the yellow page lacks %q: %q", want, reply.plaintext)
+		}
+	}
+	// The opaque ids stay in the configuration, out of the chat.
+	for _, id := range []string{"sec-local", "echo-delayed"} {
+		if strings.Contains(reply.plaintext, id) {
+			t.Fatalf("the yellow page leaks the opaque id %q: %q", id, reply.plaintext)
+		}
 	}
 }
 

@@ -110,3 +110,66 @@ func TestAudioSourceConversionValidates(t *testing.T) {
 		t.Fatalf("AudioSourceData error = %v, want one naming the entry and its cause", err)
 	}
 }
+
+// parseSipBot parses a configuration document consisting of the given
+// <sipBot/> body.
+func parseSipBot(t *testing.T, body string) *SipBotXML {
+	t.Helper()
+	doc := "<serverConfig>" + body + "</serverConfig>"
+	path := filepath.Join(t.TempDir(), "serverConfig.xml")
+	if err := os.WriteFile(path, []byte(doc), 0o644); err != nil {
+		t.Fatalf("write the config: %v", err)
+	}
+	cfg, err := LoadServerConfig(path)
+	if err != nil {
+		t.Fatalf("LoadServerConfig: %v", err)
+	}
+	if cfg.SipBot == nil {
+		t.Fatal("the document has no sipBot element")
+	}
+	return cfg.SipBot
+}
+
+// TestSipBotParsesYellowPage covers the <sipBot/> element's
+// <yellowPage/> child: the sections and their contacts — the optional
+// description defaulting to empty — and the absent page.
+func TestSipBotParsesYellowPage(t *testing.T) {
+	sb := parseSipBot(t, `<sipBot url="wss://x/api/ss/ws" jwt="t">
+  <yellowPage>
+    <section id="local" name="local">
+      <contact id="echo" name="echo test" aor="9196"/>
+      <contact id="echo-delayed" name="delayed echo test" aor="9195" description="echoes back after 250ms"/>
+    </section>
+    <section id="pbx" name="the PBX"/>
+  </yellowPage>
+</sipBot>`)
+	if sb.YellowPage == nil {
+		t.Fatal("the sip bot carries no yellow page")
+	}
+	sections := sb.YellowPage.Sections
+	if len(sections) != 2 {
+		t.Fatalf("the yellow page has %d sections, want 2", len(sections))
+	}
+	if sections[0].ID != "local" || sections[0].Name != "local" {
+		t.Fatalf("section[0] = %+v", sections[0])
+	}
+	contacts := sections[0].Contacts
+	if len(contacts) != 2 {
+		t.Fatalf("section[0] has %d contacts, want 2", len(contacts))
+	}
+	if contacts[0].ID != "echo" || contacts[0].Name != "echo test" ||
+		contacts[0].AOR != "9196" || contacts[0].Description != "" {
+		t.Fatalf("contact[0] = %+v", contacts[0])
+	}
+	if contacts[1].Description != "echoes back after 250ms" {
+		t.Fatalf("contact[1] = %+v", contacts[1])
+	}
+	if sections[1].Name != "the PBX" || len(sections[1].Contacts) != 0 {
+		t.Fatalf("section[1] = %+v", sections[1])
+	}
+
+	// No <yellowPage/> child: the page stays nil.
+	if sb := parseSipBot(t, `<sipBot url="wss://x/api/ss/ws" jwt="t"/>`); sb.YellowPage != nil {
+		t.Fatalf("no yellowPage element, parsed = %+v", sb.YellowPage)
+	}
+}

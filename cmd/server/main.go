@@ -455,13 +455,15 @@ func startMusicBot(ctx context.Context, cfg *pkgmodelsserverconfig.MusicBotXML, 
 // the bot lends to users who bring no credential of their own — an
 // entry the pool rejects (a malformed sipUri or usernameRange, an empty
 // sipServer) fails the startup, the music bot's audioSource discipline.
+// Its optional <yellowPage/> child is the phone book the CLI's
+// /yellow-page command lists.
 func startSipBot(ctx context.Context, cfg *pkgmodelsserverconfig.SipBotXML) error {
 	pool, err := sipCredentialPoolOf(cfg.CredentialPool)
 	if err != nil {
 		return err
 	}
 	return startBotClient(ctx, "sip bot", &cfg.BotClientXML, stereoOpusPCFactory(pkgapiiceservers.ParseURLs(cfg.IceServers)), func(client *rtc.HeadlessRTCClient) {
-		sipbot.New(client, sipbot.NewOnMemoryUserSessionStorage(), pool, sipbot.Configuration{Logger: logger, TestSIPContact: cfg.TestSIPContact})
+		sipbot.New(client, sipbot.NewOnMemoryUserSessionStorage(), pool, sipbot.Configuration{Logger: logger, TestSIPContact: cfg.TestSIPContact, YellowPage: yellowPageOf(cfg.YellowPage)})
 	})
 }
 
@@ -482,6 +484,26 @@ func sipCredentialPoolOf(x *pkgmodelsserverconfig.SipCredentialPoolXML) (*sipbot
 		ranges = append(ranges, sipbot.SIPCredentialRange{UsernameRange: r.UsernameRange, Password: r.Password, SIPServer: r.SIPServer})
 	}
 	return sipbot.NewSIPCredentialPool(credentials, ranges)
+}
+
+// yellowPageOf converts the element's <yellowPage/> child into the
+// bot's phone book — nil when the element carries none (the /yellow-page
+// command then answers that the page is empty). Nothing is validated:
+// a contact's aor is anything /call accepts, and a bad one simply fails
+// when dialed.
+func yellowPageOf(x *pkgmodelsserverconfig.YellowPageXML) []sipbot.YellowPageSection {
+	if x == nil {
+		return nil
+	}
+	sections := make([]sipbot.YellowPageSection, 0, len(x.Sections))
+	for _, s := range x.Sections {
+		section := sipbot.YellowPageSection{ID: s.ID, Name: s.Name, Contacts: make([]sipbot.YellowPageContact, 0, len(s.Contacts))}
+		for _, c := range s.Contacts {
+			section.Contacts = append(section.Contacts, sipbot.YellowPageContact{ID: c.ID, Name: c.Name, Description: c.Description, AOR: c.AOR})
+		}
+		sections = append(sections, section)
+	}
+	return sections
 }
 
 // stereoOpusPCFactory builds the music bot's peer-connection factory:

@@ -93,6 +93,12 @@ type Configuration struct {
 	// dials (e.g. "9664@192.168.1.2") — a known-good callee on the SIP
 	// network the deployment tests against. Empty disables /test-call.
 	TestSIPContact string
+
+	// YellowPage is the bot's phone book: the deployment's example
+	// callable numbers (the <yellowPage/> element of serverConfig.xml),
+	// listed by the CLI's /yellow-page command grouped by section. Empty
+	// answers that the page is empty.
+	YellowPage []YellowPageSection
 }
 
 // New wires the sip bot onto client: a msg_handler.Server serving the
@@ -126,7 +132,7 @@ func New(client *rtc.HeadlessRTCClient, storage UserSessionStorage, pool *SIPCre
 		bindPort:     config.BindPort,
 		externalHost: config.ExternalHost,
 	}
-	msg_handler.NewServer(client, newSipHandler(logger, storage, pool, stack, time.Duration(expiry)*time.Second, config.TestSIPContact), msg_handler.Configuration{Logger: logger})
+	msg_handler.NewServer(client, newSipHandler(logger, storage, pool, stack, time.Duration(expiry)*time.Second, config.TestSIPContact, config.YellowPage), msg_handler.Configuration{Logger: logger})
 }
 
 // sipStack is the per-account SIP client factory: the bot's sip-leg

@@ -53,6 +53,7 @@ const (
 		"/register <user@host> <password> — register your SIP account (e.g. /register 2001@sip.example.com passW_0rd)\n" +
 		"/unregister — drop the registration and the stored credential\n" +
 		"/call <user@host> — phone a SIP subscriber (a bare user keeps your account's domain)\n" +
+		"/yellow-page — list the phone book: the example numbers you can call\n" +
 		"/test-call — phone the bot's configured test callee\n" +
 		"/hangup — end the current call\n" +
 		"No account of your own? Just /call — when the bot's pool has a free account, it lends you one."
@@ -100,6 +101,10 @@ type sipHandler struct {
 	// Configuration's TestSIPContact); empty disables the command.
 	testContact string
 
+	// yellowPage is the bot's phone book (the Configuration's
+	// YellowPage), listed by the CLI's /yellow-page command.
+	yellowPage []YellowPageSection
+
 	// accounts is the per-peer SIP runtime (registrations); calls the
 	// per-peer call state. The maps are shared across peers' channel
 	// goroutines; the values' own synchronization is theirs.
@@ -109,8 +114,8 @@ type sipHandler struct {
 
 var _ msg_handler.BotMessageHandler = (*sipHandler)(nil)
 
-func newSipHandler(logger *slog.Logger, storage UserSessionStorage, pool *SIPCredentialPool, stack sipStack, expiry time.Duration, testContact string) *sipHandler {
-	return &sipHandler{logger: logger, storage: storage, pool: pool, stack: stack, expiry: expiry, testContact: testContact}
+func newSipHandler(logger *slog.Logger, storage UserSessionStorage, pool *SIPCredentialPool, stack sipStack, expiry time.Duration, testContact string, yellowPage []YellowPageSection) *sipHandler {
+	return &sipHandler{logger: logger, storage: storage, pool: pool, stack: stack, expiry: expiry, testContact: testContact, yellowPage: yellowPage}
 }
 
 // HandleChatMessage is the CLI: parse the line, answer it.
@@ -129,6 +134,8 @@ func (h *sipHandler) HandleChatMessage(ctx context.Context, msg *msg_handler.Cha
 		h.unregister(ctx, msg, w)
 	case "/call":
 		h.call(ctx, msg, w, fields[1:])
+	case "/yellow-page":
+		h.say(msg.From, w, yellowPageText(h.yellowPage))
 	case "/test-call":
 		h.testCall(ctx, msg, w)
 	case "/hangup":

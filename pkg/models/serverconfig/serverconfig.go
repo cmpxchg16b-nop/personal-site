@@ -155,7 +155,7 @@ type MusicBotXML struct {
 
 // SipBotXML mirrors the <sipBot/> section of serverConfig.xml: a bot
 // client (the embedded BotClientXML attributes) carrying the sip bot's
-// test callee and its credential pool.
+// test callee, its credential pool, and its yellow page.
 type SipBotXML struct {
 	BotClientXML
 	// TestSIPContact is the raw testSIPContact attribute: the SIP
@@ -168,6 +168,9 @@ type SipBotXML struct {
 	// lend, and a /call from a user without a registration always
 	// answers with the register hint.
 	CredentialPool *SipCredentialPoolXML `xml:"sipCredentialPool"`
+	// YellowPage is nil when the element carries no <yellowPage/> child;
+	// the bot's /yellow-page command then answers that the page is empty.
+	YellowPage *YellowPageXML `xml:"yellowPage"`
 }
 
 // SipCredentialPoolXML mirrors the <sipCredentialPool/> child of the
@@ -199,6 +202,39 @@ type SipCredentialRangeXML struct {
 	UsernameRange string `xml:"usernameRange,attr"`
 	Password      string `xml:"password,attr"`
 	SIPServer     string `xml:"sipServer,attr"`
+}
+
+// YellowPageXML mirrors the <yellowPage/> child of the <sipBot/>
+// section: the bot's phone book of example callable numbers, printed
+// into the chat by the CLI's /yellow-page command — zero or more
+// <section/> elements. Converted to the bot's Configuration.YellowPage
+// at wiring time (see cmd/server).
+type YellowPageXML struct {
+	Sections []YellowPageSectionXML `xml:"section"`
+}
+
+// YellowPageSectionXML mirrors one <section/> of the yellow page: a
+// named group of contacts. ID is an opaque string uniquely identifying
+// the section in the document; Name is the display caption the
+// /yellow-page listing prints.
+type YellowPageSectionXML struct {
+	ID       string                 `xml:"id,attr"`
+	Name     string                 `xml:"name,attr"`
+	Contacts []YellowPageContactXML `xml:"contact"`
+}
+
+// YellowPageContactXML mirrors one <contact/> of a yellow-page section:
+// one example callable number. ID is an opaque string uniquely
+// identifying the contact in the document; Name the display name; AOR
+// the dial target — anything the bot CLI's /call accepts (a bare user
+// "9196", user@host, or a full SIP URI), deliberately unvalidated;
+// Description an optional one-line note the listing prints beside the
+// entry.
+type YellowPageContactXML struct {
+	ID          string `xml:"id,attr"`
+	Name        string `xml:"name,attr"`
+	AOR         string `xml:"aor,attr"`
+	Description string `xml:"description,attr"`
 }
 
 // AudioSourceXML mirrors a single <audioSource/> entry of the

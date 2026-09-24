@@ -81,6 +81,7 @@ Chat lines, exactly like the music bot's commands:
 | `/register <user@host> <password>`   | associate the chat user with the SIP credential, REGISTER the AOR `sip:user@host` against its host, and keep the registration alive (§6). A later `/register` re-registers (replaces the credential).                                                                                                                                                                              |
 | `/unregister`                        | cancel the registration (a SIP de-REGISTER goes out), drop the stored credential, and end any call in progress                                                                                                                                                                                                                                                                     |
 | `/call <user@host>` (or bare `user`) | phone the callee through the SIP network and the user through the browser; one active call per chat user. A bare `user` is completed with the registered account's domain. Without a registration the bot loans an account from the credential pool when one is configured and has one free (§5), and says so; when the pool is empty (or absent), the answer points at /register. |
+| `/yellow-page`                       | print the yellow page — the phone book of example callable numbers from the configuration (the <sipBot/> element's <yellowPage/> child, §10), grouped by section: who to call, without memorizing numbers                                                                                                                                                                          |
 | `/test-call`                         | phone the configured test callee (the `<sipBot/>` element's `testSIPContact`, e.g. `9664@192.168.1.2`) — a known-good subscriber of the SIP network the deployment tests against; answers unavailable when unconfigured                                                                                                                                                            |
 | `/hangup`                            | end the current call from chat (equivalent to the browser's hangup button)                                                                                                                                                                                                                                                                                                         |
 
@@ -510,6 +511,19 @@ pool, cfg)` and reusing `stereoOpusPCFactory` (the webrtc leg negotiates
   audioSource discipline. The `usernameRange` attribute additionally
   carries an XSD pattern (`[0-9]+-[0-9]+`) so a malformed value is
   flagged by the schema alone; the semantic checks stay Go-side.
+- The `<sipBot/>` element's optional `<yellowPage/>` child is the bot's
+  phone book — the deployment's example callable numbers, printed into
+  the chat by the CLI's `/yellow-page` command so a user can pick a
+  callee without memorizing numbers: zero or more `<section/>` elements
+  (`id` an opaque string, `name` the display caption the listing
+  prints), each holding zero or more `<contact/>` entries (`id`, `name`,
+  an optional `description`, and the `aor` — the dial target, anything
+  `/call` accepts: a bare user (`9196`), user@host, or a full SIP URI).
+  Mirrored in `serverconfig.go` by `YellowPageXML` /
+  `YellowPageSectionXML` / `YellowPageContactXML` and converted at
+  wiring time into `Configuration.YellowPage`. No entry is validated —
+  deliberately, the `aor` above all: a bad one simply fails when someone
+  `/call`s it, with `/call`'s own error for an answer.
 
 ## 11. Concerns and caveats
 
@@ -600,6 +614,7 @@ where a choice had to be made:
 | `sipbot.go`                  | package doc, `Configuration`, `New` (wires the msg_handler.Server), `sipStack` (the per-account SIP client factory)                                                           |
 | `session.go`                 | `UserSession`, `UserSessionStorage`, `OnMemoryUserSessionStorage`                                                                                                             |
 | `pool.go`                    | `SIPCredentialPool` (+ the `SIPCredential`/`SIPCredentialRange` config shapes): the lazy, mutex-free account pool — the atomic cursor, the release channel, the range parsing |
+| `yellowpage.go`              | the yellow page: the YellowPageSection/YellowPageContact config shapes and the /yellow-page listing's rendering                                                               |
 | `handler.go`                 | `sipHandler` — the `BotMessageHandler`: CLI dispatch, registration lifecycle, call policy, hangup matrix                                                                      |
 | `account.go`                 | per-user SIP account runtime: the register loop and the diago `Invite` dial path                                                                                              |
 | `call.go`                    | per-call state + the relay: the two pump goroutines, track/dialog wiring, teardown                                                                                            |
@@ -622,4 +637,7 @@ range parsing, the allocation order, exhaustion, and release/re-loan
 `/call` (the REGISTER and INVITE carry the pooled identity), the
 exhaustion and registration-failure replies, and the release points —
 `/unregister`, a replacing `/register`, and the peer session's end (via
-the harness's subscriber aging).
+the harness's subscriber aging). The yellow page adds its rendering's
+unit tests (sections, descriptions, the empty page) and a CLI
+integration test: `/yellow-page` answers with the configured sections
+and contacts, threaded on the command.
