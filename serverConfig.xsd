@@ -247,6 +247,30 @@
           <xsd:element name="yellowPage" type="yellowPageType" minOccurs="0" />
         </xsd:sequence>
         <xsd:attribute name="testSIPContact" type="xsd:string" use="optional" />
+        <!-- ipPreference selects the address family of every DNS
+             resolution in the sip leg (the registrar's and the callees'
+             hostnames): v4Only resolves A records only, v6Only AAAA
+             records only, default (the default) keeps the library's own
+             behavior (IPv4 preferred). IP literals are unaffected. A
+             non-default value resolves through the bot's filtering DNS
+             proxy, which relays to the upstreamDNSResolver attribute's
+             resolver (host[:port], the port defaulting to 53) —
+             required then, rejected with the default; the wiring
+             enforces the pairing at startup. -->
+        <xsd:attribute name="ipPreference" use="optional" default="default">
+          <xsd:simpleType>
+            <xsd:restriction base="xsd:string">
+              <xsd:enumeration value="default" />
+              <xsd:enumeration value="v4Only" />
+              <xsd:enumeration value="v6Only" />
+            </xsd:restriction>
+          </xsd:simpleType>
+        </xsd:attribute>
+        <xsd:attribute
+          name="upstreamDNSResolver"
+          type="xsd:string"
+          use="optional"
+        />
       </xsd:extension>
     </xsd:complexContent>
   </xsd:complexType>

@@ -456,14 +456,22 @@ func startMusicBot(ctx context.Context, cfg *pkgmodelsserverconfig.MusicBotXML, 
 // entry the pool rejects (a malformed sipUri or usernameRange, an empty
 // sipServer) fails the startup, the music bot's audioSource discipline.
 // Its optional <yellowPage/> child is the phone book the CLI's
-// /yellow-page command lists.
+// /yellow-page command lists. Its optional ipPreference attribute
+// ("v6Only", "v4Only", "default") selects the address family every DNS
+// resolution in the sip leg honors — with an explicit
+// upstreamDNSResolver the bot's filtering DNS proxy relays to, required
+// for a non-default preference; an invalid pairing fails the startup.
 func startSipBot(ctx context.Context, cfg *pkgmodelsserverconfig.SipBotXML) error {
 	pool, err := sipCredentialPoolOf(cfg.CredentialPool)
 	if err != nil {
 		return err
 	}
+	ipPreference, err := sipbot.ParseIPPreference(cfg.IPPreference, cfg.UpstreamDNSResolver)
+	if err != nil {
+		return err
+	}
 	return startBotClient(ctx, "sip bot", &cfg.BotClientXML, stereoOpusPCFactory(pkgapiiceservers.ParseURLs(cfg.IceServers)), func(client *rtc.HeadlessRTCClient) {
-		sipbot.New(client, sipbot.NewOnMemoryUserSessionStorage(), pool, sipbot.Configuration{Logger: logger, TestSIPContact: cfg.TestSIPContact, YellowPage: yellowPageOf(cfg.YellowPage)})
+		sipbot.New(client, sipbot.NewOnMemoryUserSessionStorage(), pool, sipbot.Configuration{Logger: logger, TestSIPContact: cfg.TestSIPContact, YellowPage: yellowPageOf(cfg.YellowPage), IPPreference: ipPreference, UpstreamDNSResolver: cfg.UpstreamDNSResolver})
 	})
 }
 

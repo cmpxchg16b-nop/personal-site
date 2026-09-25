@@ -690,6 +690,21 @@ func newFakePBXOn(t *testing.T, ip string, answerCode int, opus bool) *fakePBX {
 	if err := rsv.Close(); err != nil {
 		t.Fatalf("release the reserved port: %v", err)
 	}
+	return newFakePBXOnPort(t, ip, port, answerCode, opus)
+}
+
+// newFakePBXOnPort starts a fake PBX on the given loopback address and
+// SIP port. Two PBXs sharing one port — one on 127.0.0.1, one on ::1 —
+// let one DNS hostname map to one registrar per address family (the
+// ipPreference test).
+func newFakePBXOnPort(t *testing.T, ip string, port int, answerCode int, opus bool) *fakePBX {
+	t.Helper()
+	listenIP := net.ParseIP(ip)
+	if c, err := net.ListenPacket("udp", net.JoinHostPort(ip, "0")); err != nil {
+		t.Skipf("no %s loopback on this host: %v", ip, err)
+	} else {
+		_ = c.Close()
+	}
 	rtpConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: listenIP, Port: 0})
 	if err != nil {
 		t.Fatalf("bind the media socket: %v", err)
@@ -1936,6 +1951,96 @@ func TestSipBotIPv6(t *testing.T) {
 	registerMsg := chat("/register 2001@" + pbx.addr + " s3cret")
 	waitBotMessage(t, probe, botId, "the manual registered reply over IPv6", isChatReply(registerMsg, "Registered as sip:2001@"+pbx.addr))
 	pbx.waitForPBX(t, "the manual REGISTER over IPv6", func() bool { return pbx.registers == 2 })
+}
+
+// TestSipBotIPPreference covers the ipPreference attribute end to end:
+// the registrar's HOSTNAME (not a literal) resolves through the bot's
+// filtering DNS proxy — a fake upstream resolver maps pbx.test to both
+// loopbacks, one fake PBX per family sharing one port — and the
+// REGISTER and the INVITE must arrive at the preferred family's PBX
+// alone, the wire identity staying the hostname.
+func TestSipBotIPPreference(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		pref IPPreference
+		v6   bool
+	}{
+		{"v4Only", IPPreferenceV4Only, false},
+		{"v6Only", IPPreferenceV6Only, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// One loopback port for both families' PBXs.
+			rsv, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+			if err != nil {
+				t.Fatalf("reserve the shared port: %v", err)
+			}
+			port := rsv.LocalAddr().(*net.UDPAddr).Port
+			if err := rsv.Close(); err != nil {
+				t.Fatalf("release the reserved port: %v", err)
+			}
+			pbx4 := newFakePBXOnPort(t, "127.0.0.1", port, 486, true) // busy: the calls need never complete
+			pbx6 := newFakePBXOnPort(t, "::1", port, 486, true)
+			upstream := newFakeDNS(t, map[string][]string{"pbx.test.": {"127.0.0.1", "::1"}}, nil, nil)
+
+			net := newClientTestNet(t, ss.DefaultSubscriberAging)
+			c, _ := startClient(t, net, "bot", func(c *rtc.RTCClientConfiguration) {
+				c.SubscriberId = "2-bot"
+			})
+			New(c, NewOnMemoryUserSessionStorage(), nil, Configuration{
+				Logger:              testLogger(t),
+				IPPreference:        tc.pref,
+				UpstreamDNSResolver: upstream.addr,
+			})
+			user, probe, _, _ := startUserProbe(t, net, "user", "1-user")
+			botId, userId := pairUp(t, c, user)
+
+			dc := probe.waitDC(t, botId, msg_handler.DataChannelLabelMessages)
+			chat := func(text string) ss.MsgId {
+				t.Helper()
+				m := baseMsg(ss.WellKnownChIdMain, userId, botId)
+				m["plaintext"] = text
+				if err := dc.SendText(mustJSON(t, m)); err != nil {
+					t.Fatalf("SendText: %v", err)
+				}
+				return ss.MsgId(m["msgId"].(string))
+			}
+
+			want, other := pbx4, pbx6
+			if tc.v6 {
+				want, other = pbx6, pbx4
+			}
+			registrar := fmt.Sprintf("pbx.test:%d", port)
+
+			registerMsg := chat("/register 2001@" + registrar + " passW_0rd")
+			waitBotMessage(t, probe, botId, "the registered reply", isChatReply(registerMsg, "Registered as sip:2001@"+registrar))
+			want.waitForPBX(t, "the REGISTER at the preferred family's PBX", func() bool {
+				return want.registers == 1 && want.registrations[0].from == "2001"
+			})
+
+			callMsg := chat("/call 1001@" + registrar)
+			waitBotMessage(t, probe, botId, "the call-failed line", isChatReply(callMsg, "Call failed: "))
+			want.waitForPBX(t, "the INVITE at the preferred family's PBX", func() bool {
+				return want.invites == 1 && want.inviteFrom == "2001" && want.inviteTo == "1001"
+			})
+
+			// The suppressed family's PBX stayed silent (the register and
+			// the call have both completed at the other one, so a misrouted
+			// message would have arrived by now).
+			time.Sleep(300 * time.Millisecond)
+			other.mu.Lock()
+			n := other.registers + other.invites
+			other.mu.Unlock()
+			if n != 0 {
+				t.Errorf("the suppressed family's PBX received %d messages (registers+invites), want 0", n)
+			}
+
+			// A clean unregister while everything is alive: the de-REGISTER
+			// takes the same family (and the teardown races nothing).
+			unregisterMsg := chat("/unregister")
+			waitBotMessage(t, probe, botId, "the unregistered reply", isChatReply(unregisterMsg, "Unregistered."))
+			want.waitForPBX(t, "the de-REGISTER at the preferred family's PBX", func() bool { return want.unregistered })
+		})
+	}
 }
 
 // TestSipBotMyNumber covers /my-number's three answers: the not-

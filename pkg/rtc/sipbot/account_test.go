@@ -1,6 +1,7 @@
 package sipbot
 
 import (
+	"context"
 	"net"
 	"strings"
 	"testing"
@@ -54,8 +55,13 @@ func TestParseAddressOfRecord(t *testing.T) {
 // registrar — an IPv6 address for an IPv6 registrar, IPv4 for IPv4 (the
 // exact address is the host's routing table's, so the assertions check
 // the family), an unresolvable registrar gets the IPv4 wildcard — and an
-// explicit BindHost wins verbatim.
+// explicit BindHost wins verbatim. A non-default ipPreference resolves
+// the registrar through the bot's filtering DNS proxy (a fake upstream
+// maps dual.test to both loopbacks) and the pick follows the
+// preference's family — a registrar without the family's address gets
+// the family's wildcard.
 func TestBindHostFor(t *testing.T) {
+	ctx := context.Background()
 	auto := sipStack{}
 	for _, tc := range []struct {
 		host string
@@ -66,7 +72,7 @@ func TestBindHostFor(t *testing.T) {
 		{"[2a0a:4cc0::1]", true},
 		{"[::1]", true},
 	} {
-		got := auto.bindHostFor(UserSession{Host: tc.host})
+		got := auto.bindHostFor(ctx, UserSession{Host: tc.host})
 		ip := net.ParseIP(got)
 		if ip == nil {
 			t.Errorf("bindHostFor(%q) = %q, not an IP", tc.host, got)
@@ -77,12 +83,52 @@ func TestBindHostFor(t *testing.T) {
 		}
 	}
 	// Unresolvable: the IPv4 wildcard default.
-	if got := auto.bindHostFor(UserSession{Host: "not a valid host!"}); got != "0.0.0.0" {
+	if got := auto.bindHostFor(ctx, UserSession{Host: "not a valid host!"}); got != "0.0.0.0" {
 		t.Errorf("bindHostFor(unresolvable) = %q, want 0.0.0.0", got)
 	}
 	// A pinned BindHost wins regardless of the registrar's family.
 	pinned := sipStack{bindHost: "127.0.0.1"}
-	if got := pinned.bindHostFor(UserSession{Host: "[2a0a:4cc0::1]"}); got != "127.0.0.1" {
+	if got := pinned.bindHostFor(ctx, UserSession{Host: "[2a0a:4cc0::1]"}); got != "127.0.0.1" {
 		t.Errorf("pinned bindHostFor = %q, want the pin", got)
+	}
+
+	// The ipPreference path: the registrar's name resolves through the
+	// bot's filtering proxy (a fake upstream maps dual.test to both
+	// loopbacks), and the pick is the preference's family.
+	upstream := newFakeDNS(t, map[string][]string{"dual.test.": {"127.0.0.1", "::1"}}, nil, nil)
+	v6Loopback := true
+	if c, err := net.ListenPacket("udp6", "[::1]:0"); err != nil {
+		v6Loopback = false
+	} else {
+		_ = c.Close()
+	}
+	for _, tc := range []struct {
+		pref IPPreference
+		host string
+		want string
+	}{
+		{IPPreferenceV4Only, "dual.test", "127.0.0.1"},
+		{IPPreferenceV6Only, "dual.test", "::1"},
+		// A literal of the suppressed family is not a resolution — it
+		// passes the filter, but the pick must stay the preference's, so
+		// the family's wildcard answers.
+		{IPPreferenceV4Only, "[::1]", "0.0.0.0"},
+		{IPPreferenceV6Only, "127.0.0.1", "::"},
+		// Unresolvable: the family's wildcard.
+		{IPPreferenceV6Only, "absent.test", "::"},
+	} {
+		if tc.want == "::1" && !v6Loopback {
+			continue // no IPv6 loopback on this host
+		}
+		stack := sipStack{ipPreference: tc.pref}
+		proxy, err := startFilteringResolver(tc.pref, upstream.addr)
+		if err != nil {
+			t.Fatalf("startFilteringResolver(%q): %v", tc.pref, err)
+		}
+		stack.dnsProxy = proxy
+		if got := stack.bindHostFor(ctx, UserSession{Host: tc.host}); got != tc.want {
+			t.Errorf("bindHostFor(%q, %q) = %q, want %q", tc.pref, tc.host, got, tc.want)
+		}
+		proxy.Close()
 	}
 }

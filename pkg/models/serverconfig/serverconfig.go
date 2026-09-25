@@ -163,6 +163,16 @@ type SipBotXML struct {
 	// "9664@192.168.1.2") — a known-good callee on the SIP network the
 	// deployment tests against. Empty disables /test-call.
 	TestSIPContact string `xml:"testSIPContact,attr"`
+	// IPPreference is the raw ipPreference attribute: the address family
+	// every DNS resolution in the sip leg honors — "v6Only", "v4Only",
+	// or "default" (empty, the default). Validated at wiring time with
+	// sipbot.ParseIPPreference (see cmd/server).
+	IPPreference string `xml:"ipPreference,attr"`
+	// UpstreamDNSResolver is the raw upstreamDNSResolver attribute: the
+	// upstream DNS resolver (host[:port], the port defaulting to 53) the
+	// bot's filtering DNS proxy relays to — required with a non-default
+	// ipPreference, rejected with the default.
+	UpstreamDNSResolver string `xml:"upstreamDNSResolver,attr"`
 	// CredentialPool is nil when the element carries no
 	// <sipCredentialPool/> child; the sip bot then has no accounts to
 	// lend, and a /call from a user without a registration always

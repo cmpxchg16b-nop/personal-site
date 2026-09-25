@@ -302,6 +302,17 @@
        tests against (the example points at a LAN PBX's test
        extension); empty disables /test-call.
 
+       ipPreference selects the address family of every DNS resolution in
+       the sip leg (the registrar's and the callees' hostnames):
+       "v4Only" resolves A records only, "v6Only" AAAA records only, and
+       "default" (the default) keeps the library's own behavior (IPv4
+       preferred, IPv6 when no A record exists). IP literals are
+       unaffected. A non-default value resolves through the bot's
+       filtering DNS proxy, so it requires upstreamDNSResolver — the
+       upstream DNS resolver the proxy relays to (host[:port], the port
+       defaulting to 53); the attribute is rejected with the default. An
+       invalid pairing fails the startup.
+
        The optional <sipCredentialPool/> child is the bot's pool of SIP
        accounts, lent to chat users who bring no credential of their own
        (a /call loans a free account and registers it, and the reply
@@ -330,6 +341,7 @@
     subscriberId="sipbot"
     keepAliveInterval="5s"
     testSIPContact="9664@192.168.1.2"
+    ipPreference="default"
   >
     <sipCredentialPool>
       <sipCredential sipUri="sip:1001@sip.example.com" password="1234" />

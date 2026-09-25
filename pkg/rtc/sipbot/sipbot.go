@@ -92,6 +92,26 @@ type Configuration struct {
 	// RegisterExpiry is the registration's Expires; zero selects 300 s.
 	RegisterExpiry int
 
+	// IPPreference selects the address family of every DNS hostname
+	// resolution in the sip leg — the registrar's and the callees':
+	// IPPreferenceV4Only resolves A records only, IPPreferenceV6Only AAAA
+	// records only (a hostname without one fails its registration with
+	// the DNS error), and IPPreferenceDefault (the zero value) keeps
+	// sipgo's own behavior (IPv4 preferred, IPv6 used when no A record
+	// exists). The account sockets' bind-address selection (an empty
+	// BindHost) follows the same family. IP literals are not resolutions
+	// and pass unaffected. A non-default value resolves through the bot's
+	// own filtering DNS proxy, so it requires UpstreamDNSResolver; see
+	// dns.go.
+	IPPreference IPPreference
+
+	// UpstreamDNSResolver is the upstream DNS resolver (host[:port], the
+	// port defaulting to 53) the bot's filtering DNS proxy relays to —
+	// required with a non-default IPPreference, rejected with the default
+	// (which uses the system resolver untouched). Validate the pairing
+	// with ParseIPPreference; New panics on an invalid one.
+	UpstreamDNSResolver string
+
 	// TestSIPContact is the SIP address the CLI's /test-call command
 	// dials (e.g. "9664@192.168.1.2") — a known-good callee on the SIP
 	// network the deployment tests against. Empty disables /test-call.
@@ -113,7 +133,10 @@ type Configuration struct {
 // registration always answers with the /register hint); the SIP clients
 // the registrations and calls run on are opened per account (see
 // sipStack). It panics when a label is already taken, mirroring the
-// client's HandleDataChannel. The bot needs no further driving.
+// client's HandleDataChannel — and likewise when a non-default
+// IPPreference's pairing with UpstreamDNSResolver is invalid (validate
+// it with ParseIPPreference) or its filtering DNS proxy cannot start.
+// The bot needs no further driving.
 func New(client *rtc.HeadlessRTCClient, storage UserSessionStorage, pool *SIPCredentialPool, config Configuration) {
 	logger := config.Logger
 	if logger == nil {
@@ -134,6 +157,23 @@ func New(client *rtc.HeadlessRTCClient, storage UserSessionStorage, pool *SIPCre
 		bindHost:     config.BindHost,
 		bindPort:     config.BindPort,
 		externalHost: config.ExternalHost,
+		ipPreference: config.IPPreference.normalize(),
+	}
+	// A non-default ipPreference needs the bot's filtering DNS proxy
+	// (dns.go) on its explicit upstream resolver. The proxy is shared
+	// by every account and lives for the bot's lifetime (the process,
+	// in the shipped wiring). A bad pairing is a misconfiguration:
+	// cmd/server validates with ParseIPPreference at startup, so a
+	// panic here means a programmatic caller skipped it.
+	if _, err := ParseIPPreference(string(stack.ipPreference), config.UpstreamDNSResolver); err != nil {
+		panic(fmt.Sprintf("sipbot: %v", err))
+	}
+	if stack.ipPreference != IPPreferenceDefault {
+		proxy, err := startFilteringResolver(stack.ipPreference, config.UpstreamDNSResolver)
+		if err != nil {
+			panic(fmt.Sprintf("sipbot: the filtering DNS proxy: %v", err))
+		}
+		stack.dnsProxy = proxy
 	}
 	h := newSipHandler(logger, storage, pool, stack, time.Duration(expiry)*time.Second, config.TestSIPContact, config.YellowPage)
 	// The unsolicited-send path (the inbound call's ring) is the Server's
@@ -153,6 +193,12 @@ type sipStack struct {
 	bindHost     string
 	bindPort     int
 	externalHost string
+	// ipPreference selects the address family of every DNS resolution
+	// (dns.go); dnsProxy is the bot's filtering DNS reverse proxy — nil
+	// under the default preference, where the system resolver is used
+	// untouched.
+	ipPreference IPPreference
+	dnsProxy     *filteringResolver
 }
 
 // open materializes one account's SIP client: a diago whose UA is named
@@ -167,14 +213,22 @@ type sipStack struct {
 // ends (diago's serve-handler lifetime discipline). The client dies
 // with ctx: the account stops it once the de-REGISTER left.
 func (s sipStack) open(ctx context.Context, session UserSession, onInbound func(inDialog *diago.DialogServerSession)) (*diago.Diago, error) {
-	ua, err := sipgo.NewUA(sipgo.WithUserAgent(session.Username))
+	uaOpts := []sipgo.UserAgentOption{sipgo.WithUserAgent(session.Username)}
+	if s.dnsProxy != nil {
+		// A non-default ipPreference resolves every hostname the account's
+		// client touches — the registrar's, the callees' — through the
+		// bot's filtering DNS proxy (dns.go): the answers come back in the
+		// chosen family only.
+		uaOpts = append(uaOpts, sipgo.WithUserAgentDNSResolver(s.dnsProxy.resolver))
+	}
+	ua, err := sipgo.NewUA(uaOpts...)
 	if err != nil {
 		return nil, err
 	}
 	dg := diago.NewDiago(ua,
 		diago.WithTransport(diago.Transport{
 			Transport:    s.transport,
-			BindHost:     s.bindHostFor(session),
+			BindHost:     s.bindHostFor(ctx, session),
 			BindPort:     s.bindPort,
 			ExternalHost: s.externalHost,
 		}),
@@ -203,12 +257,16 @@ func (s sipStack) open(ctx context.Context, session UserSession, onInbound func(
 // registrar would use — so the account's socket binds, and the Contact
 // and SDP advertise, exactly the address the registrar already sees the
 // bot's packets come from. A UDP dial sends nothing; it just answers the
-// routing question. This is also what makes IPv6 work: an IPv4 socket
-// cannot write to an IPv6 registrar (the kernel's "non-IPv4 address"
-// write error), and diago's own interface resolution picks a link-local
-// IPv6 on hosts without a global one — the route lookup gets the right
-// family and the right address in one step.
-func (s sipStack) bindHostFor(session UserSession) string {
+// routing question. Under a non-default ipPreference the registrar
+// resolves through the bot's filtering DNS proxy (dns.go) — the same
+// view of the namespace the wire resolutions get — so the socket's
+// family always matches the one the account's resolver picks for the
+// wire. This is also what makes IPv6 work: an IPv4 socket cannot write
+// to an IPv6 registrar (the kernel's "non-IPv4 address" write error),
+// and diago's own interface resolution picks a link-local IPv6 on hosts
+// without a global one — the route lookup gets the right family and the
+// right address in one step.
+func (s sipStack) bindHostFor(ctx context.Context, session UserSession) string {
 	if s.bindHost != "" {
 		return s.bindHost
 	}
@@ -218,6 +276,30 @@ func (s sipStack) bindHostFor(session UserSession) string {
 	port := session.Port
 	if port == 0 {
 		port = 5060
+	}
+	if s.dnsProxy != nil {
+		// A non-default ipPreference resolves through the bot's filtering
+		// DNS proxy — the same view of the namespace the wire resolutions
+		// get, upstream included.
+		ips, err := s.dnsProxy.resolver.LookupIP(ctx, "ip", host)
+		if err != nil {
+			return s.ipPreference.wildcard() // unresolvable — the registration will say why
+		}
+		// The proxy filters DNS-sourced answers, but a static-source
+		// answer (/etc/hosts) escapes it — re-filter so the socket's
+		// family stays the preference's.
+		for _, ip := range ips {
+			if !s.ipPreference.allows(ip) {
+				continue
+			}
+			if conn, err := net.DialUDP("udp", nil, &net.UDPAddr{IP: ip, Port: port}); err == nil {
+				source := conn.LocalAddr().(*net.UDPAddr).IP.String()
+				_ = conn.Close()
+				return source
+			}
+			return s.ipPreference.wildcard() // resolved but unrouted
+		}
+		return s.ipPreference.wildcard()
 	}
 	raddr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(host, strconv.Itoa(port)))
 	if err != nil || raddr.IP == nil {

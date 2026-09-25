@@ -597,11 +597,29 @@ drain the pool.
 pool, cfg)` and reusing `stereoOpusPCFactory` (the webrtc leg negotiates
   opus either way; PCMU/PCMA stay registered for the browser's own
   calls).
-- The `<sipBot/>` element carries one attribute of its own beyond
+- The `<sipBot/>` element carries its own attributes beyond
   `botClientType`: `testSIPContact`, the SIP address the CLI's
   `/test-call` command dials (e.g. `9664@192.168.1.2`) — a known-good
-  callee for deployment smoke tests; empty disables the command.
-- `sipbot.Configuration`: `Logger`, `TestSIPContact`, and the sip-leg
+  callee for deployment smoke tests; empty disables the command —
+  `ipPreference`, the address family every DNS resolution in the sip
+  leg honors: `v6Only`, `v4Only`, or `default` (the default); and
+  `upstreamDNSResolver`, the upstream DNS resolver (host[:port], the
+  port defaulting to 53) the family-filtering DNS proxy relays to —
+  required with a non-default `ipPreference`, rejected with the
+  default. Under a non-default preference the registrar's and callees'
+  hostnames resolve only to the chosen family's records (A for
+  `v4Only`, AAAA for `v6Only`), so registrations, calls, and the
+  account sockets' bind-address selection all take the same family, and
+  a hostname with no record of the chosen family fails its registration
+  with the DNS error. IP literals are not resolutions and pass
+  unaffected — a wrong-family literal registrar simply fails to send.
+  `default` keeps sipgo's own behavior (IPv4 preferred, IPv6 used when
+  no A record exists). Mirrored by `SipBotXML.IPPreference` /
+  `SipBotXML.UpstreamDNSResolver`, validated at startup
+  (`ParseIPPreference` — the pool's discipline), carried by
+  `Configuration.IPPreference` / `Configuration.UpstreamDNSResolver`.
+- `sipbot.Configuration`: `Logger`, `TestSIPContact`, `IPPreference`,
+  `UpstreamDNSResolver`, and the sip-leg
   knobs — `Transport` (default `udp`), `ExternalHost` (default empty; the
   SDP/RTP address the PBX sees, for hosts where the bind address is
   wrong), `RegisterExpiry` (default 300 s). Each registered account
@@ -609,8 +627,10 @@ pool, cfg)` and reusing `stereoOpusPCFactory` (the webrtc leg negotiates
   `BindPort` at 0: a fixed port admits one account at a time. An empty
   `BindHost` (the default) binds each account to the source address of
   the route to its registrar — the Contact and SDP advertise the address
-  the registrar already sees, in the registrar's own address family, so
-  IPv6 registrars work (an IPv4 socket cannot write to one); an explicit
+  the registrar already sees, in the registrar's own address family
+  (constrained by `ipPreference` when one is set: the route lookup
+  resolves the registrar through the same filtering proxy), so IPv6
+  registrars work (an IPv4 socket cannot write to one); an explicit
   `BindHost` is used verbatim for every account, its family constraining
   which registrars are reachable. Either way an account's family is its
   registrar's: a `/call` to a literal address of the other family (a v6
@@ -750,6 +770,43 @@ where a choice had to be made:
     almost immediately); any other failure is the registrar's real
     answer. The race is every account's first-transaction-only, so the
     keepalive and the dial paths never see it.
+19. **The family-filtering resolver** (`ipPreference` ≠ `default`):
+    sipgo's transport layer resolves every outbound request-URI host
+    through its UA's `*net.Resolver`, replaceable via
+    `WithUserAgentDNSResolver` — the library's only exported DNS hook
+    (its own family-preference knob, `withTransportLayerDNSLookupIP`,
+    is unexported as of v1.6.0, the latest release). The bot installs
+    the pure-Go resolver (`PreferGo`) dialed at the bot's ONE filtering
+    DNS proxy (shared by every account — the filter is stateless): a
+    reverse proxy (miekg/dns) bound to an ephemeral loopback port, UDP
+    and TCP alike (a truncated UDP answer's TCP retry must find a
+    listener), relaying every query to the configured
+    `upstreamDNSResolver` with `ExchangeContext` — except the
+    suppressed family's qtype (AAAA under `v4Only`, A under `v6Only`),
+    which it answers itself with an empty NOERROR (NODATA — never
+    NXDOMAIN, which could poison the allowed family's parallel lookup;
+    and with the RA bit set: an empty NOERROR that is neither
+    authoritative nor recursion-available trips the Go resolver's
+    lame-referral check). Everything else crosses untouched, so TTLs,
+    CNAME chains, and NXDOMAINs keep their real meaning and sipgo's
+    SRV fallback keeps working (the SRV target's chase re-enters the
+    filter as ordinary A/AAAA queries). `bindHostFor` resolves through
+    the same proxy, so the account socket's family always matches the
+    wire's. The SIP messages on the wire are untouched — the hostnames
+    stay hostnames; only the routing changes. The rest of the process
+    keeps the system resolver: only the sip leg's accounts use the
+    upstream.
+20. **The resolver's edges**: names answered from a static source
+    (`/etc/hosts`) never reach the proxy — the pure-Go resolver
+    consults files first — so a dual-family hosts entry escapes the
+    filter and sipgo's own prefer-IPv4 then applies (bindHostFor
+    re-filters its own answers, so the socket's family still stays the
+    preference's); IP literals short-circuit the same way
+    (deliberately: a literal is not a resolution — a wrong-family
+    literal registrar fails at send). The proxy is the bot's one
+    addition to the process's socket table (a loopback UDP+TCP pair on
+    an ephemeral port) and lives for the bot's lifetime — the process,
+    in the shipped wiring.
 
 ## 12. Package layout and testing
 
@@ -761,6 +818,7 @@ where a choice had to be made:
 | `session.go`                 | `UserSession`, `UserSessionStorage`, `OnMemoryUserSessionStorage`                                                                                                             |
 | `pool.go`                    | `SIPCredentialPool` (+ the `SIPCredential`/`SIPCredentialRange` config shapes): the lazy, mutex-free account pool — the atomic cursor, the release channel, the range parsing |
 | `yellowpage.go`              | the yellow page: the YellowPageSection/YellowPageContact config shapes and the /yellow-page listing's rendering                                                               |
+| `dns.go`                     | the `ipPreference` machinery: the IPPreference type and its parse, and the filtering DNS reverse proxy (miekg/dns) the account UAs' resolver dials                            |
 | `handler.go`                 | `sipHandler` — the `BotMessageHandler`: CLI dispatch (/my-number reads the live registration), registration lifecycle, call policy, hangup matrix                             |
 | `inbound.go`                 | the inbound call: the account socket's INVITE → the browser's ring → the 200 OK relay-arming; the ring timeout, the dialog watcher, the UAS-side termination verbs            |
 | `account.go`                 | per-user SIP account runtime: the register loop, the diago `Invite` dial path, and the inbound-INVITE routing callback the client is opened with                              |
@@ -795,7 +853,18 @@ caller's CANCEL) and its integration tests: end to end (the browser
 rings, the 180 and the 200 + SDP cross, media flows both ways, the
 caller's BYE ends the browser leg), the browser's decline crossing as
 603, the caller's CANCEL crossing as the browser's CANCEL, and the
-busy-at-the-browser inbound call's 486. Two harness disciplines keep
+busy-at-the-browser inbound call's 486. The `ipPreference` machinery
+adds its own: the parse's table (the values and the upstream pairing),
+the filtering proxy driven through the REAL `net.Resolver` machinery
+against a fake upstream resolver (a table-driven miekg/dns server: the
+family filtering both ways, the NODATA of a name without the allowed
+family's records, the upstream's NXDOMAIN propagating, the SRV relay,
+the truncated answer's TCP retry, the IP-literal bypass),
+`bindHostFor`'s family matrix, and an integration test with two fake
+PBXs sharing one loopback port — one on 127.0.0.1, one on ::1 — where
+the fake upstream maps the registrar's hostname to both families and
+the REGISTER, the INVITE, and the de-REGISTER must arrive at the
+preferred family's PBX alone. Two harness disciplines keep
 the suite's flakes diagnosable and its teardown clean: a message wait
 that times out dumps everything the probe recorded (a bot failure reply
 the predicate did not expect is visible without a rerun), and the

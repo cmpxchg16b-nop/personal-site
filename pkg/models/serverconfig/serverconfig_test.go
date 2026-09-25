@@ -173,3 +173,16 @@ func TestSipBotParsesYellowPage(t *testing.T) {
 		t.Fatalf("no yellowPage element, parsed = %+v", sb.YellowPage)
 	}
 }
+
+// TestSipBotParsesIPPreference covers the <sipBot/> element's
+// ipPreference and upstreamDNSResolver attributes: present and absent.
+func TestSipBotParsesIPPreference(t *testing.T) {
+	sb := parseSipBot(t, `<sipBot url="wss://x/api/ss/ws" jwt="t" ipPreference="v6Only" upstreamDNSResolver="[2606:4700:4700::1111]:53"/>`)
+	if sb.IPPreference != "v6Only" || sb.UpstreamDNSResolver != "[2606:4700:4700::1111]:53" {
+		t.Fatalf("parsed = %+v", sb)
+	}
+	// Absent: both stay empty (the default preference, no upstream).
+	if sb := parseSipBot(t, `<sipBot url="wss://x/api/ss/ws" jwt="t"/>`); sb.IPPreference != "" || sb.UpstreamDNSResolver != "" {
+		t.Fatalf("no attributes, parsed = %+v", sb)
+	}
+}
