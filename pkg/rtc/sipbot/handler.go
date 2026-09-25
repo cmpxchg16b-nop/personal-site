@@ -58,7 +58,7 @@ const (
 		"/yellow-page — list the phone book: the example numbers you can call\n" +
 		"/test-call — phone the bot's configured test callee\n" +
 		"/hangup — end the current call\n" +
-		"No account of your own? Just /call — when the bot's pool has a free account, it lends you one."
+		"No account of your own? When the bot's pool has a free account it lends you one as you arrive (and tells you your number) — or just /call."
 	attachmentRefusal = "Attachments are not supported — I'm a SIP bot. Try /help."
 	unknownCommand    = "Unrecognized command — try /help."
 	registerUsage     = "Usage: /register <user@host> <password> — e.g. /register 2001@sip.example.com passW_0rd."
@@ -98,8 +98,7 @@ type sipHandler struct {
 	pool *SIPCredentialPool
 	// stack opens each account's own SIP client — one per registered
 	// user, never a client shared across users.
-	stack  sipStack
-	expiry time.Duration
+	stack sipStack
 
 	// testContact is the CLI /test-call command's SIP callee (the
 	// Configuration's TestSIPContact); empty disables the command.
@@ -114,6 +113,16 @@ type sipHandler struct {
 	// goroutines; the values' own synchronization is theirs.
 	accounts sync.Map // ss.SubscriberId → *account
 	calls    sync.Map // ss.SubscriberId → *peerCall
+
+	// accountMu serializes the account lifecycle — the session-start
+	// loan, /register, /unregister, /call's ensure, the session-end
+	// teardown — so the start hook's off-hub registration cannot race a
+	// command's own. The critical section includes the bounded first
+	// REGISTER (registerTimeout): a command, or the hub's end hook, can
+	// wait behind another account's registration for at most that bound.
+	// Nothing hub-bound (WriterFor) runs under it — the hub itself takes
+	// it in the end hook.
+	accountMu sync.Mutex
 
 	// writers is the unsolicited-send path (the msg_handler.Server's
 	// WriterFor): a ResponseWriter for a peer outside any message — the
@@ -131,8 +140,8 @@ type writerSource interface {
 
 var _ msg_handler.BotMessageHandler = (*sipHandler)(nil)
 
-func newSipHandler(logger *slog.Logger, storage UserSessionStorage, pool *SIPCredentialPool, stack sipStack, expiry time.Duration, testContact string, yellowPage []YellowPageSection) *sipHandler {
-	return &sipHandler{logger: logger, storage: storage, pool: pool, stack: stack, expiry: expiry, testContact: testContact, yellowPage: yellowPage}
+func newSipHandler(logger *slog.Logger, storage UserSessionStorage, pool *SIPCredentialPool, stack sipStack, testContact string, yellowPage []YellowPageSection) *sipHandler {
+	return &sipHandler{logger: logger, storage: storage, pool: pool, stack: stack, testContact: testContact, yellowPage: yellowPage}
 }
 
 // HandleChatMessage is the CLI: parse the line, answer it.
@@ -189,11 +198,62 @@ func (h *sipHandler) HandleCalling(ctx context.Context, sip *msg_handler.SipMess
 	}
 }
 
-// HandlePeerSessionStart is a deliberate no-op: allocation from the
-// credential pool is on-demand (at /call), never at session start — the
-// bot holds a peer session with every online channel member, and
-// presence alone must not loan accounts to lurkers who never dial.
-func (h *sipHandler) HandlePeerSessionStart(_ context.Context, _ ss.SubscriberId) {
+// HandlePeerSessionStart loans and registers a pooled account for a
+// peer who brought no credential of their own — early, at the session's
+// birth rather than on the first /call: the call then need not bear the
+// REGISTER round trip, and the peer's number is callable (inbound.go)
+// for the session's whole life. Best-effort: an empty pool or a failed
+// registration leaves the peer to /call's on-demand path, which answers
+// the failure itself. The work is spawned — the hub never waits on the
+// REGISTER's round trip.
+func (h *sipHandler) HandlePeerSessionStart(ctx context.Context, peer ss.SubscriberId) {
+	if h.pool == nil {
+		return
+	}
+	go h.loanPooledAccount(ctx, peer)
+}
+
+// loanPooledAccount is the session start's off-hub work: allocate a
+// pooled account for the peer and REGISTER it, exactly like /register's
+// outcome, then tell the peer their number (the unsolicited path — the
+// /call-time announcement's earlier twin, so the user always knows which
+// identity a callee sees). Serialized with the commands' own account
+// lifecycle by accountMu: a peer who /registered or /called first (or
+// whose session already ended) is left alone.
+func (h *sipHandler) loanPooledAccount(ctx context.Context, peer ss.SubscriberId) {
+	h.accountMu.Lock()
+	if ctx.Err() != nil {
+		h.accountMu.Unlock()
+		return // the session ended before the loan even started
+	}
+	if _, ok := h.accounts.Load(peer); ok {
+		h.accountMu.Unlock()
+		return // an account already stands (a fast /call)
+	}
+	if _, ok := h.storage.Load(peer); ok {
+		h.accountMu.Unlock()
+		return // the peer brought their own credential meanwhile
+	}
+	session, ok := h.pool.Allocate()
+	if !ok {
+		h.accountMu.Unlock()
+		h.logger.Info("sipbot: no pooled account for the session-start loan", "peer", peer)
+		return
+	}
+	a, err := newAccount(ctx, h.logger, h.stack, session, h.inboundServe(peer))
+	if err != nil {
+		h.accountMu.Unlock()
+		h.pool.Release(session)
+		h.logger.Warn("sipbot: the session-start loan's registration failed", "peer", peer, "aor", session.AddressOfRecord, "err", err)
+		return
+	}
+	h.setAccount(peer, a)
+	h.storage.Store(peer, session)
+	h.accountMu.Unlock()
+	h.logger.Info("sipbot: loaned a pooled account at the session's start", "peer", peer, "aor", session.AddressOfRecord)
+	// The announcement goes after the lock: WriterFor round-trips the hub,
+	// which the session-end hook — an accountMu taker — may be occupying.
+	h.say(peer, h.writers.WriterFor(peer), fmt.Sprintf("Registered as sip:%s (an account from the bot's pool).", a.session.AddressOfRecord))
 }
 
 // HandlePeerSessionEnd is the bot's session-end teardown — the
@@ -206,7 +266,8 @@ func (h *sipHandler) HandlePeerSessionStart(_ context.Context, _ ss.SubscriberId
 // to the pool. A manual credential survives in the store by design: the
 // next session's /call revives it. Runs on the Server's hub goroutine:
 // all of it is fast bookkeeping (the dialog's BYE is sent on its own
-// goroutine, as everywhere).
+// goroutine, as everywhere); the accountMu section can wait behind an
+// in-flight registration for at most registerTimeout.
 func (h *sipHandler) HandlePeerSessionEnd(_ context.Context, peer ss.SubscriberId) {
 	if v, ok := h.calls.Load(peer); ok {
 		c := v.(*peerCall)
@@ -216,6 +277,8 @@ func (h *sipHandler) HandlePeerSessionEnd(_ context.Context, peer ss.SubscriberI
 			h.logger.Info("sipbot: the session's end ended the call", "peer", peer, "callId", c.callId)
 		}
 	}
+	h.accountMu.Lock()
+	defer h.accountMu.Unlock()
 	if v, ok := h.accounts.Load(peer); ok {
 		a := v.(*account)
 		a.stop()
@@ -313,10 +376,10 @@ func (h *sipHandler) handleHangup(ctx context.Context, sip *msg_handler.SipMessa
 }
 
 // register is the /register command: validate the credential, end any
-// call (the identity is changing), REGISTER the AOR — the first
-// REGISTER synchronously, so the reply carries the registrar's actual
-// answer — and keep the registration alive in the background. A
-// previous registration is replaced.
+// call (the identity is changing), and REGISTER the AOR — synchronously,
+// so the reply carries the registrar's actual answer; the registration
+// then stands until the account ends. A previous registration is
+// replaced.
 func (h *sipHandler) register(ctx context.Context, msg *msg_handler.ChatMessage, w msg_handler.ResponseWriter, args []string) {
 	peer := msg.From
 	if len(args) != 2 {
@@ -332,8 +395,10 @@ func (h *sipHandler) register(ctx context.Context, msg *msg_handler.ChatMessage,
 		h.endCall(ctx, peer, v.(*peerCall))
 		h.say(peer, w, "The call in progress was ended.")
 	}
-	a, err := newAccount(ctx, h.logger, h.stack, session, h.expiry, h.inboundServe(peer))
+	h.accountMu.Lock()
+	a, err := newAccount(ctx, h.logger, h.stack, session, h.inboundServe(peer))
 	if err != nil {
+		h.accountMu.Unlock()
 		h.say(peer, w, fmt.Sprintf("Registration failed: %v.", err))
 		return
 	}
@@ -344,6 +409,7 @@ func (h *sipHandler) register(ctx context.Context, msg *msg_handler.ChatMessage,
 		h.pool.Release(old)
 	}
 	h.storage.Store(peer, session)
+	h.accountMu.Unlock()
 	h.say(peer, w, fmt.Sprintf("Registered as sip:%s.", session.AddressOfRecord))
 }
 
@@ -355,17 +421,21 @@ func (h *sipHandler) unregister(ctx context.Context, msg *msg_handler.ChatMessag
 	if v, ok := h.calls.Load(peer); ok {
 		h.endCall(ctx, peer, v.(*peerCall))
 	}
+	h.accountMu.Lock()
 	if v, ok := h.accounts.Load(peer); ok {
 		a := v.(*account)
 		a.stop()
 		h.accounts.CompareAndDelete(peer, a)
 	}
-	if session, ok := h.storage.Delete(peer); !ok {
-		h.say(peer, w, notRegistered)
-		return
-	} else if session.Pooled {
+	session, ok := h.storage.Delete(peer)
+	if ok && session.Pooled {
 		// The loan returns to the pool with its store entry.
 		h.pool.Release(session)
+	}
+	h.accountMu.Unlock()
+	if !ok {
+		h.say(peer, w, notRegistered)
+		return
 	}
 	h.say(peer, w, "Unregistered.")
 }
@@ -373,21 +443,20 @@ func (h *sipHandler) unregister(ctx context.Context, msg *msg_handler.ChatMessag
 // myNumber is the /my-number command: the user's currently registered
 // SIP address — the number others can dial to ring this chat (the
 // inbound path, inbound.go) — or the not-registered answer. The answer
-// reads the LIVE registration (the account's own flag), not the
-// credential store: a stored credential whose registration died or has
-// not run yet is not callable, so it reads as not-registered.
+// reads the LIVE registration (an account in the map — published only
+// once its REGISTER succeeded), not the credential store: a stored
+// credential whose registration has not run yet (a fresh session before
+// its first /call) is not callable, so it reads as not-registered.
 func (h *sipHandler) myNumber(msg *msg_handler.ChatMessage, w msg_handler.ResponseWriter) {
 	peer := msg.From
 	if v, ok := h.accounts.Load(peer); ok {
 		a := v.(*account)
-		if a.registered.Load() {
-			if a.session.Pooled {
-				h.say(peer, w, fmt.Sprintf("Your number is sip:%s (an account from the bot's pool).", a.session.AddressOfRecord))
-			} else {
-				h.say(peer, w, fmt.Sprintf("Your number is sip:%s.", a.session.AddressOfRecord))
-			}
-			return
+		if a.session.Pooled {
+			h.say(peer, w, fmt.Sprintf("Your number is sip:%s (an account from the bot's pool).", a.session.AddressOfRecord))
+		} else {
+			h.say(peer, w, fmt.Sprintf("Your number is sip:%s.", a.session.AddressOfRecord))
 		}
+		return
 	}
 	hint := noNumber
 	if h.pool != nil {
@@ -627,21 +696,20 @@ func (h *sipHandler) detachLater(ctx context.Context, c *peerCall) {
 }
 
 // ensureAccount answers the peer's live registration: the account in
-// the map when it is believed registered; else a revival of the stored
-// credential; else — for a user who never /registered — a loan from the
-// bot's credential pool, registered and stored exactly like a
-// /register's outcome (the pooled flag tells the caller to announce it).
-// The revive's and the loan's first REGISTER are synchronous and
-// bounded, like /register's. The errors are the user-facing answers,
-// each pointing at /register: no credential at all (no pool
-// configured), an exhausted pool, or a failed registration — a pooled
-// account that fails to register returns to the pool.
+// the map; else a revival of the stored credential; else — for a user
+// who never /registered and whose session-start loan did not land — a
+// loan from the bot's credential pool, registered and stored exactly
+// like a /register's outcome (the pooled flag tells the caller to
+// announce it). The revive's and the loan's first REGISTER are
+// synchronous and bounded, like /register's. The errors are the
+// user-facing answers, each pointing at /register: no credential at all
+// (no pool configured), an exhausted pool, or a failed registration — a
+// pooled account that fails to register returns to the pool.
 func (h *sipHandler) ensureAccount(ctx context.Context, peer ss.SubscriberId) (*account, bool, error) {
+	h.accountMu.Lock()
+	defer h.accountMu.Unlock()
 	if v, ok := h.accounts.Load(peer); ok {
-		a := v.(*account)
-		if a.registered.Load() {
-			return a, false, nil
-		}
+		return v.(*account), false, nil
 	}
 	session, ok := h.storage.Load(peer)
 	pooled := false
@@ -657,7 +725,7 @@ func (h *sipHandler) ensureAccount(ctx context.Context, peer ss.SubscriberId) (*
 		pooled = true
 		h.logger.Info("sipbot: loaned a pooled account", "peer", peer, "aor", session.AddressOfRecord)
 	}
-	a, err := newAccount(ctx, h.logger, h.stack, session, h.expiry, h.inboundServe(peer))
+	a, err := newAccount(ctx, h.logger, h.stack, session, h.inboundServe(peer))
 	if err != nil {
 		if pooled {
 			h.pool.Release(session)

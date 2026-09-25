@@ -1,16 +1,21 @@
 package sipbot
 
 // This file is one chat user's SIP account: the runtime of the identity
-// a /register stored — the REGISTER keepalive loop that holds the AOR's
-// registration up, and the dial path that places the user's outbound
-// calls. The account is runtime, not data: it lives in the handler's
-// account map, next to (never inside) the UserSessionStorage, which
-// holds only the credential.
+// a /register stored — the REGISTER that puts the AOR's registration up,
+// and the dial path that places the user's outbound calls. The account
+// is runtime, not data: it lives in the handler's account map, next to
+// (never inside) the UserSessionStorage, which holds only the
+// credential.
 //
 // The account's lifetime is its context: /unregister, a replacing
-// /register, or the peer session's end cancels it — the keepalive loop
-// then sends the de-REGISTER on its way out (SIP's own unregister:
-// Contact "*", Expires 0).
+// /register, or the peer session's end cancels it — the de-REGISTER goes
+// out on the way down (SIP's own unregister: Contact "*", Expires 0).
+// There is no expiry and no refresh timer: the registration is an event,
+// not a lease — the bot's own lifecycle says when to register (the
+// account's birth) and when to de-register (its end), which a dumb
+// re-REGISTER clock cannot know. (A registrar that expires bindings on
+// its own clock would lose the number — the deployment's registrar keeps
+// them.)
 
 import (
 	"context"
@@ -18,7 +23,6 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
-	"sync/atomic"
 	"syscall"
 	"time"
 	"unicode"
@@ -40,46 +44,37 @@ const registerTimeout = 5 * time.Second
 const registerBindRetries = 5
 const registerBindRetryBackoff = 20 * time.Millisecond
 
-// registerRetry is how long the keepalive loop waits before retrying a
-// re-REGISTER that failed transiently (a network wobble, a 5xx-less
-// error); diago's own default.
-const registerRetry = 5 * time.Second
-
 // account is one chat user's SIP runtime: its own SIP client (the
-// registration keepalive and the dial-out identity run on a diago of
-// the account's own — never a client shared with other users, each user
-// brings their own credential).
+// registration and the dial-out identity run on a diago of the account's
+// own — never a client shared with other users, each user brings their
+// own credential). An account in the handler's map is registered by
+// construction: newAccount publishes only after the first REGISTER
+// succeeded.
 type account struct {
 	logger  *slog.Logger
 	dg      *diago.Diago
 	session UserSession
-	expiry  time.Duration
 
 	ctx    context.Context
 	cancel context.CancelFunc
 	// stackStop tears down the account's SIP client. It must outlive the
-	// keepalive by the de-REGISTER's round trip: the keepalive's teardown
+	// registration by the de-REGISTER's round trip: the teardown watcher
 	// calls it once that left, never before.
 	stackStop context.CancelFunc
-
-	// registered says whether the registration is believed live — set by
-	// the first REGISTER's success, cleared when the keepalive loop dies
-	// on a final error. Read by /call's gating.
-	registered atomic.Bool
 }
 
 // newAccount opens the session's own SIP client and registers its AOR
-// against its registrar: the first REGISTER runs synchronously (bounded
-// by registerTimeout) so its outcome answers the /register command; the
-// keepalive then re-registers in the background until the account's ctx
-// ends, which also sends the de-REGISTER. onInbound is handed the
-// account's inbound SIP calls (someone dialing the registered AOR) —
-// see inbound.go.
-func newAccount(ctx context.Context, logger *slog.Logger, stack sipStack, session UserSession, expiry time.Duration, onInbound func(inDialog *diago.DialogServerSession)) (*account, error) {
-	a := &account{logger: logger, session: session, expiry: expiry}
+// against its registrar: the REGISTER runs synchronously (bounded by
+// registerTimeout) so its outcome answers the /register command; the
+// registration then stands untouched for the account's whole life — no
+// expiry, no refresh loop — until the account's ctx ends, which sends
+// the de-REGISTER. onInbound is handed the account's inbound SIP calls
+// (someone dialing the registered AOR) — see inbound.go.
+func newAccount(ctx context.Context, logger *slog.Logger, stack sipStack, session UserSession, onInbound func(inDialog *diago.DialogServerSession)) (*account, error) {
+	a := &account{logger: logger, session: session}
 	a.ctx, a.cancel = context.WithCancel(ctx)
 	// The client's ctx is NOT the account's: the socket must outlive the
-	// registration loop by the de-REGISTER's round trip.
+	// registration by the de-REGISTER's round trip.
 	stackCtx, stackStop := context.WithCancel(context.Background())
 	a.stackStop = stackStop
 	dg, err := stack.open(stackCtx, session, onInbound)
@@ -106,7 +101,6 @@ func newAccount(ctx context.Context, logger *slog.Logger, stack sipStack, sessio
 		t, err = dg.RegisterTransaction(a.ctx, recipient, diago.RegisterOptions{
 			Username: session.Username,
 			Password: session.Password,
-			Expiry:   expiry,
 		})
 		if err == nil {
 			// diago builds the REGISTER bare — From/To/Via are added at send
@@ -142,46 +136,26 @@ func newAccount(ctx context.Context, logger *slog.Logger, stack sipStack, sessio
 		case <-time.After(registerBindRetryBackoff):
 		}
 	}
-	a.registered.Store(true)
-	go a.keepalive(t)
+	go a.holdRegistration(t)
 	return a, nil
 }
 
-// keepalive re-registers until the account ends; a final failure (the
-// registrar's 401/407 or 5xx, which diago surfaces unchanged) marks the
-// registration dead so the next /call says so. The de-REGISTER goes out
-// on the way down.
-func (a *account) keepalive(t *diago.RegisterTransaction) {
-	defer func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if err := t.Unregister(ctx); err != nil && !errors.Is(err, context.Canceled) {
-			a.logger.Warn("sipbot: the de-REGISTER failed", "aor", a.session.AddressOfRecord, "err", err)
-		}
-		// The de-REGISTER left — the account's SIP client can go now.
-		a.stackStop()
-	}()
-	for {
-		err := t.QualifyLoop(a.ctx)
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			return // the account ended — a normal unregister
-		}
-		var rerr *diago.RegisterResponseError
-		if errors.As(err, &rerr) {
-			code := rerr.RegisterRes.StatusCode
-			if code == 401 || code == 407 || (code > 500 && code < 600) {
-				a.logger.Warn("sipbot: the registration died", "aor", a.session.AddressOfRecord, "status", code)
-				a.registered.Store(false)
-				return
-			}
-		}
-		a.logger.Warn("sipbot: re-REGISTER failed; retrying", "aor", a.session.AddressOfRecord, "err", err)
-		select {
-		case <-a.ctx.Done():
-			return
-		case <-time.After(registerRetry):
-		}
+// holdRegistration keeps the account's registration for the account's
+// whole life. There is nothing to do while the account lives — no
+// refresh clock: the lifecycle hooks, not a timer, say when the
+// registration ends — so the goroutine's one job is the way out: once
+// the account's ctx ends, the de-REGISTER goes out, and only then does
+// the SIP client go (the socket must outlive the de-REGISTER's round
+// trip).
+func (a *account) holdRegistration(t *diago.RegisterTransaction) {
+	<-a.ctx.Done()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := t.Unregister(ctx); err != nil && !errors.Is(err, context.Canceled) {
+		a.logger.Warn("sipbot: the de-REGISTER failed", "aor", a.session.AddressOfRecord, "err", err)
 	}
+	// The de-REGISTER left — the account's SIP client can go now.
+	a.stackStop()
 }
 
 // dial places the user's outbound call to target (a SIP URI without the
@@ -237,8 +211,8 @@ func withSipScheme(addr string) string {
 	return "sip:" + addr
 }
 
-// stop ends the account: the keepalive dies (sending the de-REGISTER)
-// and dials in progress unwind.
+// stop ends the account: the teardown watcher fires (sending the
+// de-REGISTER) and dials in progress unwind.
 func (a *account) stop() {
 	a.cancel()
 }

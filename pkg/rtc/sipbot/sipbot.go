@@ -52,7 +52,6 @@ import (
 	"net"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/emiago/diago"
 	"github.com/emiago/diago/media"
@@ -103,9 +102,6 @@ type Configuration struct {
 	BindHost     string
 	BindPort     int
 	ExternalHost string
-
-	// RegisterExpiry is the registration's Expires; zero selects 300 s.
-	RegisterExpiry int
 
 	// IPPreference selects the address family of every DNS hostname
 	// resolution in the sip leg — the registrar's and the callees':
@@ -161,10 +157,6 @@ func New(client *rtc.HeadlessRTCClient, storage UserSessionStorage, pool *SIPCre
 	if transport == "" {
 		transport = "udp"
 	}
-	expiry := config.RegisterExpiry
-	if expiry == 0 {
-		expiry = 300
-	}
 
 	stack := sipStack{
 		logger:       logger,
@@ -190,7 +182,7 @@ func New(client *rtc.HeadlessRTCClient, storage UserSessionStorage, pool *SIPCre
 		}
 		stack.dnsProxy = proxy
 	}
-	h := newSipHandler(logger, storage, pool, stack, time.Duration(expiry)*time.Second, config.TestSIPContact, config.YellowPage)
+	h := newSipHandler(logger, storage, pool, stack, config.TestSIPContact, config.YellowPage)
 	// The unsolicited-send path (the inbound call's ring) is the Server's
 	// WriterFor — a wiring-time assignment: no handler invocation can
 	// precede the client's Run, which the caller starts after New returns.

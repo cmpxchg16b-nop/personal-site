@@ -574,6 +574,17 @@ func isChatReply(inReplyTo ss.MsgId, contains string) func(*rawMsg) bool {
 	}
 }
 
+// isChatAnnouncement matches an unthreaded plain-text bot message
+// carrying the given substring — the unsolicited WriterFor path (an
+// event that is not one of the peer's messages, like the session-start
+// loan's announcement).
+func isChatAnnouncement(contains string) func(*rawMsg) bool {
+	return func(m *rawMsg) bool {
+		return m.mimeType == wireMimePlaintext && m.inReplyTo == "" &&
+			strings.Contains(m.plaintext, contains)
+	}
+}
+
 // isCallStatusAmend matches the chat-control amend of the given INVITE
 // reporting the given call status.
 func isCallStatusAmend(inviteMsgId ss.MsgId, callId, status string) func(*rawMsg) bool {
@@ -660,6 +671,7 @@ type registration struct {
 	from    string // the From URI's user
 	contact string // the Contact URI's user
 	source  string // the datagram's source address (the account's socket)
+	expires string // the Expires header's value ("": the REGISTER carried none)
 }
 
 // newFakePBX starts a fake PBX answering INVITEs with answerCode, on the
@@ -772,6 +784,9 @@ func newFakePBXOnPort(t *testing.T, ip string, port int, answerCode int, opus bo
 			reg := registration{from: req.From().Address.User, source: req.Source()}
 			if c := req.Contact(); c != nil {
 				reg.contact = c.Address.User
+			}
+			if exp := req.GetHeader("Expires"); exp != nil {
+				reg.expires = strings.TrimSpace(exp.Value())
 			}
 			f.mu.Lock()
 			f.registers++
@@ -1394,10 +1409,14 @@ func TestSipBotRegisterUnregister(t *testing.T) {
 	pbx.waitForPBX(t, "the authenticated REGISTER", func() bool { return pbx.registers == 1 })
 	pbx.waitForPBX(t, "the REGISTER's digest username", func() bool { return pbx.authedUser == "2001" })
 	// The identity on the wire is the user's, never the bot's: the From
-	// is the AOR and the Contact's user part is the username.
-	pbx.waitForPBX(t, "the REGISTER's From and Contact", func() bool {
+	// is the AOR and the Contact's user part is the username. And the
+	// REGISTER carries NO Expires header: the registration stands until
+	// the account's own lifecycle ends it (the de-REGISTER below), not
+	// some lease the registrar could expire under an ongoing call.
+	pbx.waitForPBX(t, "the REGISTER's From and Contact, and no Expires", func() bool {
 		return len(pbx.registrations) == 1 &&
-			pbx.registrations[0].from == "2001" && pbx.registrations[0].contact == "2001"
+			pbx.registrations[0].from == "2001" && pbx.registrations[0].contact == "2001" &&
+			pbx.registrations[0].expires == ""
 	})
 
 	unregisterMsg := chat("/unregister")
@@ -1736,12 +1755,14 @@ func TestSipBotTestCall(t *testing.T) {
 	pbx.waitForPBX(t, "the callee's BYE", func() bool { return pbx.byes == 1 })
 }
 
-// TestSipBotPoolCall covers the pool's happy path: a user with no
-// /register /calls — the bot loans an account from the pool, registers
-// it (the REGISTER carries the pooled identity, digest and all), says
-// so, and dials the callee with it; /unregister returns the loan (the
+// TestSipBotPoolCall covers the pool's happy path: the session's start
+// already loans an account from the pool for the credential-less user
+// and registers it (the REGISTER carries the pooled identity, digest
+// and all), announcing it unthreaded; the /call then dials straight
+// away with the pooled identity. /unregister returns the loan (the
 // de-REGISTER goes out), and the pool hands the same account out again
-// to the next /call.
+// to the next /call — the on-demand fallback, whose registration line
+// is threaded on the command.
 func TestSipBotPoolCall(t *testing.T) {
 	net := newClientTestNet(t, ss.DefaultSubscriberAging)
 	pbx := newFakePBX(t, 200, true)
@@ -1764,14 +1785,22 @@ func TestSipBotPoolCall(t *testing.T) {
 		return ss.MsgId(m["msgId"].(string))
 	}
 
-	// The /call loans the pool's account, registers it, says so, dials.
-	callMsg := chat("/call 1001@" + pbx.addr)
-	waitBotMessage(t, probe, botId, "the pooled registration line", isChatReply(callMsg, "Registered as sip:1101@"+pbx.addr+" (an account from the bot's pool)"))
-	waitBotMessage(t, probe, botId, "the calling line", isChatReply(callMsg, "Calling 1001@"))
+	// The session's start already loaned the pool's account and
+	// registered it — the announcement is the unthreaded WriterFor path,
+	// so the first /call need not bear the REGISTER round trip.
+	waitBotMessage(t, probe, botId, "the session-start loan's announcement", isChatAnnouncement("Registered as sip:1101@"+pbx.addr+" (an account from the bot's pool)"))
 	pbx.waitForPBX(t, "the pooled account's REGISTER, its own socket and identity", func() bool {
 		return len(pbx.registrations) == 1 &&
 			pbx.registrations[0].from == "1101" && pbx.registrations[0].contact == "1101"
 	})
+
+	// The /call finds the loan standing: no registration line of its own,
+	// straight to the calling line.
+	callMsg := chat("/call 1001@" + pbx.addr)
+	waitBotMessage(t, probe, botId, "the calling line", isChatReply(callMsg, "Calling 1001@"))
+	if n := countBotMessages(probe, botId, isChatReply(callMsg, "Registered as")); n != 0 {
+		t.Fatalf("the /call announced %d registration lines, want none (the session start announced it)", n)
+	}
 	pbx.waitForPBX(t, "the callee's INVITE with the pooled identity", func() bool {
 		return pbx.invites == 1 && pbx.inviteFrom == "1101" && pbx.inviteTo == "1001"
 	})
@@ -1782,7 +1811,9 @@ func TestSipBotPoolCall(t *testing.T) {
 	waitBotMessage(t, probe, botId, "the unregistered reply", isChatReply(unregisterMsg, "Unregistered."))
 	pbx.waitForPBX(t, "the pooled account's de-REGISTER", func() bool { return pbx.unregistered })
 
-	// …and the pool hands the same account out again to the next /call.
+	// …and the pool hands the same account out again to the next /call —
+	// the on-demand path, whose registration line is threaded on the
+	// command (the session start's loan is long gone).
 	callMsg2 := chat("/call 1002@" + pbx.addr)
 	waitBotMessage(t, probe, botId, "the second pooled registration line", isChatReply(callMsg2, "Registered as sip:1101@"))
 	pbx.waitForPBX(t, "the re-loaned account's REGISTER", func() bool { return pbx.registers == 2 })
@@ -1801,9 +1832,7 @@ func TestSipBotPoolExhausted(t *testing.T) {
 	}
 	bot := startBot(t, net, "bot", "2-bot", "", pool)
 	alice, aliceProbe, _, _ := startUserProbe(t, net, "alice", "1-alice")
-	bob, bobProbe, _, _ := startUserProbe(t, net, "bob", "1-bob")
 	botId, aliceId := pairUp(t, bot, alice)
-	_, bobId := pairUp(t, bot, bob)
 
 	chat := func(probe *wireProbe, userId ss.SubscriberId, text string) ss.MsgId {
 		t.Helper()
@@ -1816,12 +1845,24 @@ func TestSipBotPoolExhausted(t *testing.T) {
 		return ss.MsgId(m["msgId"].(string))
 	}
 
-	// Alice loans the pool's only account (a range's single member).
-	aliceCall := chat(aliceProbe, aliceId, "/call 1001@"+pbx.addr)
-	waitBotMessage(t, aliceProbe, botId, "alice's pooled registration line", isChatReply(aliceCall, "Registered as sip:1101@"))
+	// Alice's session start loans the pool's only account (a range's
+	// single member) — the announcement is unthreaded. Bob must not
+	// arrive before it landed: the session starts race (the dcmsg
+	// channels come up asynchronously, pair order notwithstanding), so
+	// bob starts only once the loan is deterministically alice's.
+	waitBotMessage(t, aliceProbe, botId, "alice's session-start announcement", isChatAnnouncement("Registered as sip:1101@"))
+	bob, bobProbe, _, _ := startUserProbe(t, net, "bob", "1-bob")
+	_, bobId := pairUp(t, bot, bob)
 
-	// Bob's /call finds the pool empty and says so, pointing at /register;
-	// his own /register is unaffected.
+	// Her /call finds the loan standing and dials straight away; Bob's
+	// session start found the pool empty (silently), so his /call answers
+	// with the pool-empty reply, pointing at /register; his own /register
+	// is unaffected.
+	aliceCall := chat(aliceProbe, aliceId, "/call 1001@"+pbx.addr)
+	waitBotMessage(t, aliceProbe, botId, "alice's calling line", isChatReply(aliceCall, "Calling 1001@"))
+	if n := countBotMessages(aliceProbe, botId, isChatReply(aliceCall, "Registered as")); n != 0 {
+		t.Fatalf("alice's /call announced %d registration lines, want none (the session start announced it)", n)
+	}
 	bobCall := chat(bobProbe, bobId, "/call 1001@"+pbx.addr)
 	waitBotMessage(t, bobProbe, botId, "the pool-empty reply", isChatReply(bobCall, "pool of SIP accounts is empty"))
 	bobRegister := chat(bobProbe, bobId, "/register 2001@"+pbx.addr+" s3cret")
@@ -1889,11 +1930,13 @@ func TestSipBotPoolRegistrationFails(t *testing.T) {
 	waitBotMessage(t, probe, botId, "the manual registered reply", isChatReply(registerMsg, "Registered as sip:2001@"))
 }
 
-// TestSipBotPoolSessionEndReleases covers the lifecycle hook: the user's
-// chat session ends (the subscriber drops out and ages out), and the
-// bot's session-end teardown runs — the pooled loan's de-REGISTER goes
-// out and the account returns to the pool, to serve the next user's
-// /call. A shorter subscriber aging makes the dropout observable.
+// TestSipBotPoolSessionEndReleases covers the lifecycle hooks: the
+// user's chat session starts (the pooled loan and its REGISTER happen
+// there, announced unthreaded) and ends (the subscriber drops out and
+// ages out), and the bot's session-end teardown runs — the loan's
+// de-REGISTER goes out and the account returns to the pool, to serve
+// the next user's session. A shorter subscriber aging makes the dropout
+// observable.
 func TestSipBotPoolSessionEndReleases(t *testing.T) {
 	net := newClientTestNet(t, 300*time.Millisecond)
 	pbx := newFakePBX(t, 486, true)
@@ -1916,21 +1959,24 @@ func TestSipBotPoolSessionEndReleases(t *testing.T) {
 		return ss.MsgId(m["msgId"].(string))
 	}
 
-	aliceCall := chat(aliceProbe, aliceId, "/call 1001@"+pbx.addr)
-	waitBotMessage(t, aliceProbe, botId, "alice's pooled registration line", isChatReply(aliceCall, "Registered as sip:1101@"))
+	// The session's start loaned the account and registered it.
+	waitBotMessage(t, aliceProbe, botId, "alice's session-start announcement", isChatAnnouncement("Registered as sip:1101@"))
 	pbx.waitForPBX(t, "the pooled account's REGISTER", func() bool { return pbx.registers == 1 })
+	aliceCall := chat(aliceProbe, aliceId, "/call 1001@"+pbx.addr)
+	waitBotMessage(t, aliceProbe, botId, "alice's calling line", isChatReply(aliceCall, "Calling 1001@"))
 
 	// Alice drops out: her registration ages out, the bot's session with
 	// her ends, and the hook returns the loan — the de-REGISTER goes out.
 	aliceStop()
 	pbx.waitForPBX(t, "the pooled account's de-REGISTER on the session's end", func() bool { return pbx.unregistered })
 
-	// Bob's /call loans the returned account — a pool that kept the loan
-	// would answer "empty".
+	// Bob's session start loans the returned account — a pool that kept
+	// the loan would leave him empty-handed.
 	bob, bobProbe, _, _ := startUserProbe(t, net, "bob", "1-bob")
 	_, bobId := pairUp(t, bot, bob)
+	waitBotMessage(t, bobProbe, botId, "bob's session-start announcement", isChatAnnouncement("Registered as sip:1101@"))
 	bobCall := chat(bobProbe, bobId, "/call 1002@"+pbx.addr)
-	waitBotMessage(t, bobProbe, botId, "bob's pooled registration line", isChatReply(bobCall, "Registered as sip:1101@"))
+	waitBotMessage(t, bobProbe, botId, "bob's calling line", isChatReply(bobCall, "Calling 1002@"))
 }
 
 // TestSipBotIPv6 covers the sip leg over IPv6: an account's socket takes
@@ -1960,12 +2006,14 @@ func TestSipBotIPv6(t *testing.T) {
 		return ss.MsgId(m["msgId"].(string))
 	}
 
-	// The pooled account registers against the IPv6 registrar and dials.
-	callMsg := chat("/call 1001@" + pbx.addr)
-	waitBotMessage(t, probe, botId, "the pooled registration line", isChatReply(callMsg, "Registered as sip:1101@"+pbx.addr))
+	// The session's start loaned the pooled account and registered it
+	// against the IPv6 registrar; the /call then dials through it.
+	waitBotMessage(t, probe, botId, "the session-start loan's announcement", isChatAnnouncement("Registered as sip:1101@"+pbx.addr))
 	pbx.waitForPBX(t, "the pooled account's REGISTER over IPv6", func() bool {
 		return len(pbx.registrations) == 1 && pbx.registrations[0].from == "1101"
 	})
+	callMsg := chat("/call 1001@" + pbx.addr)
+	waitBotMessage(t, probe, botId, "the calling line", isChatReply(callMsg, "Calling 1001@"))
 	pbx.waitForPBX(t, "the INVITE over IPv6", func() bool {
 		return pbx.invites == 1 && pbx.inviteFrom == "1101" && pbx.inviteTo == "1001"
 	})
@@ -2104,9 +2152,11 @@ func TestSipBotMyNumber(t *testing.T) {
 	waitBotMessage(t, probe, botId, "the not-registered answer again", isChatReply(m, "Not registered to a SIP registrar yet"))
 }
 
-// TestSipBotMyNumberPooled covers the pooled variant: no number before
-// the first /call loans an account (the answer then carries the pool
-// hint), and the loaned number — marked as the pool's — after.
+// TestSipBotMyNumberPooled covers the pooled variant: the session's
+// start loans the account (announced unthreaded), so /my-number shows
+// the loaned number — marked as the pool's — right away; a second user,
+// whose session start found the pool empty, gets the not-registered
+// answer with the pool hint.
 func TestSipBotMyNumberPooled(t *testing.T) {
 	net := newClientTestNet(t, ss.DefaultSubscriberAging)
 	pbx := newFakePBX(t, 200, true)
@@ -2115,12 +2165,12 @@ func TestSipBotMyNumberPooled(t *testing.T) {
 		t.Fatalf("NewSIPCredentialPool: %v", err)
 	}
 	bot := startBot(t, net, "bot", "2-bot", "", pool)
-	user, probe, _, _ := startUserProbe(t, net, "user", "1-user")
-	botId, userId := pairUp(t, bot, user)
+	alice, aliceProbe, _, _ := startUserProbe(t, net, "alice", "1-alice")
+	botId, aliceId := pairUp(t, bot, alice)
 
-	dc := probe.waitDC(t, botId, msg_handler.DataChannelLabelMessages)
-	chat := func(text string) ss.MsgId {
+	chat := func(probe *wireProbe, userId ss.SubscriberId, text string) ss.MsgId {
 		t.Helper()
+		dc := probe.waitDC(t, botId, msg_handler.DataChannelLabelMessages)
 		m := baseMsg(ss.WellKnownChIdMain, userId, botId)
 		m["plaintext"] = text
 		if err := dc.SendText(mustJSON(t, m)); err != nil {
@@ -2129,20 +2179,21 @@ func TestSipBotMyNumberPooled(t *testing.T) {
 		return ss.MsgId(m["msgId"].(string))
 	}
 
-	m := chat("/my-number")
-	waitBotMessage(t, probe, botId, "the not-registered answer with the pool hint", func(got *rawMsg) bool {
+	// The session's start loaned the pool's account; /my-number shows it,
+	// marked as the pool's.
+	waitBotMessage(t, aliceProbe, botId, "the session-start loan's announcement", isChatAnnouncement("Registered as sip:1101@"+pbx.addr+" (an account from the bot's pool)"))
+	m := chat(aliceProbe, aliceId, "/my-number")
+	waitBotMessage(t, aliceProbe, botId, "the pooled number", isChatReply(m, "Your number is sip:1101@"+pbx.addr+" (an account from the bot's pool)."))
+
+	// Bob's session start found the pool empty (alice holds the only
+	// account), so his /my-number answers not-registered, with the pool
+	// hint.
+	bob, bobProbe, _, _ := startUserProbe(t, net, "bob", "1-bob")
+	_, bobId := pairUp(t, bot, bob)
+	m = chat(bobProbe, bobId, "/my-number")
+	waitBotMessage(t, bobProbe, botId, "the not-registered answer with the pool hint", func(got *rawMsg) bool {
 		return isChatReply(m, "Not registered to a SIP registrar yet")(got) && strings.Contains(got.plaintext, "pool")
 	})
-
-	// The /call loans the pool's account; /my-number then shows it,
-	// marked as the pool's.
-	callMsg := chat("/call 1001@" + pbx.addr)
-	waitBotMessage(t, probe, botId, "the pooled registration line", isChatReply(callMsg, "Registered as sip:1101@"))
-	m = chat("/my-number")
-	waitBotMessage(t, probe, botId, "the pooled number", isChatReply(m, "Your number is sip:1101@"+pbx.addr+" (an account from the bot's pool)."))
-
-	hangupMsg := chat("/hangup")
-	waitBotMessage(t, probe, botId, "the hung-up reply", isChatReply(hangupMsg, "Hung up."))
 }
 
 // TestSipBotInboundCallEndToEnd covers the reverse direction: a SIP

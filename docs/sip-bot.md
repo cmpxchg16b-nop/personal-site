@@ -45,7 +45,7 @@ graph TD
     A["sipHandler<br/>pkg/rtc/sipbot/handler.go<br/>message policy: CLI, registration<br/>lifecycle, call policy"] --> B["msg_handler.Server<br/>data-channel layer: dcmsg/dcbin decoding,<br/>echo rule, call-log amends"]
     B --> C["HeadlessRTCClient<br/>pkg/rtc: signalling, peer sessions,<br/>perfect negotiation, AddTrack/RemoveTrack"]
     C --> D["Signalling Server (WS relay)<br/>+ pion PeerConnection per peer"]
-    A --> E["per-user account: register loop + diago UAC<br/>(one SIP client per registered user)<br/>github.com/emiago/diago on sipgo"]
+    A --> E["per-user account: REGISTER at birth, de-REGISTER at the end<br/>+ diago UAC (one SIP client per registered user)<br/>github.com/emiago/diago on sipgo"]
     E --> F["SIP network<br/>registrar / proxy / callee"]
     G["UserSessionStorage<br/>(OnMemoryUserSessionStorage)"] -.-> A
     H["SIPCredentialPool<br/>shared, lazy, mutex-free<br/>(atomic cursor + release channel)"] -.-> A
@@ -60,8 +60,9 @@ graph TD
 - **sip-leg**: one `diago.Diago` transaction user **per registered chat
   user** — each `/register` opens a dedicated SIP client (its own sipgo
   UA, named for the user's SIP username, and its own UDP socket) that
-  lives as long as the account. The registration (a `diago.Register`
-  loop) and every outbound call (a `diago.Invite` →
+  lives as long as the account. The registration (a REGISTER at the
+  account's birth, held untouched, a de-REGISTER at its end — §6) and
+  every outbound call (a `diago.Invite` →
   `DialogClientSession`) run on the account's own client, so the wire
   identity is that user's alone: the `From` is the AOR, the `Contact`'s
   `From` is the AOR, the `Contact`'s
@@ -85,16 +86,16 @@ handler (§7), media by a per-call **relay** (§8).
 
 Chat lines, exactly like the music bot's commands:
 
-| Command                              | Effect                                                                                                                                                                                                                                                                                                                                                                             |
-| ------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `/help`                              | print the help text — what the bot is and does, then the command list                                                                                                                                                                                                                                                                                                              |
-| `/register <user@host> <password>`   | associate the chat user with the SIP credential, REGISTER the AOR `sip:user@host` against its host, and keep the registration alive (§6). A later `/register` re-registers (replaces the credential).                                                                                                                                                                              |
-| `/unregister`                        | cancel the registration (a SIP de-REGISTER goes out), drop the stored credential, and end any call in progress                                                                                                                                                                                                                                                                     |
-| `/my-number`                         | print the user's currently registered SIP address — the number others can dial to ring this chat (§7.2) — or answer that the user is not registered to a SIP registrar yet. Reads the LIVE registration: a stored credential whose registration died (or has not run yet) is not callable and reads as not-registered. A number loaned from the credential pool is marked as such. |
-| `/call <user@host>` (or bare `user`) | phone the callee through the SIP network and the user through the browser; one active call per chat user. A bare `user` is completed with the registered account's domain. Without a registration the bot loans an account from the credential pool when one is configured and has one free (§5), and says so; when the pool is empty (or absent), the answer points at /register. |
-| `/yellow-page`                       | print the yellow page — the phone book of example callable numbers from the configuration (the <sipBot/> element's <yellowPage/> child, §10), grouped by section: who to call, without memorizing numbers                                                                                                                                                                          |
-| `/test-call`                         | phone the configured test callee (the `<sipBot/>` element's `testSIPContact`, e.g. `9664@192.168.1.2`) — a known-good subscriber of the SIP network the deployment tests against; answers unavailable when unconfigured                                                                                                                                                            |
-| `/hangup`                            | end the current call from chat (equivalent to the browser's hangup button)                                                                                                                                                                                                                                                                                                         |
+| Command                              | Effect                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| ------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `/help`                              | print the help text — what the bot is and does, then the command list                                                                                                                                                                                                                                                                                                                                                      |
+| `/register <user@host> <password>`   | associate the chat user with the SIP credential, REGISTER the AOR `sip:user@host` against its host, and keep the registration alive (§6). A later `/register` re-registers (replaces the credential).                                                                                                                                                                                                                      |
+| `/unregister`                        | cancel the registration (a SIP de-REGISTER goes out), drop the stored credential, and end any call in progress                                                                                                                                                                                                                                                                                                             |
+| `/my-number`                         | print the user's currently registered SIP address — the number others can dial to ring this chat (§7.2) — or answer that the user is not registered to a SIP registrar yet. Reads the LIVE registration: a stored credential whose registration has not run yet is not callable and reads as not-registered. A number loaned from the credential pool is marked as such.                                                   |
+| `/call <user@host>` (or bare `user`) | phone the callee through the SIP network and the user through the browser; one active call per chat user. A bare `user` is completed with the registered account's domain. Without a registration the bot falls back to the credential pool when one is configured and has one free (§5 — usually the session-start loan already stands), and says so; when the pool is empty (or absent), the answer points at /register. |
+| `/yellow-page`                       | print the yellow page — the phone book of example callable numbers from the configuration (the <sipBot/> element's <yellowPage/> child, §10), grouped by section: who to call, without memorizing numbers                                                                                                                                                                                                                  |
+| `/test-call`                         | phone the configured test callee (the `<sipBot/>` element's `testSIPContact`, e.g. `9664@192.168.1.2`) — a known-good subscriber of the SIP network the deployment tests against; answers unavailable when unconfigured                                                                                                                                                                                                    |
+| `/hangup`                            | end the current call from chat (equivalent to the browser's hangup button)                                                                                                                                                                                                                                                                                                                                                 |
 
 Every command answers with a chat reply (`Reply`), threaded on the
 command. Unknown commands and attachments are answered like the music
@@ -233,21 +234,28 @@ The loaned value is a full `UserSession` with `Pooled: true`; it lives
 in the store like a `/register`ed credential, the flag marking the loan
 for the release points.
 
-**When the bot allocates**: on demand, at the moment the user expresses
-intent to phone — a `/call` (or `/test-call`) from a user with neither
-a live registration nor a stored credential. Not at session start: the
-bot holds a peer session with every online channel member, so
-presence-based allocation would loan accounts to lurkers who never
-dial. Call-time allocation loans only to users who actually phone, at
-the price of that first `/call` bearing the bounded synchronous
-REGISTER round trip `/register` already pays (§6) — and the user is
-told what they got before the `Calling …` line: `Registered as
-sip:1101@sip.example.com (an account from the bot's pool).`
+**When the bot allocates**: at the peer session's start (the §9
+lifecycle hook), not on the first `/call` — the loan and its REGISTER
+happen up front, off the hub (the REGISTER's round trip rides its own
+goroutine, serialized with the commands' account lifecycle by the
+handler's account mutex), and the user is told their number right away,
+unthreaded, over the unsolicited-send path: `Registered as
+sip:1101@sip.example.com (an account from the bot's pool).` The first
+`/call` then finds the loan standing — no REGISTER round trip in the
+call path — and the number is callable (inbound, §7.2) for the
+session's whole life. The loan is **best-effort**: an empty pool or a
+failed registration is silent at session start; `/call`'s on-demand
+path (below) remains as the fallback and answers the failure itself.
+The price is presence-based allocation: the bot holds a peer session
+with every online channel member, so lurkers who never dial hold loans
+too — the pool's size is the operator's answer to that.
 
 Inside `/call`'s account resolution the order is: live registered
-account → use it; stored credential → revive it; otherwise → `Allocate`
+account → use it (the common case, the session-start loan included);
+stored credential → revive it; otherwise → `Allocate`
 → REGISTER the pooled account exactly like `/register` does → store it
-(flagged) → dial. Both failure modes answer the user so they know to
+(flagged) → dial — with the registration line then threaded on the
+`/call` itself. Both failure modes answer the user so they know to
 fall back to `/register` (that is the requirement): no pool configured
 → the v1 `Not registered — /register … first.`; an exhausted pool →
 `The bot's pool of SIP accounts is empty — /register … to use your own
@@ -260,7 +268,7 @@ is the fallback.
 supersedes the loan); the peer session's end (the §9 lifecycle hook).
 A loan is therefore session-scoped — unlike a manual credential, which
 survives the session in the store by design (§4); a reconnecting user's
-next `/call` allocates afresh, possibly a different account, which an
+new session allocates afresh, possibly a different account, which an
 outbound-only SBC can shrug at.
 
 **Duplication is the operator's business**: the pool neither detects
@@ -277,8 +285,8 @@ configuration owns the consequence.
    command's two fields map to `UserSession{AddressOfRecord, Username,
 Host, Password}`.
 2. **Store** the session, replacing any previous one (and cancelling the
-   previous registration loop, after hanging up any call in progress).
-3. **First REGISTER synchronously, with a timeout** (~5 s, ctx-scoped):
+   previous registration, after hanging up any call in progress).
+3. **REGISTER synchronously, with a timeout** (~5 s, ctx-scoped):
    `diago.RegisterTransaction(...).Register(ctx)` performs the
    digest-authenticated transaction — on the account's own client (§2),
    the request stamped with the user's identity: the `From` is the AOR
@@ -295,17 +303,28 @@ Unauthorized`) — because a bot has no unsolicited-send path outside a
    music bot's lazy song opens already make. The one spurious failure
    this step absorbs silently is diago's startup race (caveat 18): the
    first transaction's bind conflict is retried, never reported.
-4. **Re-registration in the background**: the same goroutine then loops
-   re-REGISTERing before expiry (diago's qualify loop semantics;
-   `Expiry` default 300 s, `RetryInterval` on transient failures). Its
-   ctx is cancelled by `/unregister`, a replacing `/register`, the
-   peer-session end, or process shutdown.
-5. `/call` requires a session whose registration is believed live; a
-   registration that died in the background surfaces at the next command
-   (`Not registered — /register first.`). A `/call` from a user with no
-   credential at all tries the credential pool first (§5); only when the
-   pool cannot provide an account, or the pooled account fails to
-   register, does the command answer with the `/register` hint.
+4. **The registration then stands untouched for the account's whole
+   life** — no `Expires` header, no refresh timer. The REGISTER used to
+   carry a 300 s expiry with a re-REGISTER loop at 0.75×, and the
+   registrar expired the binding under ongoing calls, cutting them at
+   the lease line — an unconditional disruption a refresh clock can
+   never fix, because the clock is dumb about what the bot is doing.
+   The bot's own lifecycle knows better: the account's birth is when to
+   register (`/register`, a `/call` revival, a session-start pool loan),
+   its end is when to de-register (`/unregister`, a replacing
+   `/register`, the peer session's end, process shutdown — the account's
+   ctx cancel drives the de-REGISTER, Contact `"*"` / Expires 0, on the
+   account's way out). The trade: a registrar that expires bindings on
+   its own clock would lose the number mid-session — the deployment's
+   registrar keeps them (§11).
+5. `/call` requires a registered account: one in the map is registered
+   by construction (the account is published only after its REGISTER
+   succeeded). With no background refresh there is no background health
+   signal either — a registrar that dies mid-session surfaces at the
+   next dial, not at a timer. A `/call` from a user with no account at
+   all tries the stored credential, then the credential pool (§5); only
+   when neither can provide a registered account does the command answer
+   with the `/register` hint.
 
 ## 7. Call flows
 
@@ -597,10 +616,16 @@ hook — replacing the two ctx-watcher goroutines of the pre-hook design:
 end the call in progress (the callee's dialog gets its BYE; the browser
 leg is gone, there is nothing to tell), stop the account (its own ctx
 teardown sends the de-REGISTER), and return a pooled loan — the store
-entry is dropped, the credential released. The start hook is a
-deliberate no-op: allocation is on-demand (§5), because the bot
-sessions with every online channel member and presence alone must not
-drain the pool.
+entry is dropped, the credential released. The start hook is the pool
+loan's front door (§5): a peer with no credential of their own is
+loaned and REGISTERed a pooled account right there — off the hub, the
+REGISTER's round trip on its own goroutine — and told their number over
+the unsolicited-send path. Because the start hook's work is concurrent
+with the commands' own account lifecycle, every account mutation (the
+loan, /register, /unregister, /call's ensure, the end hook's teardown)
+is serialized on the handler's account mutex; the critical section can
+include the bounded first REGISTER, so the hub's end hook can wait
+behind one for at most the REGISTER timeout.
 
 ## 10. Hosting and configuration
 
@@ -639,7 +664,7 @@ pool, cfg)` and reusing `stereoOpusPCFactory` (the webrtc leg negotiates
   `UpstreamDNSResolver`, and the sip-leg
   knobs — `Transport` (default `udp`), `ExternalHost` (default empty; the
   SDP/RTP address the PBX sees, for hosts where the bind address is
-  wrong), `RegisterExpiry` (default 300 s). Each registered account
+  wrong). Each registered account
   binds its own diago transport — a dedicated socket per user — so keep
   `BindPort` at 0: a fixed port admits one account at a time. An empty
   `BindHost` (the default) binds each account to the source address of
@@ -734,7 +759,10 @@ where a choice had to be made:
    its negotiated port from the start.
 10. **REGISTER round trip on the dcmsg goroutine** (§6): bounded by a
     5 s timeout; a dead registrar stalls that peer's command channel for
-    at most the timeout, never the process.
+    at most the timeout, never the process. (The session-start pool
+    loan's REGISTER rides its own goroutine instead — the hub never
+    waits on it, though the end hook can queue behind it on the account
+    mutex for at most the same bound.)
 11. **Security surface**: the SIP credential lives in process memory as
     plain data (digest auth needs the password, not a hash). The bot
     trusts the SIP network it is pointed at — a malicious PBX speaks to
@@ -757,12 +785,19 @@ where a choice had to be made:
     (digest auth needs the password itself, never a hash) — the
     document's file permissions are the protection, exactly as for its
     OAuth client secrets; the in-memory caveat (11) covers the rest.
-15. **Session-end cleanup races a dying session's in-flight command**:
-    a `/call` whose bounded REGISTER outlives its session can re-store
-    a pooled session after the end hook cleaned up — the loan then
-    holds until the process restarts (and the account may register
-    concurrently with a re-loaned twin, which SIP tolerates — §5's
-    duplication note). Narrow, self-limiting, and not worth a lock.
+15. **Registrations are never refreshed** (§6): the REGISTER carries
+    no `Expires` and no re-REGISTER loop runs — an ongoing call is
+    never cut at a lease line, and the de-REGISTER is driven by the
+    bot's own lifecycle. The flip side: a registrar that expires
+    bindings on its own clock loses the number mid-session (inbound
+    stops; outbound dials through the account's socket keep working
+    until the network path itself requires the binding) — the
+    deployment's registrar must keep bindings, which is exactly the
+    behavior this design was tuned against. Session-end cleanup cannot
+    race an in-flight registration: the account mutex serializes the
+    two (a registration that outlives its session fails on the dead
+    session's ctx, or is torn down by the end hook right after it
+    lands).
 16. **The inbound ring timeout is the bot's own** (60 s): a browser
     left ringing (the user walked away) is CANCELLed and the caller
     gets a 480; the timeout loses a same-instant-answer race
@@ -786,7 +821,7 @@ where a choice had to be made:
     of times inside the 5 s REGISTER budget (the listener is pooled
     almost immediately); any other failure is the registrar's real
     answer. The race is every account's first-transaction-only, so the
-    keepalive and the dial paths never see it.
+    dial paths never see it.
 19. **The family-filtering resolver** (`ipPreference` ≠ `default`):
     sipgo's transport layer resolves every outbound request-URI host
     through its UA's `*net.Resolver`, replaceable via
@@ -841,19 +876,19 @@ where a choice had to be made:
 
 `pkg/rtc/sipbot/`:
 
-| file                         | contents                                                                                                                                                                                       |
-| ---------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `sipbot.go`                  | package doc, `Configuration`, `New` (wires the msg_handler.Server), `sipStack` (the per-account SIP client factory), `codecAudioOpusStereo` (the sip-leg's opus with the RFC 7587 stereo fmtp) |
-| `session.go`                 | `UserSession`, `UserSessionStorage`, `OnMemoryUserSessionStorage`                                                                                                                              |
-| `pool.go`                    | `SIPCredentialPool` (+ the `SIPCredential`/`SIPCredentialRange` config shapes): the lazy, mutex-free account pool — the atomic cursor, the release channel, the range parsing                  |
-| `yellowpage.go`              | the yellow page: the YellowPageSection/YellowPageContact config shapes and the /yellow-page listing's rendering                                                                                |
-| `dns.go`                     | the `ipPreference` machinery: the IPPreference type and its parse, and the filtering DNS reverse proxy (miekg/dns) the account UAs' resolver dials                                             |
-| `handler.go`                 | `sipHandler` — the `BotMessageHandler`: CLI dispatch (/my-number reads the live registration), registration lifecycle, call policy, hangup matrix                                              |
-| `inbound.go`                 | the inbound call: the account socket's INVITE → the browser's ring → the 200 OK relay-arming; the ring timeout, the dialog watcher, the UAS-side termination verbs                             |
-| `account.go`                 | per-user SIP account runtime: the register loop, the diago `Invite` dial path, and the inbound-INVITE routing callback the client is opened with                                               |
-| `call.go`                    | per-call state + the relay: the two pump goroutines, the `sipLeg` interface over both dialog types, track/dialog wiring, teardown                                                              |
-| `transcode.go`               | the codec matrix: passthrough, G.711↔PCM↔opus paths, resamplers, the sample accumulator, opus TOC durations                                                                                    |
-| `opus_codec.go` / `_stub.go` | libopus encode+decode behind the `cgo` tag; the pure-Go stub fails G.711-leg calls with the explanatory error                                                                                  |
+| file                         | contents                                                                                                                                                                                              |
+| ---------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `sipbot.go`                  | package doc, `Configuration`, `New` (wires the msg_handler.Server), `sipStack` (the per-account SIP client factory), `codecAudioOpusStereo` (the sip-leg's opus with the RFC 7587 stereo fmtp)        |
+| `session.go`                 | `UserSession`, `UserSessionStorage`, `OnMemoryUserSessionStorage`                                                                                                                                     |
+| `pool.go`                    | `SIPCredentialPool` (+ the `SIPCredential`/`SIPCredentialRange` config shapes): the lazy, mutex-free account pool — the atomic cursor, the release channel, the range parsing                         |
+| `yellowpage.go`              | the yellow page: the YellowPageSection/YellowPageContact config shapes and the /yellow-page listing's rendering                                                                                       |
+| `dns.go`                     | the `ipPreference` machinery: the IPPreference type and its parse, and the filtering DNS reverse proxy (miekg/dns) the account UAs' resolver dials                                                    |
+| `handler.go`                 | `sipHandler` — the `BotMessageHandler`: CLI dispatch (/my-number reads the live registration), registration lifecycle (incl. the session-start pool loan), call policy, hangup matrix                 |
+| `inbound.go`                 | the inbound call: the account socket's INVITE → the browser's ring → the 200 OK relay-arming; the ring timeout, the dialog watcher, the UAS-side termination verbs                                    |
+| `account.go`                 | per-user SIP account runtime: the registration's lifecycle (REGISTER at birth, de-REGISTER at the end — no expiry, no refresh), the diago `Invite` dial path, and the inbound-INVITE routing callback |
+| `call.go`                    | per-call state + the relay: the two pump goroutines, the `sipLeg` interface over both dialog types, track/dialog wiring, teardown                                                                     |
+| `transcode.go`               | the codec matrix: passthrough, G.711↔PCM↔opus paths, resamplers, the sample accumulator, opus TOC durations                                                                                           |
+| `opus_codec.go` / `_stub.go` | libopus encode+decode behind the `cgo` tag; the pure-Go stub fails G.711-leg calls with the explanatory error                                                                                         |
 
 `third_party/diago/` sits beside the package: diago v0.32.2 vendored
 with the per-codec-fmtp patch (§8, §11.21), wired by `go.mod`'s
@@ -869,10 +904,14 @@ stream captured/generated RTP) so the B2BUA runs end to end in-process
 — browser-side probe speaking dcmsg like `musicbot_test.go`, no real
 network. The `/call` flow asserts both legs: the webrtc-leg dialog verbs
 and track attach on one side, the SIP REGISTER/INVITE/BYE transactions
-and relayed RTP on the other. The pool adds its own: unit tests for the
+and relayed RTP on the other — and the REGISTER carries no `Expires`
+header, the expiry-less lifecycle's wire-level assertion. The pool adds
+its own: unit tests for the
 range parsing, the allocation order, exhaustion, and release/re-loan
-(concurrency under `-race`); integration tests for the auto-allocated
-`/call` (the REGISTER and INVITE carry the pooled identity), the
+(concurrency under `-race`); integration tests for the session-start
+loan (the REGISTER and the unthreaded announcement at the session's
+birth, the `/call` dialing straight away) and its on-demand fallback
+(the REGISTER and INVITE carry the pooled identity), the
 exhaustion and registration-failure replies, and the release points —
 `/unregister`, a replacing `/register`, and the peer session's end (via
 the harness's subscriber aging). The yellow page adds its rendering's
