@@ -73,7 +73,10 @@ graph TD
   SIP network is **whatever the SDP negotiation settles on**; the bot
   offers, in preference order, **opus, PCMU, PCMA** (plus
   telephone-event, which the media relay ignores — see §11), in both
-  directions.
+  directions. The opus it offers — and answers with — announces
+  `a=fmtp:96 useinbandfec=1;stereo=1`: in-band FEC and the RFC 7587
+  stereo receive preference, the webrtc-leg's stereo negotiation
+  mirrored onto the SIP side (§8).
 
 The two legs meet only inside the bot: signalling state is relayed by the
 handler (§7), media by a per-call **relay** (§8).
@@ -453,6 +456,20 @@ Transcoding is **avoided whenever both legs are opus** — the codec's own
 packets cross the SBC byte for byte; the code makes the passthrough the
 first branch, not a degenerate case of a transcode pipeline.
 
+The sip-leg's opus carries the RFC 7587 fmtp `useinbandfec=1;stereo=1`
+— in-band FEC and the stereo receive preference — on **both** emission
+points: the outbound INVITE's offer and the inbound call's 200 OK
+answer (diago's negotiation keeps the local codecs, fmtp included, for
+the answer). A stereo-capable peer may then send stereo, which the
+passthrough delivers to the stereo-negotiated browser leg untouched;
+a mono peer is unaffected, the parameter being a preference, never a
+requirement. diago's SDP generator hardcodes the opus fmtp
+(`useinbandfec=0`) and its `media.Codec` has no field for one —
+upstream through v0.40.0 — so diago is **vendored** at
+`third_party/diago` (a `replace` in `go.mod`) with a minimal patch: a
+per-codec `Fmtp` string the SDP generator honors and codec matching
+ignores (the fork's `PATCHES.md` has the details).
+
 Transcoding specifics:
 
 - **G.711** via `github.com/emiago/diago/audio`'s slice helpers (on
@@ -807,24 +824,40 @@ where a choice had to be made:
     addition to the process's socket table (a loopback UDP+TCP pair on
     an ephemeral port) and lives for the bot's lifetime — the process,
     in the shipped wiring.
+21. **diago is vendored**: `third_party/diago` is v0.32.2 plus the
+    fmtp patch (§8), selected by a `replace` in `go.mod`. Upgrading
+    diago now means re-checking the patch against the new release —
+    its touch points are the SDP generator and the codec matcher, and
+    upstream through v0.40.0 still hardcodes the opus fmtp, so the
+    fork stays load-bearing. The vendored copy is a nested module:
+    invisible to the repo's `go test ./...`, so the sipbot suite's
+    wire-level SDP assertions (the offer's and the answer's fmtp
+    lines, §12) are the patch's coverage. The Dockerfile's
+    `go mod download` layer copies the vendored `go.mod` along with
+    the root module files — a replace target must exist before the
+    module graph resolves.
 
 ## 12. Package layout and testing
 
 `pkg/rtc/sipbot/`:
 
-| file                         | contents                                                                                                                                                                      |
-| ---------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `sipbot.go`                  | package doc, `Configuration`, `New` (wires the msg_handler.Server), `sipStack` (the per-account SIP client factory)                                                           |
-| `session.go`                 | `UserSession`, `UserSessionStorage`, `OnMemoryUserSessionStorage`                                                                                                             |
-| `pool.go`                    | `SIPCredentialPool` (+ the `SIPCredential`/`SIPCredentialRange` config shapes): the lazy, mutex-free account pool — the atomic cursor, the release channel, the range parsing |
-| `yellowpage.go`              | the yellow page: the YellowPageSection/YellowPageContact config shapes and the /yellow-page listing's rendering                                                               |
-| `dns.go`                     | the `ipPreference` machinery: the IPPreference type and its parse, and the filtering DNS reverse proxy (miekg/dns) the account UAs' resolver dials                            |
-| `handler.go`                 | `sipHandler` — the `BotMessageHandler`: CLI dispatch (/my-number reads the live registration), registration lifecycle, call policy, hangup matrix                             |
-| `inbound.go`                 | the inbound call: the account socket's INVITE → the browser's ring → the 200 OK relay-arming; the ring timeout, the dialog watcher, the UAS-side termination verbs            |
-| `account.go`                 | per-user SIP account runtime: the register loop, the diago `Invite` dial path, and the inbound-INVITE routing callback the client is opened with                              |
-| `call.go`                    | per-call state + the relay: the two pump goroutines, the `sipLeg` interface over both dialog types, track/dialog wiring, teardown                                             |
-| `transcode.go`               | the codec matrix: passthrough, G.711↔PCM↔opus paths, resamplers, the sample accumulator, opus TOC durations                                                                   |
-| `opus_codec.go` / `_stub.go` | libopus encode+decode behind the `cgo` tag; the pure-Go stub fails G.711-leg calls with the explanatory error                                                                 |
+| file                         | contents                                                                                                                                                                                       |
+| ---------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `sipbot.go`                  | package doc, `Configuration`, `New` (wires the msg_handler.Server), `sipStack` (the per-account SIP client factory), `codecAudioOpusStereo` (the sip-leg's opus with the RFC 7587 stereo fmtp) |
+| `session.go`                 | `UserSession`, `UserSessionStorage`, `OnMemoryUserSessionStorage`                                                                                                                              |
+| `pool.go`                    | `SIPCredentialPool` (+ the `SIPCredential`/`SIPCredentialRange` config shapes): the lazy, mutex-free account pool — the atomic cursor, the release channel, the range parsing                  |
+| `yellowpage.go`              | the yellow page: the YellowPageSection/YellowPageContact config shapes and the /yellow-page listing's rendering                                                                                |
+| `dns.go`                     | the `ipPreference` machinery: the IPPreference type and its parse, and the filtering DNS reverse proxy (miekg/dns) the account UAs' resolver dials                                             |
+| `handler.go`                 | `sipHandler` — the `BotMessageHandler`: CLI dispatch (/my-number reads the live registration), registration lifecycle, call policy, hangup matrix                                              |
+| `inbound.go`                 | the inbound call: the account socket's INVITE → the browser's ring → the 200 OK relay-arming; the ring timeout, the dialog watcher, the UAS-side termination verbs                             |
+| `account.go`                 | per-user SIP account runtime: the register loop, the diago `Invite` dial path, and the inbound-INVITE routing callback the client is opened with                                               |
+| `call.go`                    | per-call state + the relay: the two pump goroutines, the `sipLeg` interface over both dialog types, track/dialog wiring, teardown                                                              |
+| `transcode.go`               | the codec matrix: passthrough, G.711↔PCM↔opus paths, resamplers, the sample accumulator, opus TOC durations                                                                                    |
+| `opus_codec.go` / `_stub.go` | libopus encode+decode behind the `cgo` tag; the pure-Go stub fails G.711-leg calls with the explanatory error                                                                                  |
+
+`third_party/diago/` sits beside the package: diago v0.32.2 vendored
+with the per-codec-fmtp patch (§8, §11.21), wired by `go.mod`'s
+`replace`.
 
 Tests mirror the existing suites' disciplines: `OnMemoryUserSessionStorage`
 concurrency; the transcoder round trips (G.711 encode/decode against
@@ -864,7 +897,10 @@ the truncated answer's TCP retry, the IP-literal bypass),
 PBXs sharing one loopback port — one on 127.0.0.1, one on ::1 — where
 the fake upstream maps the registrar's hostname to both families and
 the REGISTER, the INVITE, and the de-REGISTER must arrive at the
-preferred family's PBX alone. Two harness disciplines keep
+preferred family's PBX alone. Both end-to-end call tests assert the
+sip-leg's SDP shape: the outbound INVITE's offer and the inbound
+call's 200 OK answer must carry `a=rtpmap:96 opus/48000/2` and
+`a=fmtp:96 useinbandfec=1;stereo=1` verbatim. Two harness disciplines keep
 the suite's flakes diagnosable and its teardown clean: a message wait
 that times out dumps everything the probe recorded (a bot failure reply
 the predicate did not expect is visible without a rerun), and the

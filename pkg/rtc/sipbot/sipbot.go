@@ -62,6 +62,21 @@ import (
 	"personal-site/pkg/rtc/msg_handler"
 )
 
+// codecAudioOpusStereo is the sip-leg's opus: diago's constant annotated
+// with the RFC 7587 fmtp parameters announcing in-band FEC and the stereo
+// receive preference (stereo=1) — the webrtc-leg's stereo opus
+// (stereoOpusPCFactory) mirrored onto the SIP side. It rides both the
+// outbound INVITE's offer and the inbound call's answer (diago's
+// negotiation keeps the local codecs, Fmtp included — see
+// third_party/diago/PATCHES.md), so when the far end settles on opus the
+// relay is a stereo passthrough end to end; a mono opus peer is unaffected
+// (stereo is a preference, never a requirement).
+var codecAudioOpusStereo = func() media.Codec {
+	c := media.CodecAudioOpus
+	c.Fmtp = "useinbandfec=1;stereo=1"
+	return c
+}()
+
 // Configuration configures the sip bot.
 type Configuration struct {
 	// Logger receives the bot's diagnostics; nil selects slog's default
@@ -238,7 +253,7 @@ func (s sipStack) open(ctx context.Context, session UserSession, onInbound func(
 		// PBXs that insist on negotiating it; the relay drops it.
 		diago.WithMediaConfig(diago.MediaConfig{
 			Codecs: []media.Codec{
-				media.CodecAudioOpus,
+				codecAudioOpusStereo,
 				media.CodecAudioUlaw,
 				media.CodecAudioAlaw,
 				media.CodecTelephoneEvent8000,

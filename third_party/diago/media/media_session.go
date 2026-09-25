@@ -755,7 +755,10 @@ func (s *MediaSession) updateRemoteCodecs(codecs []Codec, answerer bool) int {
 		filter := make([]Codec, 0, len(codecs))
 		for _, rc := range s.Codecs {
 			for _, c := range codecs {
-				if c == rc {
+				if codecsMatch(c, rc) {
+					// Keep the offer's codec (its payload type is the answer's
+					// duty) annotated with the local codec's Fmtp.
+					c.Fmtp = rc.Fmtp
 					filter = append(filter, c)
 					break
 				}
@@ -768,7 +771,7 @@ func (s *MediaSession) updateRemoteCodecs(codecs []Codec, answerer bool) int {
 	filter := codecs[:0] // reuse buffer
 	for _, rc := range codecs {
 		for _, c := range s.Codecs {
-			if c == rc {
+			if codecsMatch(c, rc) {
 				filter = append(filter, c)
 				break
 			}
@@ -776,6 +779,27 @@ func (s *MediaSession) updateRemoteCodecs(codecs []Codec, answerer bool) int {
 	}
 	s.filterCodecs = filter
 	return len(s.filterCodecs)
+}
+
+// codecsMatch reports whether two codecs are the same for SDP negotiation.
+// Fmtp annotates the local offer/answer and is never parsed from remote
+// SDP, so it must not take part in matching — with it, a local codec
+// carrying an Fmtp string would never equal its remote counterpart and no
+// codec would ever negotiate. (Local patch — see PATCHES.md.)
+func codecsMatch(a, b Codec) bool {
+	a.Fmtp = ""
+	b.Fmtp = ""
+	return a == b
+}
+
+// codecFmtpLine renders the codec's a=fmtp line: the codec's own Fmtp when
+// set, otherwise the built-in default. (Local patch — see PATCHES.md.)
+func codecFmtpLine(f Codec, def string) string {
+	params := f.Fmtp
+	if params == "" {
+		params = def
+	}
+	return "a=fmtp:" + strconv.Itoa(int(f.PayloadType)) + " " + params
 }
 
 // CommonCodecs returns common codecs if negotiation is finished, that is Local and Remote SDP are exchanged
@@ -1195,7 +1219,6 @@ type dtlsSetup struct {
 
 func generateSDPForAudio(sessionID uint64, sessionVersion uint64, rtpProfile string, originIP net.IP, connectionIP net.IP, rtpPort int, mode string, codecs []Codec, sdes sdesInline, dtlsSet *dtlsSetup) []byte {
 	// ntpTime := GetCurrentNTPTimestamp()
-
 	fmts := make([]string, len(codecs))
 	formatsMap := []string{}
 	for i, f := range codecs {
@@ -1209,13 +1232,16 @@ func generateSDPForAudio(sessionID uint64, sessionVersion uint64, rtpProfile str
 			formatsMap = append(formatsMap, "a=rtpmap:96 opus/48000/2")
 			// Providing 0 when FEC cannot be used on the receiving side is RECOMMENDED.
 			// https://datatracker.ietf.org/doc/html/rfc7587
-			formatsMap = append(formatsMap, "a=fmtp:96 useinbandfec=0")
+			formatsMap = append(formatsMap, codecFmtpLine(f, "useinbandfec=0"))
 		case CodecTelephoneEvent8000.PayloadType:
 			formatsMap = append(formatsMap, "a=rtpmap:101 telephone-event/8000")
-			formatsMap = append(formatsMap, "a=fmtp:101 0-16")
+			formatsMap = append(formatsMap, codecFmtpLine(f, "0-16"))
 		default:
 			s := fmt.Sprintf("a=rtpmap:%d %s/%d/%d", f.PayloadType, f.Name, f.SampleRate, f.NumChannels)
 			formatsMap = append(formatsMap, s)
+			if f.Fmtp != "" {
+				formatsMap = append(formatsMap, codecFmtpLine(f, ""))
+			}
 		}
 		fmts[i] = strconv.Itoa(int(f.PayloadType))
 	}

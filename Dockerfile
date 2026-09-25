@@ -19,7 +19,10 @@ FROM --platform=$BUILDPLATFORM golang:1.25 AS builder
 WORKDIR /src
 
 # Module files first so go mod download is cached across source changes.
+# The vendored diago's go.mod must come along: go.mod's replace directive
+# points at it, and go mod download resolves the module graph through it.
 COPY go.mod go.sum ./
+COPY third_party/diago/go.mod third_party/diago/go.mod
 RUN go mod download
 
 # Rest of the source, including web/site/out for the embed.

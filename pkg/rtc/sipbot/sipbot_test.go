@@ -627,6 +627,7 @@ type fakePBX struct {
 	invites       int
 	inviteFrom    string
 	inviteTo      string
+	inviteSDP     string // the last INVITE's SDP offer, verbatim
 	byes          int
 	rtpReceived   int
 	rtpPayloads   [][]byte
@@ -794,6 +795,7 @@ func newFakePBXOnPort(t *testing.T, ip string, port int, answerCode int, opus bo
 		peer := parseSDPMediaAddr(t, req.Body())
 		f.mu.Lock()
 		f.rtpPeer = peer
+		f.inviteSDP = string(req.Body())
 		f.mu.Unlock()
 		dialog, err := dialogs.ReadInvite(req, tx)
 		if err != nil {
@@ -980,6 +982,19 @@ func (f *fakePBX) waitDialog(t *testing.T) *sipgo.DialogServerSession {
 	}
 }
 
+// requireStereoOpusSDP asserts the SDP body announces the bot's stereo
+// opus: the dual-channel rtpmap and the RFC 7587 fmtp line carrying
+// in-band FEC and the stereo receive preference — the exact wire string
+// the sip leg must speak.
+func requireStereoOpusSDP(t *testing.T, what, body string) {
+	t.Helper()
+	for _, want := range []string{"a=rtpmap:96 opus/48000/2", "a=fmtp:96 useinbandfec=1;stereo=1"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("%s lacks %q:\n%s", what, want, body)
+		}
+	}
+}
+
 // streamOpus sends 20 ms opus RTP packets to the bot's media address —
 // the callee's voice — cycling the given payloads until ctx ends (the
 // relay drops them while the browser leg is still being set up, so the
@@ -1029,11 +1044,12 @@ type fakeCall struct {
 	answerCtx    context.Context
 	answerCancel context.CancelFunc
 
-	mu       sync.Mutex
-	ringing  bool          // a 180 arrived
-	res      *sip.Response // the final response (nil until WaitAnswer returned)
-	peer     *net.UDPAddr  // the bot's media address, off the 200 OK's SDP
-	answered bool          // the 200 OK arrived and its ACK went out
+	mu        sync.Mutex
+	ringing   bool          // a 180 arrived
+	res       *sip.Response // the final response (nil until WaitAnswer returned)
+	peer      *net.UDPAddr  // the bot's media address, off the 200 OK's SDP
+	answerSDP string        // the 200 OK's SDP answer, verbatim
+	answered  bool          // the 200 OK arrived and its ACK went out
 }
 
 // call rings the registrant user: an INVITE to the contact the
@@ -1137,6 +1153,7 @@ func (fc *fakeCall) waitAnswered() {
 	}
 	fc.mu.Lock()
 	fc.peer = peer
+	fc.answerSDP = string(res.Body())
 	fc.answered = true
 	fc.mu.Unlock()
 }
@@ -1484,6 +1501,12 @@ func TestSipBotCallEndToEnd(t *testing.T) {
 	pbx.waitForPBX(t, "the callee's INVITE", func() bool { return pbx.invites == 1 })
 	pbx.waitForPBX(t, "the INVITE's From/To", func() bool { return pbx.inviteFrom == "2001" && pbx.inviteTo == "1001" })
 	pbx.waitForPBX(t, "the INVITE's digest username", func() bool { return pbx.authedUser == "2001" })
+	// The offer announces stereo opus (RFC 7587): the webrtc-leg's stereo
+	// negotiation mirrored onto the sip-leg.
+	pbx.mu.Lock()
+	offer := pbx.inviteSDP
+	pbx.mu.Unlock()
+	requireStereoOpusSDP(t, "the INVITE's SDP offer", offer)
 	dialog := pbx.waitDialog(t)
 
 	// The user picks up. The accept's shape mirrors the browser's: the
@@ -2210,8 +2233,14 @@ func TestSipBotInboundCallEndToEnd(t *testing.T) {
 	time.Sleep(300 * time.Millisecond)
 	sip(map[string]any{"callId": callId, "response": map[string]any{"code": 200, "phrase": "OK"}})
 
-	// The caller gets his 200 OK + SDP; his ACK arms the relay.
+	// The caller gets his 200 OK + SDP; his ACK arms the relay. The answer
+	// announces stereo opus too: the negotiation keeps the local codecs, so
+	// the offer's fmtp is the answer's as well.
 	call.waitAnswered()
+	call.mu.Lock()
+	answer := call.answerSDP
+	call.mu.Unlock()
+	requireStereoOpusSDP(t, "the 200 OK's SDP answer", answer)
 
 	// The caller speaks: the opus packets cross to the browser byte for
 	// byte. The stream runs ahead of the track's wait — the probe's

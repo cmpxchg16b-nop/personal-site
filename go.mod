@@ -26,6 +26,12 @@ require (
 	golang.org/x/oauth2 v0.36.0
 )
 
+// diago is vendored with local patches (see third_party/diago/PATCHES.md):
+// the SDP generator honors a codec's Fmtp line, which upstream (checked
+// through v0.40.0) hardcodes — the sip bot needs it to announce stereo
+// opus (a=fmtp:96 useinbandfec=1;stereo=1) toward the SIP network.
+replace github.com/emiago/diago => ./third_party/diago
+
 require (
 	github.com/emiago/dtls/v3 v3.0.0-20260122183559-8b8d23e359c0 // indirect
 	github.com/go-audio/riff v1.0.0 // indirect

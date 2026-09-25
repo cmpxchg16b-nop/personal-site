@@ -28,6 +28,17 @@ type Codec struct {
 	SampleRate  uint32
 	SampleDur   time.Duration
 	NumChannels int // 1 or 2
+
+	// Fmtp is the codec's format-specific parameters string, emitted as the
+	// codec's a=fmtp line in generated SDP (e.g. "useinbandfec=1;stereo=1"
+	// for RFC 7587 stereo opus). Empty keeps the built-in default for the
+	// well-known payload types (PCMU/PCMA: none, opus: useinbandfec=0,
+	// telephone-event: 0-16) and no line otherwise. It annotates the local
+	// offer/answer only: it is not parsed from remote SDP and is ignored by
+	// codec matching (see updateRemoteCodecs).
+	//
+	// NOTE: local patch (see PATCHES.md) — not part of upstream diago.
+	Fmtp string
 }
 
 func (c *Codec) String() string {
