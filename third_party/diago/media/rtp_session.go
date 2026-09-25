@@ -1,0 +1,765 @@
+// SPDX-License-Identifier: MPL-2.0
+// SPDX-FileCopyrightText: Copyright (c) 2024, Emir Aganovic
+
+package media
+
+import (
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"sync"
+	"time"
+
+	"github.com/emiago/diago/media/sdp"
+	"github.com/pion/rtcp"
+	"github.com/pion/rtp"
+)
+
+// RTP session is RTP ReadWriter with control (RTCP) reporting
+// Session is identified by network address and port pair to which data should be sent and received
+// Participant can be part of multiple rtp sessions. One for audio, one for media.
+// So for different MediaSession (audio,video etc) different RTP session needs to be created
+// TODO
+// RTPSession can be different type:
+// - unicast or multicase
+// - replicated unicast (mixers audio)
+// RTP session is attached to RTPReader and RTPWriter
+// Now:
+// - Designed for UNICAST sessions
+// - Acts as RTP Reader Writer
+// - Only makes sense for Reporting Quality media
+// Roadmap:
+// - Can handle multiple SSRC from Reader
+// - Multiple RTCP Recever Blocks
+
+var (
+	DefaultOnReadRTCP  func(pkt rtcp.Packet, rtpStats RTPReadStats)  = nil
+	DefaultOnWriteRTCP func(pkt rtcp.Packet, rtpStats RTPWriteStats) = nil
+
+	// RTPSourceLock enables source locking after IP changes
+	RTPSourceLock bool
+
+	errRTPSessionClosed         = errors.New("rtp session is closed")
+	errRTPSessionMonitorStarted = errors.New("rtp session monitor already started")
+)
+
+type RTPSession struct {
+	// Keep pointers at top to reduce GC
+	Sess *MediaSession
+
+	rtcpMU sync.Mutex
+	// All below fields should not be updated without rtcpMu Lock
+	rtcpTicker *time.Ticker
+	rtcpClosed chan struct{}
+	monitorWG  sync.WaitGroup
+	monitorRun bool
+	readStats  RTPReadStats
+	writeStats RTPWriteStats
+
+	// Reading and Writing RTCP can be intercept. For global use DefaultOnReadRTCP, DefaultOnWriteRTCP
+	// Must be set before RTP is read or writen
+	onReadRTCP  func(pkt rtcp.Packet, rtpStats RTPReadStats)
+	onWriteRTCP func(pkt rtcp.Packet, rtpStats RTPWriteStats)
+
+	closed bool
+
+	// sourceLock when enabled locks reading RTP packets into single source addr which handles security issue
+	sourceLock        bool
+	sourceLockPackets int
+	sourceLockAddr    *net.UDPAddr
+}
+
+// Some of fields here are exported (as readonly) intentionally
+type RTPReadStats struct {
+	SSRC                   uint32
+	FirstPktSequenceNumber uint16
+	LastSequenceNumber     uint16
+	lastSeq                RTPExtendedSequenceNumber
+	// tracks first pkt seq in this interval to calculate loss of packets
+	IntervalFirstPktSeqNum uint16
+	IntervalPacketsCount   uint16
+
+	PacketsCount uint64
+	OctetCount   uint64
+
+	// RTP reading stats
+	SampleRate uint32
+	// lastRTPTime       time.Time
+	// lastRTPTimestamp  uint32
+	firstRTPTime      time.Time
+	firstRTPTimestamp uint32
+	jitter            float64
+	transit           int64
+
+	// Reading RTCP stats
+	lastSenderReportNTP       uint64
+	lastSenderReportRecvTime  time.Time
+	lastReceptionReportSeqNum uint32
+
+	// Round TRIP Time based on LSR and DLSR
+	RTT time.Duration
+
+	clockReset bool
+}
+
+/*
+	 func (stats *RTPReadStats) calcJitter(now time.Time, readPktTimestamp uint32) {
+		sampleRate := float64(stats.SampleRate)
+
+		// https://www.rfc-editor.org/rfc/rfc3550#appendix-A.8
+		// Jitter here will mostly be incorrect as Reading RTP can be faster slower
+		// and not actually dictated by sampling (clock)
+		Sij := readPktTimestamp - stats.lastRTPTimestamp
+		Rij := now.Sub(stats.lastRTPTime)
+		D := Rij.Seconds()*sampleRate - float64(Sij)
+		if D < 0 {
+			D = -D
+		}
+		stats.jitter = stats.jitter + (D-stats.jitter)/16
+	}
+*/
+func (stats *RTPReadStats) calcJitter(now time.Time, readPktTimestamp uint32) {
+	sampleRate := float64(stats.SampleRate)
+
+	// Calculate samples
+	// https://www.rfc-editor.org/rfc/rfc3550#appendix-A.8
+	rtpSampleArrival := stats.firstRTPTimestamp + uint32(now.Sub(stats.firstRTPTime).Seconds()*sampleRate)
+	transit := int64(rtpSampleArrival) - int64(readPktTimestamp)
+
+	D := transit - stats.transit
+	stats.transit = transit
+
+	if D < 0 {
+		D = -D
+	}
+	jit := (float64(D) - stats.jitter) / 16.0
+
+	stats.jitter = stats.jitter + jit
+}
+
+// Some of fields here are exported (as readonly) intentionally
+type RTPWriteStats struct {
+	SSRC uint32
+
+	lastPacketTime      time.Time
+	lastPacketTimestamp uint32
+	sampleRate          uint32
+
+	// RTCP stats
+	PacketsCount uint64
+	OctetCount   uint64
+}
+
+// RTP session creates new RTP reader/writer from session
+func NewRTPSession(sess *MediaSession) *RTPSession {
+	return &RTPSession{
+		Sess:        sess,
+		rtcpTicker:  time.NewTicker(5 * time.Second),
+		rtcpClosed:  make(chan struct{}),
+		onReadRTCP:  DefaultOnReadRTCP,
+		onWriteRTCP: DefaultOnWriteRTCP,
+		sourceLock:  RTPSourceLock,
+	}
+}
+
+// Fork creates a new RTP session lifecycle for a forked media session while
+// preserving RTP and RTCP statistics.
+func (s *RTPSession) Fork(sess *MediaSession) *RTPSession {
+	s.rtcpMU.Lock()
+	defer s.rtcpMU.Unlock()
+
+	fork := NewRTPSession(sess)
+	fork.readStats = s.readStats
+	fork.writeStats = s.writeStats
+	fork.onReadRTCP = s.onReadRTCP
+	fork.onWriteRTCP = s.onWriteRTCP
+	fork.sourceLock = s.sourceLock
+	fork.sourceLockPackets = s.sourceLockPackets
+	if s.sourceLockAddr != nil {
+		addr := *s.sourceLockAddr
+		fork.sourceLockAddr = &addr
+	}
+
+	oldCodec := CodecAudioFromSession(s.Sess)
+	newCodec := CodecAudioFromSession(sess)
+	if oldCodec.SampleRate != newCodec.SampleRate {
+		fork.readStats.SampleRate = newCodec.SampleRate
+		fork.readStats.firstRTPTime = time.Time{}
+		fork.readStats.firstRTPTimestamp = 0
+		fork.readStats.jitter = 0
+		fork.readStats.transit = 0
+		fork.readStats.clockReset = true
+		fork.writeStats.sampleRate = newCodec.SampleRate
+	}
+
+	return fork
+}
+
+func (s *RTPSession) close(wait bool) error {
+	s.rtcpMU.Lock()
+	closed := s.closed
+	s.closed = true
+	if !closed {
+		close(s.rtcpClosed)
+	}
+	s.rtcpTicker.Stop()
+	rtcpConn := s.Sess.rtcpConn
+	s.rtcpMU.Unlock()
+
+	err := rtcpConn.SetDeadline(time.Now())
+	if wait {
+		s.monitorWG.Wait()
+	}
+	return err
+}
+
+// MonitorClose stops RTCP monitoring and waits until all monitor goroutines
+// have exited. The RTP/RTCP connections remain open for a replacement fork.
+func (s *RTPSession) MonitorClose() error {
+	return s.close(true)
+}
+
+func (s *RTPSession) Close() error {
+	return s.close(false)
+}
+
+func (s *RTPSession) OnReadRTCP(f func(pkt rtcp.Packet, rtpStats RTPReadStats)) {
+	s.rtcpMU.Lock()
+	defer s.rtcpMU.Unlock()
+	s.onReadRTCP = f
+}
+
+func (s *RTPSession) OnWriteRTCP(f func(pkt rtcp.Packet, rtpStats RTPWriteStats)) {
+	s.rtcpMU.Lock()
+	defer s.rtcpMU.Unlock()
+	s.onWriteRTCP = f
+}
+
+func (s *RTPSession) startMonitor(goroutines int) error {
+	s.rtcpMU.Lock()
+	defer s.rtcpMU.Unlock()
+
+	if s.monitorRun {
+		return errRTPSessionMonitorStarted
+	}
+	if s.closed {
+		return errRTPSessionClosed
+	}
+	// A fork reuses the media session's RTCP connection. MonitorClose expires
+	// both deadlines to stop the previous monitor, so clear both before any
+	// replacement reader or writer starts.
+	if err := s.Sess.rtcpConn.SetDeadline(time.Time{}); err != nil {
+		return err
+	}
+	s.monitorRun = true
+	s.monitorWG.Add(goroutines)
+	return nil
+}
+
+// ReadRTP reads RTP
+// NOTE: For RTCP we may read some properties of media session. Do not run this until
+// full media session is negotiated. For updating media, media session forking must be done!
+func (s *RTPSession) ReadRTP(b []byte, readPkt *rtp.Packet) (n int, err error) {
+	sess := s.Sess
+	for {
+		n, err = sess.ReadRTP(b, readPkt)
+		if err != nil {
+			return n, err
+		}
+
+		// NOTE: n can be 0 if there is session mode changed but pkt will be still parsed
+
+		// Validate pkt. Check is it keep alive
+		if readPkt.Version == 0 {
+			DefaultLogger().Debug("Received RTP with invalid version. Skipping", "pkt.ssrc", readPkt.SSRC, "pkt.seq", readPkt.SequenceNumber)
+			continue
+		}
+		if len(readPkt.Payload) == 0 {
+			DefaultLogger().Debug("Received RTP with empty Payload. Keep Alive? Skipping", "pkt.ssrc", readPkt.SSRC, "pkt.seq", readPkt.SequenceNumber)
+			continue
+		}
+
+		if s.sourceLock && !s.sourceLockProtection(readPkt, sess.ReadRTPFromAddr) {
+			DefaultLogger().Debug("RTP Source lock protection learning. Skipping", "pkt.ssrc", readPkt.SSRC, "pkt.seq", readPkt.SequenceNumber)
+			continue
+		}
+
+		break
+	}
+
+	s.rtcpMU.Lock()
+	defer s.rtcpMU.Unlock()
+	// pktArrival := time.Now()
+	stats := &s.readStats
+	now := time.Now()
+
+	// For now we only track latest SSRC
+	if stats.SSRC != readPkt.SSRC {
+		// For now we will reset all our stats.
+		// We expect that SSRC only changed but MULTI RTP stream per one session is not supported
+		// NOTE: Reading codecs may be in a race while establishing session but it is expected
+		// that caller should not run reading while session is established
+		codec := sess.Codecs[0]
+		if codec.PayloadType != readPkt.PayloadType {
+			for _, c := range sess.Codecs {
+				if c.PayloadType == readPkt.PayloadType {
+					codec = c
+					break
+				}
+			}
+
+			if codec.PayloadType != readPkt.PayloadType {
+				DefaultLogger().Warn("Received RTP with unsupported payload_type", "pt", readPkt.PayloadType)
+				return 0, nil
+			}
+		}
+
+		*stats = RTPReadStats{
+			SSRC:                   readPkt.SSRC,
+			FirstPktSequenceNumber: readPkt.SequenceNumber,
+			SampleRate:             codec.SampleRate,
+			firstRTPTime:           now,
+			firstRTPTimestamp:      readPkt.Timestamp,
+		}
+		stats.lastSeq.InitSeq(readPkt.SequenceNumber)
+	} else {
+		stats.lastSeq.UpdateSeq(readPkt.SequenceNumber)
+
+		if stats.clockReset {
+			stats.firstRTPTime = now
+			stats.firstRTPTimestamp = readPkt.Timestamp
+			stats.transit = 0
+			stats.clockReset = false
+		} else if readPkt.Marker {
+			// Reset our firstRTPtime to improve jitter calc
+			stats.firstRTPTime = now
+			stats.firstRTPTimestamp = readPkt.Timestamp
+		} else {
+			// https://datatracker.ietf.org/doc/html/rfc3550#page-39
+			stats.calcJitter(now, readPkt.Timestamp)
+		}
+
+	}
+	payloadSize := n - readPkt.Header.MarshalSize() - int(readPkt.PaddingSize)
+
+	stats.IntervalPacketsCount++
+	stats.PacketsCount++
+	stats.OctetCount += uint64(payloadSize)
+	stats.LastSequenceNumber = readPkt.SequenceNumber
+	// stats.clockRTPTimestamp+=
+
+	if stats.IntervalFirstPktSeqNum == 0 {
+		stats.IntervalFirstPktSeqNum = readPkt.SequenceNumber
+	}
+
+	// stats.lastRTPTime = now
+	// stats.lastRTPTimestamp = readPkt.Timestamp
+
+	return n, err
+}
+
+// sourceLockProtection locks RTP handling only to one source change
+func (s *RTPSession) sourceLockProtection(pkt *rtp.Packet, from net.Addr) bool {
+	// TODO: Consider handling flood RTP protection
+	// RTP must be udp
+	fromAddr, ok := from.(*net.UDPAddr)
+	if !ok {
+		return false
+	}
+
+	if s.sourceLockAddr != nil {
+		return s.sourceLockAddr.IP.Equal(fromAddr.IP) && s.sourceLockAddr.Port == fromAddr.Port && s.sourceLockAddr.Zone == fromAddr.Zone
+	}
+
+	if s.readStats.lastSeq.seqNum+1 != pkt.SequenceNumber {
+		if s.readStats.lastSeq.seqNum != 0 {
+			// if not first packet then reset
+			s.sourceLockPackets = 0
+			return false
+		}
+	}
+
+	// We wait couple packets before considering this is right source
+	s.sourceLockPackets++
+	if s.sourceLockPackets < 4 {
+		// Not enough packets
+		return false
+	}
+
+	s.sourceLockAddr = fromAddr
+	return true
+}
+
+func (s *RTPSession) ReadRTPRaw(buf []byte) (int, error) {
+	// In this case just proxy RTP. RTP Session can not work without full RTP decoded
+	// It is expected that RTCP is also proxied
+	return s.Sess.ReadRTPRaw(buf)
+}
+
+func (s *RTPSession) WriteRTP(pkt *rtp.Packet) error {
+	sess := s.Sess
+	if err := sess.WriteRTP(pkt); err != nil {
+		return err
+	}
+
+	s.rtcpMU.Lock()
+	writeStats := &s.writeStats
+	// For now we only track latest SSRC
+	if writeStats.SSRC != pkt.SSRC {
+		codec, err := func() (Codec, error) {
+			// Find codec from promoted list of codecs
+			for _, c := range sess.Codecs {
+				if c.PayloadType == pkt.PayloadType {
+					return c, nil
+				}
+			}
+			return Codec{}, fmt.Errorf("unknown media codec used for payload type=%d", pkt.PayloadType)
+		}()
+		if err != nil {
+			return err
+		}
+
+		*writeStats = RTPWriteStats{
+			SSRC:       pkt.SSRC,
+			sampleRate: codec.SampleRate,
+		}
+	}
+
+	writeStats.PacketsCount++
+	writeStats.OctetCount += uint64(len(pkt.Payload))
+	writeStats.lastPacketTime = time.Now()
+	writeStats.lastPacketTimestamp = pkt.Timestamp
+
+	s.rtcpMU.Unlock()
+	return nil
+}
+
+func (s *RTPSession) ReadStats() RTPReadStats {
+	s.rtcpMU.Lock()
+	defer s.rtcpMU.Unlock()
+	return s.readStats
+}
+
+func (s *RTPSession) WriteStats() RTPWriteStats {
+	s.rtcpMU.Lock()
+	defer s.rtcpMU.Unlock()
+	return s.writeStats
+}
+
+// Monitor starts reading RTCP and monitoring media quality
+func (s *RTPSession) Monitor() error {
+	sess := s.Sess
+	if sess.Raddr.IP == nil || sess.rtcpRaddr.IP == nil {
+		return fmt.Errorf("raddr of RTP is not present. You must call this after RemoteSDP is parsed")
+	}
+	if err := s.startMonitor(1); err != nil {
+		return err
+	}
+
+	errchan := make(chan error)
+	go func() {
+		defer s.monitorWG.Done()
+		errchan <- s.readRTCP()
+	}()
+
+	var err error
+	for {
+		var now time.Time
+		select {
+		case now = <-s.rtcpTicker.C:
+		case <-s.rtcpClosed:
+			DefaultLogger().Debug("RTCP writer closed")
+			return nil
+		}
+		if err = s.writeRTCP(now); err != nil {
+			break
+		}
+	}
+	return errors.Join(err, <-errchan)
+}
+
+// MonitorBackground is helper to keep monitoring in background
+// MUST Be called after session REMOTE SDP is parsed
+func (s *RTPSession) MonitorBackground() error {
+	sess := s.Sess
+	if sess.Raddr.IP == nil || sess.rtcpRaddr.IP == nil {
+		return fmt.Errorf("raddr of RTP is not present. Is RemoteSDP called. Monitor RTP Session failed")
+	}
+
+	if err := s.startMonitor(2); err != nil {
+		return err
+	}
+
+	log := DefaultLogger()
+	go func() {
+		defer s.monitorWG.Done()
+		log.Debug("RTCP reader started", "laddr", sess.rtcpConn.LocalAddr().String())
+		if err := s.readRTCP(); err != nil {
+			if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
+				log.Debug("RTP session RTCP reader exit")
+				return
+			}
+
+			if e, ok := err.(net.Error); ok && e.Timeout() {
+				// Must be  closed
+				log.Debug("RTP session RTCP closed with timeout")
+				return
+			}
+
+			log.Error("RTP session RTCP reader stopped with error", "error", err)
+		}
+	}()
+
+	go func() {
+		defer s.monitorWG.Done()
+		log.Debug("RTCP writer started", "raddr", sess.rtcpRaddr.String())
+		for {
+			var now time.Time
+			select {
+			case now = <-s.rtcpTicker.C:
+			case <-s.rtcpClosed:
+				log.Debug("RTCP writer closed")
+				return
+			}
+
+			if err := s.writeRTCP(now); err != nil {
+				if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
+					log.Debug("RTP session RTCP writer exit")
+					return
+				}
+				log.Error("RTP session RTCP writer stopped with error", "error", err, "now", now.String())
+				return
+			}
+		}
+	}()
+	return nil
+}
+
+func (s *RTPSession) readRTCP() error {
+	sess := s.Sess
+	// TODO use sync pool here
+	buf := make([]byte, 1600)
+	rtcpBuf := make([]rtcp.Packet, 5) // What would be more correct value?
+
+	// Serialize clearing the read deadline with MonitorClose. Otherwise a
+	// monitor goroutine that starts late could clear the deadline after the
+	// stop signal and block forever on the shared RTCP connection.
+	s.rtcpMU.Lock()
+	var err error
+	if !s.closed {
+		err = sess.rtcpConn.SetReadDeadline(time.Time{}) // For now make sure we are not getting timeout
+	}
+	s.rtcpMU.Unlock()
+	if err != nil {
+		return err
+	}
+
+	for {
+		n, err := sess.ReadRTCP(buf, rtcpBuf)
+		if err != nil {
+			if errors.Is(err, errRTCPFailedToUnmarshal) {
+				DefaultLogger().Error("RTCP Unmarshal error. Continue listen", "error", err)
+				continue
+			}
+			return err
+		}
+
+		for _, pkt := range rtcpBuf[:n] {
+			s.readRTCPPacket(pkt)
+		}
+	}
+}
+
+func (s *RTPSession) readRTCPPacket(pkt rtcp.Packet) {
+	s.rtcpMU.Lock()
+	now := time.Now()
+
+	// Add interceptor
+	onReadRTCP := s.onReadRTCP
+	if onReadRTCP != nil {
+		stats := s.readStats
+		s.rtcpMU.Unlock()
+		onReadRTCP(pkt, stats)
+		s.rtcpMU.Lock()
+	}
+
+	switch p := pkt.(type) {
+	case *rtcp.SenderReport:
+		// It can happen that we have nothing received from RTP till now
+		if s.readStats.SSRC == 0 {
+			s.readStats.SSRC = p.SSRC
+		}
+
+		s.readStats.lastSenderReportNTP = p.NTPTime
+		s.readStats.lastSenderReportRecvTime = now
+
+		for _, rr := range p.Reports {
+			s.readReceptionReport(rr, now)
+		}
+
+	case *rtcp.ReceiverReport:
+		for _, rr := range p.Reports {
+			s.readReceptionReport(rr, now)
+		}
+	}
+	s.rtcpMU.Unlock()
+
+}
+
+func (s *RTPSession) readReceptionReport(rr rtcp.ReceptionReport, now time.Time) {
+	// For now only use single SSRC
+	if rr.SSRC != s.writeStats.SSRC {
+		DefaultLogger().Warn("Reception report SSRC does not match our internal", "ssrc", rr.SSRC, "expected", s.writeStats.SSRC)
+		return
+	}
+
+	// compute jitter
+	// https://tools.ietf.org/html/rfc3550#page-39
+	// Round trip time
+	if rr.LastSenderReport != 0 {
+		var skewed bool
+		s.readStats.RTT, skewed = calcRTT(now, rr.LastSenderReport, rr.Delay)
+		if skewed {
+			DefaultLogger().Warn("Internal RTCP clock skew detected", "ssrc", rr.SSRC, "rtt", s.readStats.RTT.String())
+		}
+	}
+	// used to calc fraction lost
+	s.readStats.lastReceptionReportSeqNum = rr.LastSequenceNumber
+}
+
+func (s *RTPSession) writeRTCP(now time.Time) error {
+	sess := s.Sess
+
+	var pkt rtcp.Packet
+
+	// If there is no writer in session (a=recvonly) then generate only receiver report
+	// otherwise always go with sender report with reception reports
+	s.rtcpMU.Lock()
+	if sess.Mode == sdp.ModeRecvonly {
+		if s.readStats.SSRC == 0 {
+			s.rtcpMU.Unlock()
+			return nil
+		}
+
+		rr := rtcp.ReceiverReport{}
+		s.parseReceiverReport(&rr, now, s.readStats.SSRC)
+
+		pkt = &rr
+	} else {
+		if s.writeStats.SSRC == 0 {
+			s.rtcpMU.Unlock()
+			return nil
+		}
+
+		sr := rtcp.SenderReport{}
+		s.parseSenderReport(&sr, now, s.writeStats.SSRC)
+
+		pkt = &sr
+	}
+
+	// Reset any current reading interval stats
+	s.readStats.IntervalFirstPktSeqNum = 0
+	s.readStats.IntervalPacketsCount = 0
+
+	// Add interceptor
+	onWriteRTCP := s.onWriteRTCP
+	if onWriteRTCP != nil {
+		stats := s.writeStats
+		s.rtcpMU.Unlock()
+		onWriteRTCP(pkt, stats)
+	} else {
+		s.rtcpMU.Unlock()
+	}
+
+	return sess.WriteRTCP(pkt)
+}
+
+func (s *RTPSession) parseReceiverReport(receiverReport *rtcp.ReceiverReport, now time.Time, ssrc uint32) {
+	receptionReport := rtcp.ReceptionReport{}
+
+	s.parseReceptionReport(&receptionReport, now)
+	*receiverReport = rtcp.ReceiverReport{
+		SSRC:    ssrc,
+		Reports: []rtcp.ReceptionReport{receptionReport},
+	}
+}
+
+func (s *RTPSession) parseSenderReport(senderReport *rtcp.SenderReport, now time.Time, ssrc uint32) {
+
+	// Write stats
+	writeStats := &s.writeStats
+	rtpTimestampOffset := now.Sub(writeStats.lastPacketTime).Seconds() * float64(s.writeStats.sampleRate)
+	// Same as asterisk
+	// Sender Report should contain Receiver Report if user acts as sender and receiver
+	// Otherwise on Read we should generate only receiver Report
+	*senderReport = rtcp.SenderReport{
+		SSRC:        ssrc,
+		NTPTime:     NTPTimestamp(now),
+		RTPTime:     writeStats.lastPacketTimestamp + uint32(rtpTimestampOffset),
+		PacketCount: uint32(min(writeStats.PacketsCount, 1<<32)), // Saturate to largest 32 bit value
+		OctetCount:  uint32(min(writeStats.OctetCount, 1<<32)),
+	}
+
+	if s.readStats.SSRC > 0 {
+		receptionReport := rtcp.ReceptionReport{}
+		s.parseReceptionReport(&receptionReport, now)
+		senderReport.Reports = []rtcp.ReceptionReport{receptionReport}
+	}
+}
+
+func (s *RTPSession) parseReceptionReport(receptionReport *rtcp.ReceptionReport, now time.Time) {
+	var sequenceCycles uint16 = 0 // TODO have sequence cycles handled
+
+	// Read stats
+	readStats := &s.readStats
+	lastExtendedSeq := &readStats.lastSeq
+
+	// fraction loss is caluclated as packets loss / number expected in interval as fixed point number with point number at the left edge
+	receivedLastSeq := int64(lastExtendedSeq.ReadExtendedSeq())
+	readIntervalExpectedPkts := receivedLastSeq - int64(readStats.IntervalFirstPktSeqNum)
+	readIntervalLost := max(readIntervalExpectedPkts-int64(readStats.IntervalPacketsCount), 0)
+	fractionLost := float64(readIntervalLost) / float64(readIntervalExpectedPkts) // Can be negative
+
+	// Watch OUT FOR -1
+	expectedPkts := uint64(receivedLastSeq) - uint64(readStats.FirstPktSequenceNumber)
+
+	// interarrival jitter
+	// network transit time
+	// Assert
+
+	lastReceivedSenderReportTime := readStats.lastSenderReportRecvTime
+	var delay time.Duration
+	if !lastReceivedSenderReportTime.IsZero() {
+		delay = now.Sub(lastReceivedSenderReportTime)
+	}
+
+	// TODO handle multiple SSRC
+	*receptionReport = rtcp.ReceptionReport{
+		SSRC:               readStats.SSRC,
+		FractionLost:       uint8(max(fractionLost*256, 0)),                         // Can be negative. Saturate to zero
+		TotalLost:          uint32(min(expectedPkts-readStats.PacketsCount, 1<<32)), // Saturate to largest 32 bit value
+		LastSequenceNumber: uint32(sequenceCycles)<<16 + uint32(readStats.LastSequenceNumber),
+		Jitter:             uint32(readStats.jitter),                    // TODO
+		LastSenderReport:   uint32(readStats.lastSenderReportNTP >> 16), // LSR
+		Delay:              uint32(delay.Seconds() * 65356),             // DLSR
+	}
+}
+
+func FractionLostFloat(f uint8) float64 {
+	return float64(f) / 256
+}
+
+func calcRTT(now time.Time, lastSenderReport uint32, delaySenderReport uint32) (rtt time.Duration, skewed bool) {
+	nowNTP := NTPTimestamp(now)
+	now32 := uint32(nowNTP >> 16) // LSR is middle 32 bits of NTP timestamp
+
+	rtt32 := now32 - lastSenderReport - delaySenderReport
+	skewed = now32-delaySenderReport < lastSenderReport
+
+	secs := rtt32 & 0xFFFF0000 >> 16           // higher 16 bits
+	fracs := float64(rtt32&0x0000FFFF) / 65356 // lower 16 bits
+	rtt = time.Duration(secs)*time.Second + time.Duration(fracs*float64(time.Second))
+
+	return
+}

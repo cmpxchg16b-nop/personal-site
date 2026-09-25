@@ -1,0 +1,7 @@
+/go.work*
+/diagox
+/cmd
+/TODO.md
+/PRIVATE_DEV*.md
+/license_header_inject.sh
+/*_extra_test.go
