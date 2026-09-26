@@ -183,7 +183,18 @@ export default function MessageInput({
           htmlInput: { "aria-label": t("chat.message", { target }) },
         }}
       />
-      {/* The dial pad's toggle, docked next to the send button while
+      {/* The send button, left of the dial pad's toggle; the highlight
+          lines up with the comment form's send button (CommentForm):
+          a primary-colored icon once there is text, never a fill. */}
+      <IconButton
+        color="primary"
+        disabled={!sendable}
+        onClick={submit}
+        aria-label={t("chat.send")}
+      >
+        <SendIcon sx={{ transform: "rotate(-45deg)" }} fontSize="small" />
+      </IconButton>
+      {/* The dial pad's toggle, docked at the composer's right end while
           the conversation's call can send DTMF; lit while the pad is
           open. */}
       {dialPad !== undefined && (
@@ -198,25 +209,6 @@ export default function MessageInput({
           <DialpadIcon fontSize="small" />
         </IconButton>
       )}
-      {/* While empty the button is a quiet disabled icon; once there is
-          text it fills with the primary color as a send affordance. */}
-      <IconButton
-        color="primary"
-        disabled={!sendable}
-        onClick={submit}
-        aria-label={t("chat.send")}
-        sx={
-          sendable
-            ? {
-                bgcolor: "primary.main",
-                color: "primary.contrastText",
-                "&:hover": { bgcolor: "primary.dark" },
-              }
-            : undefined
-        }
-      >
-        <SendIcon sx={{ transform: "rotate(-45deg)" }} fontSize="small" />
-      </IconButton>
     </Box>
   );
 }
