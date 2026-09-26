@@ -101,8 +101,8 @@ func (h *sipHandler) serveInbound(peer ss.SubscriberId, inDialog *diago.DialogSe
 	}
 	// Register for the browser's mic before the INVITE goes out, so no
 	// early track is missed (the /call discipline).
-	w.OnTrack(func(remote *webrtc.TrackRemote, _ *webrtc.RTPReceiver) {
-		h.onMic(peer, remote)
+	w.OnTrack(func(remote *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
+		h.onMic(peer, remote, receiver)
 	})
 	callId, err := w.Invite(msg_handler.MediaVoice)
 	if err != nil {

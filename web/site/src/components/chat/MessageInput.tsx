@@ -14,6 +14,7 @@ import AttachFileIcon from "@mui/icons-material/AttachFile";
 import InsertDriveFileOutlinedIcon from "@mui/icons-material/InsertDriveFileOutlined";
 import ImageOutlinedIcon from "@mui/icons-material/ImageOutlined";
 import VideocamOutlinedIcon from "@mui/icons-material/VideocamOutlined";
+import DialpadIcon from "@mui/icons-material/Dialpad";
 import SendIcon from "@mui/icons-material/Send";
 import { useTranslation } from "react-i18next";
 import type { TransferKind } from "./types";
@@ -28,6 +29,13 @@ type MessageInputProps = {
   // TransferKind). The kind is the user's explicit choice here — it is
   // never derived from the file's MIME type.
   onAttachFile: (files: File[], kind: TransferKind) => void;
+  // The dial pad's toggle: present while the conversation's call
+  // negotiated DTMF (the pad exists then); open is its visibility,
+  // onToggle flips it.
+  dialPad?: {
+    open: boolean;
+    onToggle: () => void;
+  };
 };
 
 // MessageInput is the composer at the bottom of a conversation: a borderless
@@ -40,6 +48,7 @@ export default function MessageInput({
   target,
   onSend,
   onAttachFile,
+  dialPad,
 }: MessageInputProps) {
   const { t } = useTranslation();
   const [content, setContent] = useState("");
@@ -174,6 +183,21 @@ export default function MessageInput({
           htmlInput: { "aria-label": t("chat.message", { target }) },
         }}
       />
+      {/* The dial pad's toggle, docked next to the send button while
+          the conversation's call can send DTMF; lit while the pad is
+          open. */}
+      {dialPad !== undefined && (
+        <IconButton
+          color={dialPad.open ? "primary" : "default"}
+          onClick={dialPad.onToggle}
+          aria-label={t(
+            dialPad.open ? "chat.dialPad.hide" : "chat.dialPad.show",
+          )}
+          aria-pressed={dialPad.open}
+        >
+          <DialpadIcon fontSize="small" />
+        </IconButton>
+      )}
       {/* While empty the button is a quiet disabled icon; once there is
           text it fills with the primary color as a send affordance. */}
       <IconButton

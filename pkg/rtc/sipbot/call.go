@@ -86,6 +86,14 @@ type peerCall struct {
 	mic    *webrtc.TrackRemote // nil until the browser's mic arrives
 	micOn  bool                // the browser→SIP pump is running
 	ended  bool                // an end path ran; later ones no-op
+
+	// dtmfPT/dtmfOK are the webrtc-leg's negotiated telephone-event
+	// payload type (and whether one negotiated), learned from the mic's
+	// receiver at setMic: the pad's DTMF rides the mic's own RTP stream
+	// under that PT (dtmf.go). dtmfOK false means the browser leg sends
+	// no DTMF at all — the pump dispatches nothing.
+	dtmfPT uint8
+	dtmfOK bool
 }
 
 // sipLeg is the call's SIP side as the relay and the teardown see it: the
@@ -104,13 +112,17 @@ type sipLeg interface {
 // lifetime. stop ends the transcoding state and bars new pump starts;
 // pumps already blocked on a read die with their leg (the dialog's
 // close, the track's end) — the music bot's drainTrack has the same
-// shape.
+// shape. dtmfCh carries the pad's digits the browser→SIP pump parsed to
+// the digit sender (sendDigits): buffered and dropped on full, so a
+// flooded pad never stalls the audio pump.
 type relay struct {
 	toBrowser *toBrowserBridge
 	toSIP     *toSIPBridge
 
 	dialog   sipLeg
 	track    *webrtc.TrackLocalStaticSample
+	audioPT  uint8 // the sip-leg's negotiated audio payload type — anything else on the read stream is not audio (telephone-event)
+	dtmfCh   chan rune
 	stopCh   chan struct{}
 	stopOnce sync.Once
 }
@@ -162,12 +174,16 @@ func (c *peerCall) armLocked(leg sipLeg) error {
 	return nil
 }
 
-// setMic notes the browser's mic track; the browser→SIP pump starts
-// once both it and the answered dialog exist.
-func (c *peerCall) setMic(track *webrtc.TrackRemote) {
+// setMic notes the browser's mic track and its receiver's negotiated
+// telephone-event PT; the browser→SIP pump starts once both it and the
+// answered dialog exist.
+func (c *peerCall) setMic(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.mic = track
+	if pt, ok := telephoneEventPT(receiver); ok {
+		c.dtmfPT, c.dtmfOK = pt, true
+	}
 	if c.relay != nil && !c.micOn {
 		c.startMicPumpLocked()
 	}
@@ -176,7 +192,7 @@ func (c *peerCall) setMic(track *webrtc.TrackRemote) {
 // startMicPumpLocked starts the browser→SIP pump. mu held.
 func (c *peerCall) startMicPumpLocked() {
 	c.micOn = true
-	go c.relay.pumpBrowserToSIP(c.mic)
+	go c.relay.pumpBrowserToSIP(c.mic, c.dtmfPT, c.dtmfOK)
 }
 
 // activate marks the webrtc-leg answered; false when the call ended
@@ -244,6 +260,8 @@ func newRelay(dialog sipLeg, track *webrtc.TrackLocalStaticSample) (*relay, erro
 		toSIP:     toSIP,
 		dialog:    dialog,
 		track:     track,
+		audioPT:   props.Codec.PayloadType,
+		dtmfCh:    make(chan rune, 16),
 		stopCh:    make(chan struct{}),
 	}, nil
 }
@@ -269,7 +287,12 @@ func (r *relay) stopped() bool {
 // track. The pump is self-paced by the arriving RTP; while the track is
 // unbound (the browser still rings) pion drops the writes — the music
 // bot's "empty room". It dies on the dialog's close (the callee's BYE,
-// the call's hangup) or a conversion error.
+// the call's hangup) or a conversion error. Payloads whose payload type
+// is not the negotiated audio codec's — telephone-event, the one other
+// PT the sip-leg can legitimately carry — are dropped, never converted:
+// a 4-byte DTMF event fed to the opus/G.711 bridge is a garbage blip.
+// (The SIP→browser DTMF direction is deliberately not transported —
+// docs/sip-bot.md §8.)
 func (r *relay) pumpSIPToBrowser() {
 	if r.stopped() {
 		return
@@ -278,6 +301,11 @@ func (r *relay) pumpSIPToBrowser() {
 	if err != nil {
 		return
 	}
+	// The concrete reader exposes the last packet's header (safe in the
+	// reading goroutine, which the pump is); diago does no PT filtering
+	// of its own. A nil pktReader (a future diago wrapping the reader)
+	// degrades to no filtering — today's behavior, never a crash.
+	pktReader, _ := reader.(*media.RTPPacketReader)
 	buf := make([]byte, media.RTPBufSize)
 	for {
 		n, err := reader.Read(buf)
@@ -286,6 +314,9 @@ func (r *relay) pumpSIPToBrowser() {
 		}
 		if r.stopped() {
 			return
+		}
+		if pktReader != nil && pktReader.PacketHeader.PayloadType != r.audioPT {
+			continue
 		}
 		werr := r.toBrowser.put(buf[:n], func(data []byte, dur time.Duration) error {
 			return r.track.WriteSample(pionmedia.Sample{Data: data, Duration: dur})
@@ -299,15 +330,26 @@ func (r *relay) pumpSIPToBrowser() {
 // pumpBrowserToSIP relays the browser's mic to the callee: opus packets
 // read off the mic's remote track, converted, written to the dialog.
 // Paced by the browser's packets; it dies on the track's end (the
-// peer's teardown, the session's close) or a conversion error.
-func (r *relay) pumpBrowserToSIP(mic *webrtc.TrackRemote) {
+// peer's teardown, the session's close) or a conversion error. The
+// webrtc-leg's DTMF surfaces in the same read stream — telephone-event
+// shares the mic's SSRC, only its negotiated PT (dtmfPT, when dtmfOK)
+// tells it from audio — and is parsed per RFC 4733 (dtmf.go): a fresh
+// END packet's digit queues onto the sip-leg's DTMF writer.
+func (r *relay) pumpBrowserToSIP(mic *webrtc.TrackRemote, dtmfPT uint8, dtmfOK bool) {
 	if r.stopped() {
 		return
 	}
-	writer, err := r.dialog.AudioWriter()
+	// The dialog's writer is DTMF-aware: audio passes through it under
+	// its lock, and WriteDTMF injects the event series onto the same RTP
+	// stream (PT 101, the sip-leg's telephone-event) — diago's own
+	// interleaving discipline.
+	dtmfWriter := diago.DTMFWriter{}
+	writer, err := r.dialog.AudioWriter(diago.WithAudioWriterDTMF(&dtmfWriter))
 	if err != nil {
 		return
 	}
+	go r.sendDigits(&dtmfWriter)
+	var dedup dtmfDeduper
 	for {
 		pkt, _, err := mic.ReadRTP()
 		if err != nil {
@@ -316,11 +358,44 @@ func (r *relay) pumpBrowserToSIP(mic *webrtc.TrackRemote) {
 		if r.stopped() {
 			return
 		}
+		if dtmfOK && pkt.PayloadType == dtmfPT {
+			ev, ok := parseDTMFEvent(pkt.Payload)
+			if !ok || !ev.end {
+				continue // start/update packets are not the cue; a complete press is
+			}
+			digit, ok := ev.digit()
+			if !ok || !dedup.freshEnd(ev.code, pkt.Timestamp) {
+				continue
+			}
+			select {
+			case r.dtmfCh <- digit:
+			default: // a flooded pad drops digits, never stalls the pump
+			}
+			continue
+		}
 		werr := r.toSIP.put(pkt.Payload, func(data []byte) error {
 			_, err := writer.Write(data)
 			return err
 		})
 		if werr != nil {
+			return
+		}
+	}
+}
+
+// sendDigits drains the pad's digit queue onto the sip-leg: diago's
+// WriteDTMF emits the RFC 4733 event series (≈140 ms of real time per
+// digit, holding the audio writer's lock — the audio's pause is the
+// price of sharing one RTP stream), so it runs off the audio pump. It
+// dies on the relay's stop or a failed write (the dialog is gone then).
+func (r *relay) sendDigits(w *diago.DTMFWriter) {
+	for {
+		select {
+		case digit := <-r.dtmfCh:
+			if err := w.WriteDTMF(digit); err != nil {
+				return
+			}
+		case <-r.stopCh:
 			return
 		}
 	}

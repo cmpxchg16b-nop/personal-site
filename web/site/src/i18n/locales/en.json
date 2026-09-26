@@ -151,6 +151,12 @@
       "callingShort": "Calling…",
       "inCallShort": "In call"
     },
+    "dialPad": {
+      "title": "Dial pad",
+      "show": "Show the dial pad",
+      "hide": "Hide the dial pad",
+      "key": "Dial {{key}}"
+    },
     "volume": {
       "title": "Call audio",
       "microphone": "Microphone",

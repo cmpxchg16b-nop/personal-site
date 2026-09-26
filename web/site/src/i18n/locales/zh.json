@@ -151,6 +151,12 @@
       "callingShort": "呼叫中…",
       "inCallShort": "通话中"
     },
+    "dialPad": {
+      "title": "拨号键盘",
+      "show": "显示拨号键盘",
+      "hide": "隐藏拨号键盘",
+      "key": "拨号 {{key}}"
+    },
     "volume": {
       "title": "通话音量",
       "microphone": "麦克风",

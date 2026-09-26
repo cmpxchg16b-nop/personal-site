@@ -12,9 +12,12 @@
 // holds its capture (acquireLocalInput / the camera hold below) and its
 // detach releases it, so the captures open with the first accepted call
 // needing them and stop with the last — the browser's recording
-// indicators light exactly while a call is sending. The hook owns no
-// session state: it is purely an effect of the wire-carried
-// invitations, decoupled from the connections' signalling state.
+// indicators light exactly while a call is sending. The mic senders the
+// attachments create also answer the pairs' DTMF dialers (dtmfFor): the
+// dial pad's existence is the negotiated telephone-event capability,
+// read off the live senders. The hook owns no session state: it is
+// purely an effect of the wire-carried invitations, decoupled from the
+// connections' signalling state.
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { AudioGraph } from "@/api/audio/audiograph";
@@ -25,6 +28,17 @@ import type { ActivePhoneCall } from "./types";
 // callKey indexes one call's media attachments by its pair.
 function callKey(channelId: ChannelId, peer: SubscriberId): string {
   return `${channelId}:${peer}`;
+}
+
+// DialerHandle is one pair's DTMF sender as the dial pad sees it.
+export interface DialerHandle {
+  /**
+   * Queues one digit (0-9, *, #) as an RFC 4733 telephone-event on the
+   * call's audio sender. A no-op while the sender cannot insert tones
+   * (not connected yet, held): canInsertDTMF is the live gate, checked
+   * at press time, not render time.
+   */
+  insert: (digit: string) => void;
 }
 
 export interface UseCallMediaResult {
@@ -54,6 +68,15 @@ export interface UseCallMediaResult {
     channelId: ChannelId,
     peer: SubscriberId,
   ) => MediaStream | null;
+  /**
+   * The pair's DTMF dialer while its call negotiated telephone-event
+   * (RFC 4733) — null otherwise (no attached mic, or the peer answered
+   * the capability away). The dial pad's existence test; the pad's
+   * visibility is the user's own toggle (the linphone model: capability
+   * decides existence, the user decides showing). Render-safe like
+   * localAnalyser.
+   */
+  dtmfFor: (channelId: ChannelId, peer: SubscriberId) => DialerHandle | null;
 }
 
 export function useCallMedia(
@@ -76,6 +99,10 @@ export function useCallMedia(
   const [localCamera, setLocalCamera] = useState<MediaStream | null>(null);
   // The peers' camera streams per pair (video tracks off the wire).
   const remoteVideosRef = useRef(new Map<string, MediaStream>());
+  // The pairs whose mic senders' first negotiation is being watched:
+  // getParameters().codecs stays empty until the offer/answer completes,
+  // and the DTMF capability read needs that moment (dtmfFor below).
+  const dtmfWatchedRef = useRef(new Set<string>());
   // Bumped whenever an attachment changes, so render-time reads
   // (localAnalyser, localCamera, remoteAnalyserFor, remoteVideoFor) see
   // them the moment they exist.
@@ -227,6 +254,27 @@ export function useCallMedia(
             }
             sendersRef.current.set(key, sender);
             setMediaVersion((v) => v + 1);
+            // Watch the sender's first negotiation out: the DTMF
+            // capability read (dtmfFor) needs the negotiated codec
+            // list, which populates only once the offer/answer
+            // completes — bounded, and abandoned if the attachment
+            // went first.
+            if (!dtmfWatchedRef.current.has(key)) {
+              dtmfWatchedRef.current.add(key);
+              void (async () => {
+                for (
+                  let i = 0;
+                  i < 50 && sendersRef.current.get(key) === sender;
+                  i++
+                ) {
+                  if (sender.getParameters().codecs.length > 0) break;
+                  await new Promise((resolve) => setTimeout(resolve, 100));
+                }
+                if (sendersRef.current.get(key) === sender) {
+                  setMediaVersion((v) => v + 1);
+                }
+              })();
+            }
           } catch (err) {
             // Permission denied, or no capture device: the call stays
             // accepted, we just send silence.
@@ -273,6 +321,7 @@ export function useCallMedia(
       const sep = key.indexOf(":");
       sessions.removeTrack(key.slice(0, sep), key.slice(sep + 1), sender);
       sendersRef.current.delete(key);
+      dtmfWatchedRef.current.delete(key);
       audio.removeRemote(key);
       audio.releaseLocalInput();
       setMediaVersion((v) => v + 1);
@@ -308,10 +357,37 @@ export function useCallMedia(
     [],
   );
 
+  // dtmfFor answers the pair's dialer while its mic sender can speak
+  // RFC 4733: a dtmf object on the audio sender AND telephone-event
+  // among the negotiated send codecs — the WebRTC API's own capability
+  // verdict (docs/webrtc-sip-dtmf-consideration.md).
+  const dtmfFor = useCallback(
+    (channelId: ChannelId, peer: SubscriberId): DialerHandle | null => {
+      const key = callKey(channelId, peer);
+      const sender = sendersRef.current.get(key);
+      if (sender?.dtmf == null) return null;
+      const negotiated = sender
+        .getParameters()
+        .codecs.some(
+          (c) => c.mimeType.toLowerCase() === "audio/telephone-event",
+        );
+      if (!negotiated) return null;
+      return {
+        insert: (digit: string) => {
+          const live = sendersRef.current.get(key);
+          if (live?.dtmf?.canInsertDTMF !== true) return;
+          live.dtmf.insertDTMF(digit);
+        },
+      };
+    },
+    [],
+  );
+
   return {
     localAnalyser: audio?.localAnalyser ?? null,
     remoteAnalyserFor,
     localCamera,
     remoteVideoFor,
+    dtmfFor,
   };
 }

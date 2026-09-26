@@ -296,15 +296,41 @@ func NewHeadlessRTCClient(newNegotiator NegotiatorFactory, config RTCClientConfi
 	return c, nil
 }
 
+// TelephoneEventCodec is the RFC 4733 telephone-event the factories
+// register: 8000 Hz, the events 0-16 (0-9, *, #, A-D, flash), PT 126 —
+// Chrome's own choice, clear of the default video list's assignments
+// (101 is VP9's RTX there; a PT collision fails registration).
+var TelephoneEventCodec = webrtc.RTPCodecParameters{
+	RTPCodecCapability: webrtc.RTPCodecCapability{
+		MimeType:    MimeTypeTelephoneEvent,
+		ClockRate:   8000,
+		SDPFmtpLine: "0-16",
+	},
+	PayloadType: 126,
+}
+
+// MimeTypeTelephoneEvent is telephone-event's SDP mime type — pion has no
+// constant for it (its DTMF support stops at negotiation).
+const MimeTypeTelephoneEvent = "audio/telephone-event"
+
 // defaultPeerConnectionFactory builds the default peer-connection
 // factory: a pion peer connection with the configured ICE servers —
 // mirroring the browser's { iceServers: urls.length ? [{ urls }] : [] }
 // — and the answering DTLS role the session's politeness dictates: the
 // polite peer is the session's initial offerer (it creates the data
 // channels), hence the DTLS server; its answers must say so
-// (setup:passive), which pion's defaults would not do.
+// (setup:passive), which pion's defaults would not do. The media engine
+// is pion's default codecs plus telephone-event, which every browser
+// registers: without it a browser's DTMF capability is answered away.
 func defaultPeerConnectionFactory(iceServers []string) func(polite bool) (*webrtc.PeerConnection, error) {
 	return func(polite bool) (*webrtc.PeerConnection, error) {
+		mediaEngine := &webrtc.MediaEngine{}
+		if err := mediaEngine.RegisterDefaultCodecs(); err != nil {
+			return nil, err
+		}
+		if err := mediaEngine.RegisterCodec(TelephoneEventCodec, webrtc.RTPCodecTypeAudio); err != nil {
+			return nil, err
+		}
 		settingEngine := webrtc.SettingEngine{}
 		role := webrtc.DTLSRoleClient
 		if polite {
@@ -317,7 +343,10 @@ func defaultPeerConnectionFactory(iceServers []string) func(polite bool) (*webrt
 		if len(iceServers) > 0 {
 			config.ICEServers = []webrtc.ICEServer{{URLs: iceServers}}
 		}
-		return webrtc.NewAPI(webrtc.WithSettingEngine(settingEngine)).NewPeerConnection(config)
+		return webrtc.NewAPI(
+			webrtc.WithMediaEngine(mediaEngine),
+			webrtc.WithSettingEngine(settingEngine),
+		).NewPeerConnection(config)
 	}
 }
 

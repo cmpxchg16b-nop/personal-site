@@ -506,8 +506,8 @@ func (h *sipHandler) call(ctx context.Context, msg *msg_handler.ChatMessage, w m
 	}
 	// Register for the browser's mic before the INVITE goes out, so no
 	// early track is missed (the music bot's discipline).
-	w.OnTrack(func(remote *webrtc.TrackRemote, _ *webrtc.RTPReceiver) {
-		h.onMic(peer, remote)
+	w.OnTrack(func(remote *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
+		h.onMic(peer, remote, receiver)
 	})
 	callId, err := w.Invite(msg_handler.MediaVoice)
 	if err != nil {
@@ -754,10 +754,12 @@ func (h *sipHandler) setAccount(peer ss.SubscriberId, a *account) {
 
 // onMic is the inbound-media callback: the browser's mic track joins
 // the call's relay (the browser→SIP pump starts once both it and the
-// answered dialog exist). A mic that is not opus — every browser offers
-// opus first, so this is the degenerate case — is drained, not
-// transcoded: the sip-leg hears silence, and the log says why.
-func (h *sipHandler) onMic(peer ss.SubscriberId, track *webrtc.TrackRemote) {
+// answered dialog exist). The receiver comes along for the negotiated
+// telephone-event PT — the pad's DTMF rides the mic's own read stream
+// (dtmf.go). A mic that is not opus — every browser offers opus first,
+// so this is the degenerate case — is drained, not transcoded: the
+// sip-leg hears silence, and the log says why.
+func (h *sipHandler) onMic(peer ss.SubscriberId, track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
 	h.logger.Info("sipbot: inbound track", "peer", peer, "codec", track.Codec().MimeType)
 	v, ok := h.calls.Load(peer)
 	if !ok || track.Codec().MimeType != webrtc.MimeTypeOpus {
@@ -773,7 +775,7 @@ func (h *sipHandler) onMic(peer ss.SubscriberId, track *webrtc.TrackRemote) {
 		}()
 		return
 	}
-	v.(*peerCall).setMic(track)
+	v.(*peerCall).setMic(track, receiver)
 }
 
 // say answers the peer with a chat message, logging a failed send.

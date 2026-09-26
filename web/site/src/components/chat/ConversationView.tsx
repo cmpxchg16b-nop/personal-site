@@ -58,6 +58,13 @@ type ConversationViewProps = {
   // FFT taps of the two voices while in call (see useCallMedia).
   localAnalyser: AnalyserNode | null;
   remoteAnalyser: AnalyserNode | null;
+  // The dial pad's toggle in the composer (see MessageInput): present
+  // while the conversation's call negotiated DTMF — the pad exists then
+  // — with its visibility and the toggle's callback.
+  dialPad?: {
+    open: boolean;
+    onToggle: () => void;
+  };
   // onBack returns to the channel list; only reachable on phone-sized
   // viewports where the sidebar and the conversation don't share the screen.
   onBack: () => void;
@@ -112,6 +119,7 @@ export default function ConversationView({
   onEndCall,
   localAnalyser,
   remoteAnalyser,
+  dialPad,
   onBack,
   sx,
 }: ConversationViewProps) {
@@ -303,6 +311,7 @@ export default function ConversationView({
         target={target}
         onSend={onSend}
         onAttachFile={onAttachFile}
+        dialPad={dialPad}
       />
     </Box>
   );

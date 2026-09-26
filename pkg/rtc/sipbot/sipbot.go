@@ -42,7 +42,10 @@
 // preferred, then PCMU, PCMA), and when both legs settled on opus the
 // relay is a pure passthrough: the codec's own packets cross the SBC
 // byte for byte, with transcoding (G.711 ↔ PCM ↔ opus) only when the
-// two legs differ (see transcode.go).
+// two legs differ (see transcode.go). DTMF crosses too, as RFC 4733
+// telephone-event, WebRTC-leg → SIP-leg: the browser user's key presses
+// reach the SIP network; the reverse direction is deliberately not
+// transported (see dtmf.go).
 package sipbot
 
 import (
@@ -241,8 +244,10 @@ func (s sipStack) open(ctx context.Context, session UserSession, onInbound func(
 		}),
 		// The offer's preference order: opus first — when the far end
 		// takes it, the relay is a passthrough; the G.711 twins are the
-		// transcoding fallbacks. telephone-event rides along for the
-		// PBXs that insist on negotiating it; the relay drops it.
+		// transcoding fallbacks. telephone-event rides along always —
+		// the browser user's key presses cross to the SIP network on it
+		// (call.go's DTMF relay); inbound answers echo it only when the
+		// caller's offer announced it (diago's negotiation intersects).
 		diago.WithMediaConfig(diago.MediaConfig{
 			Codecs: []media.Codec{
 				codecAudioOpusStereo,

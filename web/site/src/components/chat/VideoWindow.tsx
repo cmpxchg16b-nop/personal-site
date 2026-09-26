@@ -3,14 +3,13 @@
 // VideoWindow is one floating video view of a video call — the peer's
 // camera, or our own — scoped to the chat app (not to the open
 // conversation), like the incoming-call window: it stays visible while
-// the user wanders the chat. A borderless card: the video fills it,
-// captioned with the peer's name (the peer view) or "me" (our own
-// preview, mirrored like a mirror). The whole card is draggable.
+// the user wanders the chat. A borderless FloatingCard: the video fills
+// it, captioned with the peer's name (the peer view) or "me" (our own
+// preview, mirrored like a mirror).
 
-import { useEffect, useRef, useState } from "react";
-import type { PointerEvent as ReactPointerEvent } from "react";
-import { Box, Paper, Typography } from "@mui/material";
-import DragIndicatorIcon from "@mui/icons-material/DragIndicator";
+import { useEffect, useRef } from "react";
+import { Box } from "@mui/material";
+import { FloatingCard } from "./FloatingCard";
 
 type VideoWindowProps = {
   // The caption strip's text: the peer's name, or "me" for our own.
@@ -35,11 +34,6 @@ export function VideoWindow({
   home,
   width = 280,
 }: VideoWindowProps) {
-  // The drag offset from the window's home position, in pixels.
-  const [offset, setOffset] = useState({ x: 0, y: 0 });
-  const dragRef = useRef<
-    { pointerId: number; fromX: number; fromY: number } | undefined
-  >(undefined);
   const videoRef = useRef<HTMLVideoElement>(null);
 
   useEffect(() => {
@@ -56,61 +50,8 @@ export function VideoWindow({
     };
   }, [stream]);
 
-  const onDragStart = (e: ReactPointerEvent<HTMLElement>) => {
-    dragRef.current = {
-      pointerId: e.pointerId,
-      fromX: e.clientX - offset.x,
-      fromY: e.clientY - offset.y,
-    };
-    e.currentTarget.setPointerCapture(e.pointerId);
-  };
-  const onDragMove = (e: ReactPointerEvent<HTMLElement>) => {
-    const drag = dragRef.current;
-    if (drag === undefined || drag.pointerId !== e.pointerId) return;
-    setOffset({ x: e.clientX - drag.fromX, y: e.clientY - drag.fromY });
-  };
-  const onDragEnd = (e: ReactPointerEvent<HTMLElement>) => {
-    if (dragRef.current?.pointerId !== e.pointerId) return;
-    dragRef.current = undefined;
-    e.currentTarget.releasePointerCapture(e.pointerId);
-  };
-
   return (
-    <Paper
-      elevation={8}
-      onPointerDown={onDragStart}
-      onPointerMove={onDragMove}
-      onPointerUp={onDragEnd}
-      onPointerCancel={onDragEnd}
-      sx={{
-        position: "fixed",
-        ...home,
-        zIndex: (theme) => theme.zIndex.modal,
-        width,
-        borderRadius: 2,
-        overflow: "hidden",
-        transform: `translate(${offset.x}px, ${offset.y}px)`,
-        cursor: "grab",
-        touchAction: "none",
-      }}
-    >
-      {/* The caption strip: the peer's name, or "me" for our own. */}
-      <Box
-        sx={{
-          display: "flex",
-          alignItems: "center",
-          gap: 0.5,
-          px: 1,
-          py: 0.25,
-          bgcolor: "action.hover",
-          color: "text.secondary",
-        }}
-      >
-        <DragIndicatorIcon fontSize="small" />
-        <Typography variant="caption" noWrap sx={{ fontWeight: 600 }}>
-          {title}
-        </Typography>
-      </Box>
+    <FloatingCard title={title} home={home} width={width}>
       <Box
         component="video"
         ref={videoRef}
@@ -124,6 +65,6 @@ export function VideoWindow({
           transform: mirrored ? "scaleX(-1)" : undefined,
         }}
       />
-    </Paper>
+    </FloatingCard>
   );
 }

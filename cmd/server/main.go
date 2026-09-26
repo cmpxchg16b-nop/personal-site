@@ -441,7 +441,7 @@ func startMusicBot(ctx context.Context, cfg *pkgmodelsserverconfig.MusicBotXML, 
 		}
 		sources = append(sources, src)
 	}
-	return startBotClient(ctx, "music bot", &cfg.BotClientXML, stereoOpusPCFactory(pkgapiiceservers.ParseURLs(cfg.IceServers)), func(client *rtc.HeadlessRTCClient) {
+	return startBotClient(ctx, "music bot", &cfg.BotClientXML, stereoOpusPCFactory(pkgapiiceservers.ParseURLs(cfg.IceServers), false), func(client *rtc.HeadlessRTCClient) {
 		musicbot.New(client, musicbot.Configuration{Logger: logger, AudioSources: sources})
 	})
 }
@@ -470,7 +470,7 @@ func startSipBot(ctx context.Context, cfg *pkgmodelsserverconfig.SipBotXML) erro
 	if err != nil {
 		return err
 	}
-	return startBotClient(ctx, "sip bot", &cfg.BotClientXML, stereoOpusPCFactory(pkgapiiceservers.ParseURLs(cfg.IceServers)), func(client *rtc.HeadlessRTCClient) {
+	return startBotClient(ctx, "sip bot", &cfg.BotClientXML, stereoOpusPCFactory(pkgapiiceservers.ParseURLs(cfg.IceServers), true), func(client *rtc.HeadlessRTCClient) {
 		sipbot.New(client, sipbot.NewOnMemoryUserSessionStorage(), pool, sipbot.Configuration{Logger: logger, TestSIPContact: cfg.TestSIPContact, YellowPage: yellowPageOf(cfg.YellowPage), IPPreference: ipPreference, UpstreamDNSResolver: cfg.UpstreamDNSResolver})
 	})
 }
@@ -523,8 +523,12 @@ func yellowPageOf(x *pkgmodelsserverconfig.YellowPageXML) []sipbot.YellowPageSec
 // offer carries it and every browser answers it, so the song keeps its
 // channels. The music bot declines video calls, yet the default video
 // codecs stay registered so a video m-line the peer proposes still
-// negotiates instead of being rejected out of hand.
-func stereoOpusPCFactory(iceServers []string) func(polite bool) (*webrtc.PeerConnection, error) {
+// negotiates instead of being rejected out of hand. dtmf says whether
+// telephone-event (RFC 4733) joins the audio codecs — the sip bot takes
+// it (its calls face IVRs the user drives with a dial pad), the music
+// bot does not (a music line has no use for one, and a browser seeing
+// the capability would offer the pad).
+func stereoOpusPCFactory(iceServers []string, dtmf bool) func(polite bool) (*webrtc.PeerConnection, error) {
 	return func(polite bool) (*webrtc.PeerConnection, error) {
 		m := &webrtc.MediaEngine{}
 		// The audio defaults, opus upgraded to stereo; the video defaults
@@ -538,6 +542,9 @@ func stereoOpusPCFactory(iceServers []string) func(polite bool) (*webrtc.PeerCon
 			{RTPCodecCapability: webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeG722, ClockRate: 8000}, PayloadType: 9},
 			{RTPCodecCapability: webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypePCMU, ClockRate: 8000}, PayloadType: 0},
 			{RTPCodecCapability: webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypePCMA, ClockRate: 8000}, PayloadType: 8},
+		}
+		if dtmf {
+			audio = append(audio, rtc.TelephoneEventCodec)
 		}
 		for _, c := range audio {
 			if err := m.RegisterCodec(c, webrtc.RTPCodecTypeAudio); err != nil {

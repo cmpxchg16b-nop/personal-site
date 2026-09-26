@@ -28,9 +28,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/emiago/diago/media"
 	"github.com/emiago/sipgo"
 	"github.com/emiago/sipgo/sip"
 	"github.com/google/uuid"
+	"github.com/pion/interceptor"
 	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v4"
 	pionmedia "github.com/pion/webrtc/v4/pkg/media"
@@ -642,6 +644,7 @@ type fakePBX struct {
 	byes          int
 	rtpReceived   int
 	rtpPayloads   [][]byte
+	rtpPTs        []uint8 // the payload type each recorded payload arrived with
 
 	dialogs    chan *sipgo.DialogServerSession // established dialogs (after ACK)
 	rtpStart   chan struct{}                   // closed when the first dialog's media is up
@@ -888,6 +891,7 @@ func newFakePBXOnPort(t *testing.T, ip string, port int, answerCode int, opus bo
 			f.mu.Lock()
 			f.rtpReceived++
 			f.rtpPayloads = append(f.rtpPayloads, slices.Clone(pkt.Payload))
+			f.rtpPTs = append(f.rtpPTs, pkt.PayloadType)
 			f.mu.Unlock()
 		}
 	}()
@@ -1262,6 +1266,34 @@ func (f *fakePBX) waitRTP(t *testing.T, n int) [][]byte {
 	return slices.Clone(f.rtpPayloads)
 }
 
+// waitDTMF waits until the fake received one full RFC 4733 series for
+// the event and NOTHING beyond it: diago's writer emits a fixed 7-packet
+// encoding (4 start updates, then the END three times) per WriteDTMF, so
+// the exact counts prove the press crossed exactly once — the browser
+// side's own END retransmissions having been deduped to one emission
+// (three series would mean 9 ENDs).
+func (f *fakePBX) waitDTMF(t *testing.T, code uint8) {
+	t.Helper()
+	f.waitForPBX(t, fmt.Sprintf("the DTMF series for event %d", code), func() bool {
+		starts, ends := 0, 0
+		for i, pt := range f.rtpPTs {
+			if pt != media.CodecTelephoneEvent8000.PayloadType {
+				continue
+			}
+			ev, ok := parseDTMFEvent(f.rtpPayloads[i])
+			if !ok || ev.code != code {
+				continue
+			}
+			if ev.end {
+				ends++
+			} else {
+				starts++
+			}
+		}
+		return starts == 4 && ends == 3
+	})
+}
+
 // waitForPBX waits for a recorded-fact predicate on the PBX.
 func (f *fakePBX) waitForPBX(t *testing.T, what string, pred func() bool) {
 	t.Helper()
@@ -1625,6 +1657,267 @@ func TestSipBotCallEndToEnd(t *testing.T) {
 	waitBotMessage(t, probe, botId, "the bot's BYE", isSipRequest(callId, "BYE"))
 	waitBotMessage(t, probe, botId, "the callee-hung-up line", isChatReply(callMsg, "Callee hung up."))
 	waitBotMessage(t, probe, botId, "the ended amend", isCallStatusAmend(inviteMsgId, callId, "ended"))
+}
+
+// dtmfInjector is the DTMF test's probe-side interceptor, turning
+// crafted mic payloads into telephone-event packets on the wire. pion's
+// track API rewrites every outgoing packet's PT to the bound codec's, so
+// a track cannot emit telephone-event (docs/webrtc-sip-dtmf-
+// consideration.md's note on the pion gap) — the rewrite happens below
+// the track, on the packet's way out: a payload of
+// [0xEE, event, flags, durHi, durLo] leaves with the negotiated
+// telephone-event PT and the magic byte stripped, every other payload
+// passes untouched. pt is the wire's telephone-event PT, armed once the
+// call's media is up.
+type dtmfInjector struct {
+	interceptor.NoOp
+	pt atomic.Int32
+}
+
+// BindLocalStream wraps each local stream's writer with the rewrite.
+func (i *dtmfInjector) BindLocalStream(_ *interceptor.StreamInfo, writer interceptor.RTPWriter) interceptor.RTPWriter {
+	return interceptor.RTPWriterFunc(func(header *rtp.Header, payload []byte, attributes interceptor.Attributes) (int, error) {
+		if pt := i.pt.Load(); pt >= 0 && len(payload) == 5 && payload[0] == 0xEE {
+			header.PayloadType = uint8(pt)
+			return writer.Write(header, payload[1:], attributes)
+		}
+		return writer.Write(header, payload, attributes)
+	})
+}
+
+// interceptorFactory adapts a function to interceptor.Factory, the
+// registry's currency.
+type interceptorFactory func(id string) (interceptor.Interceptor, error)
+
+// NewInterceptor implements interceptor.Factory.
+func (f interceptorFactory) NewInterceptor(id string) (interceptor.Interceptor, error) {
+	return f(id)
+}
+
+// dtmfProbePCFactory builds the DTMF test probe's peer-connection
+// factory: the client's default (whose media engine already registers
+// telephone-event, mirroring the browser) plus the injector.
+func dtmfProbePCFactory(inj *dtmfInjector) func(polite bool) (*webrtc.PeerConnection, error) {
+	return func(polite bool) (*webrtc.PeerConnection, error) {
+		m := &webrtc.MediaEngine{}
+		if err := m.RegisterDefaultCodecs(); err != nil {
+			return nil, err
+		}
+		if err := m.RegisterCodec(rtc.TelephoneEventCodec, webrtc.RTPCodecTypeAudio); err != nil {
+			return nil, err
+		}
+		ir := &interceptor.Registry{}
+		if err := webrtc.RegisterDefaultInterceptors(m, ir); err != nil {
+			return nil, err
+		}
+		ir.Add(interceptorFactory(func(string) (interceptor.Interceptor, error) { return inj, nil }))
+		// The answering DTLS role follows the session's politeness — the
+		// default factory's discipline (pkg/rtc/client.go).
+		settingEngine := webrtc.SettingEngine{}
+		role := webrtc.DTLSRoleClient
+		if polite {
+			role = webrtc.DTLSRoleServer
+		}
+		if err := settingEngine.SetAnsweringDTLSRole(role); err != nil {
+			return nil, err
+		}
+		return webrtc.NewAPI(
+			webrtc.WithMediaEngine(m),
+			webrtc.WithSettingEngine(settingEngine),
+			webrtc.WithInterceptorRegistry(ir),
+		).NewPeerConnection(webrtc.Configuration{})
+	}
+}
+
+// TestSipBotCallDTMF covers the pad's data plane end to end: the
+// browser's key presses — RFC 4733 telephone-event packets sharing the
+// mic's own RTP stream — cross the SBC and reach the SIP callee as
+// diago's event series, while the audio keeps flowing. The probe emits
+// the events through the injector (the track API cannot); the fake PBX,
+// whose SDP answer offers telephone-event as PBXs do, records the wire.
+// The signalling rides along: the bot's INVITE offer must announce
+// telephone-event, and the probe learning its PT proves the webrtc-leg
+// negotiated it.
+func TestSipBotCallDTMF(t *testing.T) {
+	net := newClientTestNet(t, ss.DefaultSubscriberAging)
+	bot := startBot(t, net, "bot", "2-bot", "", nil)
+	inj := &dtmfInjector{}
+	inj.pt.Store(-1)
+	user, stop := startClient(t, net, "user", func(c *rtc.RTCClientConfiguration) {
+		c.SubscriberId = "1-user"
+		c.NewPeerConnection = dtmfProbePCFactory(inj)
+	})
+	defer stop()
+	probe := newWireProbe()
+	probe.register(t, user)
+	botId, userId := pairUp(t, bot, user)
+	pbx := newFakePBX(t, 200, true)
+
+	dc := probe.waitDC(t, botId, msg_handler.DataChannelLabelMessages)
+	chat := func(text string) ss.MsgId {
+		t.Helper()
+		m := baseMsg(ss.WellKnownChIdMain, userId, botId)
+		m["plaintext"] = text
+		if err := dc.SendText(mustJSON(t, m)); err != nil {
+			t.Fatalf("SendText: %v", err)
+		}
+		return ss.MsgId(m["msgId"].(string))
+	}
+	sip := func(body map[string]any) {
+		t.Helper()
+		m := baseMsg(ss.WellKnownChIdMain, userId, botId)
+		m["mimeType"] = wireMimeSip
+		m["sip"] = body
+		if err := dc.SendText(mustJSON(t, m)); err != nil {
+			t.Fatalf("SendText: %v", err)
+		}
+	}
+
+	registerMsg := chat("/register 2001@" + pbx.addr + " passW_0rd")
+	waitBotMessage(t, probe, botId, "the registered reply", isChatReply(registerMsg, "Registered as"))
+
+	callMsg := chat("/call 1001@" + pbx.addr)
+	invite := waitBotMessage(t, probe, botId, "the bot's INVITE", func(m *rawMsg) bool {
+		return isSipInvite(m) && m.sip.XMedia == "voice" && m.sip.XCallStatus == "inviting"
+	})
+	callId := invite.sip.CallId
+	pbx.waitForPBX(t, "the callee's INVITE", func() bool { return pbx.invites == 1 })
+	// The sip-leg's offer always announces telephone-event — the pad's
+	// capability declaration toward the SIP network.
+	pbx.mu.Lock()
+	offer := pbx.inviteSDP
+	pbx.mu.Unlock()
+	if !strings.Contains(offer, "a=rtpmap:101 telephone-event/8000") {
+		t.Fatalf("the INVITE's SDP offer carries no telephone-event:\n%s", offer)
+	}
+	dialog := pbx.waitDialog(t)
+
+	// The user picks up: mic first (a TrackLocalStaticRTP this time —
+	// WriteRTP's header control is what the press series' shared
+	// timestamps need), the 200 OK once the mic's renegotiation settled.
+	micTrack, err := webrtc.NewTrackLocalStaticRTP(
+		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus, ClockRate: 48000, Channels: 2}, "mic", "probe")
+	if err != nil {
+		t.Fatalf("the mic track: %v", err)
+	}
+	if _, err := user.AddTrack(botId, micTrack); err != nil {
+		t.Fatalf("attach the mic: %v", err)
+	}
+	time.Sleep(300 * time.Millisecond)
+	sip(map[string]any{"callId": callId, "response": map[string]any{"code": 200, "phrase": "OK"}})
+	waitBotMessage(t, probe, botId, "the callee-answered line", isChatReply(callMsg, "Callee answered."))
+
+	// Arm the injector: the wire's telephone-event PT is the bot's
+	// registered one — the bot offers the webrtc-leg's media, so its
+	// MediaEngine's PT is what both directions carry (the answer echoes
+	// the offer). The bot accepting the injector's packets at all is the
+	// webrtc-leg negotiation's proof.
+	inj.pt.Store(int32(rtc.TelephoneEventCodec.PayloadType))
+
+	// The mic's stream, sequenced by hand: audio packets and key presses
+	// share one SSRC, one sequence space, one clock.
+	seq := uint16(1)
+	ts := uint32(1000)
+	emitAudio := func(payload []byte) {
+		t.Helper()
+		pkt := &rtp.Packet{
+			Header:  rtp.Header{Version: 2, PayloadType: 96, SequenceNumber: seq, Timestamp: ts, SSRC: 0xD17F},
+			Payload: payload,
+		}
+		seq++
+		ts += 960 // 20 ms at 48 kHz
+		if err := micTrack.WriteRTP(pkt); err != nil {
+			t.Fatalf("the audio packet: %v", err)
+		}
+	}
+	// press emits one key press, the browser's insertDTMF shape: a start
+	// packet, then the END retransmitted three times — every packet of
+	// the press sharing the event's start timestamp (RFC 4733).
+	press := func(event uint8) {
+		t.Helper()
+		start := ts
+		emit := func(end bool, duration uint16) {
+			t.Helper()
+			flags := uint8(10) // volume 10
+			if end {
+				flags |= 0x80
+			}
+			pkt := &rtp.Packet{
+				Header:  rtp.Header{Version: 2, SequenceNumber: seq, Timestamp: start, SSRC: 0xD17F},
+				Payload: []byte{0xEE, event, flags, byte(duration >> 8), byte(duration)},
+			}
+			seq++
+			if err := micTrack.WriteRTP(pkt); err != nil {
+				t.Fatalf("the DTMF packet: %v", err)
+			}
+		}
+		emit(false, 400)
+		emit(true, 800)
+		emit(true, 800)
+		emit(true, 800)
+		ts += 4800 // the 100 ms tone went by (800 units at 8 kHz)
+	}
+
+	// The audio flows before, through, and after the presses.
+	voice := opusVoice(4)
+	for _, p := range voice {
+		emitAudio(p)
+	}
+	pbx.waitRTP(t, 1)
+	press(5) // "5"
+	pbx.waitDTMF(t, 5)
+	press(11) // "#"
+	pbx.waitDTMF(t, 11)
+	for _, p := range voice {
+		emitAudio(p)
+	}
+	// …and the post-press audio reaches the callee too (the pad never
+	// wedged the pump).
+	heard := map[string]bool{}
+	deadline := time.Now().Add(testTimeout)
+	for len(heard) < len(voice) {
+		for _, got := range pbx.waitRTP(t, 1) {
+			heard[string(got)] = true
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the callee heard %d of the %d distinct mic packets after the presses", len(heard), len(voice))
+		}
+	}
+
+	// Settle, then the exact wire totals: each press crossed exactly
+	// once — diago's 7-packet series — the browser side's retransmitted
+	// ENDs deduped (a duplicate emission would read as 14 telephone-
+	// event packets per press, not 7).
+	time.Sleep(300 * time.Millisecond)
+	pbx.mu.Lock()
+	total := 0
+	perCode := map[uint8][2]int{} // code → [starts, ends]
+	for i, pt := range pbx.rtpPTs {
+		if pt != media.CodecTelephoneEvent8000.PayloadType {
+			continue
+		}
+		ev, ok := parseDTMFEvent(pbx.rtpPayloads[i])
+		if !ok {
+			continue
+		}
+		total++
+		counts := perCode[ev.code]
+		if ev.end {
+			counts[1]++
+		} else {
+			counts[0]++
+		}
+		perCode[ev.code] = counts
+	}
+	pbx.mu.Unlock()
+	if total != 14 || perCode[5] != [2]int{4, 3} || perCode[11] != [2]int{4, 3} {
+		t.Fatalf("the DTMF wire totals: %d packets, per-code %v (want 14, 5: [4 3], 11: [4 3])", total, perCode)
+	}
+
+	if err := dialog.Bye(context.Background()); err != nil {
+		t.Fatalf("the callee's BYE: %v", err)
+	}
+	waitBotMessage(t, probe, botId, "the callee-hung-up line", isChatReply(callMsg, "Callee hung up."))
 }
 
 // TestSipBotCallBusy covers the callee's refusal while the browser leg

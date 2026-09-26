@@ -14,6 +14,8 @@ import ChatSidebar from "./ChatSidebar";
 import ConversationView from "./ConversationView";
 import { IncomingCallWindow } from "./IncomingCallWindow";
 import { VideoWindow } from "./VideoWindow";
+import { DialPad } from "./DialPad";
+import type { DialerHandle } from "./useCallMedia";
 import {
   conversationKey,
   type ActivePhoneCall,
@@ -99,6 +101,9 @@ type ChatAppProps = {
     channelId: ChannelId,
     peer: SubscriberId,
   ) => MediaStream | null;
+  // One pair's DTMF dialer while its call negotiated telephone-event
+  // (see useCallMedia): the dial pad's existence test.
+  dtmfFor: (channelId: ChannelId, peer: SubscriberId) => DialerHandle | null;
 };
 
 export default function ChatApp({
@@ -123,9 +128,14 @@ export default function ChatApp({
   remoteAnalyserFor,
   localCamera,
   remoteVideoFor,
+  dtmfFor,
 }: ChatAppProps) {
   const { t } = useTranslation();
   const [mobileListOpen, setMobileListOpen] = useState(false);
+  // The dial pad's visibility — viewport chrome like mobileListOpen:
+  // the pad EXISTS while the open conversation's call negotiated DTMF
+  // (activeDialer below), and SHOWS on the user's toggle.
+  const [dialPadOpen, setDialPadOpen] = useState(false);
 
   const conversation: Conversation | null =
     selected === null
@@ -160,6 +170,14 @@ export default function ChatApp({
   const videoCalls = Object.values(calls).filter(
     (call) => call.status === "accepted" && call.kind === "video",
   );
+
+  // The open conversation's DTMF dialer: the call must be accepted (the
+  // mic's sender only exists then) and telephone-event negotiated. Null
+  // hides both the composer's toggle and the pad itself.
+  const activeDialer =
+    selected === null || activeCall?.status !== "accepted"
+      ? null
+      : dtmfFor(selected.channelId, selected.userId);
 
   const handleSelect = (ref: ConversationRef) => {
     onSelect(ref);
@@ -215,6 +233,14 @@ export default function ChatApp({
               ? null
               : remoteAnalyserFor(selected.channelId, selected.userId)
           }
+          dialPad={
+            activeDialer === null
+              ? undefined
+              : {
+                  open: dialPadOpen,
+                  onToggle: () => setDialPadOpen((open) => !open),
+                }
+          }
           onBack={() => setMobileListOpen(true)}
           sx={{ display: { xs: mobileListOpen ? "none" : "flex", sm: "flex" } }}
         />
@@ -254,6 +280,15 @@ export default function ChatApp({
           />
         );
       })}
+      {/* The dial pad: the open conversation's in-call keypad, floated
+          like the video windows while the user keeps it open. */}
+      {dialPadOpen && activeDialer !== null && (
+        <DialPad
+          home={{ bottom: 120, left: 48 }}
+          onDigit={activeDialer.insert}
+          onClose={() => setDialPadOpen(false)}
+        />
+      )}
     </>
   );
 }

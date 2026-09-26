@@ -73,8 +73,9 @@ graph TD
   account's owner and rings their browser (§7.2). The codec toward the
   SIP network is **whatever the SDP negotiation settles on**; the bot
   offers, in preference order, **opus, PCMU, PCMA** (plus
-  telephone-event, which the media relay ignores — see §11), in both
-  directions. The opus it offers — and answers with — announces
+  telephone-event — the browser user's key presses cross to the SIP
+  network on it, §8), in both directions. The opus it offers — and
+  answers with — announces
   `a=fmtp:96 useinbandfec=1;stereo=1`: in-band FEC and the RFC 7587
   stereo receive preference, the webrtc-leg's stereo negotiation
   mirrored onto the SIP side (§8).
@@ -382,6 +383,13 @@ The reverse-propagation cases:
 Mid-call `/call` (a second one) is refused while a call stands; `/play`-style
 switching has no meaning here.
 
+DTMF rides the signalling from the start: the webrtc-leg's media
+renegotiation always negotiates RFC 4733 telephone-event (the bot's
+peer-connection factory registers it — every browser offers and accepts
+it), and the outbound INVITE's SDP offer always announces it toward the
+SIP network, so the browser's dial pad reaches an IVR the moment the
+call is up (§8).
+
 ### Inbound — a SIP subscriber phones the user
 
 The reverse direction: someone on the SIP network dials the AOR a user
@@ -447,6 +455,13 @@ discovered in its (and sipgo's) source, on which the flow rests:
   its just-answered dialog BYEd by the answerer itself).
 - The relay and the codec matrix are direction-blind (§8): the dialog's
   payload reader/writer is the DialogMedia both session types embed.
+
+DTMF's signalling is the mirror of the outbound flow's: the 200 OK's
+SDP answer echoes telephone-event exactly when the caller's offer
+announced it (diago's negotiation intersects the account's codec list),
+and the webrtc-leg negotiates it unconditionally — the capability
+travels from the SIP network through the bot to the browser's dial pad
+(§8).
 
 Inbound calls are to a **registered** identity: the INVITE arrives on
 the account's socket, so the account exists by construction. A pooled
@@ -515,6 +530,29 @@ Transcoding specifics:
 - **Timing tolerance**: read loops treat a read error as end-of-call
   media (the leg is gone) and stop the call; write errors on an unbound
   webrtc track are the music bot's benign "empty room".
+
+**DTMF (RFC 4733 telephone-event)** crosses the SBC **WebRTC-leg →
+SIP-leg only**. On the read side the events need no track of their own:
+they share the mic's SSRC and surface in the browser→SIP pump's own
+read stream, dispatched by payload type — the webrtc-leg's negotiated
+telephone-event PT, learned from the mic's `RTPReceiver` at track
+arrival, never hardcoded (dtmf.go). The 4-byte event payloads are
+parsed by hand (pion has no DTMF API), the END packet's three
+retransmissions are deduped on the event's start timestamp, and each
+fresh digit queues onto a small channel — a flooded pad drops digits,
+it never stalls the audio pump. On the write side the sip-leg speaks
+diago's own DTMF writer (`WithAudioWriterDTMF`): a dedicated goroutine
+drains the channel into `WriteDTMF`, which injects its fixed 7-packet
+series (start updates + the thrice-repeated END, PT 101, the PT the
+sip-leg negotiated) onto the dialog's RTP stream under the audio
+writer's own lock — diago's interleaving discipline, the ≈140 ms per
+digit of paused audio being the price of one shared stream. The reverse
+direction is deliberately not transported: payloads arriving on the
+sip-leg whose PT is not the negotiated audio codec's are dropped before
+the bridge, never transcoded — SIP-side DTMF never reaches the browser.
+The asymmetry is a product decision, not an oversight: the WebRTC-side
+users are end users who press keys, the SIP-side ones are IVRs and
+enterprise phones that consume them.
 
 **cgo gating**: a pure-Go build plays opus↔opus calls (passthrough needs
 no codec) and refuses a call whose sip-leg negotiated G.711, with the
@@ -739,9 +777,19 @@ where a choice had to be made:
    `EarlyMediaDetect` + `WaitAnswer` can carry 183 ringback later — the
    relay's "empty room" discipline already tolerates media before the
    browser answers, so the follow-up is local to the dial path.
-6. **No DTMF**: telephone-event is negotiated (PBXs offer it) but the
-   relay drops it; IVR menus are unreachable in v1. diago's
-   `DTMFReader`/`DTMFWriter` are the follow-up hooks.
+6. **DTMF crosses WebRTC-leg → SIP-leg only** (§8): the browser user's
+   key presses reach the SIP network as RFC 4733 telephone-event; events
+   arriving from the SIP side are dropped at the relay, never
+   transcoded, never shown. The edges this leaves: a press whose END
+   packets are all lost is lost with them (the parser acts on ENDs and
+   runs no stuck-key timeout); a call whose sip-leg did not negotiate
+   telephone-event still emits the digits (diago's writer is
+   unconditional) into a session that never agreed to them — the peer
+   drops the unknown PT; and the webrtc-leg negotiates telephone-event
+   unconditionally, so the browser's dial pad can exist on a call with
+   no DTMF consumer at the far end — the linphone model's accepted
+   false positive (docs/webrtc-sip-dtmf-consideration.md: capability
+   decides the pad's existence, the user its visibility).
 7. **ptime assumption on the sip-leg writer**: writes are whole 20 ms
    frames (the accumulator guarantees them), matching diago's clock;
    the SDP advertises no exotic ptime. Opus passthrough timestamps come
@@ -887,6 +935,7 @@ where a choice had to be made:
 | `inbound.go`                 | the inbound call: the account socket's INVITE → the browser's ring → the 200 OK relay-arming; the ring timeout, the dialog watcher, the UAS-side termination verbs                                    |
 | `account.go`                 | per-user SIP account runtime: the registration's lifecycle (REGISTER at birth, de-REGISTER at the end — no expiry, no refresh), the diago `Invite` dial path, and the inbound-INVITE routing callback |
 | `call.go`                    | per-call state + the relay: the two pump goroutines, the `sipLeg` interface over both dialog types, track/dialog wiring, teardown                                                                     |
+| `dtmf.go`                    | the relay's DTMF vocabulary: the RFC 4733 event payload's parse and digit mapping, the negotiated telephone-event PT's discovery, the END retransmissions' deduper                                    |
 | `transcode.go`               | the codec matrix: passthrough, G.711↔PCM↔opus paths, resamplers, the sample accumulator, opus TOC durations                                                                                           |
 | `opus_codec.go` / `_stub.go` | libopus encode+decode behind the `cgo` tag; the pure-Go stub fails G.711-leg calls with the explanatory error                                                                                         |
 
@@ -939,7 +988,14 @@ the REGISTER, the INVITE, and the de-REGISTER must arrive at the
 preferred family's PBX alone. Both end-to-end call tests assert the
 sip-leg's SDP shape: the outbound INVITE's offer and the inbound
 call's 200 OK answer must carry `a=rtpmap:96 opus/48000/2` and
-`a=fmtp:96 useinbandfec=1;stereo=1` verbatim. Two harness disciplines keep
+`a=fmtp:96 useinbandfec=1;stereo=1` verbatim. DTMF adds its own
+end-to-end test: the probe emits RFC 4733 event packets sharing the
+mic's SSRC through a PT-rewriting interceptor (pion's track API cannot
+write a foreign PT), and the fake PBX — whose SDP offers
+telephone-event, as PBXs do — must record each press's full 7-packet
+series exactly once (the browser side's retransmitted ENDs deduped)
+while the audio keeps flowing; the outbound INVITE's offer must
+announce telephone-event. Two harness disciplines keep
 the suite's flakes diagnosable and its teardown clean: a message wait
 that times out dumps everything the probe recorded (a bot failure reply
 the predicate did not expect is visible without a rerun), and the
