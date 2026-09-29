@@ -11,9 +11,11 @@ package sipbot
 //   - attachments are refused with a chat reply,
 //   - an incoming call from the browser is declined (a browser-
 //     originated call to the bot has no SIP routing target),
-//   - /call opens both legs of a B2BUA: it phones the user on the
-//     webrtc-leg (the bot's own INVITE over dcmsg) and phones the callee
-//     on the sip-leg (a diago INVITE), then relays the two legs'
+//   - /call opens both legs of a B2BUA: it phones the callee on the
+//     sip-leg (a diago INVITE), and once the callee answered — the
+//     answer's codec selection in hand — phones the user on the
+//     webrtc-leg (the bot's own INVITE over dcmsg, the speaker track's
+//     offer pinned to the selection), then relays the two legs'
 //     signalling and media (see call.go),
 //   - an inbound SIP call to the user's registered AOR does the same in
 //     reverse: it rings the user's browser (see inbound.go).
@@ -40,6 +42,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/emiago/diago"
 	"github.com/pion/webrtc/v4"
 
 	"personal-site/pkg/models/ss"
@@ -76,18 +79,6 @@ const (
 // two offers never meet in flight as a glare the polite yield would
 // answer with a peer-connection rebuild a browser cannot survive.
 const hangupDetachDelay = 500 * time.Millisecond
-
-// voiceTrackCodec carries the webrtc-leg's audio: opus 48 kHz. The fmtp
-// mirrors the server-side peer connections' (cmd/server's
-// stereoOpusPCFactory): stereo=1 keeps a stereo opus source audible in
-// stereo through the passthrough; the transcoded voice path simply
-// encodes mono packets, which are valid RFC 7587 on it.
-var voiceTrackCodec = webrtc.RTPCodecCapability{
-	MimeType:    webrtc.MimeTypeOpus,
-	ClockRate:   48000,
-	Channels:    2,
-	SDPFmtpLine: "minptime=10;useinbandfec=1;stereo=1",
-}
 
 // sipHandler is the sip bot's msg_handler.BotMessageHandler.
 type sipHandler struct {
@@ -271,9 +262,9 @@ func (h *sipHandler) loanPooledAccount(ctx context.Context, peer ss.SubscriberId
 func (h *sipHandler) HandlePeerSessionEnd(_ context.Context, peer ss.SubscriberId) {
 	if v, ok := h.calls.Load(peer); ok {
 		c := v.(*peerCall)
-		if dialog, _, ok := c.end(); ok {
+		if e, ok := c.end(); ok {
 			h.calls.CompareAndDelete(peer, c)
-			h.hangupDialog(dialog)
+			h.hangupDialog(e.dialog)
 			h.logger.Info("sipbot: the session's end ended the call", "peer", peer, "callId", c.callId)
 		}
 	}
@@ -303,8 +294,10 @@ func (h *sipHandler) handleInvite(sip *msg_handler.SipMessage, w msg_handler.Res
 }
 
 // handleResponse folds the browser's answer to the bot's INVITE: on 200
-// OK the call's opus track goes on the wire; on a decline the call —
-// the sip-leg's dial included — is dropped.
+// OK the call activates (its track went on the wire at ring time — the
+// defensive re-attach is a no-op); on a decline the call is dropped —
+// outbound the already-answered callee gets the BYE, inbound the caller
+// the mirrored 603.
 func (h *sipHandler) handleResponse(sip *msg_handler.SipMessage, w msg_handler.ResponseWriter) {
 	peer := sip.From
 	v, ok := h.calls.Load(peer)
@@ -312,29 +305,29 @@ func (h *sipHandler) handleResponse(sip *msg_handler.SipMessage, w msg_handler.R
 		return // an answer to a call the bot never opened (or already ended)
 	}
 	c := v.(*peerCall)
-	if c.callId != sip.CallId {
+	if c.callIdSnapshot() != sip.CallId {
 		return
 	}
 	if sip.Response.Code == msg_handler.SipCodeOK {
 		if !c.activate() {
 			return // a duplicate answer, or the call already ended
 		}
-		if err := w.AttachMedia(c.track); err != nil {
+		if err := c.attachPinned(); err != nil && !errors.Is(err, errCallEnded) {
 			// The call stands answered but carries no media toward the
 			// browser; the peer can still hang up, which resets the state
 			// (the music bot's failure shape).
 			h.logger.Warn("sipbot: attach on accepted call failed", "peer", peer, "err", err)
-			return
 		}
-		h.logger.Info("sipbot: the browser answered; the track is on the wire", "peer", peer, "callId", c.callId)
+		h.logger.Info("sipbot: the browser answered", "peer", peer, "callId", c.callId)
 		if c.inbound {
-			// The SIP caller gets his 200 OK now: Answer builds the media
-			// session and awaits the ACK, so it runs on its own goroutine.
+			// The SIP caller gets his 200 OK now: AnswerOptions builds the
+			// media session and awaits the ACK, so it runs on its own
+			// goroutine.
 			go h.answerInbound(peer, c)
 		}
 		return
 	}
-	dialog, _, ok := c.end()
+	e, ok := c.end()
 	if !ok {
 		return
 	}
@@ -344,7 +337,10 @@ func (h *sipHandler) handleResponse(sip *msg_handler.SipMessage, w msg_handler.R
 		// webrtc-leg's vocabulary (a generic termination would be a 480).
 		h.declineInbound(c.serverDialog)
 	} else {
-		h.hangupDialog(dialog)
+		h.hangupDialog(e.dialog)
+	}
+	if e.attached {
+		h.detachLater(context.Background(), e.track, c.w)
 	}
 	h.logger.Info("sipbot: call declined by the user", "peer", peer, "callId", c.callId)
 	h.sayp(c, "Call declined.")
@@ -360,17 +356,17 @@ func (h *sipHandler) handleHangup(ctx context.Context, sip *msg_handler.SipMessa
 		return
 	}
 	c := v.(*peerCall)
-	if c.callId != sip.CallId {
+	if c.callIdSnapshot() != sip.CallId {
 		return
 	}
-	dialog, phase, ok := c.end()
+	e, ok := c.end()
 	if !ok {
 		return
 	}
 	h.calls.CompareAndDelete(peer, c)
-	h.hangupDialog(dialog)
-	if phase == phaseActive {
-		h.detachLater(ctx, c)
+	h.hangupDialog(e.dialog)
+	if e.attached {
+		h.detachLater(ctx, e.track, c.w)
 	}
 	h.logger.Info("sipbot: call ended by the user", "peer", peer, "callId", c.callId)
 }
@@ -466,8 +462,9 @@ func (h *sipHandler) myNumber(msg *msg_handler.ChatMessage, w msg_handler.Respon
 }
 
 // call is the /call command: with a registration in place and no call
-// standing, the bot phones the user on the webrtc-leg and the callee on
-// the sip-leg, and joins them.
+// standing, the SIP dial starts at once on its own goroutine — the
+// browser is rung only once the callee answered, with the answer's
+// codec selection (docs/sip-bot.md §7.1) — and the legs are joined.
 func (h *sipHandler) call(ctx context.Context, msg *msg_handler.ChatMessage, w msg_handler.ResponseWriter, args []string) {
 	peer := msg.From
 	if len(args) != 1 {
@@ -488,13 +485,8 @@ func (h *sipHandler) call(ctx context.Context, msg *msg_handler.ChatMessage, w m
 		// which identity the callee sees.
 		h.say(peer, w, fmt.Sprintf("Registered as sip:%s (an account from the bot's pool).", a.session.AddressOfRecord))
 	}
-	track, err := webrtc.NewTrackLocalStaticSample(voiceTrackCodec, "sip-voice", "sipbot")
-	if err != nil {
-		h.say(peer, w, fmt.Sprintf("Could not prepare the call: %v.", err))
-		return
-	}
 	dialCtx, dialCancel := context.WithCancel(ctx)
-	c := &peerCall{target: args[0], track: track, w: w, pendingCancel: dialCancel}
+	c := &peerCall{target: args[0], w: w, pendingCancel: dialCancel}
 	// The store, not the early check above, is the one-call gate: an
 	// inbound ring (its own goroutine) can slip in between the two, so
 	// the check IS the store here — the loser of the race backs out
@@ -504,19 +496,6 @@ func (h *sipHandler) call(ctx context.Context, msg *msg_handler.ChatMessage, w m
 		h.say(peer, w, "Already in a call — /hangup first.")
 		return
 	}
-	// Register for the browser's mic before the INVITE goes out, so no
-	// early track is missed (the music bot's discipline).
-	w.OnTrack(func(remote *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
-		h.onMic(peer, remote, receiver)
-	})
-	callId, err := w.Invite(msg_handler.MediaVoice)
-	if err != nil {
-		h.calls.CompareAndDelete(peer, c)
-		dialCancel()
-		h.say(peer, w, fmt.Sprintf("Could not call you: %v.", err))
-		return
-	}
-	c.callId = callId
 	h.say(peer, w, fmt.Sprintf("Calling %s…", args[0]))
 	// The dial runs on its own goroutine: ringing the PSTN takes
 	// seconds, and the peer's channel goroutine never waits on it. The
@@ -537,8 +516,9 @@ func (h *sipHandler) testCall(ctx context.Context, msg *msg_handler.ChatMessage,
 }
 
 // hangup is the /hangup command: the call's user-side end from chat —
-// the browser leg is told (CANCEL while it rings, BYE once answered),
-// the sip-leg's dialog goes down.
+// the browser leg is told (CANCEL while it rings, BYE once answered —
+// nothing when it was never rung), the sip-leg's dialog goes down, the
+// attached track withdraws on the hangup delay.
 func (h *sipHandler) hangup(ctx context.Context, msg *msg_handler.ChatMessage, w msg_handler.ResponseWriter) {
 	peer := msg.From
 	v, ok := h.calls.Load(peer)
@@ -547,31 +527,24 @@ func (h *sipHandler) hangup(ctx context.Context, msg *msg_handler.ChatMessage, w
 		return
 	}
 	c := v.(*peerCall)
-	dialog, phase, ok := c.end()
+	e, ok := c.end()
 	if !ok {
 		return
 	}
 	h.calls.CompareAndDelete(peer, c)
-	h.hangupDialog(dialog)
-	if phase == phaseRinging {
-		if err := w.Cancel(c.callId); err != nil {
-			h.logger.Warn("sipbot: CANCEL not sent", "peer", peer, "err", err)
-		}
-	} else {
-		if err := w.Bye(c.callId); err != nil {
-			h.logger.Warn("sipbot: BYE not sent", "peer", peer, "err", err)
-		}
-		h.detachLater(ctx, c)
-	}
+	h.hangupDialog(e.dialog)
+	h.endBrowserLeg(ctx, w, e)
 	h.say(peer, w, "Hung up.")
 }
 
 // dial rings the callee: one diago INVITE on the account's identity,
-// answered when the callee answers. Its endings, all exactly-once
-// through the call's end: a dial failure (busy, unreachable — or the
-// user hanging up first, which cancels the dial's ctx) terminates the
-// browser leg and says why; an answered dialog arms the relay and gets
-// its hangup watcher.
+// answered when the callee answers. The answer's codec selection pins
+// the call (the speaker track is created with it), the relay arms, and
+// only then is the browser rung — a busy or unreachable callee never
+// disturbs it. Its endings, all exactly-once through the call's end: a
+// dial failure (busy, unreachable — or the user hanging up first, which
+// cancels the dial's ctx) is the chat line alone (no webrtc-leg verbs
+// exist yet); an answered dialog watches for the callee's hangup.
 func (h *sipHandler) dial(a *account, peer ss.SubscriberId, c *peerCall, dialCtx context.Context) {
 	var rang atomic.Bool
 	dialog, err := a.dial(dialCtx, c.target, func(code int) {
@@ -580,44 +553,103 @@ func (h *sipHandler) dial(a *account, peer ss.SubscriberId, c *peerCall, dialCtx
 		}
 	})
 	if err != nil {
-		dlg, phase, ok := c.end()
+		e, ok := c.end()
 		if !ok {
 			return // the call ended while the dial was in flight
 		}
 		h.calls.CompareAndDelete(peer, c)
-		h.hangupDialog(dlg)
-		h.tellBrowserEnded(c, phase)
+		h.hangupDialog(e.dialog)
 		h.sayp(c, fmt.Sprintf("Call failed: %v.", err))
+		return
+	}
+	// The callee answered: the answer's top audio codec is the call's
+	// (diago's negotiated codec — docs/sip-bot.md §8).
+	props := diago.MediaProps{}
+	if _, err := dialog.AudioReader(diago.WithAudioReaderMediaProps(&props)); err != nil {
+		h.failDialedCall(peer, c, dialog, fmt.Errorf("the answered dialog's media never came up: %w", err))
+		return
+	}
+	if err := c.setCodec(props.Codec); err != nil {
+		if errors.Is(err, errCallEnded) {
+			// The user ended it while the callee was being rung: the end's
+			// owner has no dialog to hang up — the just-answered callee is
+			// this path's.
+			h.hangupDialog(dialog)
+			return
+		}
+		h.failDialedCall(peer, c, dialog, err)
 		return
 	}
 	if err := c.setDialog(dialog); err != nil {
-		h.hangupDialog(dialog)
 		if errors.Is(err, errCallEnded) {
-			return // the user ended it while the callee was being rung
-		}
-		_, phase, ok := c.end()
-		if !ok {
+			h.hangupDialog(dialog) // see above
 			return
 		}
-		h.calls.CompareAndDelete(peer, c)
-		h.tellBrowserEnded(c, phase)
-		h.sayp(c, fmt.Sprintf("Call failed: %v.", err))
+		h.failDialedCall(peer, c, dialog, err)
 		return
 	}
-	h.sayp(c, "Callee answered.")
 	// The callee's hangup (the dialog's ctx) ends the whole call: the
 	// browser leg is told, the state reset.
 	go func() {
 		<-dialog.Context().Done()
-		dlg, phase, ok := c.end()
+		e, ok := c.end()
 		if !ok {
 			return // ended from this side already
 		}
 		h.calls.CompareAndDelete(peer, c)
-		h.hangupDialog(dlg)
-		h.tellBrowserEnded(c, phase)
+		h.hangupDialog(e.dialog)
+		h.endBrowserLeg(context.Background(), c.w, e)
 		h.sayp(c, "Callee hung up.")
 	}()
+	// Ring the browser with the selection: the mic registration first
+	// (so no early track is missed — the music bot's discipline), then
+	// the pinned attach (the offer carries exactly the selected codec),
+	// then the INVITE. Each step re-checks the call lives: an end
+	// landing mid-ring is its owner's teardown — the ring's sender
+	// Cancels the just-sent ring.
+	c.w.OnTrack(func(remote *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
+		h.onMic(peer, remote, receiver)
+	})
+	if err := c.attachPinned(); err != nil {
+		if errors.Is(err, errCallEnded) {
+			return
+		}
+		h.failDialedCall(peer, c, nil, fmt.Errorf("could not call you: %w", err))
+		return
+	}
+	callId, err := c.w.Invite(msg_handler.MediaVoice)
+	if err != nil {
+		h.failDialedCall(peer, c, nil, fmt.Errorf("could not call you: %w", err))
+		return
+	}
+	if !c.setCallId(callId) {
+		// An end landed while the INVITE was being sent — its owner saw
+		// no callId and sent nothing; cancel the just-sent ring.
+		if err := c.w.Cancel(callId); err != nil {
+			h.logger.Warn("sipbot: CANCEL not sent", "peer", peer, "err", err)
+		}
+		return
+	}
+	h.sayp(c, "Callee answered.")
+}
+
+// failDialedCall ends an outbound call whose callee already answered —
+// the codec would not map, the relay would not arm, or the browser
+// could not be rung: the answered callee is hung up, the attached
+// track withdrawn, the user told why. A just-answered dialog the
+// failure path has not hung up yet is passed as hangup.
+func (h *sipHandler) failDialedCall(peer ss.SubscriberId, c *peerCall, hangup sipLeg, err error) {
+	h.hangupDialog(hangup)
+	e, ok := c.end()
+	if !ok {
+		return // the call ended meanwhile — its owner tears down
+	}
+	h.calls.CompareAndDelete(peer, c)
+	h.hangupDialog(e.dialog)
+	if e.attached {
+		h.detachLater(context.Background(), e.track, c.w)
+	}
+	h.sayp(c, fmt.Sprintf("Call failed: %v.", err))
 }
 
 // endCall runs the call's full teardown from the peer's channel
@@ -625,39 +657,37 @@ func (h *sipHandler) dial(a *account, peer ss.SubscriberId, c *peerCall, dialCtx
 // is hung up, the browser leg told, the track withdrawn on the hangup
 // delay, and the user told.
 func (h *sipHandler) endCall(ctx context.Context, peer ss.SubscriberId, c *peerCall) {
-	dialog, phase, ok := c.end()
+	e, ok := c.end()
 	if !ok {
 		return
 	}
 	h.calls.CompareAndDelete(peer, c)
-	h.hangupDialog(dialog)
-	if phase == phaseRinging {
-		if err := c.w.Cancel(c.callId); err != nil {
-			h.logger.Warn("sipbot: CANCEL not sent", "peer", peer, "err", err)
-		}
-	} else {
-		if err := c.w.Bye(c.callId); err != nil {
-			h.logger.Warn("sipbot: BYE not sent", "peer", peer, "err", err)
-		}
-		h.detachLater(ctx, c)
-	}
+	h.hangupDialog(e.dialog)
+	h.endBrowserLeg(ctx, c.w, e)
 }
 
-// tellBrowserEnded terminates the call's webrtc-leg from the SIP side's
-// async paths: CANCEL while the browser still rings, BYE once it
-// answered — and in the answered case the track's withdrawal waits out
-// the peer's own teardown offer.
-func (h *sipHandler) tellBrowserEnded(c *peerCall, phase callPhase) {
-	if phase == phaseRinging {
-		if err := c.w.Cancel(c.callId); err != nil {
-			h.logger.Warn("sipbot: CANCEL not sent", "err", err)
+// endBrowserLeg terminates the call's webrtc-leg after its end: CANCEL
+// while the browser still rings, BYE once it answered — and nothing
+// when the browser was never rung (an outbound dial that failed before
+// the ring) — the attached track's withdrawal then waiting out the
+// peer's own teardown offer.
+func (h *sipHandler) endBrowserLeg(ctx context.Context, w msg_handler.ResponseWriter, e callEnd) {
+	if e.callId != "" {
+		var err error
+		verb := "BYE"
+		if e.phase == phaseRinging {
+			verb = "CANCEL"
+			err = w.Cancel(e.callId)
+		} else {
+			err = w.Bye(e.callId)
 		}
-		return
+		if err != nil {
+			h.logger.Warn("sipbot: "+verb+" not sent", "err", err)
+		}
 	}
-	if err := c.w.Bye(c.callId); err != nil {
-		h.logger.Warn("sipbot: BYE not sent", "err", err)
+	if e.attached {
+		h.detachLater(ctx, e.track, w)
 	}
-	h.detachLater(context.Background(), c)
 }
 
 // hangupDialog sends the dialog's termination without blocking the
@@ -681,13 +711,13 @@ func (h *sipHandler) hangupDialog(dialog sipLeg) {
 // detachLater withdraws the call's track after the hangup delay — see
 // the constant's comment; the music bot's handleHangup has the same
 // shape, and so does its reason.
-func (h *sipHandler) detachLater(ctx context.Context, c *peerCall) {
+func (h *sipHandler) detachLater(ctx context.Context, track *webrtc.TrackLocalStaticSample, w msg_handler.ResponseWriter) {
 	go func() {
 		t := time.NewTimer(hangupDetachDelay)
 		defer t.Stop()
 		select {
 		case <-t.C:
-			if err := c.w.DetachMedia(c.track); err != nil {
+			if err := w.DetachMedia(track); err != nil {
 				h.logger.Warn("sipbot: track not detached on hangup", "err", err)
 			}
 		case <-ctx.Done():
@@ -754,17 +784,18 @@ func (h *sipHandler) setAccount(peer ss.SubscriberId, a *account) {
 
 // onMic is the inbound-media callback: the browser's mic track joins
 // the call's relay (the browser→SIP pump starts once both it and the
-// answered dialog exist). The receiver comes along for the negotiated
-// telephone-event PT — the pad's DTMF rides the mic's own read stream
-// (dtmf.go). A mic that is not opus — every browser offers opus first,
-// so this is the degenerate case — is drained, not transcoded: the
-// sip-leg hears silence, and the log says why.
+// answered dialog exist) — but only when it speaks the call's codec:
+// the mic's m-line is answered with the codec pin, so anything else is
+// the failed presumption (docs/sip-bot.md §11.8) — drained, not
+// bridged, the sip-leg hearing silence while the log says why. The
+// receiver comes along for the negotiated telephone-event PT — the
+// pad's DTMF rides the mic's own read stream (dtmf.go).
 func (h *sipHandler) onMic(peer ss.SubscriberId, track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
 	h.logger.Info("sipbot: inbound track", "peer", peer, "codec", track.Codec().MimeType)
 	v, ok := h.calls.Load(peer)
-	if !ok || track.Codec().MimeType != webrtc.MimeTypeOpus {
+	if !ok || !v.(*peerCall).micCodecOK(track.Codec().MimeType) {
 		if ok {
-			h.logger.Warn("sipbot: the mic is not opus; draining it", "peer", peer, "codec", track.Codec().MimeType)
+			h.logger.Warn("sipbot: the mic is not the call's codec; draining it", "peer", peer, "codec", track.Codec().MimeType)
 		}
 		go func() {
 			for {

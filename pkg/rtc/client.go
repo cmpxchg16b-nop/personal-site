@@ -421,14 +421,25 @@ func (c *HeadlessRTCClient) HandleTrackFunc(handler func(ctx context.Context, ch
 // The track survives a glare rebuild: the client re-adds the session's
 // tracks to the rebuilt connection. The returned sender does NOT — it
 // belongs to the replaced connection — so RemoveTrack keys by track, never
-// by sender. The track must be a comparable implementation (pion's track
+// The track must be a comparable implementation (pion's track
 // types are pointers).
 func (c *HeadlessRTCClient) AddTrack(peer ss.SubscriberId, track webrtc.TrackLocal) (*webrtc.RTPSender, error) {
+	return c.AddTrackWithCodecPreferences(peer, track, nil)
+}
+
+// AddTrackWithCodecPreferences adds track like AddTrack and pins the
+// codec preferences of its transceiver: the session's offers and answers
+// carry exactly codecs for the track's m-line (pion generates both from
+// the transceiver's preferences). The pin is in place before the
+// renegotiation the attach triggers, and it is recorded with the track
+// and re-applied when a glare rebuild re-adds the track to the fresh
+// connection. A nil codecs is AddTrack exactly.
+func (c *HeadlessRTCClient) AddTrackWithCodecPreferences(peer ss.SubscriberId, track webrtc.TrackLocal, codecs []webrtc.RTPCodecParameters) (*webrtc.RTPSender, error) {
 	if track == nil {
 		panic("rtc: nil track")
 	}
 	reply := make(chan addTrackReply, 1)
-	c.serviceChan <- addTrackNote{peer: peer, track: track, reply: reply}
+	c.serviceChan <- addTrackNote{peer: peer, track: track, codecs: codecs, reply: reply}
 	r := <-reply
 	return r.sender, r.err
 }
@@ -530,11 +541,13 @@ type trackHandlerNote struct {
 }
 
 // addTrackNote attaches a local media track to a peer session's peer
-// connection (AddTrack).
+// connection (AddTrack). codecs, when non-nil, pins the track's
+// transceiver's codec preferences (AddTrackWithCodecPreferences).
 type addTrackNote struct {
-	peer  ss.SubscriberId
-	track webrtc.TrackLocal
-	reply chan<- addTrackReply // buffered: answered once
+	peer   ss.SubscriberId
+	track  webrtc.TrackLocal
+	codecs []webrtc.RTPCodecParameters
+	reply  chan<- addTrackReply // buffered: answered once
 }
 
 type addTrackReply struct {
@@ -1055,8 +1068,31 @@ func (c *HeadlessRTCClient) handleAddTrackNote(run *clientRun, n addTrackNote) {
 		n.reply <- addTrackReply{err: err}
 		return
 	}
-	sess.tracks = append(sess.tracks, sessionTrack{track: n.track, sender: sender})
+	if n.codecs != nil {
+		// The pin lands before the renegotiation the attach fires
+		// (OnNegotiationNeeded is enqueued, not run, by AddTrack), so the
+		// session's offers and answers carry exactly the pinned codecs.
+		if err := pinTransceiverCodecs(sess.pc, sender, n.codecs); err != nil {
+			_ = sess.pc.RemoveTrack(sender)
+			n.reply <- addTrackReply{err: err}
+			return
+		}
+	}
+	sess.tracks = append(sess.tracks, sessionTrack{track: n.track, sender: sender, codecs: n.codecs})
 	n.reply <- addTrackReply{sender: sender}
+}
+
+// pinTransceiverCodecs pins the codec preferences of the transceiver
+// sender belongs to — pion's RTPTransceiver.SetCodecPreferences, found
+// by the sender (AddTrackWithCodecPreferences' hub-side half, and the
+// glare rebuild's re-apply).
+func pinTransceiverCodecs(pc *webrtc.PeerConnection, sender *webrtc.RTPSender, codecs []webrtc.RTPCodecParameters) error {
+	for _, t := range pc.GetTransceivers() {
+		if t.Sender() == sender {
+			return t.SetCodecPreferences(codecs)
+		}
+	}
+	return errors.New("rtc: no transceiver for the track's sender")
 }
 
 // handleRemoveTrackNote detaches a local media track from the session's
@@ -1152,7 +1188,17 @@ func (c *HeadlessRTCClient) handleRebuildNote(run *clientRun, n rebuildNote) {
 			n.reply <- rebuildReply{err: fmt.Errorf("rtc: re-add track %q: %w", st.track.ID(), err)}
 			return
 		}
-		tracks = append(tracks, sessionTrack{track: st.track, sender: sender})
+		if st.codecs != nil {
+			// The codec pin the track was attached with re-applies on the
+			// fresh connection — the answer to the colliding offer must
+			// carry the pin too.
+			if err := pinTransceiverCodecs(fresh, sender, st.codecs); err != nil {
+				_ = fresh.Close()
+				n.reply <- rebuildReply{err: fmt.Errorf("rtc: re-pin track %q: %w", st.track.ID(), err)}
+				return
+			}
+		}
+		tracks = append(tracks, sessionTrack{track: st.track, sender: sender, codecs: st.codecs})
 	}
 	n.sess.pc = fresh
 	n.sess.channels = channels
@@ -1266,10 +1312,12 @@ type peerSession struct {
 // sessionTrack is one local media track attached to the session's peer
 // connection, with its current sender — refreshed when a glare rebuild
 // re-adds the track to the rebuilt connection, so the session's record
-// never holds a stale sender.
+// stays removal-ready — and its codec pin when the track was attached
+// with one (AddTrackWithCodecPreferences), re-applied on the rebuild.
 type sessionTrack struct {
 	track  webrtc.TrackLocal
 	sender *webrtc.RTPSender
+	codecs []webrtc.RTPCodecParameters // nil: unpinned (a plain AddTrack)
 }
 
 // run drives the session's negotiation until the session's context ends.

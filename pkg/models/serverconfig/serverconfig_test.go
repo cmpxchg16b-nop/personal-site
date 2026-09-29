@@ -186,3 +186,17 @@ func TestSipBotParsesIPPreference(t *testing.T) {
 		t.Fatalf("no attributes, parsed = %+v", sb)
 	}
 }
+
+// TestSipBotParsesWebRTCCodecs covers the <sipBot/> element's
+// webrtcCodecs attribute (the presumed WebRTC codec list): present and
+// absent.
+func TestSipBotParsesWebRTCCodecs(t *testing.T) {
+	sb := parseSipBot(t, `<sipBot url="wss://x/api/ss/ws" jwt="t" webrtcCodecs="opus,pcmu"/>`)
+	if sb.WebRTCCodecs != "opus,pcmu" {
+		t.Fatalf("parsed = %+v", sb)
+	}
+	// Absent: it stays empty (the wiring's default list).
+	if sb := parseSipBot(t, `<sipBot url="wss://x/api/ss/ws" jwt="t"/>`); sb.WebRTCCodecs != "" {
+		t.Fatalf("no attribute, parsed = %+v", sb)
+	}
+}

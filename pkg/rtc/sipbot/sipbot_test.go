@@ -350,14 +350,90 @@ func (p *trackProbe) waitTrack(t *testing.T, n int) *webrtc.TrackRemote {
 // it, the rest ignore it (cleanup cancels anyway).
 func startUserProbe(t *testing.T, net *clientTestNet, name string, id ss.SubscriberId) (*rtc.HeadlessRTCClient, *wireProbe, *trackProbe, context.CancelFunc) {
 	t.Helper()
+	return startUserProbeOn(t, net, name, id, nil)
+}
+
+// startUserProbeOn is startUserProbe with a configuration hook (the
+// pin tests tap the probe's peer connections).
+func startUserProbeOn(t *testing.T, net *clientTestNet, name string, id ss.SubscriberId, configure func(*rtc.RTCClientConfiguration)) (*rtc.HeadlessRTCClient, *wireProbe, *trackProbe, context.CancelFunc) {
+	t.Helper()
 	user, stop := startClient(t, net, name, func(c *rtc.RTCClientConfiguration) {
 		c.SubscriberId = id
+		if configure != nil {
+			configure(c)
+		}
 	})
 	probe := newWireProbe()
 	probe.register(t, user)
 	tprobe := newTrackProbe()
 	tprobe.register(t, user)
 	return user, probe, tprobe, stop
+}
+
+// tapPCFactory builds a peer-connection factory mirroring the client's
+// default (the default codecs plus telephone-event, the politeness
+// DTLS role) that stores each created connection in box — the pin
+// tests' view of the negotiated SDP.
+func tapPCFactory(box *atomic.Pointer[webrtc.PeerConnection]) func(polite bool) (*webrtc.PeerConnection, error) {
+	return func(polite bool) (*webrtc.PeerConnection, error) {
+		m := &webrtc.MediaEngine{}
+		if err := m.RegisterDefaultCodecs(); err != nil {
+			return nil, err
+		}
+		if err := m.RegisterCodec(rtc.TelephoneEventCodec, webrtc.RTPCodecTypeAudio); err != nil {
+			return nil, err
+		}
+		settingEngine := webrtc.SettingEngine{}
+		role := webrtc.DTLSRoleClient
+		if polite {
+			role = webrtc.DTLSRoleServer
+		}
+		if err := settingEngine.SetAnsweringDTLSRole(role); err != nil {
+			return nil, err
+		}
+		pc, err := webrtc.NewAPI(webrtc.WithMediaEngine(m), webrtc.WithSettingEngine(settingEngine)).NewPeerConnection(webrtc.Configuration{})
+		if err != nil {
+			return nil, err
+		}
+		box.Store(pc)
+		return pc, nil
+	}
+}
+
+// waitOfferSettled waits until the tapped probe connection holds a
+// stable remote description carrying an audio m-line — the bot's
+// ring-time media offer has landed and been answered — and returns the
+// offer.
+func waitOfferSettled(t *testing.T, box *atomic.Pointer[webrtc.PeerConnection]) *webrtc.SessionDescription {
+	t.Helper()
+	waitFor(t, "the bot's media offer to settle", func() bool {
+		pc := box.Load()
+		return pc != nil && pc.SignalingState() == webrtc.SignalingStateStable &&
+			pc.RemoteDescription() != nil && strings.Contains(pc.RemoteDescription().SDP, "m=audio")
+	})
+	remote := box.Load().RemoteDescription()
+	if remote == nil {
+		t.Fatal("the probe holds no remote description")
+	}
+	return remote
+}
+
+// sdpAudioFormats extracts the payload-type list of the SDP's audio
+// m-line — the codec pin's wire shape.
+func sdpAudioFormats(t *testing.T, body string) []string {
+	t.Helper()
+	for line := range strings.Lines(body) {
+		line = strings.TrimRight(line, "\r\n")
+		if strings.HasPrefix(line, "m=audio ") {
+			fields := strings.Fields(line)
+			if len(fields) < 4 {
+				t.Fatalf("the audio m-line is malformed: %q", line)
+			}
+			return fields[3:]
+		}
+	}
+	t.Fatalf("no audio m-line in the SDP:\n%s", body)
+	return nil
 }
 
 // readOneRTP reads one packet off a remote track, failing the test when
@@ -960,6 +1036,12 @@ func (f *fakePBX) sdpBody() []byte {
 	return []byte(sdp + fmt.Sprintf("m=audio %d RTP/AVP 0 101\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:101 telephone-event/8000\r\n", port))
 }
 
+// rtpPort is the fake's media socket's port — the custom-SDP callers'
+// m-line port.
+func (f *fakePBX) rtpPort() int {
+	return f.rtp.LocalAddr().(*net.UDPAddr).Port
+}
+
 // parseSDPMediaAddr extracts the media address (the c= line's IP, the
 // m= line's port) from an SDP body.
 func parseSDPMediaAddr(t *testing.T, body []byte) *net.UDPAddr {
@@ -1014,11 +1096,12 @@ func requireStereoOpusSDP(t *testing.T, what, body string) {
 	}
 }
 
-// streamOpus sends 20 ms opus RTP packets to the bot's media address —
-// the callee's voice — cycling the given payloads until ctx ends (the
-// relay drops them while the browser leg is still being set up, so the
-// stream simply runs on). It starts once the first dialog's media is up.
-func (f *fakePBX) streamOpus(ctx context.Context, payloads [][]byte) {
+// streamRTP sends 20 ms RTP packets of the given payload type and
+// timestamp step to the bot's media address — the callee's voice —
+// cycling the given payloads until ctx ends (the relay drops them while
+// the browser leg is still being set up, so the stream simply runs on).
+// It starts once the first dialog's media is up.
+func (f *fakePBX) streamRTP(ctx context.Context, payloads [][]byte, pt uint8, tsStep uint32) {
 	<-f.rtpStart
 	f.mu.Lock()
 	peer := f.rtpPeer
@@ -1028,7 +1111,7 @@ func (f *fakePBX) streamOpus(ctx context.Context, payloads [][]byte) {
 	}
 	for i := 0; ; i++ {
 		pkt := &rtp.Packet{
-			Header:  rtp.Header{Version: 2, PayloadType: 96, SequenceNumber: uint16(i), Timestamp: uint32(i * 960), SSRC: 0xC0FFEE},
+			Header:  rtp.Header{Version: 2, PayloadType: pt, SequenceNumber: uint16(i), Timestamp: uint32(i) * tsStep, SSRC: 0xC0FFEE},
 			Payload: payloads[i%len(payloads)],
 		}
 		data, err := pkt.Marshal()
@@ -1044,6 +1127,18 @@ func (f *fakePBX) streamOpus(ctx context.Context, payloads [][]byte) {
 		case <-time.After(20 * time.Millisecond):
 		}
 	}
+}
+
+// streamOpus streams the payloads as 20 ms opus RTP (PT 96, 960 ticks
+// per packet).
+func (f *fakePBX) streamOpus(ctx context.Context, payloads [][]byte) {
+	f.streamRTP(ctx, payloads, 96, 960)
+}
+
+// streamPCMU streams the payloads as 20 ms PCMU RTP (PT 0, 160 ticks
+// per packet).
+func (f *fakePBX) streamPCMU(ctx context.Context, payloads [][]byte) {
+	f.streamRTP(ctx, payloads, 0, 160)
 }
 
 // ---- The fake as a caller: the inbound-call tests' UAC side ----
@@ -1077,6 +1172,14 @@ type fakeCall struct {
 // call's waits drive it from there.
 func (f *fakePBX) call(t *testing.T, user string) *fakeCall {
 	t.Helper()
+	return f.callSDP(t, user, f.sdpBody())
+}
+
+// callSDP is call carrying the given SDP body — the codec-negotiation
+// tests drive the offer's contents (a list sharing nothing with the
+// presumed one earns a 488).
+func (f *fakePBX) callSDP(t *testing.T, user string, body []byte) *fakeCall {
+	t.Helper()
 	f.mu.Lock()
 	source := ""
 	for _, r := range f.registrations {
@@ -1108,7 +1211,7 @@ func (f *fakePBX) call(t *testing.T, user string) *fakeCall {
 	fc := &fakeCall{t: t, f: f}
 	fc.answerCtx, fc.answerCancel = context.WithCancel(context.Background())
 	t.Cleanup(fc.answerCancel)
-	dlg, err := f.clientDialogs.Invite(fc.answerCtx, sip.Uri{User: user, Host: host, Port: port}, f.sdpBody(),
+	dlg, err := f.clientDialogs.Invite(fc.answerCtx, sip.Uri{User: user, Host: host, Port: port}, body,
 		sip.NewHeader("Content-Type", "application/sdp"), from)
 	if err != nil {
 		t.Fatalf("the fake's INVITE: %v", err)
@@ -1212,6 +1315,13 @@ func (fc *fakeCall) bye() {
 // media address, one packet per 20 ms, until ctx ends. It runs only once
 // the answer was taken (the media address comes from it).
 func (fc *fakeCall) stream(ctx context.Context, payloads [][]byte) {
+	fc.streamRTP(ctx, payloads, 96, 960)
+}
+
+// streamRTP is stream with the payload type and timestamp step of the
+// call's negotiated codec (PT 96 and 960 ticks for opus; PT 0 and 160
+// for PCMU).
+func (fc *fakeCall) streamRTP(ctx context.Context, payloads [][]byte, pt uint8, tsStep uint32) {
 	fc.mu.Lock()
 	peer := fc.peer
 	fc.mu.Unlock()
@@ -1220,7 +1330,7 @@ func (fc *fakeCall) stream(ctx context.Context, payloads [][]byte) {
 	}
 	for i := 0; ; i++ {
 		pkt := &rtp.Packet{
-			Header:  rtp.Header{Version: 2, PayloadType: 96, SequenceNumber: uint16(i), Timestamp: uint32(i * 960), SSRC: 0xCA11E1},
+			Header:  rtp.Header{Version: 2, PayloadType: pt, SequenceNumber: uint16(i), Timestamp: uint32(i) * tsStep, SSRC: 0xCA11E1},
 			Payload: payloads[i%len(payloads)],
 		}
 		data, err := pkt.Marshal()
@@ -1246,6 +1356,20 @@ func opusVoice(n int) [][]byte {
 		p[0] = 0xF8 // a fullband 20 ms frame, one per packet
 		for j := 1; j < len(p); j++ {
 			p[j] = byte(i*67 + j*31) // distinct, non-silent
+		}
+		payloads[i] = p
+	}
+	return payloads
+}
+
+// pcmuVoice returns n distinct synthetic 20 ms PCMU frames (160 bytes
+// at 8 kHz).
+func pcmuVoice(n int) [][]byte {
+	payloads := make([][]byte, n)
+	for i := range payloads {
+		p := make([]byte, 160)
+		for j := range p {
+			p[j] = byte(i*73 + j*19) // distinct, never the 0xFF silence
 		}
 		payloads[i] = p
 	}
@@ -1506,157 +1630,195 @@ func TestSipBotPerUserStacks(t *testing.T) {
 }
 
 // TestSipBotCallEndToEnd covers the whole B2BUA: /register, /call —
-// the bot phones the browser on the webrtc-leg and the callee on the
-// sip-leg — both legs answer, opus media crosses untouched in both
-// directions (the passthrough), and the callee's BYE ends the call on
-// the browser's side too (BYE, the chat line, the ended amend).
+// the bot phones the callee on the sip-leg FIRST (a busy or unreachable
+// callee would never disturb the browser), and once the callee answered
+// — the answer's codec selection in hand — phones the browser on the
+// webrtc-leg with the offer pinned to that selection (opus in one
+// variant, PCMU in the other: the G.711 path is a passthrough now, so
+// it runs without cgo). Media then crosses byte for byte in both
+// directions, and the callee's BYE ends the call on the browser's side
+// too (BYE, the chat line, the ended amend).
 func TestSipBotCallEndToEnd(t *testing.T) {
-	net := newClientTestNet(t, ss.DefaultSubscriberAging)
-	bot := startBot(t, net, "bot", "2-bot", "", nil)
-	user, probe, tprobe, _ := startUserProbe(t, net, "user", "1-user")
-	botId, userId := pairUp(t, bot, user)
-	pbx := newFakePBX(t, 200, true)
+	for _, tc := range []struct {
+		name        string
+		opus        bool     // the fake PBX's answer codec (and so the call's)
+		micCodec    webrtc.RTPCodecCapability
+		voice       func(int) [][]byte
+		stream      func(*fakePBX, context.Context, [][]byte)
+		wantFormats []string // the webrtc-leg pin's m-line payload types
+	}{
+		{
+			name:        "opus",
+			opus:        true,
+			micCodec:    webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus, ClockRate: 48000, Channels: 2},
+			voice:       opusVoice,
+			stream:      func(f *fakePBX, ctx context.Context, p [][]byte) { f.streamOpus(ctx, p) },
+			wantFormats: []string{"111", "126"},
+		},
+		{
+			name:        "pcmu",
+			opus:        false,
+			micCodec:    webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypePCMU, ClockRate: 8000, Channels: 1},
+			voice:       pcmuVoice,
+			stream:      func(f *fakePBX, ctx context.Context, p [][]byte) { f.streamPCMU(ctx, p) },
+			wantFormats: []string{"0", "126"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			net := newClientTestNet(t, ss.DefaultSubscriberAging)
+			bot := startBot(t, net, "bot", "2-bot", "", nil)
+			var pcBox atomic.Pointer[webrtc.PeerConnection]
+			user, probe, tprobe, _ := startUserProbeOn(t, net, "user", "1-user", func(c *rtc.RTCClientConfiguration) {
+				c.NewPeerConnection = tapPCFactory(&pcBox)
+			})
+			botId, userId := pairUp(t, bot, user)
+			pbx := newFakePBX(t, 200, tc.opus)
 
-	dc := probe.waitDC(t, botId, msg_handler.DataChannelLabelMessages)
-	chat := func(text string) ss.MsgId {
-		t.Helper()
-		m := baseMsg(ss.WellKnownChIdMain, userId, botId)
-		m["plaintext"] = text
-		if err := dc.SendText(mustJSON(t, m)); err != nil {
-			t.Fatalf("SendText: %v", err)
-		}
-		return ss.MsgId(m["msgId"].(string))
-	}
-	sip := func(body map[string]any) {
-		t.Helper()
-		m := baseMsg(ss.WellKnownChIdMain, userId, botId)
-		m["mimeType"] = wireMimeSip
-		m["sip"] = body
-		if err := dc.SendText(mustJSON(t, m)); err != nil {
-			t.Fatalf("SendText: %v", err)
-		}
-	}
-
-	registerMsg := chat("/register 2001@" + pbx.addr + " passW_0rd")
-	waitBotMessage(t, probe, botId, "the registered reply", isChatReply(registerMsg, "Registered as"))
-
-	// The call: the bot phones the user…
-	callMsg := chat("/call 1001@" + pbx.addr)
-	invite := waitBotMessage(t, probe, botId, "the bot's INVITE", func(m *rawMsg) bool {
-		return isSipInvite(m) && m.sip.XMedia == "voice" && m.sip.XCallStatus == "inviting"
-	})
-	callId, inviteMsgId := invite.sip.CallId, invite.msgId
-	waitBotMessage(t, probe, botId, "the calling line", isChatReply(callMsg, "Calling 1001@"))
-
-	// …and the callee, with the user's own identity, digest and all.
-	pbx.waitForPBX(t, "the callee's INVITE", func() bool { return pbx.invites == 1 })
-	pbx.waitForPBX(t, "the INVITE's From/To", func() bool { return pbx.inviteFrom == "2001" && pbx.inviteTo == "1001" })
-	pbx.waitForPBX(t, "the INVITE's digest username", func() bool { return pbx.authedUser == "2001" })
-	// The offer announces stereo opus (RFC 7587): the webrtc-leg's stereo
-	// negotiation mirrored onto the sip-leg.
-	pbx.mu.Lock()
-	offer := pbx.inviteSDP
-	pbx.mu.Unlock()
-	requireStereoOpusSDP(t, "the INVITE's SDP offer", offer)
-	dialog := pbx.waitDialog(t)
-
-	// The user picks up. The accept's shape mirrors the browser's: the
-	// mic goes on the connection FIRST — a fresh m-line on the quiet
-	// connection, so nothing collides with it — and the 200 OK then
-	// flies. (The reverse order recycles the bot's sendrecv transceiver,
-	// and pion re-binds the recycled m-line's inbound RTP without firing
-	// OnTrack — the bot would never learn the mic exists.)
-	micTrack, err := webrtc.NewTrackLocalStaticSample(
-		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus, ClockRate: 48000, Channels: 2}, "mic", "probe")
-	if err != nil {
-		t.Fatalf("the mic track: %v", err)
-	}
-	if _, err := user.AddTrack(botId, micTrack); err != nil {
-		t.Fatalf("attach the mic: %v", err)
-	}
-	// The mic speaks from here on, one packet per 20 ms (samples written
-	// before it binds drop — the "empty room").
-	spoken := make([][]byte, 5)
-	for i := range spoken {
-		p := make([]byte, 30)
-		p[0] = 0xF8
-		for j := 1; j < len(p); j++ {
-			p[j] = byte(i*53 + j*17)
-		}
-		spoken[i] = p
-	}
-	micCtx, stopMic := context.WithCancel(context.Background())
-	t.Cleanup(stopMic)
-	go func() {
-		for i := 0; ; i++ {
-			if err := micTrack.WriteSample(pionmedia.Sample{Data: spoken[i%len(spoken)], Duration: 20 * time.Millisecond}); err != nil {
-				return
+			dc := probe.waitDC(t, botId, msg_handler.DataChannelLabelMessages)
+			chat := func(text string) ss.MsgId {
+				t.Helper()
+				m := baseMsg(ss.WellKnownChIdMain, userId, botId)
+				m["plaintext"] = text
+				if err := dc.SendText(mustJSON(t, m)); err != nil {
+					t.Fatalf("SendText: %v", err)
+				}
+				return ss.MsgId(m["msgId"].(string))
 			}
-			select {
-			case <-micCtx.Done():
-				return
-			case <-time.After(20 * time.Millisecond):
+			sip := func(body map[string]any) {
+				t.Helper()
+				m := baseMsg(ss.WellKnownChIdMain, userId, botId)
+				m["mimeType"] = wireMimeSip
+				m["sip"] = body
+				if err := dc.SendText(mustJSON(t, m)); err != nil {
+					t.Fatalf("SendText: %v", err)
+				}
 			}
-		}
-	}()
-	// Let the mic's offer/answer settle (in-process, a couple of ms)
-	// before the 200 OK triggers the bot's own attach offer, so the two
-	// renegotiations never meet in flight.
-	time.Sleep(300 * time.Millisecond)
-	sip(map[string]any{"callId": callId, "response": map[string]any{"code": 200, "phrase": "OK"}})
 
-	// The bot's opus track attaches. The callee's voice starts streaming
-	// — the probe's OnTrack fires only once media actually arrives, so
-	// the stream runs ahead of the track's wait.
-	streamCtx, stopStream := context.WithCancel(context.Background())
-	t.Cleanup(stopStream)
-	voice := opusVoice(5)
-	go pbx.streamOpus(streamCtx, voice)
-	track := tprobe.waitTrack(t, 1)
-	waitBotMessage(t, probe, botId, "the callee-answered line", isChatReply(callMsg, "Callee answered."))
-	waitBotMessage(t, probe, botId, "the accepted amend", isCallStatusAmend(inviteMsgId, callId, "accepted"))
+			registerMsg := chat("/register 2001@" + pbx.addr + " passW_0rd")
+			waitBotMessage(t, probe, botId, "the registered reply", isChatReply(registerMsg, "Registered as"))
 
-	// The callee speaks: the opus packets cross the SBC byte for byte.
-	heardVoice := map[string]bool{}
-	for len(heardVoice) < len(voice) {
-		pkt := readOneRTP(t, track)
-		heardVoice[string(pkt.Payload)] = true
-	}
-	for _, want := range voice {
-		if !heardVoice[string(want)] {
-			t.Fatalf("a streamed packet never reached the browser (the passthrough changed or lost it)")
-		}
-	}
+			// The call: the SIP leg leads — the bot phones the callee with
+			// the user's own identity, digest and all…
+			callMsg := chat("/call 1001@" + pbx.addr)
+			waitBotMessage(t, probe, botId, "the calling line", isChatReply(callMsg, "Calling 1001@"))
+			pbx.waitForPBX(t, "the callee's INVITE", func() bool { return pbx.invites == 1 })
+			pbx.waitForPBX(t, "the INVITE's From/To", func() bool { return pbx.inviteFrom == "2001" && pbx.inviteTo == "1001" })
+			pbx.waitForPBX(t, "the INVITE's digest username", func() bool { return pbx.authedUser == "2001" })
+			// The offer announces stereo opus (RFC 7587) among the presumed
+			// WebRTC codec list: the webrtc-leg's stereo negotiation mirrored
+			// onto the sip-leg.
+			pbx.mu.Lock()
+			offer := pbx.inviteSDP
+			pbx.mu.Unlock()
+			requireStereoOpusSDP(t, "the INVITE's SDP offer", offer)
 
-	// The user speaks: the mic's opus packets cross byte for byte too.
-	heard := map[string]bool{}
-	deadline := time.Now().Add(testTimeout)
-	for {
-		for _, got := range pbx.waitRTP(t, 1) {
-			heard[string(got)] = true
-		}
-		all := true
-		for _, p := range spoken {
-			if !heard[string(p)] {
-				all = false
+			// …and ONLY once the callee answered is the browser rung: the
+			// established SIP dialog exists by the time the bot's INVITE
+			// lands (a busy callee would never have produced one — the
+			// browser would have been left alone).
+			dialog := pbx.waitDialog(t)
+			invite := waitBotMessage(t, probe, botId, "the bot's INVITE", func(m *rawMsg) bool {
+				return isSipInvite(m) && m.sip.XMedia == "voice" && m.sip.XCallStatus == "inviting"
+			})
+			callId, inviteMsgId := invite.sip.CallId, invite.msgId
+			waitBotMessage(t, probe, botId, "the callee-answered line", isChatReply(callMsg, "Callee answered."))
+
+			// The webrtc-leg's media offer is pinned to the codec the callee
+			// selected: the bot's offer toward the probe carries exactly
+			// [the call's codec, telephone-event].
+			pinned := waitOfferSettled(t, &pcBox)
+			if got := sdpAudioFormats(t, pinned.SDP); !slices.Equal(got, tc.wantFormats) {
+				t.Fatalf("the bot's offer is pinned to %v, want %v:\n%s", got, tc.wantFormats, pinned.SDP)
 			}
-		}
-		if all {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("the callee heard %d of the %d distinct mic packets", len(heard), len(spoken))
-		}
-	}
 
-	// The callee hangs up: the browser leg is ended by the bot (BYE, the
-	// chat line, the ended amend) — signalling termination both ways.
-	if err := dialog.Bye(context.Background()); err != nil {
-		t.Fatalf("the callee's BYE: %v", err)
+			// The user picks up. The accept's shape mirrors the browser's:
+			// the mic joins the pinned m-line (its track speaks the pinned
+			// codec), the 200 OK then flies. No settle sleep is needed: the
+			// bot's own offer settled above, so the mic's re-offer is the
+			// only one in flight.
+			micTrack, err := webrtc.NewTrackLocalStaticSample(tc.micCodec, "mic", "probe")
+			if err != nil {
+				t.Fatalf("the mic track: %v", err)
+			}
+			if _, err := user.AddTrack(botId, micTrack); err != nil {
+				t.Fatalf("attach the mic: %v", err)
+			}
+			// The mic speaks from here on, one packet per 20 ms (samples
+			// written before it binds drop — the "empty room").
+			spoken := tc.voice(5)
+			micCtx, stopMic := context.WithCancel(context.Background())
+			t.Cleanup(stopMic)
+			go func() {
+				for i := 0; ; i++ {
+					if err := micTrack.WriteSample(pionmedia.Sample{Data: spoken[i%len(spoken)], Duration: 20 * time.Millisecond}); err != nil {
+						return
+					}
+					select {
+					case <-micCtx.Done():
+						return
+					case <-time.After(20 * time.Millisecond):
+					}
+				}
+			}()
+			sip(map[string]any{"callId": callId, "response": map[string]any{"code": 200, "phrase": "OK"}})
+
+			// The callee's voice starts streaming — the probe's OnTrack
+			// fires only once media actually arrives, so the stream runs
+			// ahead of the track's wait. The track speaks the pinned codec.
+			streamCtx, stopStream := context.WithCancel(context.Background())
+			t.Cleanup(stopStream)
+			voice := tc.voice(5)
+			go tc.stream(pbx, streamCtx, voice)
+			track := tprobe.waitTrack(t, 1)
+			if codec := track.Codec(); !strings.EqualFold(codec.MimeType, tc.micCodec.MimeType) {
+				t.Fatalf("the bot's track toward the browser is %s, want %s", codec.MimeType, tc.micCodec.MimeType)
+			}
+			waitBotMessage(t, probe, botId, "the accepted amend", isCallStatusAmend(inviteMsgId, callId, "accepted"))
+
+			// The callee speaks: the packets cross the SBC byte for byte.
+			heardVoice := map[string]bool{}
+			for len(heardVoice) < len(voice) {
+				pkt := readOneRTP(t, track)
+				heardVoice[string(pkt.Payload)] = true
+			}
+			for _, want := range voice {
+				if !heardVoice[string(want)] {
+					t.Fatalf("a streamed packet never reached the browser (the passthrough changed or lost it)")
+				}
+			}
+
+			// The user speaks: the mic's packets cross byte for byte too.
+			heard := map[string]bool{}
+			deadline := time.Now().Add(testTimeout)
+			for {
+				for _, got := range pbx.waitRTP(t, 1) {
+					heard[string(got)] = true
+				}
+				all := true
+				for _, p := range spoken {
+					if !heard[string(p)] {
+						all = false
+					}
+				}
+				if all {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatalf("the callee heard %d of the %d distinct mic packets", len(heard), len(spoken))
+				}
+			}
+
+			// The callee hangs up: the browser leg is ended by the bot (BYE,
+			// the chat line, the ended amend) — signalling termination both
+			// ways.
+			if err := dialog.Bye(context.Background()); err != nil {
+				t.Fatalf("the callee's BYE: %v", err)
+			}
+			waitBotMessage(t, probe, botId, "the bot's BYE", isSipRequest(callId, "BYE"))
+			waitBotMessage(t, probe, botId, "the callee-hung-up line", isChatReply(callMsg, "Callee hung up."))
+			waitBotMessage(t, probe, botId, "the ended amend", isCallStatusAmend(inviteMsgId, callId, "ended"))
+		})
 	}
-	waitBotMessage(t, probe, botId, "the bot's BYE", isSipRequest(callId, "BYE"))
-	waitBotMessage(t, probe, botId, "the callee-hung-up line", isChatReply(callMsg, "Callee hung up."))
-	waitBotMessage(t, probe, botId, "the ended amend", isCallStatusAmend(inviteMsgId, callId, "ended"))
 }
 
 // dtmfInjector is the DTMF test's probe-side interceptor, turning
@@ -1777,10 +1939,6 @@ func TestSipBotCallDTMF(t *testing.T) {
 	waitBotMessage(t, probe, botId, "the registered reply", isChatReply(registerMsg, "Registered as"))
 
 	callMsg := chat("/call 1001@" + pbx.addr)
-	invite := waitBotMessage(t, probe, botId, "the bot's INVITE", func(m *rawMsg) bool {
-		return isSipInvite(m) && m.sip.XMedia == "voice" && m.sip.XCallStatus == "inviting"
-	})
-	callId := invite.sip.CallId
 	pbx.waitForPBX(t, "the callee's INVITE", func() bool { return pbx.invites == 1 })
 	// The sip-leg's offer always announces telephone-event — the pad's
 	// capability declaration toward the SIP network.
@@ -1790,11 +1948,19 @@ func TestSipBotCallDTMF(t *testing.T) {
 	if !strings.Contains(offer, "a=rtpmap:101 telephone-event/8000") {
 		t.Fatalf("the INVITE's SDP offer carries no telephone-event:\n%s", offer)
 	}
+	// The browser rings once the callee answered; the pin carries
+	// telephone-event alongside the audio codec.
 	dialog := pbx.waitDialog(t)
+	invite := waitBotMessage(t, probe, botId, "the bot's INVITE", func(m *rawMsg) bool {
+		return isSipInvite(m) && m.sip.XMedia == "voice" && m.sip.XCallStatus == "inviting"
+	})
+	callId := invite.sip.CallId
+	waitBotMessage(t, probe, botId, "the callee-answered line", isChatReply(callMsg, "Callee answered."))
 
-	// The user picks up: mic first (a TrackLocalStaticRTP this time —
-	// WriteRTP's header control is what the press series' shared
-	// timestamps need), the 200 OK once the mic's renegotiation settled.
+	// The user picks up: the mic joins the pinned m-line (a
+	// TrackLocalStaticRTP — WriteRTP's header control is what the press
+	// series' shared timestamps need), the 200 OK once the mic's
+	// renegotiation settled.
 	micTrack, err := webrtc.NewTrackLocalStaticRTP(
 		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus, ClockRate: 48000, Channels: 2}, "mic", "probe")
 	if err != nil {
@@ -1805,7 +1971,6 @@ func TestSipBotCallDTMF(t *testing.T) {
 	}
 	time.Sleep(300 * time.Millisecond)
 	sip(map[string]any{"callId": callId, "response": map[string]any{"code": 200, "phrase": "OK"}})
-	waitBotMessage(t, probe, botId, "the callee-answered line", isChatReply(callMsg, "Callee answered."))
 
 	// Arm the injector: the wire's telephone-event PT is the bot's
 	// registered one — the bot offers the webrtc-leg's media, so its
@@ -1920,9 +2085,10 @@ func TestSipBotCallDTMF(t *testing.T) {
 	waitBotMessage(t, probe, botId, "the callee-hung-up line", isChatReply(callMsg, "Callee hung up."))
 }
 
-// TestSipBotCallBusy covers the callee's refusal while the browser leg
-// still rings: the dial's failure terminates the webrtc-leg with a
-// CANCEL, the chat line says why, the log settles cancelled.
+// TestSipBotCallBusy covers the callee's refusal: the SIP leg leads, so
+// a busy callee fails the dial BEFORE the browser was ever rung — the
+// chat line saying why is the whole story: no INVITE, no CANCEL, no
+// log entry.
 func TestSipBotCallBusy(t *testing.T) {
 	net := newClientTestNet(t, ss.DefaultSubscriberAging)
 	bot := startBot(t, net, "bot", "2-bot", "", nil)
@@ -1945,13 +2111,21 @@ func TestSipBotCallBusy(t *testing.T) {
 	waitBotMessage(t, probe, botId, "the registered reply", isChatReply(registerMsg, "Registered as"))
 
 	callMsg := chat("/call 1001@" + pbx.addr)
-	invite := waitBotMessage(t, probe, botId, "the bot's INVITE", isSipInvite)
-	callId, inviteMsgId := invite.sip.CallId, invite.msgId
+	waitBotMessage(t, probe, botId, "the calling line", isChatReply(callMsg, "Calling 1001@"))
+	pbx.waitForPBX(t, "the callee's INVITE", func() bool { return pbx.invites == 1 })
 
-	// The callee is busy; the still-ringing browser leg is cancelled.
-	waitBotMessage(t, probe, botId, "the CANCEL", isSipRequest(callId, "CANCEL"))
+	// The callee is busy: the chat line says so, and that is all — the
+	// browser was never disturbed.
 	waitBotMessage(t, probe, botId, "the call-failed line", isChatReply(callMsg, "Call failed: "))
-	waitBotMessage(t, probe, botId, "the cancelled amend", isCallStatusAmend(inviteMsgId, callId, "cancelled"))
+	time.Sleep(300 * time.Millisecond)
+	if n := countBotMessages(probe, botId, isSipInvite); n != 0 {
+		t.Fatalf("the busy callee still rang the browser: %d INVITEs", n)
+	}
+	if n := countBotMessages(probe, botId, func(m *rawMsg) bool {
+		return m.mimeType == wireMimeChatControl && m.ccSubtype == "amend"
+	}); n != 0 {
+		t.Fatalf("a call that never rang produced %d log amends", n)
+	}
 }
 
 // TestSipBotHangupCommand covers /hangup mid-call: both legs go down —
@@ -1987,9 +2161,10 @@ func TestSipBotHangupCommand(t *testing.T) {
 	waitBotMessage(t, probe, botId, "the registered reply", isChatReply(registerMsg, "Registered as"))
 
 	callMsg := chat("/call 1001@" + pbx.addr)
+	// The callee answers first; the browser rings on its heels.
+	pbx.waitDialog(t)
 	invite := waitBotMessage(t, probe, botId, "the bot's INVITE", isSipInvite)
 	callId := invite.sip.CallId
-	pbx.waitDialog(t)
 	sip(map[string]any{"callId": callId, "response": map[string]any{"code": 200, "phrase": "OK"}})
 	// The call is established on both legs; no media needs to flow for
 	// the hangup semantics (the probe's OnTrack fires only on arriving
@@ -2036,11 +2211,11 @@ func TestSipBotTestCall(t *testing.T) {
 	waitBotMessage(t, probe, botId, "the registered reply", isChatReply(registerMsg, "Registered as"))
 
 	testCallMsg := chat("/test-call")
-	invite := waitBotMessage(t, probe, botId, "the bot's INVITE", isSipInvite)
-	callId := invite.sip.CallId
 	waitBotMessage(t, probe, botId, "the calling line", isChatReply(testCallMsg, "Calling 9664@"))
 	pbx.waitForPBX(t, "the test callee's INVITE", func() bool { return pbx.invites == 1 && pbx.inviteTo == "9664" })
 	pbx.waitDialog(t)
+	invite := waitBotMessage(t, probe, botId, "the bot's INVITE", isSipInvite)
+	callId := invite.sip.CallId
 
 	// The user declines; the answered callee gets the BYE.
 	sip(map[string]any{"callId": callId, "response": map[string]any{"code": 603, "phrase": "Decline"}})
@@ -2490,13 +2665,205 @@ func TestSipBotMyNumberPooled(t *testing.T) {
 }
 
 // TestSipBotInboundCallEndToEnd covers the reverse direction: a SIP
-// caller dials the registered number, the browser rings, the user
-// accepts, and the call joins — media both ways, then the caller's BYE
-// ends the browser leg.
+// subscriber dials the registered number, the bot selects the call's
+// codec from the caller's offer (the first of the presumed WebRTC codec
+// list the offer carries — opus in one variant, PCMU in the other) and
+// rings the browser with the selection pinned; on the accept the 200
+// OK's SDP answer carries exactly [the selection, telephone-event];
+// media crosses byte for byte in both directions; and the caller's BYE
+// ends the browser leg (BYE, the chat line, the ended amend).
 func TestSipBotInboundCallEndToEnd(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		opus        bool // the fake PBX's offered codec (and so the call's)
+		micCodec    webrtc.RTPCodecCapability
+		voice       func(int) [][]byte
+		stream      func(*fakeCall, context.Context, [][]byte)
+		wantOffer   []string // the webrtc-leg pin's m-line payload types
+		wantAnswer  []string // the 200 OK's answer m-line payload types
+	}{
+		{
+			name:       "opus",
+			opus:       true,
+			micCodec:   webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus, ClockRate: 48000, Channels: 2},
+			voice:      opusVoice,
+			stream:     func(fc *fakeCall, ctx context.Context, p [][]byte) { fc.stream(ctx, p) },
+			wantOffer:  []string{"111", "126"},
+			wantAnswer: []string{"96", "101"},
+		},
+		{
+			name:       "pcmu",
+			opus:       false,
+			micCodec:   webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypePCMU, ClockRate: 8000, Channels: 1},
+			voice:      pcmuVoice,
+			stream:     func(fc *fakeCall, ctx context.Context, p [][]byte) { fc.streamRTP(ctx, p, 0, 160) },
+			wantOffer:  []string{"0", "126"},
+			wantAnswer: []string{"0", "101"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			net := newClientTestNet(t, ss.DefaultSubscriberAging)
+			bot := startBot(t, net, "bot", "2-bot", "", nil)
+			var pcBox atomic.Pointer[webrtc.PeerConnection]
+			user, probe, tprobe, _ := startUserProbeOn(t, net, "user", "1-user", func(c *rtc.RTCClientConfiguration) {
+				c.NewPeerConnection = tapPCFactory(&pcBox)
+			})
+			botId, userId := pairUp(t, bot, user)
+			pbx := newFakePBX(t, 200, tc.opus)
+
+			dc := probe.waitDC(t, botId, msg_handler.DataChannelLabelMessages)
+			chat := func(text string) ss.MsgId {
+				t.Helper()
+				m := baseMsg(ss.WellKnownChIdMain, userId, botId)
+				m["plaintext"] = text
+				if err := dc.SendText(mustJSON(t, m)); err != nil {
+					t.Fatalf("SendText: %v", err)
+				}
+				return ss.MsgId(m["msgId"].(string))
+			}
+			sip := func(body map[string]any) {
+				t.Helper()
+				m := baseMsg(ss.WellKnownChIdMain, userId, botId)
+				m["mimeType"] = wireMimeSip
+				m["sip"] = body
+				if err := dc.SendText(mustJSON(t, m)); err != nil {
+					t.Fatalf("SendText: %v", err)
+				}
+			}
+
+			registerMsg := chat("/register 2001@" + pbx.addr + " passW_0rd")
+			waitBotMessage(t, probe, botId, "the registered reply", isChatReply(registerMsg, "Registered as"))
+
+			// Someone on the SIP network dials the registered number.
+			call := pbx.call(t, "2001")
+
+			// The browser rings: the bot's INVITE, the chat line; the caller
+			// hears the 180.
+			invite := waitBotMessage(t, probe, botId, "the bot's INVITE", func(m *rawMsg) bool {
+				return isSipInvite(m) && m.sip.XMedia == "voice" && m.sip.XCallStatus == "inviting"
+			})
+			callId, inviteMsgId := invite.sip.CallId, invite.msgId
+			waitBotMessage(t, probe, botId, "the incoming-call line", func(m *rawMsg) bool {
+				return m.mimeType == wireMimePlaintext && strings.Contains(m.plaintext, "Incoming call from caller@")
+			})
+			call.waitRinging()
+
+			// The ring's media offer is pinned to the codec selected from
+			// the caller's offer: it carries exactly [the selection,
+			// telephone-event] toward the browser.
+			pinned := waitOfferSettled(t, &pcBox)
+			if got := sdpAudioFormats(t, pinned.SDP); !slices.Equal(got, tc.wantOffer) {
+				t.Fatalf("the ring's offer is pinned to %v, want %v:\n%s", got, tc.wantOffer, pinned.SDP)
+			}
+
+			// The user picks up: the mic joins the pinned m-line (its track
+			// speaks the pinned codec), the 200 OK then flies — the bot's
+			// own offer settled above, so the mic's re-offer is the only
+			// one in flight.
+			micTrack, err := webrtc.NewTrackLocalStaticSample(tc.micCodec, "mic", "probe")
+			if err != nil {
+				t.Fatalf("the mic track: %v", err)
+			}
+			if _, err := user.AddTrack(botId, micTrack); err != nil {
+				t.Fatalf("attach the mic: %v", err)
+			}
+			spoken := tc.voice(5)
+			micCtx, stopMic := context.WithCancel(context.Background())
+			t.Cleanup(stopMic)
+			go func() {
+				for i := 0; ; i++ {
+					if err := micTrack.WriteSample(pionmedia.Sample{Data: spoken[i%len(spoken)], Duration: 20 * time.Millisecond}); err != nil {
+						return
+					}
+					select {
+					case <-micCtx.Done():
+						return
+					case <-time.After(20 * time.Millisecond):
+					}
+				}
+			}()
+			sip(map[string]any{"callId": callId, "response": map[string]any{"code": 200, "phrase": "OK"}})
+
+			// The caller gets his 200 OK + SDP; his ACK arms the relay. The
+			// answer is pinned to the selection: exactly [the call's codec,
+			// telephone-event].
+			call.waitAnswered()
+			call.mu.Lock()
+			answer := call.answerSDP
+			call.mu.Unlock()
+			if got := sdpAudioFormats(t, answer); !slices.Equal(got, tc.wantAnswer) {
+				t.Fatalf("the 200 OK's answer formats are %v, want the pin %v:\n%s", got, tc.wantAnswer, answer)
+			}
+			if tc.opus {
+				// The answer announces stereo opus too: the negotiation keeps
+				// the local codecs, so the offer's fmtp is the answer's as well.
+				requireStereoOpusSDP(t, "the 200 OK's SDP answer", answer)
+			}
+
+			// The caller speaks: the packets cross to the browser byte for
+			// byte. The stream runs ahead of the track's wait — the probe's
+			// OnTrack fires only once media actually arrives.
+			streamCtx, stopStream := context.WithCancel(context.Background())
+			t.Cleanup(stopStream)
+			voice := tc.voice(5)
+			go tc.stream(call, streamCtx, voice)
+			track := tprobe.waitTrack(t, 1)
+			if codec := track.Codec(); !strings.EqualFold(codec.MimeType, tc.micCodec.MimeType) {
+				t.Fatalf("the bot's track toward the browser is %s, want %s", codec.MimeType, tc.micCodec.MimeType)
+			}
+			waitBotMessage(t, probe, botId, "the accepted amend", isCallStatusAmend(inviteMsgId, callId, "accepted"))
+			heardVoice := map[string]bool{}
+			for len(heardVoice) < len(voice) {
+				pkt := readOneRTP(t, track)
+				heardVoice[string(pkt.Payload)] = true
+			}
+			for _, want := range voice {
+				if !heardVoice[string(want)] {
+					t.Fatalf("a streamed packet never reached the browser (the passthrough changed or lost it)")
+				}
+			}
+
+			// The user speaks: the mic's packets cross to the caller byte
+			// for byte.
+			heard := map[string]bool{}
+			deadline := time.Now().Add(testTimeout)
+			for {
+				for _, got := range pbx.waitRTP(t, 1) {
+					heard[string(got)] = true
+				}
+				all := true
+				for _, p := range spoken {
+					if !heard[string(p)] {
+						all = false
+					}
+				}
+				if all {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatalf("the caller heard %d of the %d distinct mic packets", len(heard), len(spoken))
+				}
+			}
+
+			// The caller hangs up: the browser leg is ended by the bot (BYE,
+			// the chat line, the ended amend).
+			call.bye()
+			waitBotMessage(t, probe, botId, "the bot's BYE", isSipRequest(callId, "BYE"))
+			waitBotMessage(t, probe, botId, "the caller-hung-up line", func(m *rawMsg) bool {
+				return m.mimeType == wireMimePlaintext && strings.Contains(m.plaintext, "Caller hung up.")
+			})
+			waitBotMessage(t, probe, botId, "the ended amend", isCallStatusAmend(inviteMsgId, callId, "ended"))
+		})
+	}
+}
+
+// TestSipBotInboundCallNoCommonCodec covers the offer sharing nothing
+// with the presumed WebRTC codec list: the caller gets a 488 at once
+// and the browser never rings.
+func TestSipBotInboundCallNoCommonCodec(t *testing.T) {
 	net := newClientTestNet(t, ss.DefaultSubscriberAging)
 	bot := startBot(t, net, "bot", "2-bot", "", nil)
-	user, probe, tprobe, _ := startUserProbe(t, net, "user", "1-user")
+	user, probe, _, _ := startUserProbe(t, net, "user", "1-user")
 	botId, userId := pairUp(t, bot, user)
 	pbx := newFakePBX(t, 200, true)
 
@@ -2510,132 +2877,21 @@ func TestSipBotInboundCallEndToEnd(t *testing.T) {
 		}
 		return ss.MsgId(m["msgId"].(string))
 	}
-	sip := func(body map[string]any) {
-		t.Helper()
-		m := baseMsg(ss.WellKnownChIdMain, userId, botId)
-		m["mimeType"] = wireMimeSip
-		m["sip"] = body
-		if err := dc.SendText(mustJSON(t, m)); err != nil {
-			t.Fatalf("SendText: %v", err)
-		}
-	}
 
 	registerMsg := chat("/register 2001@" + pbx.addr + " passW_0rd")
 	waitBotMessage(t, probe, botId, "the registered reply", isChatReply(registerMsg, "Registered as"))
 
-	// Someone on the SIP network dials the registered number.
-	call := pbx.call(t, "2001")
+	// A caller whose offer shares nothing with the presumed list (speex
+	// alone) gets the 488…
+	speex := fmt.Sprintf("v=0\r\no=- 0 0 IN IP4 %s\r\ns=fakepbx\r\nc=IN IP4 %s\r\nt=0 0\r\nm=audio %d RTP/AVP 96\r\na=rtpmap:96 speex/8000\r\n", pbx.ip, pbx.ip, pbx.rtpPort())
+	call := pbx.callSDP(t, "2001", []byte(speex))
+	call.waitFailed(488)
 
-	// The browser rings: the bot's INVITE, the chat line; the caller
-	// hears the 180.
-	invite := waitBotMessage(t, probe, botId, "the bot's INVITE", func(m *rawMsg) bool {
-		return isSipInvite(m) && m.sip.XMedia == "voice" && m.sip.XCallStatus == "inviting"
-	})
-	callId, inviteMsgId := invite.sip.CallId, invite.msgId
-	waitBotMessage(t, probe, botId, "the incoming-call line", func(m *rawMsg) bool {
-		return m.mimeType == wireMimePlaintext && strings.Contains(m.plaintext, "Incoming call from caller@")
-	})
-	call.waitRinging()
-
-	// The user picks up. The accept's shape mirrors the browser's: the
-	// mic goes on the connection FIRST — a fresh m-line on the quiet
-	// connection — and the 200 OK then flies.
-	micTrack, err := webrtc.NewTrackLocalStaticSample(
-		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus, ClockRate: 48000, Channels: 2}, "mic", "probe")
-	if err != nil {
-		t.Fatalf("the mic track: %v", err)
-	}
-	if _, err := user.AddTrack(botId, micTrack); err != nil {
-		t.Fatalf("attach the mic: %v", err)
-	}
-	spoken := make([][]byte, 5)
-	for i := range spoken {
-		p := make([]byte, 30)
-		p[0] = 0xF8
-		for j := 1; j < len(p); j++ {
-			p[j] = byte(i*53 + j*17)
-		}
-		spoken[i] = p
-	}
-	micCtx, stopMic := context.WithCancel(context.Background())
-	t.Cleanup(stopMic)
-	go func() {
-		for i := 0; ; i++ {
-			if err := micTrack.WriteSample(pionmedia.Sample{Data: spoken[i%len(spoken)], Duration: 20 * time.Millisecond}); err != nil {
-				return
-			}
-			select {
-			case <-micCtx.Done():
-				return
-			case <-time.After(20 * time.Millisecond):
-			}
-		}
-	}()
-	// Let the mic's offer/answer settle before the 200 OK triggers the
-	// bot's own attach offer, so the two renegotiations never meet in
-	// flight.
+	// …and the browser is never disturbed.
 	time.Sleep(300 * time.Millisecond)
-	sip(map[string]any{"callId": callId, "response": map[string]any{"code": 200, "phrase": "OK"}})
-
-	// The caller gets his 200 OK + SDP; his ACK arms the relay. The answer
-	// announces stereo opus too: the negotiation keeps the local codecs, so
-	// the offer's fmtp is the answer's as well.
-	call.waitAnswered()
-	call.mu.Lock()
-	answer := call.answerSDP
-	call.mu.Unlock()
-	requireStereoOpusSDP(t, "the 200 OK's SDP answer", answer)
-
-	// The caller speaks: the opus packets cross to the browser byte for
-	// byte. The stream runs ahead of the track's wait — the probe's
-	// OnTrack fires only once media actually arrives.
-	streamCtx, stopStream := context.WithCancel(context.Background())
-	t.Cleanup(stopStream)
-	voice := opusVoice(5)
-	go call.stream(streamCtx, voice)
-	track := tprobe.waitTrack(t, 1)
-	waitBotMessage(t, probe, botId, "the accepted amend", isCallStatusAmend(inviteMsgId, callId, "accepted"))
-	heardVoice := map[string]bool{}
-	for len(heardVoice) < len(voice) {
-		pkt := readOneRTP(t, track)
-		heardVoice[string(pkt.Payload)] = true
+	if n := countBotMessages(probe, botId, isSipInvite); n != 0 {
+		t.Fatalf("the unbridgeable call still rang the browser: %d INVITEs", n)
 	}
-	for _, want := range voice {
-		if !heardVoice[string(want)] {
-			t.Fatalf("a streamed packet never reached the browser (the passthrough changed or lost it)")
-		}
-	}
-
-	// The user speaks: the mic's opus packets cross to the caller byte
-	// for byte.
-	heard := map[string]bool{}
-	deadline := time.Now().Add(testTimeout)
-	for {
-		for _, got := range pbx.waitRTP(t, 1) {
-			heard[string(got)] = true
-		}
-		all := true
-		for _, p := range spoken {
-			if !heard[string(p)] {
-				all = false
-			}
-		}
-		if all {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("the caller heard %d of the %d distinct mic packets", len(heard), len(spoken))
-		}
-	}
-
-	// The caller hangs up: the browser leg is ended by the bot (BYE, the
-	// chat line, the ended amend).
-	call.bye()
-	waitBotMessage(t, probe, botId, "the bot's BYE", isSipRequest(callId, "BYE"))
-	waitBotMessage(t, probe, botId, "the caller-hung-up line", func(m *rawMsg) bool {
-		return m.mimeType == wireMimePlaintext && strings.Contains(m.plaintext, "Caller hung up.")
-	})
-	waitBotMessage(t, probe, botId, "the ended amend", isCallStatusAmend(inviteMsgId, callId, "ended"))
 }
 
 // TestSipBotInboundCallDeclined covers the user's decline: the caller's

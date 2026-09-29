@@ -20,6 +20,11 @@ var (
 	CodecAudioAlaw          = Codec{PayloadType: 8, SampleRate: 8000, SampleDur: 20 * time.Millisecond, NumChannels: 1, Name: "PCMA"}
 	CodecAudioOpus          = Codec{PayloadType: 96, SampleRate: 48000, SampleDur: 20 * time.Millisecond, NumChannels: 2, Name: "opus"}
 	CodecTelephoneEvent8000 = Codec{PayloadType: 101, SampleRate: 8000, SampleDur: 20 * time.Millisecond, NumChannels: 1, Name: "telephone-event"}
+
+	// CodecAudioG722 is G.722 (PT 9). NOTE: the SampleRate is the 8000 Hz
+	// RTP clock rate of RFC 3551 — G.722's audio is 16 kHz but its RTP
+	// timestamps clock at 8000 Hz. (Local patch — see PATCHES.md.)
+	CodecAudioG722 = Codec{PayloadType: 9, SampleRate: 8000, SampleDur: 20 * time.Millisecond, NumChannels: 1, Name: "G722"}
 )
 
 type Codec struct {
@@ -99,6 +104,8 @@ func CodecAudioFromPayloadType(payloadType uint8) (Codec, error) {
 		return CodecAudioAlaw, nil
 	case sdp.FORMAT_TYPE_ULAW:
 		return CodecAudioUlaw, nil
+	case sdp.FORMAT_TYPE_G722:
+		return CodecAudioG722, nil
 	case sdp.FORMAT_TYPE_OPUS:
 		return CodecAudioOpus, nil
 	case sdp.FORMAT_TYPE_TELEPHONE_EVENT:
@@ -115,6 +122,8 @@ func mapSupportedCodec(f string) Codec {
 		return CodecAudioAlaw
 	case sdp.FORMAT_TYPE_ULAW:
 		return CodecAudioUlaw
+	case sdp.FORMAT_TYPE_G722:
+		return CodecAudioG722
 	case sdp.FORMAT_TYPE_OPUS:
 		return CodecAudioOpus
 	case sdp.FORMAT_TYPE_TELEPHONE_EVENT:
@@ -164,6 +173,14 @@ func CodecsFromSDPRead(formats []string, attrs []string, codecsAudio []Codec) (i
 
 		if f == "8" {
 			codecsAudio[n] = CodecAudioAlaw
+			n++
+			continue
+		}
+
+		// G.722's static PT (RFC 3551) needs no rtpmap line either. (Local
+		// patch — see PATCHES.md.)
+		if f == "9" {
+			codecsAudio[n] = CodecAudioG722
 			n++
 			continue
 		}

@@ -247,6 +247,20 @@
           <xsd:element name="yellowPage" type="yellowPageType" minOccurs="0" />
         </xsd:sequence>
         <xsd:attribute name="testSIPContact" type="xsd:string" use="optional" />
+        <!-- webrtcCodecs is the presumed WebRTC codec list (the sip
+             bot's end-to-end codec negotiation, see docs/sip-bot.md §8):
+             a comma-separated list of codec names — opus, g722, pcmu,
+             pcma — in the browsers' preference order; the outbound SIP
+             offer's codec list, and the inbound call's selection order
+             among the caller's offer. Unset selects the default
+             (opus,g722,pcmu,pcma). An unknown name fails the startup. -->
+        <xsd:attribute name="webrtcCodecs" use="optional">
+          <xsd:simpleType>
+            <xsd:restriction base="xsd:string">
+              <xsd:pattern value="[A-Za-z0-9]+(,[A-Za-z0-9]+)*" />
+            </xsd:restriction>
+          </xsd:simpleType>
+        </xsd:attribute>
         <!-- ipPreference selects the address family of every DNS
              resolution in the sip leg (the registrar's and the callees'
              hostnames): v4Only resolves A records only, v6Only AAAA

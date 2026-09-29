@@ -100,6 +100,13 @@ type ResponseWriter interface {
 	// attach error — rtc.ErrNoPeerSession when the session is gone.
 	AttachMedia(tracks ...webrtc.TrackLocal) error
 
+	// AttachMediaWithCodecPreferences is AttachMedia plus pinning the
+	// track's m-line codec negotiation to codecs: the session's offers
+	// and answers carry exactly codecs for the track's m-line (see
+	// rtc.HeadlessRTCClient.AddTrackWithCodecPreferences). A nil codecs
+	// is AttachMedia exactly.
+	AttachMediaWithCodecPreferences(track webrtc.TrackLocal, codecs []webrtc.RTPCodecParameters) error
+
 	// DetachMedia withdraws tracks previously offered with Accept or
 	// AttachMedia (the call ended); a no-op for a track that is not
 	// attached. Returns the first detach error.
@@ -296,6 +303,15 @@ func (w *responseWriter) AttachMedia(tracks ...webrtc.TrackLocal) error {
 		}
 	}
 	return nil
+}
+
+// AttachMediaWithCodecPreferences implements ResponseWriter.
+func (w *responseWriter) AttachMediaWithCodecPreferences(track webrtc.TrackLocal, codecs []webrtc.RTPCodecParameters) error {
+	if codecs == nil {
+		return w.AttachMedia(track)
+	}
+	_, err := w.server.client.AddTrackWithCodecPreferences(w.peer, track, codecs)
+	return err
 }
 
 // DetachMedia implements ResponseWriter.

@@ -17,9 +17,19 @@ networks that share nothing but this host:
   bot can reach over UDP (an Asterisk/FreeSWITCH/Kamailio, a residential
   VoIP provider, …).
 
-In SIP terms the bot is a **B2BUA (back-to-back user agent)**: it
-terminates both signalling planes and both media planes and relays each
-into the other. Toward the SIP network it is a UAC (REGISTER + INVITE)
+In SIP terms the bot is a **B2BUA (back-to-back user agent)** for
+**signalling** — it terminates both signalling planes and relays each
+into the other — but a **media relay** for the media plane, in the
+spirit of FreeSWITCH's proxy-media mode (neither full B2BUA media
+handling nor bypass-media): the codec is negotiated **end to end**
+between the browser and the SIP UA, and the bot's own codec preferences
+never participate — the topology is UA(WebRTC) — bot — UA(SIP), and only
+the two UAs' media support matters. Media crosses at the RTP payload
+level: the bot decrypts and re-encrypts (DTLS-SRTP is mandatory on the
+webrtc leg; the sip leg speaks plain RTP), re-originating the transport,
+crypto, PTs, SSRCs, and timestamps per leg — but never re-encodes: there
+is no transcoding anywhere, so the payload crosses byte for byte. Toward
+the SIP network the bot is a UAC (REGISTER + INVITE)
 and a UAS (inbound INVITEs to a registered AOR); toward the browser it
 is a headless bot peer (the third policy bot on the three-layer bot
 stack). The user in the browser can thus phone an arbitrary SIP
@@ -27,10 +37,11 @@ subscriber — and a SIP subscriber who dials the user's registered AOR
 rings the user's browser (§7.2):
 
 ```
-browser ──(WebRTC: SRTP, opus)──▶ SIP BOT ──(SIP/RTP: negotiated)──▶ PBX ──▶ callee
-       ◀──                        ◀──(SIP INVITE to a registered AOR)──── caller
-dcmsg SIP-subset dialog            real SIP: REGISTER, INVITE (both
-+ renegotiated m-line              directions), BYE; plain RTP media
+browser ──(WebRTC: DTLS-SRTP)──▶ SIP BOT ──(SIP/RTP)──▶ PBX ──▶ callee
+       ◀──                      ◀──(SIP INVITE to a registered AOR)──── caller
+dcmsg SIP-subset dialog          real SIP: REGISTER, INVITE (both
++ renegotiated m-line            directions), BYE; plain RTP media
+        └──── one codec, negotiated end to end by the two UAs (§8) ────┘
 ```
 
 Like the music bot and the echo bot, the bot is hosted by the server
@@ -52,11 +63,13 @@ graph TD
 ```
 
 - **webrtc-leg**: layers 1–3, identical to the music bot's. The audio
-  codec toward the browser is **opus** (48 kHz), carried on a
-  `TrackLocalStaticSample` attached to the pair's existing peer
-  connection; the in-band dialog verbs (`INVITE`/`200 OK`/`CANCEL`/`BYE`)
-  ride `dcmsg`. No new connection is ever created — "a call" is the pair's
-  connection gaining an m-line, plus a SIP dialog on the other leg.
+  codec toward the browser is **the one codec the call negotiated end to
+  end** (§8) — opus, G.722, PCMU, or PCMA — carried on a
+  `TrackLocalStaticSample` created with that codec's capability and
+  attached to the pair's existing peer connection; the in-band dialog
+  verbs (`INVITE`/`200 OK`/`CANCEL`/`BYE`) ride `dcmsg`. No new
+  connection is ever created — "a call" is the pair's connection gaining
+  an m-line, plus a SIP dialog on the other leg.
 - **sip-leg**: one `diago.Diago` transaction user **per registered chat
   user** — each `/register` opens a dedicated SIP client (its own sipgo
   UA, named for the user's SIP username, and its own UDP socket) that
@@ -65,23 +78,26 @@ graph TD
   every outbound call (a `diago.Invite` →
   `DialogClientSession`) run on the account's own client, so the wire
   identity is that user's alone: the `From` is the AOR, the `Contact`'s
-  `From` is the AOR, the `Contact`'s
   user part is the username, the digest credential is the user's — the
   bot's own identity never appears, and no user's credential ever rides
   another user's transport. The same client is the UAS for inbound
   calls: an INVITE arriving on the account's socket is routed to the
   account's owner and rings their browser (§7.2). The codec toward the
-  SIP network is **whatever the SDP negotiation settles on**; the bot
-  offers, in preference order, **opus, PCMU, PCMA** (plus
-  telephone-event — the browser user's key presses cross to the SIP
-  network on it, §8), in both directions. The opus it offers — and
-  answers with — announces
-  `a=fmtp:96 useinbandfec=1;stereo=1`: in-band FEC and the RFC 7587
-  stereo receive preference, the webrtc-leg's stereo negotiation
-  mirrored onto the SIP side (§8).
+  SIP network is **the end-to-end negotiated one** (§8): the outbound
+  INVITE's offer carries the _presumed WebRTC codec list_ (the
+  configurable `webrtcCodecs`, defaulting to opus, G.722, PCMU, PCMA —
+  plus telephone-event, §8) and the answer's selection pins the whole
+  call; the inbound call's 200 OK answers with the single selected codec
+  directly. When the selection is opus, its fmtp announces
+  `useinbandfec=1;stereo=1` (in-band FEC and the RFC 7587 stereo receive
+  preference) on both emission points — the webrtc leg's stereo
+  negotiation mirrored onto the SIP side; a stereo-capable peer's
+  packets then cross the relay untouched, and a mono peer is unaffected
+  (the parameter is a preference, never a requirement).
 
 The two legs meet only inside the bot: signalling state is relayed by the
-handler (§7), media by a per-call **relay** (§8).
+handler (§7), media by a per-call **relay** (§8) — a pair of payload
+passthroughs, one per direction.
 
 ## 3. The CLI
 
@@ -332,8 +348,11 @@ Unauthorized`) — because a bot has no unsolicited-send path outside a
 ### Outbound — `/call 1001@sip.example.com`
 
 The bot opens **both** legs and relays each leg's events into the other.
-The SIP INVITE can take seconds (ringing), so it runs on its own
-goroutine — the dcmsg goroutine never waits on the PSTN.
+Because the media negotiation is end to end (§8), the SIP leg leads: the
+callee's answer carries the codec selection, so the browser is rung only
+**after** the SIP side answered — a busy or unreachable callee never
+disturbs the browser. The SIP INVITE can take seconds (ringing), so it
+runs on its own goroutine — the dcmsg goroutine never waits on the PSTN.
 
 ```mermaid
 sequenceDiagram
@@ -344,17 +363,19 @@ sequenceDiagram
 
     U->>H: "/call 1001@sip.example.com"
     Note over H: session must be registered;<br/>one call per user
-    H->>H: call state + opus track created<br/>w.OnTrack(mic handler)
-    H->>U: w.Invite(voice) — the browser rings
     H->>U: "Calling 1001@sip.example.com…"
-    H-->>P: diago.Invite(ctx, callee, creds) — async
+    H-->>P: diago.Invite(ctx, callee, creds) — async<br/>SDP offer = the presumed WebRTC codec list (§8)
+    P-->>H: 180 Ringing (no early media in v1)
+    P-->>H: 200 OK + SDP answer → codec C known
+    Note over H: the call pins C; the speaker track<br/>is created with C's capability<br/>and the relay arms (empty-room until the track binds)
+    H->>U: AttachMedia(track, pinned) — the bot's offer<br/>carries [C, telephone-event] (§9's pin)
+    H->>U: w.Invite(voice) — the browser rings
+    H->>U: "Callee answered."
+    Note over U: the offer is answered at once —<br/>the callee's audio flows, muted<br/>until the accept resumes the AudioContext
     U->>H: 200 OK (user answered)
-    H->>R: AttachMedia(track) → renegotiation<br/>→ SRTP to the browser
-    Note over R: mic pump starts: opus RTP →<br/>sip-leg writer (§8)
-    P-->>H: 183 Ringing (no early media in v1)
-    P-->>H: 200 OK + SDP answer → codec known
-    Note over R: callee pump starts: payload reader →<br/>opus → track.WriteSample<br/>(drops while the browser leg rings —<br/>the "empty room" pattern)
-    H->>U: "Callee answered." (only when the<br/>SIP answer precedes the user's)
+    U->>H: mic offer (follows the accept by getUserMedia latency)
+    H->>U: answer pinned to [C, telephone-event]<br/>→ OnTrack fires → the mic pump starts
+    Note over R: mic payloads → sip-leg writer (§8)
     U->>H: BYE (hangup button or /hangup)
     H->>P: dialog.Hangup(ctx) → SIP BYE
     H->>R: stop pumps, DetachMedia (delayed,<br/>music-bot hangup discipline)
@@ -363,9 +384,10 @@ sequenceDiagram
 The reverse-propagation cases:
 
 - **Callee busy / unreachable**: the SIP INVITE fails (4xx/408/no
-  answer). If the browser leg still rings → `w.Cancel(callId)` (§9); if
-  the user already answered → `w.Bye(callId)`. Chat reply:
-  `Call failed: 486 Busy Here.`
+  answer) — before the browser was ever rung, so the chat reply
+  `Call failed: 486 Busy Here.` is the whole story (no webrtc-leg verbs
+  exist to send). Once the SIP side has answered, a SIP-side ending is
+  no longer a failure but the callee-hangs-up case below.
 - **Callee hangs up**: the dialog's ctx ends → the relay stops → the
   browser leg gets `w.Bye(callId)`, the chat a `Callee hung up.` line.
 - **User hangs up** (BYE/CANCEL on dcmsg, or `/hangup`): the SIP dialog
@@ -373,6 +395,8 @@ The reverse-propagation cases:
   stops, the track detaches after the music bot's `hangupDetachDelay`
   (the browser is tearing down its side at the same instant; the
   withdrawal must not race its offer into a glare rebuild).
+- **User declines** (603) after the callee answered: the SIP dialog is
+  already established, so its `Hangup` is a BYE — the callee is told.
 - **Peer session ends** (the browser drops): the session ctx cancels
   everything, and the framework's lifecycle hook (§9) runs the bot's
   session-end teardown — the call ends (the callee gets the BYE), the
@@ -384,22 +408,27 @@ Mid-call `/call` (a second one) is refused while a call stands; `/play`-style
 switching has no meaning here.
 
 DTMF rides the signalling from the start: the webrtc-leg's media
-renegotiation always negotiates RFC 4733 telephone-event (the bot's
-peer-connection factory registers it — every browser offers and accepts
-it), and the outbound INVITE's SDP offer always announces it toward the
-SIP network, so the browser's dial pad reaches an IVR the moment the
-call is up (§8).
+negotiation always pins RFC 4733 telephone-event alongside the audio
+codec (the bot's peer-connection factory registers it — every browser
+offers and accepts it), and the outbound INVITE's SDP offer always
+announces it toward the SIP network, so the browser's dial pad reaches
+an IVR the moment the call is up (§8).
 
 ### Inbound — a SIP subscriber phones the user
 
 The reverse direction: someone on the SIP network dials the AOR a user
 registered (their own credential, or a loaned pool account while the
 loan lasts), the registrar routes the INVITE to the account's socket,
-and the bot rings the user's browser. The browser needs nothing new —
+and the bot rings the user's browser. The media codec is selected the
+moment the INVITE lands (§8): C is the first codec of the presumed
+WebRTC codec list the caller's offer carries — the call the browser
+later joins is pinned to C from the start. A caller whose offer shares
+**nothing** with the presumed list gets a 488 Not Acceptable Here at
+once, and the browser never rings (likewise an INVITE without SDP —
+late-offer inbound stays unsupported). The browser needs nothing new —
 an inbound call is a bot-originated INVITE on the webrtc-leg, exactly
-the verb `/call` already uses: the answer popup, the accept (whose mic
-attach precedes the bot's media, §11.13), the decline, the hangup are
-usePhoneCalls' generic incoming-call path.
+the verb `/call` already uses: the answer popup, the accept, the
+decline, the hangup are usePhoneCalls' generic incoming-call path.
 
 ```mermaid
 sequenceDiagram
@@ -408,16 +437,18 @@ sequenceDiagram
     participant R as relay (media)
     participant U as User (browser)
 
-    P->>H: INVITE on the account's socket (diago UAS)
-    Note over H: one call per user, either direction:<br/>busy → 486 Busy Here; no live session →<br/>480 (the Invite fails)
+    P->>H: INVITE on the account's socket (diago UAS)<br/>SDP offer [S] → C = presumed-preferred of [S]
+    Note over H: one call per user, either direction:<br/>busy → 486 Busy Here; no live session →<br/>480 (the Invite fails); no common codec → 488
+    H->>U: AttachMedia(track with C's capability, pinned)<br/>— the offer carries [C, telephone-event] (§9's pin)
     H->>P: 180 Ringing
     H->>U: w.Invite(voice) — the browser rings<br/>(Server.WriterFor — §9's unsolicited path)
     H->>U: "Incoming call from <caller>…"
     Note over H: ring timeout (60 s) arms: 480 to the caller,<br/>CANCEL to the browser
     U->>H: 200 OK (user clicked accept)
-    H->>R: AttachMedia(track) → renegotiation
-    H->>P: 200 OK + SDP answer (diago Answer, ACK-awaited)<br/>→ codec known → relay arms (§8)
-    Note over R: both pumps run: caller's RTP → opus → track,<br/>mic → sip-leg writer
+    H->>P: 200 OK + SDP answer [C] (diago AnswerOptions,<br/>ACK-awaited) → relay arms (§8)
+    U->>H: mic offer (follows the accept by getUserMedia latency)
+    H->>U: answer pinned to [C, telephone-event]<br/>→ OnTrack fires → the mic pump starts
+    Note over R: both pumps run, payloads crossing byte for byte
     P->>H: BYE (the caller hangs up)
     H->>U: w.Bye(callId) — the browser leg ends
 ```
@@ -446,19 +477,21 @@ discovered in its (and sipgo's) source, on which the flow rests:
   tracking whether the 200 OK has gone out. The one exception is the
   user's explicit decline (the browser's 603), mirrored to the caller
   as a 603 Decline.
-- **`Answer` is the 200 OK**: it builds the media session from the
-  account's codec list (the same opus-first preference the outbound
-  offers), sends the SDP answer, and blocks until the caller's ACK (64·T1
+- **`Answer` is the 200 OK**: the bot answers with
+  `AnswerOptions{Codecs: [C, telephone-event]}` — the per-call codec
+  override pins the answer to the selected codec (diago's negotiation
+  intersects it with the caller's offer, so telephone-event echoes only
+  when offered). The answer blocks until the caller's ACK (64·T1
   bound) — so it runs on its own goroutine when the browser's 200 OK
   arrives, and its success binds the relay through the outbound path's
   exact-once discipline (a call that ended while Answer blocked gets
   its just-answered dialog BYEd by the answerer itself).
-- The relay and the codec matrix are direction-blind (§8): the dialog's
-  payload reader/writer is the DialogMedia both session types embed.
+- The relay is direction-blind (§8): the dialog's payload reader/writer
+  is the DialogMedia both session types embed.
 
 DTMF's signalling is the mirror of the outbound flow's: the 200 OK's
 SDP answer echoes telephone-event exactly when the caller's offer
-announced it (diago's negotiation intersects the account's codec list),
+announced it (diago's negotiation intersects the pinned codec list),
 and the webrtc-leg negotiates it unconditionally — the capability
 travels from the SIP network through the bot to the browser's dial pad
 (§8).
@@ -470,66 +503,101 @@ the loan and its socket are gone (§5). The registrar's own screening
 aside, the bot does not digest-authenticate inbound INVITEs (diago has
 no UAS auth) — §11 owns that tradeoff.
 
-## 8. The media plane: relay + codec matrix
+## 8. The media plane: the transcoding-free relay
 
-Each established call owns a **relay**: the webrtc-leg opus track
-(bot→browser), the browser's mic `TrackRemote` (browser→bot), and the
-sip-leg dialog's payload reader/writer. Two pump goroutines, one per
-direction, each a read→(maybe transcode)→write loop. diago's
+The bot is a **media relay**, not a media terminator: it never decodes,
+re-encodes, resamples, or mixes. Each established call owns a **relay**:
+the webrtc-leg track toward the browser (`TrackLocalStaticSample`
+carrying the negotiated codec), the browser's mic `TrackRemote`, and the
+sip-leg dialog's payload reader/writer — and two pump goroutines, one per
+direction, each a read→write loop at **RTP payload granularity**: the
+payload crosses byte for byte; what the bot re-originates per leg is the
+envelope (the transport address, the crypto — DTLS-SRTP on the webrtc
+leg, plain RTP on the sip leg — and the PT/SSRC/sequence/timestamp
+numbering, each leg's writer clocking its own). diago's
 `DialogMedia.AudioReader`/`AudioWriter` read and write **encoded
 payload** at packet granularity — exactly the relay's currency, so no
 RTP header work reaches the bot.
 
-| sip-leg codec (negotiated) | webrtc-leg codec (fixed) | SIP → browser                                | browser → SIP                                                 |
-| -------------------------- | ------------------------ | -------------------------------------------- | ------------------------------------------------------------- |
-| opus                       | opus                     | **passthrough**: payload → WriteSample       | **passthrough**: payload → AudioWriter                        |
-| PCMU (G.711 μ-law)         | opus                     | μ-law decode → 8k→48k resample → opus encode | opus decode → stereo downmix → 48k→8k resample → μ-law encode |
-| PCMA (G.711 A-law)         | opus                     | A-law decode → 8k→48k resample → opus encode | opus decode → stereo downmix → 48k→8k resample → A-law encode |
+### One codec, negotiated end to end
 
-Transcoding is **avoided whenever both legs are opus** — the codec's own
-packets cross the SBC byte for byte; the code makes the passthrough the
-first branch, not a degenerate case of a transcode pipeline.
+Because no transcoding exists, both directions of both legs must speak
+**one codec C** per call (plus telephone-event as the auxiliary
+alongside it — the DTMF subsection). The vocabulary is the intersection
+of what the two SDP dialects express and the relay passes: **opus, G.722,
+PCMU, PCMA**. The bot's own codec preferences never participate — the
+relay maps codec identity between the legs and nothing more:
 
-The sip-leg's opus carries the RFC 7587 fmtp `useinbandfec=1;stereo=1`
-— in-band FEC and the stereo receive preference — on **both** emission
-points: the outbound INVITE's offer and the inbound call's 200 OK
-answer (diago's negotiation keeps the local codecs, fmtp included, for
-the answer). A stereo-capable peer may then send stereo, which the
-passthrough delivers to the stereo-negotiated browser leg untouched;
-a mono peer is unaffected, the parameter being a preference, never a
-requirement. diago's SDP generator hardcodes the opus fmtp
-(`useinbandfec=0`) and its `media.Codec` has no field for one —
-upstream through v0.40.0 — so diago is **vendored** at
-`third_party/diago` (a `replace` in `go.mod`) with a minimal patch: a
-per-codec `Fmtp` string the SDP generator honors and codec matching
-ignores (the fork's `PATCHES.md` has the details).
+- **Outbound** — the WebRTC UA is the effective offerer. The browser's
+  media capability is not knowable ahead of time (its first SDP is its
+  mic offer, which follows the user's accept by a getUserMedia), so the
+  SIP INVITE's offer carries the **presumed WebRTC codec list** — the
+  configurable `webrtcCodecs`, defaulting to `[opus, g722, pcmu, pcma]`,
+  in the browsers' own preference order — plus telephone-event. The SIP
+  UA's answer **selects**: C is the answer's top audio codec (diago's
+  negotiated codec). The selection is then relayed back to the WebRTC UA
+  by pinning the webrtc leg to it (below) — which is also why the
+  browser is rung only after the SIP answer exists (§7.1).
+- **Inbound** — the SIP UA offers `[S]`. C is the first codec of the
+  presumed WebRTC codec list that appears in `[S]`: the presumed
+  browser's selection among the caller's support, made at INVITE time,
+  then relayed to the SIP UA as the 200 OK's pinned answer. The
+  browser's actual mic offer is checked against C when it arrives — a
+  mismatch means the presumption failed, and the bot drains the
+  off-script mic rather than bridging garbage (§11.8).
 
-Transcoding specifics:
+The presumption is the design's one leap: the list is exactly the audio
+codecs every browser offers (the bot's webrtc-leg MediaEngine registers
+precisely them), in the browsers' own preference order, so the presumed
+selection and a literal relay of the browser's answer coincide for every
+real browser — and a deployment facing an exotic WebRTC client trims the
+list to match (§10).
 
-- **G.711** via `github.com/emiago/diago/audio`'s slice helpers (on
-  `github.com/zaf/g711`) — 160 samples per 20 ms frame, pure Go.
-- **Opus decode/encode** via `github.com/hraban/opus` (libopus, cgo) —
-  the same binding the music bot encodes with, behind the same `cgo`
-  build-tag discipline with a stub for pure-Go builds. Voice frames are
-  encoded **mono** 48 kHz at telephony bitrate; a mono packet on the
-  stereo-negotiated webrtc leg is valid RFC 7587 and plays as dual mono.
-- **Resampling** 8 kHz ↔ 48 kHz is factor-6: 6:1 box-average decimation
-  down, 1:6 linear interpolation up — telephony-grade, allocation-free
-  per frame. (Not a polyphase filter; §11 owns that tradeoff.)
-- **Packet-duration freedom**: opus packet durations come from the TOC
-  byte (RFC 6716 §3.1 — frame count × per-frame duration), so the
-  webrtc-bound direction timestamps exactly. Transcoding pumps run a
-  small **sample accumulator**: input packets of any ptime are decoded
-  into it, and whole 20 ms output frames (160 @ 8 kHz / 960 @ 48 kHz)
-  are emitted as they fill — diago's RTP writer clocks one codec ptime
-  per write, and pion's track one `Duration` per sample.
-- **Pacing**: SIP→browser is self-paced by the arriving RTP; the
-  accumulator never writes ahead of the network. browser→SIP is paced by
-  the browser's mic packets. No tickers anywhere — unlike the music bot
-  there is no free-running source.
-- **Timing tolerance**: read loops treat a read error as end-of-call
-  media (the leg is gone) and stop the call; write errors on an unbound
-  webrtc track are the music bot's benign "empty room".
+### The webrtc-leg pin
+
+pion generates an offer's (and an answer's) per-m-line codec list from
+the transceiver's codec preferences — the MediaEngine's full list by
+default. The bot pins them with `RTPTransceiver.SetCodecPreferences`:
+when the call's codec C is known (outbound: the callee's answer;
+inbound: the caller's offer), the bot attaches its speaker track with
+the preferences pinned to `[C, telephone-event]` — the pin lands on the
+transceiver at attach time, before the renegotiation it triggers, so the
+bot's webrtc-leg offer carries exactly the selected codec. The
+preference persists on the transceiver from then on — pion refreshes it
+from a remote description only when the offer CREATES the transceiver —
+so the browser's mic joining the m-line (its re-offer) is answered with
+the same pin, and the bot's later re-offers keep it too. The mic and the
+bot's speaker converge to **one sendrecv audio m-line** on the pair's
+peer connection (the browser's accept attaches the mic a getUserMedia
+after the bot's offer, so the mic joins the bot's m-line) — safe because
+pion fires `OnTrack` for a receiver that has not received yet, i.e. on
+the mic's first RTP. The one framework affordance this needs is the
+attach-time pin itself (§9's `AddTrackWithCodecPreferences`); no SDP is
+ever patched by hand.
+
+The SIP side needs no surgery for the pin: the outbound offer is the
+account's codec list (the presumed list, configured once per account),
+and the inbound answer pins per call through diago's own
+`AnswerOptions.Codecs`.
+
+### The pumps
+
+- **SIP → browser**: read a payload off the dialog; drop it when its PT
+  is not the negotiated audio codec's (the sip leg's telephone-event is
+  the one other PT it can legitimately carry — dropped, never bridged:
+  the DTMF subsection); else `track.WriteSample(payload, dur)` — `dur`
+  from the opus packet's own TOC (RFC 6716 §3.1), so a non-20 ms opus
+  source still timestamps exactly, and `len(payload)/8` ms for the 64
+  kbps 8 kHz codecs. Writes to the not-yet-bound track drop — the music
+  bot's "empty room".
+- **browser → SIP**: read the mic's RTP; dispatch telephone-event by its
+  negotiated PT (the DTMF subsection); write every other payload into
+  the dialog's DTMF-aware writer. diago's writer re-stamps PT/SSRC/seq
+  and blocks on the codec's 20 ms ticker per write — the pump is paced
+  by it, matching the browser's own 20 ms pacing (§11.7).
+
+Both pumps treat a read error as end-of-call media and stop; both are
+self-paced by the arriving RTP — no tickers of the bot's own.
 
 **DTMF (RFC 4733 telephone-event)** crosses the SBC **WebRTC-leg →
 SIP-leg only**. On the read side the events need no track of their own:
@@ -549,17 +617,21 @@ writer's own lock — diago's interleaving discipline, the ≈140 ms per
 digit of paused audio being the price of one shared stream. The reverse
 direction is deliberately not transported: payloads arriving on the
 sip-leg whose PT is not the negotiated audio codec's are dropped before
-the bridge, never transcoded — SIP-side DTMF never reaches the browser.
-The asymmetry is a product decision, not an oversight: the WebRTC-side
-users are end users who press keys, the SIP-side ones are IVRs and
-enterprise phones that consume them.
+the bridge. The asymmetry is a product decision, not an oversight: the
+WebRTC-side users are end users who press keys, the SIP-side ones are
+IVRs and enterprise phones that consume them.
 
-**cgo gating**: a pure-Go build plays opus↔opus calls (passthrough needs
-no codec) and refuses a call whose sip-leg negotiated G.711, with the
-explanatory error — the music bot's stub discipline, extended to a
-decoder.
+**No cgo anywhere**: with transcoding gone the relay needs no codec
+implementation at all — a pure-Go (`CGO_ENABLED=0`) build relays every
+call, opus and G.711 and G.722 alike. (The music bot's libopus encoding
+is its own affair.)
 
-## 9. Framework extensions: bot-originated `Cancel`/`Bye`, the unsolicited-send path, and session lifecycle hooks
+**G.722** joined the vocabulary with the relay: the vendored diago gains
+the `CodecAudioG722` constant (PT 9, its 8000 Hz **RTP** clock), the SDP
+generator's canonical `a=rtpmap:9 G722/8000` line, and the parser's
+static-PT-9 shorthand (third_party/diago/PATCHES.md).
+
+## 9. Framework extensions: bot-originated `Cancel`/`Bye`, the unsolicited-send path, session lifecycle hooks, and the codec pin
 
 An SBC terminates signalling: when the **callee** ends or refuses the
 call, the **browser's** dialog must end too. Today the
@@ -665,6 +737,39 @@ is serialized on the handler's account mutex; the critical section can
 include the bounded first REGISTER, so the hub's end hook can wait
 behind one for at most the REGISTER timeout.
 
+### The codec pin: `AddTrackWithCodecPreferences`
+
+The end-to-end codec negotiation (§8) needs one framework affordance:
+pion generates an offer's or an answer's per-m-line codec list from the
+transceiver's codec preferences, but `AddTrack` never sets them — so a
+track's m-line always negotiates the MediaEngine's full list. The client
+gains the pinning variant, pion's own two calls done as one hub
+operation (so the pin is in place before the renegotiation the attach
+triggers):
+
+```go
+// AddTrackWithCodecPreferences adds track like AddTrack and pins the
+// codec preferences of its transceiver: the session's offers and answers
+// carry exactly codecs for the track's m-line (pion generates both from
+// the transceiver's preferences). The pin is recorded with the track
+// and re-applied when a glare rebuild re-adds the track to the fresh
+// connection. A nil codecs is AddTrack exactly.
+func (c *HeadlessRTCClient) AddTrackWithCodecPreferences(peer ss.SubscriberId, track webrtc.TrackLocal, codecs []webrtc.RTPCodecParameters) (*webrtc.RTPSender, error)
+
+// ResponseWriter, the media method's twin:
+// AttachMediaWithCodecPreferences — AttachMedia plus pinning the
+// track's m-line codec negotiation to codecs.
+AttachMediaWithCodecPreferences(track webrtc.TrackLocal, codecs []webrtc.RTPCodecParameters) error
+```
+
+The sip bot attaches the call's speaker track with the pin at RING time
+(outbound: once the callee's answer selected C; inbound: once the
+caller's offer was read), so the media capability the browser is offered
+is the far leg's selection, and the browser's mic — attached by its
+accept a getUserMedia later — joins the pinned m-line and is answered
+with the pin. The echo and music bots keep the unpinned AttachMedia:
+nil preferences are today's behavior.
+
 ## 10. Hosting and configuration
 
 - `serverConfig.xsd` / `serverconfig.go`: a `<sipBot/>` element of the
@@ -674,13 +779,21 @@ behind one for at most the REGISTER timeout.
   `--sub bot:sip --username "SIP Bot"`).
 - `cmd/server/main.go`: `startSipBot` on the shared `startBotClient`,
   wiring `sipbot.New(client, sipbot.NewOnMemoryUserSessionStorage(),
-pool, cfg)` and reusing `stereoOpusPCFactory` (the webrtc leg negotiates
-  opus either way; PCMU/PCMA stay registered for the browser's own
-  calls).
+pool, cfg)` and reusing `stereoOpusPCFactory` — its MediaEngine (opus
+  with the stereo fmtp, G.722, PCMU, PCMA, telephone-event) is exactly
+  the codec vocabulary the relay can pass, so the pin
+  (`SetCodecPreferences`) always finds its codecs registered there.
 - The `<sipBot/>` element carries its own attributes beyond
   `botClientType`: `testSIPContact`, the SIP address the CLI's
   `/test-call` command dials (e.g. `9664@192.168.1.2`) — a known-good
   callee for deployment smoke tests; empty disables the command —
+  `webrtcCodecs`, the **presumed WebRTC codec list** of §8 as a
+  comma-separated list of codec names (`opus,g722,pcmu,pcma` — the
+  default when unset): the outbound SIP offer's codec list, and the
+  inbound call's selection order among the caller's offer. Each name is
+  validated at startup (an unknown one fails the wiring); the list is
+  the presumed browser capability, in the browsers' preference order —
+  trim it to match a deployment whose WebRTC clients differ —
   `ipPreference`, the address family every DNS resolution in the sip
   leg honors: `v6Only`, `v4Only`, or `default` (the default); and
   `upstreamDNSResolver`, the upstream DNS resolver (host[:port], the
@@ -698,7 +811,8 @@ pool, cfg)` and reusing `stereoOpusPCFactory` (the webrtc leg negotiates
   `SipBotXML.UpstreamDNSResolver`, validated at startup
   (`ParseIPPreference` — the pool's discipline), carried by
   `Configuration.IPPreference` / `Configuration.UpstreamDNSResolver`.
-- `sipbot.Configuration`: `Logger`, `TestSIPContact`, `IPPreference`,
+- `sipbot.Configuration`: `Logger`, `TestSIPContact`, `WebRTCCodecs`
+  (the presumed codec list; nil selects the default), `IPPreference`,
   `UpstreamDNSResolver`, and the sip-leg
   knobs — `Transport` (default `udp`), `ExternalHost` (default empty; the
   SDP/RTP address the PBX sees, for hosts where the bind address is
@@ -773,14 +887,19 @@ where a choice had to be made:
    or blind/attended REFER. The SIP `REFER`/`re-INVITE` surfaces diago
    offers are left unwired.
 5. **No early media / ringback in v1**: between the browser's answer and
-   the callee's answer the user hears silence. diago's
+   the callee's answer the user hears silence — and since the outbound
+   flow now rings the browser only once the callee HAS answered (§7.1),
+   the callee hears silence while the user's browser rings, and a callee
+   (an IVR greeting, a "hello?") who starts talking at once has that
+   early audio dropped at the relay's unbound track (the "empty room")
+   until the user accepts. diago's
    `EarlyMediaDetect` + `WaitAnswer` can carry 183 ringback later — the
    relay's "empty room" discipline already tolerates media before the
    browser answers, so the follow-up is local to the dial path.
 6. **DTMF crosses WebRTC-leg → SIP-leg only** (§8): the browser user's
    key presses reach the SIP network as RFC 4733 telephone-event; events
    arriving from the SIP side are dropped at the relay, never
-   transcoded, never shown. The edges this leaves: a press whose END
+   bridged, never shown. The edges this leaves: a press whose END
    packets are all lost is lost with them (the parser acts on ENDs and
    runs no stuck-key timeout); a call whose sip-leg did not negotiate
    telephone-event still emits the digits (diago's writer is
@@ -790,15 +909,24 @@ where a choice had to be made:
    no DTMF consumer at the far end — the linphone model's accepted
    false positive (docs/webrtc-sip-dtmf-consideration.md: capability
    decides the pad's existence, the user its visibility).
-7. **ptime assumption on the sip-leg writer**: writes are whole 20 ms
-   frames (the accumulator guarantees them), matching diago's clock;
-   the SDP advertises no exotic ptime. Opus passthrough timestamps come
-   from the packets' own TOCs, so a non-20 ms opus peer still lands
-   correctly on the webrtc leg.
-8. **Resampler quality** is telephony-grade (box/linear, factor 6), not
-   broadcast-grade; voice over G.711 loses to the codec long before the
-   resampler. A proper polyphase filter is a drop-in replacement behind
-   the same functions.
+7. **ptime assumption on the sip-leg writer**: diago's writer blocks on
+   the negotiated codec's 20 ms ticker per write, and the browser paces
+   its mic at 20 ms — the browser→SIP passthrough assumes the two agree.
+   The SDP advertises no exotic ptime. The SIP→browser direction
+   timestamps each payload by its real duration (the opus TOC, the 64
+   kbps byte count), so a non-20 ms opus peer still lands correctly on
+   the webrtc leg.
+8. **The presumed WebRTC codec list can be wrong** (§8): a WebRTC
+   client that does not offer the selected codec breaks the pin. The
+   list defaults to the audio codecs every browser offers (opus, G.722,
+   PCMU, PCMA), so the failure is confined to exotic clients; when it
+   happens, the mic arrives carrying a codec that is not the pinned one
+   and the bot drains it (one-way audio, logged) rather than bridging
+   garbage. The same drain covers the residual race where the browser's
+   mic offer beats the bot's ring-time offer onto the wire (an instant
+   accept plus an instant getUserMedia) and lands on a fresh,
+   never-pinned m-line. The `webrtcCodecs` configuration (§10) is the
+   operator's lever against the first.
 9. **NAT**: the sip leg is plain UDP SIP + plain RTP (no ICE, no STUN,
    no SRTP/SDES in v1). The bot belongs on a network that reaches the
    PBX directly; `ExternalHost` covers the simple
@@ -820,15 +948,20 @@ where a choice had to be made:
     track-detach delay and the polite-rebuild caveats of
     `docs/music-bot.md` §8 apply to the relay's track exactly as to the
     player's.
-13. **The mic must arrive on a fresh m-line** (the browser's natural
-    order — accept attaches the mic, then the bot's media follows):
-    pion recycles a sendrecv transceiver for a later `AddTrack`, and a
-    track that arrives on a recycled m-line re-binds its inbound RTP to
-    the already-bound receiver **without firing `OnTrack`** (the
-    session-29 trap) — the bot's `OnTrack` registration would never see
-    the mic. The framework's register-before-INVITE discipline plus the
-    browser's accept order keep this from happening; the bot also
-    drains any unexpected non-opus track defensively.
+13. **A track re-binding a used receiver fires no `OnTrack`** — the
+    session-29 trap, on which the whole media choreography rests: pion
+    fires `OnTrack` only for a receiver that has not received yet (on
+    the first RTP), and a recycled m-line whose receiver already
+    carried media re-binds a new remote track silently. The call's
+    audio m-line converges to one sendrecv section (the mic and the
+    bot's speaker join via transceiver recycling, in whichever order
+    the accept's timing produces), and it stays safe because the mic's
+    receiver is always fresh at call setup — and because the hangup
+    renegotiation recreates it for the next call. The pin (§8) is what
+    keeps that one m-line codec-consistent: with the bot's offer leading
+    at ring time and the mic joining it, both directions settle on C
+    (the mic-offer-first race is caveat 8's drain). The bot still drains
+    any unexpected non-C track defensively.
 14. **Pool passwords live in the configuration document** in plaintext
     (digest auth needs the password itself, never a hash) — the
     document's file permissions are the protection, exactly as for its
@@ -907,15 +1040,17 @@ where a choice had to be made:
     addition to the process's socket table (a loopback UDP+TCP pair on
     an ephemeral port) and lives for the bot's lifetime — the process,
     in the shipped wiring.
-21. **diago is vendored**: `third_party/diago` is v0.32.2 plus the
-    fmtp patch (§8), selected by a `replace` in `go.mod`. Upgrading
-    diago now means re-checking the patch against the new release —
-    its touch points are the SDP generator and the codec matcher, and
-    upstream through v0.40.0 still hardcodes the opus fmtp, so the
+21. **diago is vendored**: `third_party/diago` is v0.32.2 plus local
+    patches (§8), selected by a `replace` in `go.mod`. Upgrading
+    diago now means re-checking the patches against the new release —
+    their touch points are the SDP generator and the codec matcher (the
+    per-codec `Fmtp`; upstream through v0.40.0 still hardcodes the opus
+    fmtp) and the codec vocabulary (the G.722 constant, its canonical
+    rtpmap line, its static-PT parse shorthand) — so the
     fork stays load-bearing. The vendored copy is a nested module:
     invisible to the repo's `go test ./...`, so the sipbot suite's
-    wire-level SDP assertions (the offer's and the answer's fmtp
-    lines, §12) are the patch's coverage. The Dockerfile's
+    wire-level SDP assertions (the offer's and the answer's codec
+    lines, §12) are the patches' coverage. The Dockerfile's
     `go mod download` layer copies the vendored `go.mod` along with
     the root module files — a replace target must exist before the
     module graph resolves.
@@ -924,29 +1059,28 @@ where a choice had to be made:
 
 `pkg/rtc/sipbot/`:
 
-| file                         | contents                                                                                                                                                                                              |
-| ---------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `sipbot.go`                  | package doc, `Configuration`, `New` (wires the msg_handler.Server), `sipStack` (the per-account SIP client factory), `codecAudioOpusStereo` (the sip-leg's opus with the RFC 7587 stereo fmtp)        |
-| `session.go`                 | `UserSession`, `UserSessionStorage`, `OnMemoryUserSessionStorage`                                                                                                                                     |
-| `pool.go`                    | `SIPCredentialPool` (+ the `SIPCredential`/`SIPCredentialRange` config shapes): the lazy, mutex-free account pool — the atomic cursor, the release channel, the range parsing                         |
-| `yellowpage.go`              | the yellow page: the YellowPageSection/YellowPageContact config shapes and the /yellow-page listing's rendering                                                                                       |
-| `dns.go`                     | the `ipPreference` machinery: the IPPreference type and its parse, and the filtering DNS reverse proxy (miekg/dns) the account UAs' resolver dials                                                    |
-| `handler.go`                 | `sipHandler` — the `BotMessageHandler`: CLI dispatch (/my-number reads the live registration), registration lifecycle (incl. the session-start pool loan), call policy, hangup matrix                 |
-| `inbound.go`                 | the inbound call: the account socket's INVITE → the browser's ring → the 200 OK relay-arming; the ring timeout, the dialog watcher, the UAS-side termination verbs                                    |
-| `account.go`                 | per-user SIP account runtime: the registration's lifecycle (REGISTER at birth, de-REGISTER at the end — no expiry, no refresh), the diago `Invite` dial path, and the inbound-INVITE routing callback |
-| `call.go`                    | per-call state + the relay: the two pump goroutines, the `sipLeg` interface over both dialog types, track/dialog wiring, teardown                                                                     |
-| `dtmf.go`                    | the relay's DTMF vocabulary: the RFC 4733 event payload's parse and digit mapping, the negotiated telephone-event PT's discovery, the END retransmissions' deduper                                    |
-| `transcode.go`               | the codec matrix: passthrough, G.711↔PCM↔opus paths, resamplers, the sample accumulator, opus TOC durations                                                                                           |
-| `opus_codec.go` / `_stub.go` | libopus encode+decode behind the `cgo` tag; the pure-Go stub fails G.711-leg calls with the explanatory error                                                                                         |
+| file            | contents                                                                                                                                                                                                                      |
+| --------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `sipbot.go`     | package doc, `Configuration`, `New` (wires the msg_handler.Server), `sipStack` (the per-account SIP client factory), `codecAudioOpusStereo` (the sip-leg's opus with the RFC 7587 stereo fmtp)                                |
+| `session.go`    | `UserSession`, `UserSessionStorage`, `OnMemoryUserSessionStorage`                                                                                                                                                             |
+| `pool.go`       | `SIPCredentialPool` (+ the `SIPCredential`/`SIPCredentialRange` config shapes): the lazy, mutex-free account pool — the atomic cursor, the release channel, the range parsing                                                 |
+| `yellowpage.go` | the yellow page: the YellowPageSection/YellowPageContact config shapes and the /yellow-page listing's rendering                                                                                                               |
+| `dns.go`        | the `ipPreference` machinery: the IPPreference type and its parse, and the filtering DNS reverse proxy (miekg/dns) the account UAs' resolver dials                                                                            |
+| `handler.go`    | `sipHandler` — the `BotMessageHandler`: CLI dispatch (/my-number reads the live registration), registration lifecycle (incl. the session-start pool loan), call policy, hangup matrix                                         |
+| `inbound.go`    | the inbound call: the account socket's INVITE → the browser's ring → the 200 OK relay-arming; the ring timeout, the dialog watcher, the UAS-side termination verbs                                                            |
+| `account.go`    | per-user SIP account runtime: the registration's lifecycle (REGISTER at birth, de-REGISTER at the end — no expiry, no refresh), the diago `Invite` dial path, and the inbound-INVITE routing callback                         |
+| `call.go`       | per-call state + the relay: the two passthrough pump goroutines, the call's pinned codec, the `sipLeg` interface over both dialog types, track/dialog wiring, teardown                                                        |
+| `codecs.go`     | the relay's codec vocabulary: the pion↔diago codec mapping, the presumed WebRTC codec list's parse/validation, the SDP codec-list reads (the INVITE's offer, the browser's mic offer), packet-duration helpers (the opus TOC) |
+| `dtmf.go`       | the relay's DTMF vocabulary: the RFC 4733 event payload's parse and digit mapping, the negotiated telephone-event PT's discovery, the END retransmissions' deduper                                                            |
 
 `third_party/diago/` sits beside the package: diago v0.32.2 vendored
-with the per-codec-fmtp patch (§8, §11.21), wired by `go.mod`'s
+with the local patches (§8, §11.21), wired by `go.mod`'s
 `replace`.
 
 Tests mirror the existing suites' disciplines: `OnMemoryUserSessionStorage`
-concurrency; the transcoder round trips (G.711 encode/decode against
-`zaf/g711`, resampler factor invariants, accumulator ptime freedom, TOC
-durations against RFC 6716's table); the handler's CLI against the
+concurrency; the codec vocabulary's units (the presumed-list parse and
+validation, the pion↔diago mapping, the opus TOC durations against RFC
+6716's table); the handler's CLI against the
 echobot/musicbot-style in-memory harness with a **fake SIP server**
 (a `sipgo` UAS script: expect REGISTER, answer INVITE with a fixed SDP,
 stream captured/generated RTP) so the B2BUA runs end to end in-process
@@ -988,14 +1122,22 @@ the REGISTER, the INVITE, and the de-REGISTER must arrive at the
 preferred family's PBX alone. Both end-to-end call tests assert the
 sip-leg's SDP shape: the outbound INVITE's offer and the inbound
 call's 200 OK answer must carry `a=rtpmap:96 opus/48000/2` and
-`a=fmtp:96 useinbandfec=1;stereo=1` verbatim. DTMF adds its own
+`a=fmtp:96 useinbandfec=1;stereo=1` verbatim when opus is the selected
+codec. DTMF adds its own
 end-to-end test: the probe emits RFC 4733 event packets sharing the
 mic's SSRC through a PT-rewriting interceptor (pion's track API cannot
 write a foreign PT), and the fake PBX — whose SDP offers
 telephone-event, as PBXs do — must record each press's full 7-packet
 series exactly once (the browser side's retransmitted ENDs deduped)
 while the audio keeps flowing; the outbound INVITE's offer must
-announce telephone-event. Two harness disciplines keep
+announce telephone-event. The proxy-media rework adds its own: the
+outbound browser ring must follow the SIP 200 OK (never precede it);
+the webrtc-leg's SDP must pin the call to the single selected codec
+plus telephone-event — asserted for an opus answer and for a PCMU one
+(the G.711 path now a passthrough, so it runs without cgo); the relayed
+payloads must cross byte for byte in both directions; the inbound call
+must answer 488 and never ring the browser when the caller's offer
+shares nothing with the presumed list. Two harness disciplines keep
 the suite's flakes diagnosable and its teardown clean: a message wait
 that times out dumps everything the probe recorded (a bot failure reply
 the predicate did not expect is visible without a rerun), and the

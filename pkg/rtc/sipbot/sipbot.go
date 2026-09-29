@@ -34,15 +34,16 @@
 // (inbound.go). The client dies with the account; the bot's own
 // identity never appears on the wire.
 //
-// The bot terminates both signalling planes and both media planes and
-// relays each into the other: dialog events cross as the handler's
-// Invite/Cancel/Bye on one side and diago's Invite/Hangup on the other,
-// and media crosses as the call's relay — the codec toward the browser
-// is always opus, the codec toward the SIP network is negotiated (opus
-// preferred, then PCMU, PCMA), and when both legs settled on opus the
-// relay is a pure passthrough: the codec's own packets cross the SBC
-// byte for byte, with transcoding (G.711 ↔ PCM ↔ opus) only when the
-// two legs differ (see transcode.go). DTMF crosses too, as RFC 4733
+// The bot terminates both signalling planes and relays each into the
+// other — dialog events cross as the handler's Invite/Cancel/Bye on one
+// side and diago's Invite/Hangup on the other — but it is a media RELAY,
+// not a media terminator (docs/sip-bot.md §8): one audio codec per call
+// is negotiated end to end between the browser and the SIP UA (the
+// presumed WebRTC codec list — Configuration.WebRTCCodecs — is offered
+// toward the SIP network outbound, and selects among the caller's offer
+// inbound; the webrtc leg is then pinned to the selection), and media
+// crosses at the RTP payload level, byte for byte — no transcoding
+// anywhere (see call.go's pumps). DTMF crosses too, as RFC 4733
 // telephone-event, WebRTC-leg → SIP-leg: the browser user's key presses
 // reach the SIP network; the reverse direction is deliberately not
 // transported (see dtmf.go).
@@ -136,6 +137,16 @@ type Configuration struct {
 	// listed by the CLI's /yellow-page command grouped by section. Empty
 	// answers that the page is empty.
 	YellowPage []YellowPageSection
+
+	// WebRTCCodecs is the presumed WebRTC codec list (docs/sip-bot.md
+	// §8): the audio codecs the browser is presumed to support, in the
+	// browsers' own preference order — the outbound SIP offer's codec
+	// list, and the inbound call's selection order among the caller's
+	// offer. Names are the codec vocabulary's ("opus", "g722", "pcmu",
+	// "pcma" — case-insensitive; validate with ParseWebRTCCodecs). Nil
+	// selects the default list. New panics on an unknown name, mirroring
+	// the IPPreference discipline.
+	WebRTCCodecs []string
 }
 
 // New wires the sip bot onto client: a msg_handler.Server serving the
@@ -169,6 +180,26 @@ func New(client *rtc.HeadlessRTCClient, storage UserSessionStorage, pool *SIPCre
 		externalHost: config.ExternalHost,
 		ipPreference: config.IPPreference.normalize(),
 	}
+	// The presumed WebRTC codec list becomes the sip-leg's offer and the
+	// inbound selection order: every account's outbound INVITE offers it
+	// (plus telephone-event — the browser user's key presses cross to the
+	// SIP network on it, call.go's DTMF relay; inbound answers echo it
+	// only when the caller's offer announced it, diago's negotiation
+	// intersecting). An unknown name is a misconfiguration: cmd/server
+	// validates with ParseWebRTCCodecs at startup, so a panic here means
+	// a programmatic caller skipped it.
+	names := config.WebRTCCodecs
+	if names == nil {
+		names = defaultWebRTCCodecs
+	}
+	for _, name := range names {
+		codec, ok := sipCodecByName(strings.ToLower(name))
+		if !ok {
+			panic(fmt.Sprintf("sipbot: unknown webrtc codec %q", name))
+		}
+		stack.audioCodecs = append(stack.audioCodecs, codec)
+	}
+	stack.codecs = append(append([]media.Codec{}, stack.audioCodecs...), media.CodecTelephoneEvent8000)
 	// A non-default ipPreference needs the bot's filtering DNS proxy
 	// (dns.go) on its explicit upstream resolver. The proxy is shared
 	// by every account and lives for the bot's lifetime (the process,
@@ -209,6 +240,12 @@ type sipStack struct {
 	// untouched.
 	ipPreference IPPreference
 	dnsProxy     *filteringResolver
+	// audioCodecs is the presumed WebRTC codec list (the inbound call's
+	// selection order among the caller's offer); codecs is the sip-leg's
+	// offer list — audioCodecs plus telephone-event. Built by New from
+	// the Configuration's WebRTCCodecs.
+	audioCodecs []media.Codec
+	codecs      []media.Codec
 }
 
 // open materializes one account's SIP client: a diago whose UA is named
@@ -242,19 +279,14 @@ func (s sipStack) open(ctx context.Context, session UserSession, onInbound func(
 			BindPort:     s.bindPort,
 			ExternalHost: s.externalHost,
 		}),
-		// The offer's preference order: opus first — when the far end
-		// takes it, the relay is a passthrough; the G.711 twins are the
-		// transcoding fallbacks. telephone-event rides along always —
+		// The offer's preference order is the presumed WebRTC codec
+		// list — the selection the far end makes pins the whole call
+		// (docs/sip-bot.md §8). telephone-event rides along always —
 		// the browser user's key presses cross to the SIP network on it
 		// (call.go's DTMF relay); inbound answers echo it only when the
 		// caller's offer announced it (diago's negotiation intersects).
 		diago.WithMediaConfig(diago.MediaConfig{
-			Codecs: []media.Codec{
-				codecAudioOpusStereo,
-				media.CodecAudioUlaw,
-				media.CodecAudioAlaw,
-				media.CodecTelephoneEvent8000,
-			},
+			Codecs: s.codecs,
 		}),
 	)
 	if err := dg.ServeBackground(ctx, onInbound); err != nil {

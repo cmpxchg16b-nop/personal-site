@@ -155,7 +155,8 @@ type MusicBotXML struct {
 
 // SipBotXML mirrors the <sipBot/> section of serverConfig.xml: a bot
 // client (the embedded BotClientXML attributes) carrying the sip bot's
-// test callee, its credential pool, and its yellow page.
+// test callee, its presumed WebRTC codec list, its credential pool, and
+// its yellow page.
 type SipBotXML struct {
 	BotClientXML
 	// TestSIPContact is the raw testSIPContact attribute: the SIP
@@ -163,6 +164,13 @@ type SipBotXML struct {
 	// "9664@192.168.1.2") — a known-good callee on the SIP network the
 	// deployment tests against. Empty disables /test-call.
 	TestSIPContact string `xml:"testSIPContact,attr"`
+	// WebRTCCodecs is the raw webrtcCodecs attribute: the presumed
+	// WebRTC codec list as a comma-separated list of codec names
+	// ("opus,g722,pcmu,pcma" — empty selects the default): the outbound
+	// SIP offer's codec list, and the inbound call's selection order
+	// among the caller's offer. Parsed and validated at wiring time with
+	// sipbot.ParseWebRTCCodecs (see cmd/server).
+	WebRTCCodecs string `xml:"webrtcCodecs,attr"`
 	// IPPreference is the raw ipPreference attribute: the address family
 	// every DNS resolution in the sip leg honors — "v6Only", "v4Only",
 	// or "default" (empty, the default). Validated at wiring time with

@@ -30,3 +30,22 @@ one. The sip bot must announce stereo opus toward the SIP network
 
 No other behavior changes. When `Fmtp` is empty everywhere (the upstream
 constants), the generated SDP is byte-identical to upstream.
+
+## Patch 2: G.722 joins the codec vocabulary
+
+Upstream's codec list stops at PCMU/PCMA/opus/telephone-event; the sip
+bot's transcoding-free relay passes G.722 end to end, so diago must
+speak it:
+
+- `media/codec.go`: `CodecAudioG722` — PT 9, and SampleRate **8000**:
+  RFC 3551 clocks G.722's RTP timestamps at 8000 Hz although the audio
+  is 16 kHz. `CodecAudioFromPayloadType` and `mapSupportedCodec` map the
+  static PT to it, and `CodecsFromSDPRead` parses a bare `9` format
+  without an rtpmap line (the same shorthand PCMU/PCMA already had).
+- `media/sdp/formats.go`: the `FORMAT_TYPE_G722` constant.
+- `media/media_session.go` `generateSDPForAudio`: a G.722 case emitting
+  the canonical `a=rtpmap:9 G722/8000` — the generic branch would append
+  a spurious `/1` channel count.
+
+No other behavior changes; SDP without PT 9 is byte-identical to
+upstream.

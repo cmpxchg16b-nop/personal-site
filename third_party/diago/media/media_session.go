@@ -1228,6 +1228,11 @@ func generateSDPForAudio(sessionID uint64, sessionVersion uint64, rtpProfile str
 			formatsMap = append(formatsMap, "a=rtpmap:0 PCMU/8000")
 		case CodecAudioAlaw.PayloadType:
 			formatsMap = append(formatsMap, "a=rtpmap:8 PCMA/8000")
+		case CodecAudioG722.PayloadType:
+			// G.722's canonical rtpmap carries NO channel count (the generic
+			// branch would append a spurious "/1"). (Local patch — see
+			// PATCHES.md.)
+			formatsMap = append(formatsMap, "a=rtpmap:9 G722/8000")
 		case CodecAudioOpus.PayloadType:
 			formatsMap = append(formatsMap, "a=rtpmap:96 opus/48000/2")
 			// Providing 0 when FEC cannot be used on the receiving side is RECOMMENDED.
