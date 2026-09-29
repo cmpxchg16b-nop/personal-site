@@ -725,6 +725,7 @@ type fakePBX struct {
 	invites       int
 	inviteFrom    string
 	inviteTo      string
+	inviteRURI    string // the last INVITE's Request-URI, verbatim
 	inviteSDP     string // the last INVITE's SDP offer, verbatim
 	byes          int
 	rtpReceived   int
@@ -894,6 +895,7 @@ func newFakePBXOnPort(t *testing.T, ip string, port int, answerCode int, opus bo
 		f.invites++
 		f.inviteFrom = req.From().Address.User
 		f.inviteTo = req.To().Address.User
+		f.inviteRURI = req.Recipient.String()
 		f.mu.Unlock()
 		peer := parseSDPMediaAddr(t, req.Body())
 		f.mu.Lock()
@@ -2212,6 +2214,68 @@ func TestSipBotCallBusy(t *testing.T) {
 	}); n != 0 {
 		t.Fatalf("a call that never rang produced %d log amends", n)
 	}
+}
+
+// TestSipBotCallRoutesViaRegistrar proves the outbound call leaves
+// through the user's own SIP server: the callee lives on a domain the
+// bot cannot even resolve, yet the INVITE must arrive at the registrar
+// — a registered user's default outbound proxy — with the Request-URI
+// untouched (the proxy routes onward to the callee's domain). The
+// pre-fix behavior resolved the Request-URI's host and sent the INVITE
+// to the callee's domain directly: an unresolvable callee domain failed
+// the call before any INVITE left, and a reachable one bypassed the
+// proxy (and, the reported bug, was unreachable from the account's
+// socket when its family differed from the registrar's).
+func TestSipBotCallRoutesViaRegistrar(t *testing.T) {
+	net := newClientTestNet(t, ss.DefaultSubscriberAging)
+	bot := startBot(t, net, "bot", "2-bot", "", nil)
+	user, probe, _, _ := startUserProbe(t, net, "user", "1-user")
+	botId, userId := pairUp(t, bot, user)
+	pbx := newFakePBX(t, 200, true)
+
+	dc := probe.waitDC(t, botId, msg_handler.DataChannelLabelMessages)
+	chat := func(text string) ss.MsgId {
+		t.Helper()
+		m := baseMsg(ss.WellKnownChIdMain, userId, botId)
+		m["plaintext"] = text
+		if err := dc.SendText(mustJSON(t, m)); err != nil {
+			t.Fatalf("SendText: %v", err)
+		}
+		return ss.MsgId(m["msgId"].(string))
+	}
+
+	registerMsg := chat("/register 2001@" + pbx.addr + " passW_0rd")
+	waitBotMessage(t, probe, botId, "the registered reply", isChatReply(registerMsg, "Registered as"))
+
+	// A callee on a domain the bot cannot resolve (RFC 2606's reserved
+	// TLD): the call can only work if the INVITE goes to the registrar.
+	callMsg := chat("/call 1234@callee.invalid")
+	waitBotMessage(t, probe, botId, "the calling line", isChatReply(callMsg, "Calling 1234@"))
+	pbx.waitForPBX(t, "the callee's INVITE at the registrar", func() bool { return pbx.invites == 1 })
+	pbx.mu.Lock()
+	ruri, to := pbx.inviteRURI, pbx.inviteTo
+	pbx.mu.Unlock()
+	if ruri != "sip:1234@callee.invalid" {
+		t.Fatalf("the INVITE's Request-URI is %q, want the callee's address untouched (sip:1234@callee.invalid)", ruri)
+	}
+	if to != "1234" {
+		t.Fatalf("the INVITE's To user is %q, want 1234", to)
+	}
+
+	// The call comes up end to end (the registrar/proxy answered): the
+	// browser rings, the user picks up, and /hangup takes both legs down.
+	pbx.waitDialog(t)
+	invite := waitBotMessage(t, probe, botId, "the bot's INVITE", isSipInvite)
+	sipMsg := baseMsg(ss.WellKnownChIdMain, userId, botId)
+	sipMsg["mimeType"] = wireMimeSip
+	sipMsg["sip"] = map[string]any{"callId": invite.sip.CallId, "response": map[string]any{"code": 200, "phrase": "OK"}}
+	if err := dc.SendText(mustJSON(t, sipMsg)); err != nil {
+		t.Fatalf("SendText: %v", err)
+	}
+	waitBotMessage(t, probe, botId, "the callee-answered line", isChatReply(callMsg, "Callee answered."))
+	hangupMsg := chat("/hangup")
+	waitBotMessage(t, probe, botId, "the hung-up reply", isChatReply(hangupMsg, "Hung up."))
+	pbx.waitForPBX(t, "the callee's BYE", func() bool { return pbx.byes == 1 })
 }
 
 // TestSipBotHangupCommand covers /hangup mid-call: both legs go down —

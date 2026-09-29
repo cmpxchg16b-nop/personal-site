@@ -50,6 +50,33 @@ func TestParseAddressOfRecord(t *testing.T) {
 	}
 }
 
+// TestProxyAddr covers the account's outbound-proxy destination (the
+// registrar doubles as it): the port defaults to 5060 (SetDestination
+// parses with net.SplitHostPort, so a port must be present), and an
+// IPv6 literal is re-bracketed into the form SplitHostPort parses back.
+func TestProxyAddr(t *testing.T) {
+	for _, tc := range []struct {
+		session UserSession
+		want    string
+	}{
+		{UserSession{Host: "sip.example.com"}, "sip.example.com:5060"},
+		{UserSession{Host: "sip.example.com", Port: 5061}, "sip.example.com:5061"},
+		{UserSession{Host: "192.168.1.2"}, "192.168.1.2:5060"},
+		{UserSession{Host: "[2a0a:4cc0::1]"}, "[2a0a:4cc0::1]:5060"},
+		{UserSession{Host: "[2a0a:4cc0::1]", Port: 5061}, "[2a0a:4cc0::1]:5061"},
+	} {
+		if got := tc.session.proxyAddr(); got != tc.want {
+			t.Errorf("proxyAddr(%+v) = %q, want %q", tc.session, got, tc.want)
+			continue
+		}
+		// The destination must round-trip through the parser SetDestination's
+		// consumer (sipgo's transport layer) uses.
+		if _, _, err := net.SplitHostPort(tc.want); err != nil {
+			t.Errorf("proxyAddr(%+v) = %q does not parse: %v", tc.session, tc.want, err)
+		}
+	}
+}
+
 // TestBindHostFor covers the account socket's address pick: an empty
 // configured BindHost selects the route's source address toward the
 // registrar — an IPv6 address for an IPv6 registrar, IPv4 for IPv4 (the

@@ -364,7 +364,7 @@ sequenceDiagram
     U->>H: "/call 1001@sip.example.com"
     Note over H: session must be registered;<br/>one call per user
     H->>U: "Calling 1001@sip.example.com…"
-    H-->>P: diago.Invite(ctx, callee, creds) — async<br/>SDP offer = the presumed WebRTC codec list (§8)
+    H-->>P: INVITE sip:callee@… sent to the account's OWN server<br/>(registrar = default outbound proxy) — async<br/>SDP offer = the presumed WebRTC codec list (§8)
     P-->>H: 180 Ringing (no early media in v1)
     P-->>H: 200 OK + SDP answer → codec C known
     Note over H: the call pins C; the speaker track<br/>is created with C's capability and the relay<br/>arms — its SIP→browser pump gated on the accept (§8)
@@ -403,6 +403,21 @@ The reverse-propagation cases:
   account stops (its de-REGISTER goes out), and a pooled loan returns
   to the pool with its store entry dropped (a manual credential
   survives in the store by design).
+
+The INVITE's routing deserves one sentence of its own: the Request-URI
+is the callee's address, but the request never goes there directly — it
+leaves through the account's **own SIP server** (`SetDestination`,
+sipgo's outbound-proxy knob; without it sipgo's destination fallback
+would resolve the Request-URI's host and dial the callee's domain
+directly). A registered user's registrar is its default outbound proxy:
+the one hop that can always route onward to the callee's domain, and
+the one address the account's socket is bound for (`bindHostFor` picks
+the source of the route TO the registrar — a callee domain in another
+address family would be unreachable from it, which was exactly the
+`sendto: network is unreachable` failure of an IPv6-bound account
+calling an IPv4-only callee domain). In-dialog requests follow the
+dialog's route set as usual (the proxy's Record-Route keeps them on the
+same path; a CANCEL inherits the INVITE's destination).
 
 Mid-call `/call` (a second one) is refused while a call stands; `/play`-style
 switching has no meaning here.
@@ -804,12 +819,13 @@ pool, cfg)` and reusing `stereoOpusPCFactory` — its MediaEngine (opus
   `upstreamDNSResolver`, the upstream DNS resolver (host[:port], the
   port defaulting to 53) the family-filtering DNS proxy relays to —
   required with a non-default `ipPreference`, rejected with the
-  default. Under a non-default preference the registrar's and callees'
-  hostnames resolve only to the chosen family's records (A for
-  `v4Only`, AAAA for `v6Only`), so registrations, calls, and the
-  account sockets' bind-address selection all take the same family, and
-  a hostname with no record of the chosen family fails its registration
-  with the DNS error. IP literals are not resolutions and pass
+  default. Under a non-default preference the registrar's hostname
+  resolves only to the chosen family's records (A for `v4Only`, AAAA
+  for `v6Only` — a callee's hostname is never resolved by the bot at
+  all: calls leave through the registrar, §7.1), so registrations,
+  calls, and the account sockets' bind-address selection all take the
+  same family, and a hostname with no record of the chosen family fails
+  its registration with the DNS error. IP literals are not resolutions and pass
   unaffected — a wrong-family literal registrar simply fails to send.
   `default` keeps sipgo's own behavior (IPv4 preferred, IPv6 used when
   no A record exists). Mirrored by `SipBotXML.IPPreference` /
@@ -1009,8 +1025,10 @@ where a choice had to be made:
     answer. The race is every account's first-transaction-only, so the
     dial paths never see it.
 19. **The family-filtering resolver** (`ipPreference` ≠ `default`):
-    sipgo's transport layer resolves every outbound request-URI host
-    through its UA's `*net.Resolver`, replaceable via
+    sipgo's transport layer resolves every outbound request's
+    destination host (the registrar's, for every request an account
+    originates — §7.1's outbound-proxy routing) through its UA's
+    `*net.Resolver`, replaceable via
     `WithUserAgentDNSResolver` — the library's only exported DNS hook
     (its own family-preference knob, `withTransportLayerDNSLookupIP`,
     is unexported as of v1.6.0, the latest release). The bot installs
@@ -1142,7 +1160,10 @@ plus telephone-event — asserted for an opus answer and for a PCMU one
 (the G.711 path now a passthrough, so it runs without cgo); the relayed
 payloads must cross byte for byte in both directions; the inbound call
 must answer 488 and never ring the browser when the caller's offer
-shares nothing with the presumed list. Two harness disciplines keep
+shares nothing with the presumed list. The outbound routing has its own:
+a /call to a callee on an UNRESOLVABLE domain must still arrive at the
+registrar (the default outbound proxy, §7.1), the Request-URI untouched.
+Two harness disciplines keep
 the suite's flakes diagnosable and its teardown clean: a message wait
 that times out dumps everything the probe recorded (a bot failure reply
 the predicate did not expect is visible without a rerun), and the

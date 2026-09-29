@@ -22,6 +22,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -160,7 +162,15 @@ func (a *account) holdRegistration(t *diago.RegisterTransaction) {
 
 // dial places the user's outbound call to target (a SIP URI without the
 // scheme — "1001@sip.example.com", or a bare user completed with the
-// account's own domain): one diago INVITE transaction carrying the
+// account's own domain). The Request-URI is the callee's address, but
+// the request itself leaves through the account's own SIP server: a
+// registered user's registrar is its default outbound proxy, the hop
+// that routes onward to the callee's domain. (Letting the INVITE go to
+// the callee domain directly — sipgo's destination fallback resolves
+// the Request-URI's host — would skip that proxy AND strand the
+// account's socket, whose bind address was chosen for the route to the
+// registrar, bindHostFor: a callee domain in another address family is
+// unreachable from it.) One diago INVITE transaction carrying the
 // account's From and digest credential, answered when the callee
 // answers. onProgress reports the provisional responses (180 Ringing).
 // The call runs on the caller's goroutine — the dial blocks until the
@@ -179,7 +189,15 @@ func (a *account) dial(ctx context.Context, target string, onProgress func(code 
 		Address:     sip.Uri{User: a.session.Username, Host: a.session.Host, Port: a.session.Port},
 		Params:      sip.NewParams(),
 	}
-	return a.dg.Invite(ctx, uri, diago.InviteOptions{
+	// diago's Invite helper (NewDialog + Invite + Ack), spelled out for
+	// the one thing the helper has no knob for: the outbound-proxy
+	// destination, set between the dialog's creation and its INVITE.
+	dialog, err := a.dg.NewDialog(uri, diago.NewDialogOptions{})
+	if err != nil {
+		return nil, err
+	}
+	dialog.InviteRequest.SetDestination(a.session.proxyAddr())
+	if err := dialog.Invite(ctx, diago.InviteClientOptions{
 		Username: a.session.Username,
 		Password: a.session.Password,
 		Headers:  []sip.Header{from},
@@ -189,7 +207,13 @@ func (a *account) dial(ctx context.Context, target string, onProgress func(code 
 			}
 			return nil
 		},
-	})
+	}); err != nil {
+		return nil, errors.Join(err, dialog.Close())
+	}
+	if err := dialog.Ack(ctx); err != nil {
+		return nil, errors.Join(err, dialog.Close())
+	}
+	return dialog, nil
 }
 
 // hasHost reports whether target carries an @host part.
@@ -257,4 +281,18 @@ func (s UserSession) hostPort() string {
 		return fmt.Sprintf("%s:%d", s.Host, s.Port)
 	}
 	return s.Host
+}
+
+// proxyAddr is the account's SIP server as a host:port destination —
+// the registrar doubles as the registered user's outbound proxy. The
+// port defaults to 5060 (SetDestination parses with net.SplitHostPort,
+// so a port must be present); an IPv6 literal is re-bracketed into
+// net.JoinHostPort form, the one SplitHostPort parses back.
+func (s UserSession) proxyAddr() string {
+	port := s.Port
+	if port == 0 {
+		port = 5060
+	}
+	host := strings.TrimPrefix(strings.TrimSuffix(s.Host, "]"), "[")
+	return net.JoinHostPort(host, strconv.Itoa(port))
 }
