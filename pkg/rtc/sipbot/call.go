@@ -16,7 +16,11 @@ package sipbot
 // envelope (transport, crypto, PT/SSRC/sequence/timestamps) per leg —
 // there is no transcoding anywhere (docs/sip-bot.md §8). The pumps are
 // self-paced by the arriving RTP: no tickers, unlike the music bot there
-// is no free-running source.
+// is no free-running source. The SIP→browser pump is gated on the
+// call's accept: the browser answers the ring-time offer at once, so
+// the track binds long before the user picks up, and an answered
+// callee's early audio must not be audible in a still-ringing browser —
+// it drops at the gate until activate (docs/sip-bot.md §11.5).
 //
 // Concurrency: the call's fields are either set before the state is
 // published (target, w — and callId before its first reader can win the
@@ -87,18 +91,23 @@ type peerCall struct {
 	// timeout's clock.
 	pendingCancel context.CancelFunc
 
-	mu      sync.Mutex
-	phase   callPhase
-	callId  string                       // the webrtc-leg dialog's id — "" until the browser is rung
-	codec   media.Codec                  // the call's end-to-end audio codec, once known (outbound: the callee's answer; inbound: the caller's offer, at creation)
-	codecOK bool                         // codec is set
-	track   *webrtc.TrackLocalStaticSample // the bot's speaker track toward the browser — created by setCodec
-	attached bool                         // the track is on the wire (the pinned attach succeeded)
-	dialog  sipLeg                       // outbound: nil until the callee answers; inbound: the pending dialog from the start
-	relay   *relay                       // nil until the SIP side is answered
-	mic     *webrtc.TrackRemote          // nil until the browser's mic arrives
-	micOn   bool                         // the browser→SIP pump is running
-	ended   bool                         // an end path ran; later ones no-op
+	// accepted is closed by activate when the browser answers the ring —
+	// the SIP→browser pump's gate, which it reads off the relay. Created
+	// at construction, closed exactly once (activate's phase guard).
+	accepted chan struct{}
+
+	mu       sync.Mutex
+	phase    callPhase
+	callId   string                         // the webrtc-leg dialog's id — "" until the browser is rung
+	codec    media.Codec                    // the call's end-to-end audio codec, once known (outbound: the callee's answer; inbound: the caller's offer, at creation)
+	codecOK  bool                           // codec is set
+	track    *webrtc.TrackLocalStaticSample // the bot's speaker track toward the browser — created by setCodec
+	attached bool                           // the track is on the wire (the pinned attach succeeded)
+	dialog   sipLeg                         // outbound: nil until the callee answers; inbound: the pending dialog from the start
+	relay    *relay                         // nil until the SIP side is answered
+	mic      *webrtc.TrackRemote            // nil until the browser's mic arrives
+	micOn    bool                           // the browser→SIP pump is running
+	ended    bool                           // an end path ran; later ones no-op
 
 	// dtmfPT/dtmfOK are the webrtc-leg's negotiated telephone-event
 	// payload type (and whether one negotiated), learned from the mic's
@@ -122,17 +131,19 @@ type sipLeg interface {
 }
 
 // relay is the call's media bridge: the two payload passthroughs and the
-// pumps' lifetime. stop bars new pump starts; pumps already blocked on a
-// read die with their leg (the dialog's close, the track's end) — the
-// music bot's drainTrack has the same shape. dtmfCh carries the pad's
-// digits the browser→SIP pump parsed to the digit sender (sendDigits):
-// buffered and dropped on full, so a flooded pad never stalls the audio
-// pump.
+// pumps' lifetime. accepted is the call's accept gate — the SIP→browser
+// pump drops the callee's audio until it closes (the user picked up).
+// stop bars new pump starts; pumps already blocked on a read die with
+// their leg (the dialog's close, the track's end) — the music bot's
+// drainTrack has the same shape. dtmfCh carries the pad's digits the
+// browser→SIP pump parsed to the digit sender (sendDigits): buffered and
+// dropped on full, so a flooded pad never stalls the audio pump.
 type relay struct {
 	dialog   sipLeg
 	track    *webrtc.TrackLocalStaticSample
-	codec    media.Codec // the call's codec — the browser-bound payloads' duration key
-	audioPT  uint8       // the sip-leg's negotiated audio payload type — anything else on the read stream is not audio (telephone-event)
+	codec    media.Codec     // the call's codec — the browser-bound payloads' duration key
+	audioPT  uint8           // the sip-leg's negotiated audio payload type — anything else on the read stream is not audio (telephone-event)
+	accepted <-chan struct{} // the accept gate — activate closes it when the user picks up
 	dtmfCh   chan rune
 	stopCh   chan struct{}
 	stopOnce sync.Once
@@ -256,7 +267,7 @@ func (c *peerCall) armRelay() error {
 // armLocked builds the relay on leg and starts the SIP→browser pump (and
 // the browser→SIP one when the mic already arrived). mu held.
 func (c *peerCall) armLocked(leg sipLeg) error {
-	r, err := newRelay(leg, c.track, c.codec)
+	r, err := newRelay(leg, c.track, c.codec, c.accepted)
 	if err != nil {
 		return err
 	}
@@ -305,8 +316,9 @@ func (c *peerCall) startMicPumpLocked() {
 	go c.relay.pumpBrowserToSIP(c.mic, c.dtmfPT, c.dtmfOK)
 }
 
-// activate marks the webrtc-leg answered; false when the call ended
-// meanwhile or the phase was already past ringing.
+// activate marks the webrtc-leg answered, opening the SIP→browser
+// pump's gate; false when the call ended meanwhile or the phase was
+// already past ringing.
 func (c *peerCall) activate() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -314,6 +326,7 @@ func (c *peerCall) activate() bool {
 		return false
 	}
 	c.phase = phaseActive
+	close(c.accepted)
 	return true
 }
 
@@ -376,18 +389,20 @@ func (c *peerCall) answerCodecs() []media.Codec {
 // newRelay builds the media bridge for the answered dialog: the
 // negotiated wire payload type read off the dialog's media properties
 // (anything else on the read stream — telephone-event — is not audio).
-func newRelay(dialog sipLeg, track *webrtc.TrackLocalStaticSample, codec media.Codec) (*relay, error) {
+// accepted is the call's accept gate for the SIP→browser pump.
+func newRelay(dialog sipLeg, track *webrtc.TrackLocalStaticSample, codec media.Codec, accepted <-chan struct{}) (*relay, error) {
 	props := diago.MediaProps{}
 	if _, err := dialog.AudioReader(diago.WithAudioReaderMediaProps(&props)); err != nil {
 		return nil, err
 	}
 	return &relay{
-		dialog:  dialog,
-		track:   track,
-		codec:   codec,
-		audioPT: props.Codec.PayloadType,
-		dtmfCh:  make(chan rune, 16),
-		stopCh:  make(chan struct{}),
+		dialog:   dialog,
+		track:    track,
+		codec:    codec,
+		audioPT:  props.Codec.PayloadType,
+		accepted: accepted,
+		dtmfCh:   make(chan rune, 16),
+		stopCh:   make(chan struct{}),
 	}, nil
 }
 
@@ -410,14 +425,20 @@ func (r *relay) stopped() bool {
 // pumpSIPToBrowser relays the callee's audio to the browser: sip-leg
 // payloads read off the dialog, written to the call's track — byte for
 // byte, the track's timestamps the payloads' own durations. The pump is
-// self-paced by the arriving RTP; while the track is unbound (the
-// browser still rings) pion drops the writes — the music bot's "empty
-// room". It dies on the dialog's close (the callee's BYE, the call's
-// hangup). Payloads whose payload type is not the negotiated audio
-// codec's — telephone-event, the one other PT the sip-leg can
-// legitimately carry — are dropped, never bridged: a 4-byte DTMF event
-// written to the audio track is a garbage blip. (The SIP→browser DTMF
-// direction is deliberately not transported — docs/sip-bot.md §8.)
+// self-paced by the arriving RTP. Until the user accepts the ring the
+// payloads drop at the accept gate: the browser's negotiator answers
+// the ring-time offer at once (it is call-state-blind), so the track
+// binds long before the accept — without the gate a callee who starts
+// talking at once (an IVR greeting, a "hello?") would be audible in a
+// still-ringing browser (docs/sip-bot.md §11.5). pion's drop of writes
+// to the not-yet-bound track (the music bot's "empty room") remains
+// for the residual window where the pump outruns the attach. The pump
+// dies on the dialog's close (the callee's BYE, the call's hangup).
+// Payloads whose payload type is not the negotiated audio codec's —
+// telephone-event, the one other PT the sip-leg can legitimately carry
+// — are dropped, never bridged: a 4-byte DTMF event written to the
+// audio track is a garbage blip. (The SIP→browser DTMF direction is
+// deliberately not transported — docs/sip-bot.md §8.)
 func (r *relay) pumpSIPToBrowser() {
 	if r.stopped() {
 		return
@@ -443,6 +464,11 @@ func (r *relay) pumpSIPToBrowser() {
 		payload := buf[:n]
 		if pktReader != nil && pktReader.PacketHeader.PayloadType != r.audioPT {
 			continue
+		}
+		select {
+		case <-r.accepted:
+		default:
+			continue // the accept gate: the browser still rings — drop
 		}
 		if err := r.track.WriteSample(pionmedia.Sample{Data: payload, Duration: packetDuration(r.codec, payload)}); err != nil {
 			return

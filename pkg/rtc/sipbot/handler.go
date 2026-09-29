@@ -486,7 +486,7 @@ func (h *sipHandler) call(ctx context.Context, msg *msg_handler.ChatMessage, w m
 		h.say(peer, w, fmt.Sprintf("Registered as sip:%s (an account from the bot's pool).", a.session.AddressOfRecord))
 	}
 	dialCtx, dialCancel := context.WithCancel(ctx)
-	c := &peerCall{target: args[0], w: w, pendingCancel: dialCancel}
+	c := &peerCall{target: args[0], w: w, pendingCancel: dialCancel, accepted: make(chan struct{})}
 	// The store, not the early check above, is the one-call gate: an
 	// inbound ring (its own goroutine) can slip in between the two, so
 	// the check IS the store here — the loser of the race backs out

@@ -96,6 +96,7 @@ func (h *sipHandler) serveInbound(peer ss.SubscriberId, inDialog *diago.DialogSe
 		serverDialog:  inDialog,
 		w:             w,
 		pendingCancel: ringCancel,
+		accepted:      make(chan struct{}),
 		dialog:        inDialog,
 	}
 	if err := c.setCodec(codec); err != nil {

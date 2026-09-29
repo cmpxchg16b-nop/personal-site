@@ -367,11 +367,11 @@ sequenceDiagram
     H-->>P: diago.Invite(ctx, callee, creds) — async<br/>SDP offer = the presumed WebRTC codec list (§8)
     P-->>H: 180 Ringing (no early media in v1)
     P-->>H: 200 OK + SDP answer → codec C known
-    Note over H: the call pins C; the speaker track<br/>is created with C's capability<br/>and the relay arms (empty-room until the track binds)
+    Note over H: the call pins C; the speaker track<br/>is created with C's capability and the relay<br/>arms — its SIP→browser pump gated on the accept (§8)
     H->>U: AttachMedia(track, pinned) — the bot's offer<br/>carries [C, telephone-event] (§9's pin)
     H->>U: w.Invite(voice) — the browser rings
     H->>U: "Callee answered."
-    Note over U: the offer is answered at once —<br/>the callee's audio flows, muted<br/>until the accept resumes the AudioContext
+    Note over U: the offer is answered at once — the track binds,<br/>but the accept gate holds the callee's audio:<br/>nothing is audible before the accept
     U->>H: 200 OK (user answered)
     U->>H: mic offer (follows the accept by getUserMedia latency)
     H->>U: answer pinned to [C, telephone-event]<br/>→ OnTrack fires → the mic pump starts
@@ -585,11 +585,16 @@ and the inbound answer pins per call through diago's own
 - **SIP → browser**: read a payload off the dialog; drop it when its PT
   is not the negotiated audio codec's (the sip leg's telephone-event is
   the one other PT it can legitimately carry — dropped, never bridged:
-  the DTMF subsection); else `track.WriteSample(payload, dur)` — `dur`
+  the DTMF subsection); drop it while the call's webrtc-leg still rings
+  — the **accept gate**: the browser's negotiator answers the ring-time
+  offer at once (it is call-state-blind), so the track binds long
+  before the user picks up, and a callee who starts talking at once (an
+  IVR greeting, a "hello?") must not be audible in a still-ringing
+  browser (§11.5); else `track.WriteSample(payload, dur)` — `dur`
   from the opus packet's own TOC (RFC 6716 §3.1), so a non-20 ms opus
   source still timestamps exactly, and `len(payload)/8` ms for the 64
   kbps 8 kHz codecs. Writes to the not-yet-bound track drop — the music
-  bot's "empty room".
+  bot's "empty room" (the pump can outrun the attach).
 - **browser → SIP**: read the mic's RTP; dispatch telephone-event by its
   negotiated PT (the DTMF subsection); write every other payload into
   the dialog's DTMF-aware writer. diago's writer re-stamps PT/SSRC/seq
@@ -886,16 +891,16 @@ where a choice had to be made:
 4. **One call per chat user** at a time; no hold, transfer, conferencing,
    or blind/attended REFER. The SIP `REFER`/`re-INVITE` surfaces diago
    offers are left unwired.
-5. **No early media / ringback in v1**: between the browser's answer and
-   the callee's answer the user hears silence — and since the outbound
-   flow now rings the browser only once the callee HAS answered (§7.1),
-   the callee hears silence while the user's browser rings, and a callee
-   (an IVR greeting, a "hello?") who starts talking at once has that
-   early audio dropped at the relay's unbound track (the "empty room")
-   until the user accepts. diago's
+5. **No early media / ringback in v1**: the user hears silence from
+   `/call` until the callee answers — the browser is not even rung
+   before that (§7.1) — and the callee's audio between their answer and
+   the user's accept drops at the relay's accept gate (§8): an IVR
+   greeting or a "hello?" spoken into the ring never reaches the
+   browser, whose negotiator auto-answers the ring-time offer (binding
+   the track) long before the accept click. diago's
    `EarlyMediaDetect` + `WaitAnswer` can carry 183 ringback later — the
-   relay's "empty room" discipline already tolerates media before the
-   browser answers, so the follow-up is local to the dial path.
+   accept gate already tolerates media before the browser answers, so
+   the follow-up is local to the dial path.
 6. **DTMF crosses WebRTC-leg → SIP-leg only** (§8): the browser user's
    key presses reach the SIP network as RFC 4733 telephone-event; events
    arriving from the SIP side are dropped at the relay, never
