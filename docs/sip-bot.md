@@ -29,18 +29,20 @@ level: the bot decrypts and re-encrypts (DTLS-SRTP is mandatory on the
 webrtc leg; the sip leg speaks plain RTP), re-originating the transport,
 crypto, PTs, SSRCs, and timestamps per leg — but never re-encodes: there
 is no transcoding anywhere, so the payload crosses byte for byte. Toward
-the SIP network the bot is a UAC (REGISTER + INVITE)
-and a UAS (inbound INVITEs to a registered AOR); toward the browser it
+the SIP network the bot is a UAC (REGISTER + INVITE + MESSAGE)
+and a UAS (inbound INVITEs and MESSAGEs to a registered AOR); toward the browser it
 is a headless bot peer (the third policy bot on the three-layer bot
 stack). The user in the browser can thus phone an arbitrary SIP
 subscriber — and a SIP subscriber who dials the user's registered AOR
-rings the user's browser (§7.2):
+rings the user's browser (§7.2) — and the two can exchange pager-mode
+text messages (SIP MESSAGE, RFC 3428) both ways (§7.3):
 
 ```
 browser ──(WebRTC: DTLS-SRTP)──▶ SIP BOT ──(SIP/RTP)──▶ PBX ──▶ callee
        ◀──                      ◀──(SIP INVITE to a registered AOR)──── caller
 dcmsg SIP-subset dialog          real SIP: REGISTER, INVITE (both
-+ renegotiated m-line            directions), BYE; plain RTP media
++ renegotiated m-line            directions), BYE, MESSAGE (both
+chat text                        directions, §7.3); plain RTP media
         └──── one codec, negotiated end to end by the two UAs (§8) ────┘
 ```
 
@@ -112,6 +114,7 @@ Chat lines, exactly like the music bot's commands:
 | `/call <user@host>` (or bare `user`) | phone the callee through the SIP network and the user through the browser; one active call per chat user. A bare `user` is completed with the registered account's domain. Without a registration the bot falls back to the credential pool when one is configured and has one free (§5 — usually the session-start loan already stands), and says so; when the pool is empty (or absent), the answer points at /register. |
 | `/yellow-page`                       | print the yellow page — the phone book of example callable numbers from the configuration (the <sipBot/> element's <yellowPage/> child, §10), grouped by section: who to call, without memorizing numbers                                                                                                                                                                                                                  |
 | `/test-call`                         | phone the configured test callee (the `<sipBot/>` element's `testSIPContact`, e.g. `9664@192.168.1.2`) — a known-good subscriber of the SIP network the deployment tests against; answers unavailable when unconfigured                                                                                                                                                                                                    |
+| `/send <user@host> <message>`        | send `message` to the SIP subscriber as a pager-mode SIP MESSAGE (RFC 3428, §7.3) — a bare `user` is completed with the registered account's domain, and the account resolution (and pool fallback) is `/call`'s. The message's byte size is capped by the configurable `maxMessageBytes` (§10); an over-limit message is rejected in chat, never truncated and never sent.                                                |
 | `/hangup`                            | end the current call from chat (equivalent to the browser's hangup button)                                                                                                                                                                                                                                                                                                                                                 |
 
 Every command answers with a chat reply (`Reply`), threaded on the
@@ -121,7 +124,8 @@ Incoming **browser** calls (a chat user phoning the bot directly, voice
 and video alike) are declined with 603: a browser-originated call to
 the bot has no routing target (see §11). The reverse direction — a SIP
 subscriber phoning the user's registered AOR — is accepted and rings
-the browser (§7.2).
+the browser (§7.2), and a SIP MESSAGE arriving at a registered AOR is
+forwarded into the chat as a bot message (§7.3).
 
 Prompt-deficiency note: the request's "`/registered` command" is read as
 the `/register` command defined alongside it; there is no separate
@@ -518,6 +522,65 @@ the loan and its socket are gone (§5). The registrar's own screening
 aside, the bot does not digest-authenticate inbound INVITEs (diago has
 no UAS auth) — §11 owns that tradeoff.
 
+### Pager-mode messages — `/send <aor> <message>` and inbound SIP MESSAGE
+
+Beside calls, the bot bridges **pager-mode instant messages** (RFC 3428
+SIP MESSAGE) in both directions. Messages are dialog-free: no session
+state, no call interaction — a `/send` mid-call is fine, and an inbound
+MESSAGE rings nothing.
+
+**Outbound** (`/send <aor> <message>`) is `/call`'s shape without the
+call: the account resolution is `ensureAccount`'s (a live registration,
+a revived stored credential, or a pool loan — announced like /call's),
+and the MESSAGE is one transaction on the account's own client carrying
+the account's identity — the pre-stamped From is the AOR with a fresh
+tag (sipgo's client fills only ABSENT headers, so the stamp survives;
+unstamped, the From would be the socket's address, not the AOR — the
+REGISTER's identity discipline). The Request-URI is the target's (a
+bare user is completed with the account's domain), but the datagram
+leaves through the account's own SIP server — `SetDestination(
+proxyAddr())`, §7.1's outbound-proxy rule verbatim: the fallback
+(resolving the target's host) would both skip the registrar and risk
+the socket-family mismatch bindHostFor exists to prevent. The body is
+`text/plain; charset=utf-8`, capped at the configured `maxMessageBytes`
+(§10) — an over-limit message is rejected in chat with both sizes,
+never truncated, never sent. The send is **synchronous** on the peer's
+channel goroutine, bounded by a 5 s context: a MESSAGE round trip is
+REGISTER-shaped, not INVITE-shaped (no ring, no human answer), and the
+reply carries the proxy's real verdict — a 401/407 challenge is answered
+with the account's digest credential and retried (sipgo's
+`DoDigestAuth`; the destination, a request field, persists across the
+retry), a 2xx is the "Message sent" confirmation, anything else the
+failure reply carrying the SIP status. Caveat 10's bounded-stall
+tradeoff owns the synchronous wait.
+
+**Inbound**, a MESSAGE arriving at a registered account's socket routes
+to the account's owner by construction — the per-account handler closure
+binds the peer (inboundServe's shape), no To-header matching. Two media
+types are supported:
+
+- `text/plain` — forwarded verbatim, attributed to the SIP From:
+  `Message from sip:<from>:⏎⏎<body>`.
+- `message/cpim` (RFC 3862) — the **reduced** subset: the CPIM headers'
+  From/To are kept (they are the IM-layer identity, rendered verbatim),
+  and the encapsulated MIME entity contributes its first `text/*` part —
+  which is how a `multipart/mixed`'s attachments and a
+  `multipart/signed`'s signature are stripped (base64 and
+  quoted-printable transfer encodings are decoded; nesting is followed
+  two levels deep). Rendered `Message from <From> to <To>:⏎⏎<body>`.
+  A malformed CPIM body is a 400. **Encrypted CPIM is not supported**
+  (`application/pkcs7-mime`, `multipart/encrypted`): like every
+  unsupported media type it is dropped silently and answered 415.
+
+Anything else — a bare multipart top level included — is **dropped
+silently**: the browser is never bothered, and the SIP side gets a
+415 Unsupported Media Type. A supported message is delivered over the
+unsolicited-send path (`Server.WriterFor` + `Reply` — the session-start
+announcement's twin): a delivered message is a 200 OK; a peer with no
+live session (ErrNoMessagingChannel) is a 480 Temporarily Unavailable —
+the registered-but-gone answer. Inbound MESSAGEs are not
+digest-authenticated — caveat 3's inbound-call posture, extended.
+
 ## 8. The media plane: the transcoding-free relay
 
 The bot is a **media relay**, not a media terminator: it never decodes,
@@ -807,6 +870,18 @@ pool, cfg)` and reusing `stereoOpusPCFactory` — its MediaEngine (opus
   `botClientType`: `testSIPContact`, the SIP address the CLI's
   `/test-call` command dials (e.g. `9664@192.168.1.2`) — a known-good
   callee for deployment smoke tests; empty disables the command —
+  `maxMessageBytes`, the byte-size cap of one `/send` message (§7.3),
+  defaulting to **800** when unset: a SIP MESSAGE rides UDP, and the
+  budget derives from IPv6's minimum link MTU (1280, RFC 8200) minus
+  the IPv6 and UDP headers (48) — 1232 bytes for the whole SIP
+  datagram — minus the presumed SIP header block (~430 bytes: Via,
+  From+tag, To, Call-ID, CSeq, Max-Forwards, User-Agent, Content-Type,
+  Content-Length run ~350, and a digest-challenged retry's
+  Authorization adds ~230). Only the bot's OWN datagram to its
+  registrar is budgeted — the Vias proxies add downstream ride their
+  own links. Deployments on TCP, or with a known path MTU, raise the
+  knob; the wiring rejects a non-positive value and anything above
+  65507 (the largest UDP payload — past it no transport can comply) —
   `webrtcCodecs`, the **presumed WebRTC codec list** of §8 as a
   comma-separated list of codec names (`opus,g722,pcmu,pcma` — the
   default when unset): the outbound SIP offer's codec list, and the
@@ -834,7 +909,8 @@ pool, cfg)` and reusing `stereoOpusPCFactory` — its MediaEngine (opus
   `Configuration.IPPreference` / `Configuration.UpstreamDNSResolver`.
 - `sipbot.Configuration`: `Logger`, `TestSIPContact`, `WebRTCCodecs`
   (the presumed codec list; nil selects the default), `IPPreference`,
-  `UpstreamDNSResolver`, and the sip-leg
+  `UpstreamDNSResolver`, `MaxMessageBytes` (the /send size cap; zero
+  selects the default), and the sip-leg
   knobs — `Transport` (default `udp`), `ExternalHost` (default empty; the
   SDP/RTP address the PBX sees, for hosts where the bind address is
   wrong). Each registered account
@@ -1064,12 +1140,14 @@ where a choice had to be made:
     an ephemeral port) and lives for the bot's lifetime — the process,
     in the shipped wiring.
 21. **diago is vendored**: `third_party/diago` is v0.32.2 plus local
-    patches (§8), selected by a `replace` in `go.mod`. Upgrading
+    patches (§8, §7.3), selected by a `replace` in `go.mod`. Upgrading
     diago now means re-checking the patches against the new release —
     their touch points are the SDP generator and the codec matcher (the
     per-codec `Fmtp`; upstream through v0.40.0 still hardcodes the opus
-    fmtp) and the codec vocabulary (the G.722 constant, its canonical
-    rtpmap line, its static-PT parse shorthand) — so the
+    fmtp), the codec vocabulary (the G.722 constant, its canonical
+    rtpmap line, its static-PT parse shorthand), and the MESSAGE hook
+    (the `OnMessage` registration and the per-transport client
+    accessor) — so the
     fork stays load-bearing. The vendored copy is a nested module:
     invisible to the repo's `go test ./...`, so the sipbot suite's
     wire-level SDP assertions (the offer's and the answer's codec
@@ -1077,6 +1155,29 @@ where a choice had to be made:
     `go mod download` layer copies the vendored `go.mod` along with
     the root module files — a replace target must exist before the
     module graph resolves.
+22. **SIP MESSAGEs are pager-mode end to end** (§7.3): out-of-dialog
+    both ways — an in-dialog MESSAGE (RFC 3428 permits one inside a
+    call's dialog) is treated as page-mode like the rest: forwarded and
+    answered, never dialog-matched. Inbound MESSAGEs are not
+    digest-authenticated — caveat 3's inbound-call posture extended to
+    messaging: the registrar's screening and the socket's ephemeral
+    port are the gatekeepers, and a direct-to-socket MESSAGE reaches
+    the browser unfiltered (its payload is chat text and renders as
+    such — no markup crosses).
+23. **The message size cap guards the bot's own UDP datagrams only**
+    (§10's arithmetic): the enforcement is outbound — an over-limit
+    `/send` is rejected in chat, never truncated (silent truncation
+    corrupts meaning; the reply states the actual and the limit, so
+    the user can split by hand). Inbound is uncapped: an oversized
+    inbound datagram is the SENDER's fragmentation problem, and the
+    webrtc leg (SCTP) fragments freely.
+24. **CPIM support is the reduced subset** (§7.3): the rendered
+    identity is the CPIM From/To — the IM-layer headers, which may
+    legitimately differ from the SIP From (a gateway stamps its own);
+    charsets beyond utf-8/us-ascii pass through untouched (the chat
+    renders UTF-8); transfer encodings beyond base64 and
+    quoted-printable are not decoded. Encrypted CPIM is out of scope
+    entirely (415) — there is no key infrastructure to decrypt with.
 
 ## 12. Package layout and testing
 
@@ -1095,6 +1196,7 @@ where a choice had to be made:
 | `call.go`       | per-call state + the relay: the two passthrough pump goroutines, the call's pinned codec, the `sipLeg` interface over both dialog types, track/dialog wiring, teardown                                                        |
 | `codecs.go`     | the relay's codec vocabulary: the pion↔diago codec mapping, the presumed WebRTC codec list's parse/validation, the SDP codec-list reads (the INVITE's offer, the browser's mic offer), packet-duration helpers (the opus TOC) |
 | `dtmf.go`       | the relay's DTMF vocabulary: the RFC 4733 event payload's parse and digit mapping, the negotiated telephone-event PT's discovery, the END retransmissions' deduper                                                            |
+| `message.go`    | SIP MESSAGE (RFC 3428, §7.3): the account's outbound send (identity stamping, registrar routing, digest retry), the inbound handler (media-type dispatch, the 415/480/200 answers), the reduced message/cpim render           |
 
 `third_party/diago/` sits beside the package: diago v0.32.2 vendored
 with the local patches (§8, §11.21), wired by `go.mod`'s
@@ -1163,7 +1265,17 @@ must answer 488 and never ring the browser when the caller's offer
 shares nothing with the presumed list. The outbound routing has its own:
 a /call to a callee on an UNRESOLVABLE domain must still arrive at the
 registrar (the default outbound proxy, §7.1), the Request-URI untouched.
-Two harness disciplines keep
+Messaging adds its own (§7.3): the reduced-CPIM render's unit table
+(the plain entity; multipart/mixed's attachments and
+multipart/signed's signature stripped; base64 and nested parts;
+encrypted and malformed bodies rejected), and two integration tests
+against the fake PBX — `/send` to an unresolvable domain must arrive
+AT THE REGISTRAR with the RURI, the account's From, and the exact body
+(the digest-challenged variant proves the 401 retry; the over-limit
+`/send` never reaches the wire), and the fake as a UAC drives the
+inbound direction (text/plain and message/cpim land in the browser
+rendered, an unsupported media type gets its 415 and the browser stays
+silent). Two harness disciplines keep
 the suite's flakes diagnosable and its teardown clean: a message wait
 that times out dumps everything the probe recorded (a bot failure reply
 the predicate did not expect is visible without a rerun), and the

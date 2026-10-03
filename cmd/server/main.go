@@ -464,6 +464,9 @@ func startMusicBot(ctx context.Context, cfg *pkgmodelsserverconfig.MusicBotXML, 
 // resolution in the sip leg honors — with an explicit
 // upstreamDNSResolver the bot's filtering DNS proxy relays to, required
 // for a non-default preference; an invalid pairing fails the startup.
+// Its optional maxMessageBytes attribute is the byte-size cap of one
+// /send message's body (unset selects the default, 800 — the UDP
+// datagram budget); an out-of-range value fails the startup.
 func startSipBot(ctx context.Context, cfg *pkgmodelsserverconfig.SipBotXML) error {
 	pool, err := sipCredentialPoolOf(cfg.CredentialPool)
 	if err != nil {
@@ -477,8 +480,12 @@ func startSipBot(ctx context.Context, cfg *pkgmodelsserverconfig.SipBotXML) erro
 	if err != nil {
 		return err
 	}
+	maxMessageBytes, err := sipbot.ParseMaxMessageBytes(cfg.MaxMessageBytes)
+	if err != nil {
+		return err
+	}
 	return startBotClient(ctx, "sip bot", &cfg.BotClientXML, stereoOpusPCFactory(pkgapiiceservers.ParseURLs(cfg.IceServers), true), func(client *rtc.HeadlessRTCClient) {
-		sipbot.New(client, sipbot.NewOnMemoryUserSessionStorage(), pool, sipbot.Configuration{Logger: logger, TestSIPContact: cfg.TestSIPContact, YellowPage: yellowPageOf(cfg.YellowPage), WebRTCCodecs: webrtcCodecs, IPPreference: ipPreference, UpstreamDNSResolver: cfg.UpstreamDNSResolver})
+		sipbot.New(client, sipbot.NewOnMemoryUserSessionStorage(), pool, sipbot.Configuration{Logger: logger, TestSIPContact: cfg.TestSIPContact, YellowPage: yellowPageOf(cfg.YellowPage), WebRTCCodecs: webrtcCodecs, IPPreference: ipPreference, UpstreamDNSResolver: cfg.UpstreamDNSResolver, MaxMessageBytes: maxMessageBytes})
 	})
 }
 

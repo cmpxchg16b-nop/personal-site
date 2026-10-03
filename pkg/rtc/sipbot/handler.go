@@ -41,6 +41,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
 
 	"github.com/emiago/diago"
 	"github.com/pion/webrtc/v4"
@@ -58,6 +59,7 @@ const (
 		"/unregister — drop the registration and the stored credential\n" +
 		"/my-number — show your registered SIP number — the one others can call you on\n" +
 		"/call <user@host> — phone a SIP subscriber (a bare user keeps your account's domain)\n" +
+		"/send <user@host> <message> — send a SIP text message\n" +
 		"/yellow-page — list the phone book: the example numbers you can call\n" +
 		"/test-call — phone the bot's configured test callee\n" +
 		"/hangup — end the current call\n" +
@@ -66,6 +68,7 @@ const (
 	unknownCommand    = "Unrecognized command — try /help."
 	registerUsage     = "Usage: /register <user@host> <password> — e.g. /register 2001@sip.example.com passW_0rd."
 	callUsage         = "Usage: /call <user@host> — e.g. /call 1001@sip.example.com."
+	sendUsage         = "Usage: /send <user@host> <message> — e.g. /send 1001@sip.example.com Hello there."
 	notRegistered     = "Not registered — /register <user@host> <password> first."
 	noNumber          = "Not registered to a SIP registrar yet — /register <user@host> <password> to get a number."
 	noNumberPoolHint  = " Or just /call — when the bot's pool has a free account, it lends you one."
@@ -99,6 +102,11 @@ type sipHandler struct {
 	// YellowPage), listed by the CLI's /yellow-page command.
 	yellowPage []YellowPageSection
 
+	// maxMessageBytes is the byte-size cap of one /send message's body
+	// (the Configuration's MaxMessageBytes, defaulted by New —
+	// docs/sip-bot.md §10 carries the arithmetic).
+	maxMessageBytes int
+
 	// accounts is the per-peer SIP runtime (registrations); calls the
 	// per-peer call state. The maps are shared across peers' channel
 	// goroutines; the values' own synchronization is theirs.
@@ -131,8 +139,8 @@ type writerSource interface {
 
 var _ msg_handler.BotMessageHandler = (*sipHandler)(nil)
 
-func newSipHandler(logger *slog.Logger, storage UserSessionStorage, pool *SIPCredentialPool, stack sipStack, testContact string, yellowPage []YellowPageSection) *sipHandler {
-	return &sipHandler{logger: logger, storage: storage, pool: pool, stack: stack, testContact: testContact, yellowPage: yellowPage}
+func newSipHandler(logger *slog.Logger, storage UserSessionStorage, pool *SIPCredentialPool, stack sipStack, testContact string, yellowPage []YellowPageSection, maxMessageBytes int) *sipHandler {
+	return &sipHandler{logger: logger, storage: storage, pool: pool, stack: stack, testContact: testContact, yellowPage: yellowPage, maxMessageBytes: maxMessageBytes}
 }
 
 // HandleChatMessage is the CLI: parse the line, answer it.
@@ -153,6 +161,8 @@ func (h *sipHandler) HandleChatMessage(ctx context.Context, msg *msg_handler.Cha
 		h.myNumber(msg, w)
 	case "/call":
 		h.call(ctx, msg, w, fields[1:])
+	case "/send":
+		h.send(ctx, msg, w)
 	case "/yellow-page":
 		h.say(msg.From, w, yellowPageText(h.yellowPage))
 	case "/test-call":
@@ -231,7 +241,7 @@ func (h *sipHandler) loanPooledAccount(ctx context.Context, peer ss.SubscriberId
 		h.logger.Info("sipbot: no pooled account for the session-start loan", "peer", peer)
 		return
 	}
-	a, err := newAccount(ctx, h.logger, h.stack, session, h.inboundServe(peer))
+	a, err := newAccount(ctx, h.logger, h.stack, session, h.inboundServe(peer), h.inboundMessage(peer))
 	if err != nil {
 		h.accountMu.Unlock()
 		h.pool.Release(session)
@@ -392,7 +402,7 @@ func (h *sipHandler) register(ctx context.Context, msg *msg_handler.ChatMessage,
 		h.say(peer, w, "The call in progress was ended.")
 	}
 	h.accountMu.Lock()
-	a, err := newAccount(ctx, h.logger, h.stack, session, h.inboundServe(peer))
+	a, err := newAccount(ctx, h.logger, h.stack, session, h.inboundServe(peer), h.inboundMessage(peer))
 	if err != nil {
 		h.accountMu.Unlock()
 		h.say(peer, w, fmt.Sprintf("Registration failed: %v.", err))
@@ -513,6 +523,49 @@ func (h *sipHandler) testCall(ctx context.Context, msg *msg_handler.ChatMessage,
 		return
 	}
 	h.call(ctx, msg, w, []string{h.testContact})
+}
+
+// send is the /send command: the message rides one pager-mode SIP
+// MESSAGE (RFC 3428) on the account's identity — /call's shape without
+// the call (docs/sip-bot.md §7.3). The raw line is cut, not Fields-split,
+// so the message keeps its inner whitespace; the account resolution is
+// /call's (a pool loan is announced the same way); the send is
+// synchronous and bounded (messageTimeout), so the reply is the proxy's
+// real verdict. An over-limit message (maxMessageBytes — the UDP
+// datagram budget, §10) is rejected with both sizes, never truncated,
+// never sent.
+func (h *sipHandler) send(ctx context.Context, msg *msg_handler.ChatMessage, w msg_handler.ResponseWriter) {
+	peer := msg.From
+	rest := strings.TrimSpace(strings.TrimPrefix(msg.Text, "/send"))
+	cut := strings.IndexFunc(rest, unicode.IsSpace)
+	if rest == "" || cut < 0 {
+		h.say(peer, w, sendUsage)
+		return
+	}
+	target, text := rest[:cut], strings.TrimSpace(rest[cut:])
+	if text == "" {
+		h.say(peer, w, sendUsage)
+		return
+	}
+	if len(text) > h.maxMessageBytes {
+		h.say(peer, w, fmt.Sprintf("Message not sent — it is %d bytes, over the %d-byte limit. Split it and try again.", len(text), h.maxMessageBytes))
+		return
+	}
+	a, pooled, err := h.ensureAccount(ctx, peer)
+	if err != nil {
+		h.say(peer, w, err.Error())
+		return
+	}
+	if pooled {
+		// The user is texting with a loaned account — they should know
+		// which identity the recipient sees (the /call discipline).
+		h.say(peer, w, fmt.Sprintf("Registered as sip:%s (an account from the bot's pool).", a.session.AddressOfRecord))
+	}
+	if err := a.sendMessage(ctx, target, text); err != nil {
+		h.say(peer, w, fmt.Sprintf("Message to %s failed: %v.", target, err))
+		return
+	}
+	h.say(peer, w, fmt.Sprintf("Message sent to %s.", target))
 }
 
 // hangup is the /hangup command: the call's user-side end from chat —
@@ -755,7 +808,7 @@ func (h *sipHandler) ensureAccount(ctx context.Context, peer ss.SubscriberId) (*
 		pooled = true
 		h.logger.Info("sipbot: loaned a pooled account", "peer", peer, "aor", session.AddressOfRecord)
 	}
-	a, err := newAccount(ctx, h.logger, h.stack, session, h.inboundServe(peer))
+	a, err := newAccount(ctx, h.logger, h.stack, session, h.inboundServe(peer), h.inboundMessage(peer))
 	if err != nil {
 		if pooled {
 			h.pool.Release(session)

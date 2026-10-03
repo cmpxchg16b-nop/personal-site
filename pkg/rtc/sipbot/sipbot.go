@@ -27,11 +27,13 @@
 // credential with /register <user@host> <password> (kept in the
 // injected UserSessionStorage) — or is loaned an account from the
 // injected SIPCredentialPool — phones a callee with /call <user@host>,
-// learns their callable address with /my-number, and ends the call with
+// sends pager-mode text with /send <user@host> <message> (SIP MESSAGE,
+// RFC 3428 — message.go), learns their callable address with
+// /my-number, and ends the call with
 // /hangup or the browser's hangup button. The same client is the UAS of
 // the reverse direction: a SIP subscriber's INVITE to the registered
 // AOR rings the user's browser, and the user's accept joins the legs
-// (inbound.go). The client dies with the account; the bot's own
+// (inbound.go), and a MESSAGE to it lands in the chat (message.go). The client dies with the account; the bot's own
 // identity never appears on the wire.
 //
 // The bot terminates both signalling planes and relays each into the
@@ -60,6 +62,7 @@ import (
 	"github.com/emiago/diago"
 	"github.com/emiago/diago/media"
 	"github.com/emiago/sipgo"
+	"github.com/emiago/sipgo/sip"
 
 	"personal-site/pkg/rtc"
 	"personal-site/pkg/rtc/msg_handler"
@@ -147,6 +150,13 @@ type Configuration struct {
 	// selects the default list. New panics on an unknown name, mirroring
 	// the IPPreference discipline.
 	WebRTCCodecs []string
+
+	// MaxMessageBytes is the byte-size cap of one /send message's body
+	// (docs/sip-bot.md §7.3): a SIP MESSAGE rides UDP, so the body must
+	// leave room for the SIP header block inside one datagram. Zero
+	// selects DefaultMaxMessageBytes; validate an explicit value with
+	// ParseMaxMessageBytes (New panics on an invalid one).
+	MaxMessageBytes int
 }
 
 // New wires the sip bot onto client: a msg_handler.Server serving the
@@ -216,7 +226,14 @@ func New(client *rtc.HeadlessRTCClient, storage UserSessionStorage, pool *SIPCre
 		}
 		stack.dnsProxy = proxy
 	}
-	h := newSipHandler(logger, storage, pool, stack, config.TestSIPContact, config.YellowPage)
+	// The /send size cap: cmd/server validates with ParseMaxMessageBytes
+	// at startup, so a panic here means a programmatic caller skipped it
+	// (the WebRTCCodecs discipline).
+	maxMessageBytes, err := ParseMaxMessageBytes(config.MaxMessageBytes)
+	if err != nil {
+		panic(fmt.Sprintf("sipbot: %v", err))
+	}
+	h := newSipHandler(logger, storage, pool, stack, config.TestSIPContact, config.YellowPage, maxMessageBytes)
 	// The unsolicited-send path (the inbound call's ring) is the Server's
 	// WriterFor — a wiring-time assignment: no handler invocation can
 	// precede the client's Run, which the caller starts after New returns.
@@ -257,9 +274,11 @@ type sipStack struct {
 // returns (responses to its transactions arrive on its socket); an
 // inbound INVITE — someone calling the registered AOR — is handed to
 // onInbound, which owns the dialog from then on and blocks until it
-// ends (diago's serve-handler lifetime discipline). The client dies
+// ends (diago's serve-handler lifetime discipline), and an inbound
+// MESSAGE — someone texting the registered AOR — to onMessage. The
+// client dies
 // with ctx: the account stops it once the de-REGISTER left.
-func (s sipStack) open(ctx context.Context, session UserSession, onInbound func(inDialog *diago.DialogServerSession)) (*diago.Diago, error) {
+func (s sipStack) open(ctx context.Context, session UserSession, onInbound func(inDialog *diago.DialogServerSession), onMessage func(req *sip.Request, tx sip.ServerTransaction) error) (*diago.Diago, error) {
 	uaOpts := []sipgo.UserAgentOption{sipgo.WithUserAgent(session.Username)}
 	if s.dnsProxy != nil {
 		// A non-default ipPreference resolves every hostname the account's
@@ -279,6 +298,9 @@ func (s sipStack) open(ctx context.Context, session UserSession, onInbound func(
 			BindPort:     s.bindPort,
 			ExternalHost: s.externalHost,
 		}),
+		// Inbound SIP MESSAGEs (RFC 3428 pager mode) route to the
+		// account's owner — see message.go.
+		diago.WithMessageHandler(onMessage),
 		// The offer's preference order is the presumed WebRTC codec
 		// list — the selection the far end makes pins the whole call
 		// (docs/sip-bot.md §8). telephone-event rides along always —

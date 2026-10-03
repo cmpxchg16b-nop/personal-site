@@ -71,15 +71,16 @@ type account struct {
 // registration then stands untouched for the account's whole life — no
 // expiry, no refresh loop — until the account's ctx ends, which sends
 // the de-REGISTER. onInbound is handed the account's inbound SIP calls
-// (someone dialing the registered AOR) — see inbound.go.
-func newAccount(ctx context.Context, logger *slog.Logger, stack sipStack, session UserSession, onInbound func(inDialog *diago.DialogServerSession)) (*account, error) {
+// (someone dialing the registered AOR) — see inbound.go; onMessage its
+// inbound SIP MESSAGEs (someone texting it) — see message.go.
+func newAccount(ctx context.Context, logger *slog.Logger, stack sipStack, session UserSession, onInbound func(inDialog *diago.DialogServerSession), onMessage func(req *sip.Request, tx sip.ServerTransaction) error) (*account, error) {
 	a := &account{logger: logger, session: session}
 	a.ctx, a.cancel = context.WithCancel(ctx)
 	// The client's ctx is NOT the account's: the socket must outlive the
 	// registration by the de-REGISTER's round trip.
 	stackCtx, stackStop := context.WithCancel(context.Background())
 	a.stackStop = stackStop
-	dg, err := stack.open(stackCtx, session, onInbound)
+	dg, err := stack.open(stackCtx, session, onInbound, onMessage)
 	if err != nil {
 		a.cancel()
 		stackStop()

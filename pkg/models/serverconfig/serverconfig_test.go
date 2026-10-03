@@ -200,3 +200,16 @@ func TestSipBotParsesWebRTCCodecs(t *testing.T) {
 		t.Fatalf("no attribute, parsed = %+v", sb)
 	}
 }
+
+// TestSipBotParsesMaxMessageBytes covers the <sipBot/> element's
+// maxMessageBytes attribute (the /send size cap): present and absent.
+func TestSipBotParsesMaxMessageBytes(t *testing.T) {
+	sb := parseSipBot(t, `<sipBot url="wss://x/api/ss/ws" jwt="t" maxMessageBytes="1200"/>`)
+	if sb.MaxMessageBytes != 1200 {
+		t.Fatalf("parsed = %+v", sb)
+	}
+	// Absent: it stays zero (the wiring's default).
+	if sb := parseSipBot(t, `<sipBot url="wss://x/api/ss/ws" jwt="t"/>`); sb.MaxMessageBytes != 0 {
+		t.Fatalf("no attribute, parsed = %+v", sb)
+	}
+}

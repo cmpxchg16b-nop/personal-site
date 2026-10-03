@@ -728,6 +728,12 @@ type fakePBX struct {
 	inviteRURI    string // the last INVITE's Request-URI, verbatim
 	inviteSDP     string // the last INVITE's SDP offer, verbatim
 	byes          int
+	messages      int
+	messageFrom   string
+	messageTo     string
+	messageRURI   string // the last MESSAGE's Request-URI, verbatim
+	messageCT     string // the last MESSAGE's Content-Type, verbatim
+	messageBody   string // the last MESSAGE's body, verbatim
 	rtpReceived   int
 	rtpPayloads   [][]byte
 	rtpPTs        []uint8 // the payload type each recorded payload arrived with
@@ -949,6 +955,27 @@ func newFakePBXOnPort(t *testing.T, ip string, port int, answerCode int, opus bo
 		// The transaction layer terminates the INVITE transaction; a
 		// 200 to the CANCEL is all the handler owes.
 		_ = tx.Respond(sip.NewResponseFromRequest(req, 200, "OK", nil))
+	})
+	srv.OnMessage(func(req *sip.Request, tx sip.ServerTransaction) {
+		// The registrar digest-challenges MESSAGEs like it does REGISTERs
+		// and INVITEs; only the authenticated retry is recorded.
+		if !f.authenticated(req) {
+			f.challenge(t, req, tx)
+			return
+		}
+		f.mu.Lock()
+		f.messages++
+		f.messageFrom = req.From().Address.User
+		f.messageTo = req.To().Address.User
+		f.messageRURI = req.Recipient.String()
+		if ct := req.ContentType(); ct != nil {
+			f.messageCT = ct.Value()
+		}
+		f.messageBody = string(req.Body())
+		f.mu.Unlock()
+		if err := tx.Respond(sip.NewResponseFromRequest(req, 200, "OK", nil)); err != nil {
+			f.errf(t, "MESSAGE 200: %v", err)
+		}
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1230,6 +1257,56 @@ func (f *fakePBX) callSDP(t *testing.T, user string, body []byte) *fakeCall {
 	fc.dlg = dlg
 	go fc.waitAnswer()
 	return fc
+}
+
+// sendMessage texts the registrant user: a pager-mode SIP MESSAGE (RFC
+// 3428) to the contact the registration came from, carrying body with
+// the given Content-Type — the inbound-messaging tests' UAC side,
+// callSDP's page-mode twin. The answer is the returned response; the
+// fake challenges nothing here (the bot's inbound side authenticates
+// nothing).
+func (f *fakePBX) sendMessage(t *testing.T, user, contentType, body string) *sip.Response {
+	t.Helper()
+	f.mu.Lock()
+	source := ""
+	for _, r := range f.registrations {
+		if r.from == user {
+			source = r.source
+		}
+	}
+	f.mu.Unlock()
+	if source == "" {
+		t.Fatalf("the fake PBX holds no registration for %s", user)
+	}
+	host, portText, err := net.SplitHostPort(source)
+	if err != nil {
+		t.Fatalf("the registrant's source %q: %v", source, err)
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil {
+		t.Fatalf("the registrant's source %q: %v", source, err)
+	}
+	if strings.Contains(host, ":") {
+		host = "[" + host + "]" // an IPv6 literal is bracketed in a SIP URI
+	}
+	uri := sip.Uri{User: user, Host: host, Port: port}
+	req := sip.NewRequest(sip.MESSAGE, uri)
+	from := &sip.FromHeader{
+		Address: sip.Uri{User: "caller", Host: f.sipHost, Port: f.port},
+		Params:  sip.NewParams(),
+	}
+	from.Params.Add("tag", sip.GenerateTagN(16))
+	req.AppendHeader(from)
+	req.AppendHeader(&sip.ToHeader{Address: *uri.Clone()})
+	req.AppendHeader(sip.NewHeader("Content-Type", contentType))
+	req.SetBody([]byte(body))
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+	res, err := f.client.Do(ctx, req)
+	if err != nil {
+		t.Fatalf("the fake's MESSAGE: %v", err)
+	}
+	return res
 }
 
 // waitAnswer collects the call's responses: the provisionals (the ring),
@@ -2325,6 +2402,157 @@ func TestSipBotHangupCommand(t *testing.T) {
 	waitBotMessage(t, probe, botId, "the bot's BYE", isSipRequest(callId, "BYE"))
 	waitBotMessage(t, probe, botId, "the hung-up reply", isChatReply(hangupMsg, "Hung up."))
 	pbx.waitForPBX(t, "the callee's BYE", func() bool { return pbx.byes == 1 })
+}
+
+// TestSipBotSendMessage covers /send (§7.3): the chat line becomes one
+// pager-mode SIP MESSAGE on the account's identity, leaving through the
+// account's registrar — the callee lives on a domain the bot cannot even
+// resolve, so the MESSAGE's arrival AT THE REGISTRAR with the
+// Request-URI untouched proves the outbound-proxy routing (the
+// TestSipBotCallRoutesViaRegistrar trick). The registrar
+// digest-challenges the MESSAGE, so the authenticated retry is what is
+// recorded — its Authorization's username the proof the retry carried
+// the account's credential. The over-limit /send is rejected in chat and
+// never reaches the wire.
+func TestSipBotSendMessage(t *testing.T) {
+	net := newClientTestNet(t, ss.DefaultSubscriberAging)
+	bot := startBot(t, net, "bot", "2-bot", "", nil)
+	user, probe, _, _ := startUserProbe(t, net, "user", "1-user")
+	botId, userId := pairUp(t, bot, user)
+	pbx := newFakePBX(t, 200, true)
+
+	dc := probe.waitDC(t, botId, msg_handler.DataChannelLabelMessages)
+	chat := func(text string) ss.MsgId {
+		t.Helper()
+		m := baseMsg(ss.WellKnownChIdMain, userId, botId)
+		m["plaintext"] = text
+		if err := dc.SendText(mustJSON(t, m)); err != nil {
+			t.Fatalf("SendText: %v", err)
+		}
+		return ss.MsgId(m["msgId"].(string))
+	}
+
+	registerMsg := chat("/register 2001@" + pbx.addr + " passW_0rd")
+	waitBotMessage(t, probe, botId, "the registered reply", isChatReply(registerMsg, "Registered as"))
+
+	// A recipient on a domain the bot cannot resolve (RFC 2606's reserved
+	// TLD): the message can only arrive if it goes to the registrar.
+	sendMsg := chat("/send 1234@callee.invalid Hello from the browser")
+	waitBotMessage(t, probe, botId, "the sent confirmation", isChatReply(sendMsg, "Message sent to 1234@callee.invalid."))
+	pbx.waitForPBX(t, "the MESSAGE at the registrar", func() bool { return pbx.messages == 1 })
+	pbx.mu.Lock()
+	from, to, ruri, ct, body, authed := pbx.messageFrom, pbx.messageTo, pbx.messageRURI, pbx.messageCT, pbx.messageBody, pbx.authedUser
+	pbx.mu.Unlock()
+	if ruri != "sip:1234@callee.invalid" {
+		t.Fatalf("the MESSAGE's Request-URI is %q, want the recipient's address untouched (sip:1234@callee.invalid)", ruri)
+	}
+	if from != "2001" || to != "1234" {
+		t.Fatalf("the MESSAGE's From/To users are %q/%q, want 2001/1234 — the account's identity, the recipient", from, to)
+	}
+	if ct != "text/plain; charset=utf-8" {
+		t.Fatalf("the MESSAGE's Content-Type is %q, want text/plain; charset=utf-8", ct)
+	}
+	if body != "Hello from the browser" {
+		t.Fatalf("the MESSAGE's body is %q, want %q", body, "Hello from the browser")
+	}
+	if authed != "2001" {
+		t.Fatalf("the authenticated retry's digest username is %q, want 2001", authed)
+	}
+
+	// Inner whitespace survives the raw-line parse.
+	spacedMsg := chat("/send 1234@callee.invalid spaced   out\ttext")
+	waitBotMessage(t, probe, botId, "the second sent confirmation", isChatReply(spacedMsg, "Message sent to"))
+	pbx.waitForPBX(t, "the second MESSAGE", func() bool { return pbx.messages == 2 })
+	pbx.mu.Lock()
+	spaced := pbx.messageBody
+	pbx.mu.Unlock()
+	if spaced != "spaced   out\ttext" {
+		t.Fatalf("the second MESSAGE's body is %q, want the inner whitespace preserved (%q)", spaced, "spaced   out\ttext")
+	}
+
+	// Over the size cap (the default 800): rejected in chat, never sent.
+	tooBigMsg := chat("/send 1234@callee.invalid " + strings.Repeat("x", 801))
+	waitBotMessage(t, probe, botId, "the over-limit rejection", isChatReply(tooBigMsg, "over the 800-byte limit"))
+	time.Sleep(100 * time.Millisecond) // let a would-be wire message land
+	pbx.mu.Lock()
+	messages := pbx.messages
+	pbx.mu.Unlock()
+	if messages != 2 {
+		t.Fatalf("the registrar recorded %d MESSAGEs, want 2 — the over-limit one must never reach the wire", messages)
+	}
+}
+
+// TestSipBotInboundMessage covers the reverse direction (§7.3): a SIP
+// MESSAGE arriving at the registered account's socket is rendered and
+// forwarded into the owner's chat — text/plain verbatim (attributed to
+// the SIP From), a message/cpim reduced (the inner From/To kept, the
+// attachment stripped) — and an unsupported media type is answered 415
+// with the browser never bothered.
+func TestSipBotInboundMessage(t *testing.T) {
+	net := newClientTestNet(t, ss.DefaultSubscriberAging)
+	bot := startBot(t, net, "bot", "2-bot", "", nil)
+	user, probe, _, _ := startUserProbe(t, net, "user", "1-user")
+	botId, userId := pairUp(t, bot, user)
+	pbx := newFakePBX(t, 200, true)
+
+	dc := probe.waitDC(t, botId, msg_handler.DataChannelLabelMessages)
+	chat := func(text string) ss.MsgId {
+		t.Helper()
+		m := baseMsg(ss.WellKnownChIdMain, userId, botId)
+		m["plaintext"] = text
+		if err := dc.SendText(mustJSON(t, m)); err != nil {
+			t.Fatalf("SendText: %v", err)
+		}
+		return ss.MsgId(m["msgId"].(string))
+	}
+
+	registerMsg := chat("/register 2001@" + pbx.addr + " passW_0rd")
+	waitBotMessage(t, probe, botId, "the registered reply", isChatReply(registerMsg, "Registered as"))
+
+	// text/plain: forwarded verbatim, attributed to the SIP From.
+	if res := pbx.sendMessage(t, "2001", "text/plain; charset=utf-8", "hello there"); res.StatusCode != 200 {
+		t.Fatalf("the text/plain MESSAGE's answer is %d, want 200", res.StatusCode)
+	}
+	plain := waitBotMessage(t, probe, botId, "the forwarded text message", isChatAnnouncement("hello there"))
+	if want := "Message from sip:caller@" + pbx.ip + ":\n\nhello there"; plain.plaintext != want {
+		t.Fatalf("the forwarded text is %q, want %q", plain.plaintext, want)
+	}
+
+	// message/cpim: the inner From/To are kept, the attachment stripped.
+	cpimBody := "From: Alice <sip:alice@example.com>\r\n" +
+		"To: Bob <sip:bob@example.com>\r\n" +
+		"\r\n" +
+		"Content-Type: multipart/mixed; boundary=bb\r\n" +
+		"\r\n" +
+		"--bb\r\n" +
+		"Content-Type: text/plain\r\n" +
+		"\r\n" +
+		"Hi Bob\r\n" +
+		"--bb\r\n" +
+		"Content-Type: application/octet-stream\r\n" +
+		"\r\n" +
+		"YmluYXJ5\r\n" +
+		"--bb--\r\n"
+	if res := pbx.sendMessage(t, "2001", "message/cpim", cpimBody); res.StatusCode != 200 {
+		t.Fatalf("the cpim MESSAGE's answer is %d, want 200", res.StatusCode)
+	}
+	cpim := waitBotMessage(t, probe, botId, "the forwarded cpim message", isChatAnnouncement("Hi Bob"))
+	wantCPIM := "Message from Alice <sip:alice@example.com> to Bob <sip:bob@example.com>:\n\nHi Bob"
+	if cpim.plaintext != wantCPIM {
+		t.Fatalf("the forwarded cpim text is %q, want %q", cpim.plaintext, wantCPIM)
+	}
+
+	// An unsupported media type: a 415 naming the supported ones, and the
+	// browser never hears of it.
+	if res := pbx.sendMessage(t, "2001", "application/json", `{"marker":"unsupported-7f3a"}`); res.StatusCode != 415 {
+		t.Fatalf("the unsupported MESSAGE's answer is %d, want 415", res.StatusCode)
+	} else if accept := res.GetHeader("Accept"); accept == nil || accept.Value() != "text/plain, message/cpim" {
+		t.Fatalf("the 415's Accept is %v, want text/plain, message/cpim", accept)
+	}
+	time.Sleep(200 * time.Millisecond) // let a would-be forwarded message land
+	if n := countBotMessages(probe, botId, isChatAnnouncement("unsupported-7f3a")); n != 0 {
+		t.Fatalf("the unsupported MESSAGE reached the browser %d time(s), want 0 — it must drop silently", n)
+	}
 }
 
 // TestSipBotTestCall covers /test-call: the configured test callee is

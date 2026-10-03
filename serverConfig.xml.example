@@ -313,6 +313,13 @@
        defaulting to 53); the attribute is rejected with the default. An
        invalid pairing fails the startup.
 
+       maxMessageBytes is the byte-size cap of one /send message's body
+       (a SIP MESSAGE rides UDP, so the body must leave room for the SIP
+       header block inside one datagram); unset selects the default, 800
+       — the budget of IPv6's minimum link MTU (1280) minus the IPv6+UDP
+       headers (48) minus the presumed SIP header block. Deployments on
+       TCP, or with a known path MTU, raise the knob.
+
        The optional <sipCredentialPool/> child is the bot's pool of SIP
        accounts, lent to chat users who bring no credential of their own
        (a /call loans a free account and registers it, and the reply

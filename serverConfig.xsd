@@ -152,7 +152,8 @@
              living in the server process exactly like the echo bot
              above (the shared attributes are the same). Its chat is a
              CLI — /help, /register <user@host> <password>, /unregister,
-             /call <user@host>, /yellow-page, /hangup — with which a chat user
+             /call <user@host>, /send <user@host> <message>, /yellow-page,
+             /hangup — with which a chat user
              registers their own SIP credential and phones arbitrary
              subscribers of the SIP network; media crosses the bot
              transcoded only when the two legs' codecs differ (opus on
@@ -163,6 +164,10 @@
                    command dials (e.g. "9664@192.168.1.2") — a known-
                    good callee on the SIP network the deployment tests
                    against; empty disables /test-call.
+
+             maxMessageBytes: the byte-size cap of one /send message's
+                   body (unset selects the default, 800 — the UDP
+                   datagram budget; see the sipBotType attribute).
 
              The optional sipCredentialPool child is the bot's pool of
              SIP accounts, lent to chat users who bring no credential of
@@ -247,6 +252,24 @@
           <xsd:element name="yellowPage" type="yellowPageType" minOccurs="0" />
         </xsd:sequence>
         <xsd:attribute name="testSIPContact" type="xsd:string" use="optional" />
+        <!-- maxMessageBytes is the byte-size cap of one /send
+             message's body (docs/sip-bot.md §7.3): a SIP MESSAGE rides
+             UDP, so the body must leave room for the SIP header block
+             inside one datagram — the default (800, when the attribute
+             is unset) derives from IPv6's minimum link MTU (1280)
+             minus the IPv6+UDP headers (48) minus the presumed SIP
+             header block (~430 bytes, a digest retry's Authorization
+             included). Deployments on TCP, or with a known path MTU,
+             raise the knob; a non-positive value or one above 65507
+             (the largest UDP payload) fails the startup. -->
+        <xsd:attribute name="maxMessageBytes" use="optional">
+          <xsd:simpleType>
+            <xsd:restriction base="xsd:int">
+              <xsd:minInclusive value="1" />
+              <xsd:maxInclusive value="65507" />
+            </xsd:restriction>
+          </xsd:simpleType>
+        </xsd:attribute>
         <!-- webrtcCodecs is the presumed WebRTC codec list (the sip
              bot's end-to-end codec negotiation, see docs/sip-bot.md §8):
              a comma-separated list of codec names — opus, g722, pcmu,

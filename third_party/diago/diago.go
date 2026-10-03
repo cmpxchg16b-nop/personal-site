@@ -28,7 +28,8 @@ type Diago struct {
 	server     *sipgo.Server
 	transports []Transport
 
-	serveHandler ServeDialogFunc
+	serveHandler   ServeDialogFunc
+	messageHandler func(req *sip.Request, tx sip.ServerTransaction) error
 
 	auth      sipgo.DigestAuth
 	mediaConf MediaConfig
@@ -187,6 +188,15 @@ func WithLogger(l *slog.Logger) DiagoOption {
 func WithServerRequestMiddleware(f func(next sipgo.RequestHandler) sipgo.RequestHandler) DiagoOption {
 	return func(dg *Diago) {
 		dg.serverMiddleware = f
+	}
+}
+
+// WithMessageHandler registers the handler of inbound SIP MESSAGE
+// requests (RFC 3428 pager mode). Unset, a MESSAGE is answered 405
+// Method Not Allowed — sipgo's no-route behavior.
+func WithMessageHandler(f func(req *sip.Request, tx sip.ServerTransaction) error) DiagoOption {
+	return func(dg *Diago) {
+		dg.messageHandler = f
 	}
 }
 
@@ -435,13 +445,22 @@ func NewDiago(ua *sipgo.UserAgent, opts ...DiagoOption) *Diago {
 		if err != nil {
 			return handleNoDialog(req, tx, err)
 		}
-
 		if cd != nil {
 			cd.handleReferNotify(req, tx)
 			return nil
 		}
 		sd.handleReferNotify(req, tx)
 		return nil
+	}))
+
+	// MESSAGE is dialog-free (RFC 3428 pager mode): no dialog matching,
+	// the handler owns the whole request. Unset, the answer is a 405 —
+	// sipgo's own no-route behavior.
+	server.OnMessage(errHandler(func(req *sip.Request, tx sip.ServerTransaction) error {
+		if dg.messageHandler == nil {
+			return tx.Respond(sip.NewResponseFromRequest(req, sip.StatusMethodNotAllowed, "Method Not Allowed", nil))
+		}
+		return dg.messageHandler(req, tx)
 	}))
 	// server.OnRefer(func(req *sip.Request, tx sip.ServerTransaction) {
 	// 	d, err := MatchDialogServer(req)
@@ -737,6 +756,19 @@ func (dg *Diago) getClient(tran *Transport) *sipgo.Client {
 	}
 
 	return tran.client
+}
+
+// Client returns the sipgo client of the named transport ("udp", "tcp"
+// ...; empty selects the first) — the account's own sending identity
+// (the Via pinning and NAT behavior are the transport's), for the
+// out-of-dialog requests the library has no helper for (MESSAGE, RFC
+// 3428). An unknown transport is an error.
+func (dg *Diago) Client(transport string) (*sipgo.Client, error) {
+	tran, exists := dg.getTransport(transport)
+	if !exists {
+		return nil, fmt.Errorf("transport=%s does not exists", transport)
+	}
+	return dg.getClient(tran), nil
 }
 
 func (dg *Diago) getTransport(transport string) (*Transport, bool) {

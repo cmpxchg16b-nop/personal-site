@@ -49,3 +49,24 @@ speak it:
 
 No other behavior changes; SDP without PT 9 is byte-identical to
 upstream.
+
+## Patch 3: SIP MESSAGE support (RFC 3428 pager mode)
+
+Upstream diago never registers sipgo's `OnMessage` handler (an inbound
+MESSAGE falls to sipgo's no-route default) and keeps its per-transport
+`*sipgo.Client` private, so a MESSAGE can neither arrive nor leave. The
+sip bot bridges pager-mode messages (docs/sip-bot.md §7.3), so:
+
+- `diago.go`: `Diago` gains a `messageHandler` field and the
+  `WithMessageHandler(func(req *sip.Request, tx sip.ServerTransaction)
+error)` option; `NewDiago` registers `server.OnMessage` through the
+  same errHandler wrapper as its siblings. The zero value answers
+  405 Method Not Allowed — an option-less diago behaves exactly as
+  upstream (sipgo's no-route answer is also a 405).
+- `diago.go`: `Diago.Client(transport string) (*sipgo.Client, error)`
+  exposes the per-transport client (the existing getTransport/getClient
+  pair) so out-of-dialog requests the library has no helper for can be
+  sent on the account's own socket — the client's Via pinning and NAT
+  behavior are the transport's own.
+
+No other behavior changes; diago's dialog machinery is untouched.

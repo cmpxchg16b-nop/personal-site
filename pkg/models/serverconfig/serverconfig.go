@@ -171,6 +171,13 @@ type SipBotXML struct {
 	// among the caller's offer. Parsed and validated at wiring time with
 	// sipbot.ParseWebRTCCodecs (see cmd/server).
 	WebRTCCodecs string `xml:"webrtcCodecs,attr"`
+	// MaxMessageBytes is the raw maxMessageBytes attribute: the
+	// byte-size cap of one /send message's body — a SIP MESSAGE rides
+	// UDP, so the body must leave room for the SIP header block inside
+	// one datagram (docs/sip-bot.md §10 carries the arithmetic). Zero
+	// (unset) selects the default. Validated at wiring time with
+	// sipbot.ParseMaxMessageBytes (see cmd/server).
+	MaxMessageBytes int `xml:"maxMessageBytes,attr"`
 	// IPPreference is the raw ipPreference attribute: the address family
 	// every DNS resolution in the sip leg honors — "v6Only", "v4Only",
 	// or "default" (empty, the default). Validated at wiring time with
