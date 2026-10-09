@@ -427,6 +427,24 @@ func waitOfferSettled(t *testing.T, box *atomic.Pointer[webrtc.PeerConnection]) 
 	return remote
 }
 
+// waitVideoOfferSettled is waitOfferSettled for a video call: the bot's
+// two attaches (the audio track's, then the video track's) drive two
+// offers toward the probe; the wait is over when the settled remote
+// description carries the video m-line — the second attach's offer.
+func waitVideoOfferSettled(t *testing.T, box *atomic.Pointer[webrtc.PeerConnection]) *webrtc.SessionDescription {
+	t.Helper()
+	waitFor(t, "the bot's media offer to settle with video", func() bool {
+		pc := box.Load()
+		return pc != nil && pc.SignalingState() == webrtc.SignalingStateStable &&
+			pc.RemoteDescription() != nil && strings.Contains(pc.RemoteDescription().SDP, "m=video")
+	})
+	remote := box.Load().RemoteDescription()
+	if remote == nil {
+		t.Fatal("the probe holds no remote description")
+	}
+	return remote
+}
+
 // sdpAudioFormats extracts the payload-type list of the SDP's audio
 // m-line — the codec pin's wire shape.
 func sdpAudioFormats(t *testing.T, body string) []string {
@@ -443,6 +461,43 @@ func sdpAudioFormats(t *testing.T, body string) []string {
 	}
 	t.Fatalf("no audio m-line in the SDP:\n%s", body)
 	return nil
+}
+
+// sdpVideoFormats is sdpAudioFormats for the video m-line; an SDP
+// without one answers nil.
+func sdpVideoFormats(t *testing.T, body string) []string {
+	t.Helper()
+	for line := range strings.Lines(body) {
+		line = strings.TrimRight(line, "\r\n")
+		if strings.HasPrefix(line, "m=video ") {
+			fields := strings.Fields(line)
+			if len(fields) < 4 {
+				t.Fatalf("the video m-line is malformed: %q", line)
+			}
+			return fields[3:]
+		}
+	}
+	return nil
+}
+
+// sdpVideoPort is the video m-line's port, -1 when the SDP carries none.
+func sdpVideoPort(t *testing.T, body string) int {
+	t.Helper()
+	for line := range strings.Lines(body) {
+		line = strings.TrimRight(line, "\r\n")
+		if strings.HasPrefix(line, "m=video ") {
+			fields := strings.Fields(line)
+			if len(fields) < 2 {
+				t.Fatalf("the video m-line is malformed: %q", line)
+			}
+			port, err := strconv.Atoi(fields[1])
+			if err != nil {
+				t.Fatalf("the video m-line's port: %v", err)
+			}
+			return port
+		}
+	}
+	return -1
 }
 
 // readOneRTP reads one packet off a remote track, failing the test when
@@ -700,6 +755,15 @@ type fakePBX struct {
 
 	answerCode int  // the final response to an INVITE (200, 486, …)
 	opus       bool // the SDP answer's codec: opus (96) when set, PCMU (0) otherwise
+	video      int  // the SDP's video section: pbxVideo* (none unless enabled)
+
+	// The demuxed-video socket: a video section answered on a port of its
+	// own (pbxVideoDemuxed) sends and records there — the "the bot
+	// respects the answer's port" proof. The muxed variant shares rtp.
+	rtpVideo         *net.UDPConn
+	rtpVideoReceived int
+	rtpVideoPayloads [][]byte
+	rtpVideoPTs      []uint8
 
 	// The UAC side: the client and its dialog cache (a BYE of one of the
 	// fake's own outbound calls routes to it — see OnBye).
@@ -749,6 +813,19 @@ type fakePBX struct {
 	// is expected, not an error.
 	tornDown atomic.Bool
 }
+
+// The fake's video-section modes (fakePBX.video): the answer's and the
+// own offers' video m-line — none, muxed on the audio socket's port, or
+// demuxed on a second socket's port.
+const (
+	pbxVideoNone = iota
+	pbxVideoMuxed
+	pbxVideoDemuxed
+)
+
+// pbxVideoPT is the fake's video payload type (VP8), the one the bot's
+// presumed video list's first entry carries.
+const pbxVideoPT = 102
 
 // errf reports a fake-PBX handler failure on the test — unless teardown
 // has begun, where a late message's failure is shutdown noise and a
@@ -1012,6 +1089,48 @@ func newFakePBXOnPort(t *testing.T, ip string, port int, answerCode int, opus bo
 	return f
 }
 
+// enableVideo makes the fake's SDP (its answers to the bot's INVITEs,
+// and the offers its own calls carry) announce a video section: VP8 at
+// the fake's video PT — muxed on the media socket's port, or, when
+// demuxed, on a second socket's port whose arrivals are recorded apart
+// (the "the bot respects the answer's own video port" proof).
+func (f *fakePBX) enableVideo(t *testing.T, demuxed bool) {
+	t.Helper()
+	f.mu.Lock()
+	f.video = pbxVideoMuxed
+	f.mu.Unlock()
+	if !demuxed {
+		return
+	}
+	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP(f.ip), Port: 0})
+	if err != nil {
+		t.Fatalf("bind the demuxed video socket: %v", err)
+	}
+	t.Cleanup(func() { conn.Close() })
+	f.mu.Lock()
+	f.video = pbxVideoDemuxed
+	f.rtpVideo = conn
+	f.mu.Unlock()
+	go func() {
+		buf := make([]byte, 2000)
+		for {
+			n, _, err := conn.ReadFromUDP(buf)
+			if err != nil {
+				return
+			}
+			pkt := &rtp.Packet{}
+			if err := pkt.Unmarshal(buf[:n]); err != nil {
+				continue
+			}
+			f.mu.Lock()
+			f.rtpVideoReceived++
+			f.rtpVideoPayloads = append(f.rtpVideoPayloads, slices.Clone(pkt.Payload))
+			f.rtpVideoPTs = append(f.rtpVideoPTs, pkt.PayloadType)
+			f.mu.Unlock()
+		}
+	}()
+}
+
 // refuseRegister makes the registrar answer 403 to an authenticated
 // REGISTER carrying user's digest username — a registrar that refuses
 // one account (a bad pooled credential).
@@ -1059,8 +1178,11 @@ func between(s, left, right string) string {
 	return s[:j]
 }
 
-// sdpBody is the fake's SDP, offer or answer alike: its media socket,
-// the codec the test configured (plus telephone-event, as PBXs do).
+// sdpBody is the fake's SDP — the answer to the bot's INVITEs, and the
+// offer its own calls carry: audio (the configured codec plus
+// telephone-event) on the media socket's port, joined by a video section
+// (VP8 at the fake's video PT) when the fake's video mode says so —
+// muxed on the same port, or demuxed on the second socket's.
 func (f *fakePBX) sdpBody() []byte {
 	port := f.rtp.LocalAddr().(*net.UDPAddr).Port
 	family := "IP4"
@@ -1069,9 +1191,18 @@ func (f *fakePBX) sdpBody() []byte {
 	}
 	sdp := fmt.Sprintf("v=0\r\no=- 0 0 IN %s %s\r\ns=fakepbx\r\nc=IN %s %s\r\nt=0 0\r\n", family, f.ip, family, f.ip)
 	if f.opus {
-		return []byte(sdp + fmt.Sprintf("m=audio %d RTP/AVP 96 101\r\na=rtpmap:96 opus/48000/2\r\na=rtpmap:101 telephone-event/8000\r\n", port))
+		sdp += fmt.Sprintf("m=audio %d RTP/AVP 96 101\r\na=rtpmap:96 opus/48000/2\r\na=rtpmap:101 telephone-event/8000\r\n", port)
+	} else {
+		sdp += fmt.Sprintf("m=audio %d RTP/AVP 0 101\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:101 telephone-event/8000\r\n", port)
 	}
-	return []byte(sdp + fmt.Sprintf("m=audio %d RTP/AVP 0 101\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:101 telephone-event/8000\r\n", port))
+	if f.video != pbxVideoNone {
+		videoPort := port
+		if f.video == pbxVideoDemuxed {
+			videoPort = f.rtpVideo.LocalAddr().(*net.UDPAddr).Port
+		}
+		sdp += fmt.Sprintf("m=video %d RTP/AVP %d\r\na=rtpmap:%d VP8/90000\r\n", videoPort, pbxVideoPT, pbxVideoPT)
+	}
+	return []byte(sdp)
 }
 
 // rtpPort is the fake's media socket's port — the custom-SDP callers'
@@ -1177,6 +1308,43 @@ func (f *fakePBX) streamOpus(ctx context.Context, payloads [][]byte) {
 // per packet).
 func (f *fakePBX) streamPCMU(ctx context.Context, payloads [][]byte) {
 	f.streamRTP(ctx, payloads, 0, 160)
+}
+
+// streamVideo streams the payloads as ≈30 fps VP8 RTP (the fake's video
+// PT, 3000 90 kHz ticks per packet, a video SSRC of its own) to the bot's
+// media address — the callee's camera. The demuxed fake sends from its
+// video socket (a real demuxed endpoint's source), the muxed one from
+// the shared socket. It starts once the first dialog's media is up.
+func (f *fakePBX) streamVideo(ctx context.Context, payloads [][]byte) {
+	<-f.rtpStart
+	f.mu.Lock()
+	peer := f.rtpPeer
+	conn := f.rtp
+	if f.video == pbxVideoDemuxed {
+		conn = f.rtpVideo
+	}
+	f.mu.Unlock()
+	if peer == nil {
+		return
+	}
+	for i := 0; ; i++ {
+		pkt := &rtp.Packet{
+			Header:  rtp.Header{Version: 2, PayloadType: pbxVideoPT, SequenceNumber: uint16(i), Timestamp: uint32(i) * 3000, SSRC: 0xBEEF01},
+			Payload: payloads[i%len(payloads)],
+		}
+		data, err := pkt.Marshal()
+		if err != nil {
+			return
+		}
+		if _, err := conn.WriteToUDP(data, peer); err != nil {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(33 * time.Millisecond):
+		}
+	}
 }
 
 // ---- The fake as a caller: the inbound-call tests' UAC side ----
@@ -1410,6 +1578,20 @@ func (fc *fakeCall) stream(ctx context.Context, payloads [][]byte) {
 // call's negotiated codec (PT 96 and 960 ticks for opus; PT 0 and 160
 // for PCMU).
 func (fc *fakeCall) streamRTP(ctx context.Context, payloads [][]byte, pt uint8, tsStep uint32) {
+	fc.streamRTPOn(fc.f.rtp, 0xCA11E1, ctx, payloads, pt, tsStep, 20*time.Millisecond)
+}
+
+// streamVideo plays the caller's camera: the payloads as ≈30 fps VP8 RTP
+// (the negotiated video PT, 3000 ticks per packet, a video SSRC of its
+// own) to the bot's media address. The fake's own offers mux the video
+// on the media socket, so the shared socket sends.
+func (fc *fakeCall) streamVideo(ctx context.Context, payloads [][]byte) {
+	fc.streamRTPOn(fc.f.rtp, 0xBEEF02, ctx, payloads, pbxVideoPT, 3000, 33*time.Millisecond)
+}
+
+// streamRTPOn is the two streamers' shared loop: paced RTP of one SSRC
+// from one socket to the bot's media address, until ctx ends.
+func (fc *fakeCall) streamRTPOn(conn *net.UDPConn, ssrc uint32, ctx context.Context, payloads [][]byte, pt uint8, tsStep uint32, pace time.Duration) {
 	fc.mu.Lock()
 	peer := fc.peer
 	fc.mu.Unlock()
@@ -1418,20 +1600,20 @@ func (fc *fakeCall) streamRTP(ctx context.Context, payloads [][]byte, pt uint8, 
 	}
 	for i := 0; ; i++ {
 		pkt := &rtp.Packet{
-			Header:  rtp.Header{Version: 2, PayloadType: pt, SequenceNumber: uint16(i), Timestamp: uint32(i) * tsStep, SSRC: 0xCA11E1},
+			Header:  rtp.Header{Version: 2, PayloadType: pt, SequenceNumber: uint16(i), Timestamp: uint32(i) * tsStep, SSRC: ssrc},
 			Payload: payloads[i%len(payloads)],
 		}
 		data, err := pkt.Marshal()
 		if err != nil {
 			return
 		}
-		if _, err := fc.f.rtp.WriteToUDP(data, peer); err != nil {
+		if _, err := conn.WriteToUDP(data, peer); err != nil {
 			return
 		}
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(20 * time.Millisecond):
+		case <-time.After(pace):
 		}
 	}
 }
@@ -1464,6 +1646,22 @@ func pcmuVoice(n int) [][]byte {
 	return payloads
 }
 
+// videoFrames returns n distinct synthetic VP8 frame payloads (the relay
+// never parses them — distinct bytes are what the byte-for-byte
+// assertions need).
+func videoFrames(n int) [][]byte {
+	payloads := make([][]byte, n)
+	for i := range payloads {
+		p := make([]byte, 300)
+		p[0] = 0x10 // a VP8 payload descriptor's bare shape
+		for j := 1; j < len(p); j++ {
+			p[j] = byte(i*41 + j*17)
+		}
+		payloads[i] = p
+	}
+	return payloads
+}
+
 // waitRTP waits until at least n RTP packets arrived at the fake's
 // media socket and returns their payloads.
 func (f *fakePBX) waitRTP(t *testing.T, n int) [][]byte {
@@ -1476,6 +1674,35 @@ func (f *fakePBX) waitRTP(t *testing.T, n int) [][]byte {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return slices.Clone(f.rtpPayloads)
+}
+
+// rtpPayloadsByPT is the fake's recorded media-socket payloads of one
+// payload type — the PT-demuxed view of the muxed arrivals (the camera's
+// packets at the negotiated video PT among the mic's audio).
+func (f *fakePBX) rtpPayloadsByPT(pt uint8) [][]byte {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out [][]byte
+	for i, p := range f.rtpPayloads {
+		if f.rtpPTs[i] == pt {
+			out = append(out, slices.Clone(p))
+		}
+	}
+	return out
+}
+
+// waitVideoRTP waits until at least n RTP packets arrived at the fake's
+// DEMUXED video socket and returns their payloads.
+func (f *fakePBX) waitVideoRTP(t *testing.T, n int) [][]byte {
+	t.Helper()
+	waitFor(t, fmt.Sprintf("%d RTP packets at the callee's video port", n), func() bool {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		return f.rtpVideoReceived >= n
+	})
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.rtpVideoPayloads)
 }
 
 // waitDTMF waits until the fake received one full RFC 4733 series for
@@ -1545,11 +1772,13 @@ func TestSipBotCLIAndGuards(t *testing.T) {
 	unknownMsg := send("hello there")
 	registerMsg := send("/register 2001@sip.example.com")
 	callMsg := send("/call 1001@sip.example.com")
+	videoCallMsg := send("/video-call 1001@sip.example.com")
+	videoCallUsageMsg := send("/video-call")
 	testCallMsg := send("/test-call")
 	hangupMsg := send("/hangup")
 
 	help := waitBotMessage(t, probe, botId, "the /help reply", isChatReply(helpMsg, "/help"))
-	for _, cmd := range []string{"/help", "/register", "/unregister", "/call", "/yellow-page", "/test-call", "/hangup"} {
+	for _, cmd := range []string{"/help", "/register", "/unregister", "/call", "/video-call", "/yellow-page", "/test-call", "/hangup"} {
 		if !strings.Contains(help.plaintext, cmd) {
 			t.Fatalf("the help text lacks %q: %q", cmd, help.plaintext)
 		}
@@ -1557,6 +1786,8 @@ func TestSipBotCLIAndGuards(t *testing.T) {
 	waitBotMessage(t, probe, botId, "the unknown-command hint", isChatReply(unknownMsg, "/help"))
 	waitBotMessage(t, probe, botId, "the register usage", isChatReply(registerMsg, "Usage: /register"))
 	waitBotMessage(t, probe, botId, "the not-registered answer", isChatReply(callMsg, "Not registered"))
+	waitBotMessage(t, probe, botId, "the video-call not-registered answer", isChatReply(videoCallMsg, "Not registered"))
+	waitBotMessage(t, probe, botId, "the video-call usage", isChatReply(videoCallUsageMsg, "Usage: /video-call"))
 	waitBotMessage(t, probe, botId, "the test-call unavailable answer", isChatReply(testCallMsg, "unavailable"))
 	waitBotMessage(t, probe, botId, "the no-call answer", isChatReply(hangupMsg, "No call in progress"))
 
@@ -3433,4 +3664,644 @@ func TestSipBotInboundCallUserHangsUp(t *testing.T) {
 	sip(map[string]any{"callId": invite.sip.CallId, "method": "BYE"})
 	pbx.waitForPBX(t, "the BYE at the caller", func() bool { return pbx.byes == 1 })
 	waitBotMessage(t, probe, botId, "the ended amend", isCallStatusAmend(invite.msgId, invite.sip.CallId, "ended"))
+}
+
+// ---------------------------------------------------------------------------
+// The video calls (docs/sip-bot.md §7.1/§7.2's video variants).
+// ---------------------------------------------------------------------------
+
+// streamSamples writes the payloads onto the track at the given sample
+// duration and pace until ctx ends — the probe's mic pump.
+func streamSamples(ctx context.Context, track *webrtc.TrackLocalStaticSample, payloads [][]byte, dur, pace time.Duration) {
+	for i := 0; ; i++ {
+		if err := track.WriteSample(pionmedia.Sample{Data: payloads[i%len(payloads)], Duration: dur}); err != nil {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(pace):
+		}
+	}
+}
+
+// streamVideoRTP writes the payloads as ≈30 fps RTP packets — the
+// probe's camera pump. A TrackLocalStaticRTP, not a sample track:
+// WriteRTP bypasses pion's payloader (which would prepend the VP8
+// payload descriptor), so the payload crossing is the frame verbatim —
+// the byte-for-byte assertions' premise.
+func streamVideoRTP(ctx context.Context, track *webrtc.TrackLocalStaticRTP, payloads [][]byte) {
+	for i := 0; ; i++ {
+		pkt := &rtp.Packet{
+			Header:  rtp.Header{Version: 2, SequenceNumber: uint16(i), Timestamp: uint32(i) * 3000, SSRC: 0xCA4E7A, Marker: true},
+			Payload: payloads[i%len(payloads)],
+		}
+		if err := track.WriteRTP(pkt); err != nil {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(33 * time.Millisecond):
+		}
+	}
+}
+
+// waitTrackKind waits for the probe's first remote track of the given
+// kind — the video tests' two tracks (the callee's voice, the callee's
+// camera) fire in stream order, so the kind, not the index, identifies.
+func (p *trackProbe) waitTrackKind(t *testing.T, kind webrtc.RTPCodecType) *webrtc.TrackRemote {
+	t.Helper()
+	find := func() *webrtc.TrackRemote {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		for _, tr := range p.tracks {
+			if tr.Kind() == kind {
+				return tr
+			}
+		}
+		return nil
+	}
+	waitFor(t, "a remote "+kind.String()+" track", func() bool { return find() != nil })
+	return find()
+}
+
+// hearAll reads the track until every payload of want crossed — the
+// byte-for-byte passthrough assertion.
+func hearAll(t *testing.T, track *webrtc.TrackRemote, want [][]byte) {
+	t.Helper()
+	heard := map[string]bool{}
+	for len(heard) < len(want) {
+		pkt := readOneRTP(t, track)
+		heard[string(pkt.Payload)] = true
+	}
+}
+
+// waitRecordedPT waits until the fake's media socket recorded every
+// payload of want at the given PT — the camera's arrivals at the
+// negotiated video PT among the mic's audio on the muxed socket.
+func (f *fakePBX) waitRecordedPT(t *testing.T, pt uint8, want [][]byte) {
+	t.Helper()
+	waitFor(t, "the fake recording the video payloads at their PT", func() bool {
+		heard := map[string]bool{}
+		for _, p := range f.rtpPayloadsByPT(pt) {
+			heard[string(p)] = true
+		}
+		for _, w := range want {
+			if !heard[string(w)] {
+				return false
+			}
+		}
+		return true
+	})
+}
+
+// acceptVideoCall is the video tests' browser-side accept: the mic and
+// the camera join their pinned m-lines (pion's kind-based transceiver
+// reuse), both streaming from then on, and the 200 OK flies. It returns
+// the payload sets (the mic's, the camera's) the fake-side assertions
+// then expect recorded.
+func acceptVideoCall(t *testing.T, user *rtc.HeadlessRTCClient, botId ss.SubscriberId, sip func(map[string]any), callId string) (spoken, filmed [][]byte) {
+	t.Helper()
+	micTrack, err := webrtc.NewTrackLocalStaticSample(webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus, ClockRate: 48000, Channels: 2}, "mic", "probe")
+	if err != nil {
+		t.Fatalf("the mic track: %v", err)
+	}
+	cameraTrack, err := webrtc.NewTrackLocalStaticRTP(webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeVP8, ClockRate: 90000}, "camera", "probe")
+	if err != nil {
+		t.Fatalf("the camera track: %v", err)
+	}
+	if _, err := user.AddTrack(botId, micTrack); err != nil {
+		t.Fatalf("attach the mic: %v", err)
+	}
+	if _, err := user.AddTrack(botId, cameraTrack); err != nil {
+		t.Fatalf("attach the camera: %v", err)
+	}
+	spoken, filmed = opusVoice(5), videoFrames(5)
+	micCtx, stopMic := context.WithCancel(context.Background())
+	t.Cleanup(stopMic)
+	go streamSamples(micCtx, micTrack, spoken, 20*time.Millisecond, 20*time.Millisecond)
+	go streamVideoRTP(micCtx, cameraTrack, filmed)
+	sip(map[string]any{"callId": callId, "response": map[string]any{"code": 200, "phrase": "OK"}})
+	return spoken, filmed
+}
+
+// TestSipBotVideoCallEndToEnd covers /video-call's happy path end to
+// end: the SIP offer carries audio AND video on ONE muxed port; the
+// callee's video answer rings the browser as a video call; the
+// webrtc-leg's settled offer is pinned to the negotiated video codec;
+// the callee's voice and camera cross to the browser byte for byte; the
+// browser's own camera crosses to the callee at the negotiated video PT
+// on the muxed socket; and the callee's BYE ends both legs.
+func TestSipBotVideoCallEndToEnd(t *testing.T) {
+	net := newClientTestNet(t, ss.DefaultSubscriberAging)
+	bot := startBot(t, net, "bot", "2-bot", "", nil)
+	var pcBox atomic.Pointer[webrtc.PeerConnection]
+	user, probe, tprobe, _ := startUserProbeOn(t, net, "user", "1-user", func(c *rtc.RTCClientConfiguration) {
+		c.NewPeerConnection = tapPCFactory(&pcBox)
+	})
+	botId, userId := pairUp(t, bot, user)
+	pbx := newFakePBX(t, 200, true)
+	pbx.enableVideo(t, false) // the muxed video answer
+
+	dc := probe.waitDC(t, botId, msg_handler.DataChannelLabelMessages)
+	chat := func(text string) ss.MsgId {
+		t.Helper()
+		m := baseMsg(ss.WellKnownChIdMain, userId, botId)
+		m["plaintext"] = text
+		if err := dc.SendText(mustJSON(t, m)); err != nil {
+			t.Fatalf("SendText: %v", err)
+		}
+		return ss.MsgId(m["msgId"].(string))
+	}
+	sip := func(body map[string]any) {
+		t.Helper()
+		m := baseMsg(ss.WellKnownChIdMain, userId, botId)
+		m["mimeType"] = wireMimeSip
+		m["sip"] = body
+		if err := dc.SendText(mustJSON(t, m)); err != nil {
+			t.Fatalf("SendText: %v", err)
+		}
+	}
+
+	registerMsg := chat("/register 2001@" + pbx.addr + " passW_0rd")
+	waitBotMessage(t, probe, botId, "the registered reply", isChatReply(registerMsg, "Registered as"))
+
+	callMsg := chat("/video-call 1001@" + pbx.addr)
+	waitBotMessage(t, probe, botId, "the calling line", isChatReply(callMsg, "Calling 1001@"))
+	pbx.waitForPBX(t, "the callee's INVITE", func() bool { return pbx.invites == 1 })
+
+	// The offer carries audio AND video on ONE port — the muxed media.
+	pbx.mu.Lock()
+	offer := pbx.inviteSDP
+	pbx.mu.Unlock()
+	if strings.Count(offer, "m=video") != 1 {
+		t.Fatalf("the offer lacks the video m-line:\n%s", offer)
+	}
+	if audioPort, videoPort := parseSDPMediaAddr(t, []byte(offer)).Port, sdpVideoPort(t, offer); audioPort != videoPort {
+		t.Fatalf("the offer's ports are (audio %d, video %d), want the one muxed port:\n%s", audioPort, videoPort, offer)
+	}
+	if !strings.Contains(offer, "a=rtpmap:102 VP8/90000") {
+		t.Fatalf("the offer lacks the VP8 rtpmap line:\n%s", offer)
+	}
+
+	dialog := pbx.waitDialog(t)
+	invite := waitBotMessage(t, probe, botId, "the bot's video INVITE", func(m *rawMsg) bool {
+		return isSipInvite(m) && m.sip.XMedia == "video" && m.sip.XCallStatus == "inviting"
+	})
+	callId, inviteMsgId := invite.sip.CallId, invite.msgId
+	waitBotMessage(t, probe, botId, "the callee-answered line", isChatReply(callMsg, "Callee answered."))
+	// The callee took the video: no degrades-to-voice note.
+	if n := countBotMessages(probe, botId, isChatReply(callMsg, "Callee has no video")); n != 0 {
+		t.Fatalf("the answered video call still said %d degrades-to-voice note(s)", n)
+	}
+
+	// The webrtc-leg's settled offer is pinned to the negotiated video
+	// codec — the video m-line carries exactly the engine's VP8.
+	pinned := waitVideoOfferSettled(t, &pcBox)
+	if got := sdpVideoFormats(t, pinned.SDP); !slices.Equal(got, []string{"96"}) {
+		t.Fatalf("the offer's video pin is %v, want [96]:\n%s", got, pinned.SDP)
+	}
+	if got := sdpAudioFormats(t, pinned.SDP); !slices.Equal(got, []string{"111", "126"}) {
+		t.Fatalf("the offer's audio pin is %v, want [111 126]:\n%s", got, pinned.SDP)
+	}
+
+	// The user picks up with mic and camera; the callee's voice and video
+	// start streaming.
+	spoken, filmed := acceptVideoCall(t, user, botId, sip, callId)
+	streamCtx, stopStream := context.WithCancel(context.Background())
+	t.Cleanup(stopStream)
+	calleeVoice, calleeVideo := opusVoice(6), videoFrames(6)
+	go pbx.streamOpus(streamCtx, calleeVoice)
+	go pbx.streamVideo(streamCtx, calleeVideo)
+
+	// The callee's media crosses to the browser byte for byte, audio and
+	// video alike (the tracks identified by kind — their firing order is
+	// the streams' own).
+	audioTrack := tprobe.waitTrackKind(t, webrtc.RTPCodecTypeAudio)
+	videoTrack := tprobe.waitTrackKind(t, webrtc.RTPCodecTypeVideo)
+	if got := videoTrack.Codec(); !strings.EqualFold(got.MimeType, webrtc.MimeTypeVP8) {
+		t.Fatalf("the bot's video track toward the browser is %s, want VP8", got.MimeType)
+	}
+	waitBotMessage(t, probe, botId, "the accepted amend", isCallStatusAmend(inviteMsgId, callId, "accepted"))
+	hearAll(t, audioTrack, calleeVoice)
+	hearAll(t, videoTrack, calleeVideo)
+
+	// The user's mic and camera cross to the callee — the camera's
+	// packets at the negotiated video PT on the MUXED socket (the answer's
+	// video port was the audio's).
+	pbx.waitRTP(t, 1)
+	pbx.waitRecordedPT(t, pbxVideoPT, filmed)
+	heardMic := map[string]bool{}
+	deadline := time.Now().Add(testTimeout)
+	for len(heardMic) < len(spoken) {
+		for _, got := range pbx.waitRTP(t, 1) {
+			heardMic[string(got)] = true
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the callee heard %d of the %d distinct mic packets", len(heardMic), len(spoken))
+		}
+	}
+
+	// The callee hangs up: the browser leg is ended by the bot.
+	if err := dialog.Bye(context.Background()); err != nil {
+		t.Fatalf("the callee's BYE: %v", err)
+	}
+	waitBotMessage(t, probe, botId, "the bot's BYE", isSipRequest(callId, "BYE"))
+	waitBotMessage(t, probe, botId, "the callee-hung-up line", isChatReply(callMsg, "Callee hung up."))
+	waitBotMessage(t, probe, botId, "the ended amend", isCallStatusAmend(inviteMsgId, callId, "ended"))
+}
+
+// TestSipBotVideoCallDemuxedAnswer covers the answer that demuxes the
+// video onto a port of its own (Asterisk's shape): the bot's camera
+// stream goes THERE (a dedicated socket, the answer respected), never to
+// the audio port — while the callee's video still arrives at the bot's
+// one muxed port and crosses to the browser.
+func TestSipBotVideoCallDemuxedAnswer(t *testing.T) {
+	net := newClientTestNet(t, ss.DefaultSubscriberAging)
+	bot := startBot(t, net, "bot", "2-bot", "", nil)
+	user, probe, tprobe, _ := startUserProbe(t, net, "user", "1-user")
+	botId, userId := pairUp(t, bot, user)
+	pbx := newFakePBX(t, 200, true)
+	pbx.enableVideo(t, true) // the demuxed video answer
+
+	dc := probe.waitDC(t, botId, msg_handler.DataChannelLabelMessages)
+	chat := func(text string) ss.MsgId {
+		t.Helper()
+		m := baseMsg(ss.WellKnownChIdMain, userId, botId)
+		m["plaintext"] = text
+		if err := dc.SendText(mustJSON(t, m)); err != nil {
+			t.Fatalf("SendText: %v", err)
+		}
+		return ss.MsgId(m["msgId"].(string))
+	}
+	sip := func(body map[string]any) {
+		t.Helper()
+		m := baseMsg(ss.WellKnownChIdMain, userId, botId)
+		m["mimeType"] = wireMimeSip
+		m["sip"] = body
+		if err := dc.SendText(mustJSON(t, m)); err != nil {
+			t.Fatalf("SendText: %v", err)
+		}
+	}
+
+	registerMsg := chat("/register 2001@" + pbx.addr + " passW_0rd")
+	waitBotMessage(t, probe, botId, "the registered reply", isChatReply(registerMsg, "Registered as"))
+
+	callMsg := chat("/video-call 1001@" + pbx.addr)
+	waitBotMessage(t, probe, botId, "the calling line", isChatReply(callMsg, "Calling 1001@"))
+	dialog := pbx.waitDialog(t)
+	invite := waitBotMessage(t, probe, botId, "the bot's video INVITE", func(m *rawMsg) bool {
+		return isSipInvite(m) && m.sip.XMedia == "video" && m.sip.XCallStatus == "inviting"
+	})
+	callId := invite.sip.CallId
+	waitBotMessage(t, probe, botId, "the callee-answered line", isChatReply(callMsg, "Callee answered."))
+
+	_, filmed := acceptVideoCall(t, user, botId, sip, callId)
+	streamCtx, stopStream := context.WithCancel(context.Background())
+	t.Cleanup(stopStream)
+	calleeVideo := videoFrames(6)
+	go pbx.streamVideo(streamCtx, calleeVideo)
+
+	// The camera's packets land on the answer's OTHER port — all of them
+	// at the video PT…
+	pbx.waitVideoRTP(t, len(filmed))
+	heard := map[string]bool{}
+	pbx.mu.Lock()
+	for i, p := range pbx.rtpVideoPayloads {
+		if pbx.rtpVideoPTs[i] != pbxVideoPT {
+			pbx.mu.Unlock()
+			t.Fatalf("a packet at PT %d reached the demuxed video port, want %d", pbx.rtpVideoPTs[i], pbxVideoPT)
+		}
+		heard[string(p)] = true
+	}
+	pbx.mu.Unlock()
+	for _, w := range filmed {
+		if !heard[string(w)] {
+			t.Fatalf("a camera packet never reached the demuxed video port")
+		}
+	}
+	// …and none on the audio port (give a would-be muxed copy its chance).
+	time.Sleep(300 * time.Millisecond)
+	if got := pbx.rtpPayloadsByPT(pbxVideoPT); len(got) != 0 {
+		t.Fatalf("%d camera packet(s) landed on the audio port, want none — the answer demuxed the video", len(got))
+	}
+
+	// The callee's video still arrives at the bot's one muxed port and
+	// crosses to the browser byte for byte.
+	videoTrack := tprobe.waitTrackKind(t, webrtc.RTPCodecTypeVideo)
+	hearAll(t, videoTrack, calleeVideo)
+
+	if err := dialog.Bye(context.Background()); err != nil {
+		t.Fatalf("the callee's BYE: %v", err)
+	}
+	waitBotMessage(t, probe, botId, "the callee-hung-up line", isChatReply(callMsg, "Callee hung up."))
+}
+
+// TestSipBotVideoCallCalleeDeclinesVideo covers the answer without
+// video: /video-call's offer carried it, the callee's answer dropped it —
+// the browser rings as a VOICE call (the offer toward it carries no video
+// m-line), the chat note says why, and the call completes voice-only.
+func TestSipBotVideoCallCalleeDeclinesVideo(t *testing.T) {
+	net := newClientTestNet(t, ss.DefaultSubscriberAging)
+	bot := startBot(t, net, "bot", "2-bot", "", nil)
+	var pcBox atomic.Pointer[webrtc.PeerConnection]
+	user, probe, tprobe, _ := startUserProbeOn(t, net, "user", "1-user", func(c *rtc.RTCClientConfiguration) {
+		c.NewPeerConnection = tapPCFactory(&pcBox)
+	})
+	botId, userId := pairUp(t, bot, user)
+	pbx := newFakePBX(t, 200, true) // no video in the answer
+
+	dc := probe.waitDC(t, botId, msg_handler.DataChannelLabelMessages)
+	chat := func(text string) ss.MsgId {
+		t.Helper()
+		m := baseMsg(ss.WellKnownChIdMain, userId, botId)
+		m["plaintext"] = text
+		if err := dc.SendText(mustJSON(t, m)); err != nil {
+			t.Fatalf("SendText: %v", err)
+		}
+		return ss.MsgId(m["msgId"].(string))
+	}
+	sip := func(body map[string]any) {
+		t.Helper()
+		m := baseMsg(ss.WellKnownChIdMain, userId, botId)
+		m["mimeType"] = wireMimeSip
+		m["sip"] = body
+		if err := dc.SendText(mustJSON(t, m)); err != nil {
+			t.Fatalf("SendText: %v", err)
+		}
+	}
+
+	registerMsg := chat("/register 2001@" + pbx.addr + " passW_0rd")
+	waitBotMessage(t, probe, botId, "the registered reply", isChatReply(registerMsg, "Registered as"))
+
+	callMsg := chat("/video-call 1001@" + pbx.addr)
+	waitBotMessage(t, probe, botId, "the calling line", isChatReply(callMsg, "Calling 1001@"))
+	pbx.waitForPBX(t, "the callee's INVITE", func() bool { return pbx.invites == 1 })
+	pbx.mu.Lock()
+	offer := pbx.inviteSDP
+	pbx.mu.Unlock()
+	if !strings.Contains(offer, "m=video") {
+		t.Fatalf("the /video-call offer lacks the video m-line:\n%s", offer)
+	}
+
+	// The callee's audio-only answer degrades the call: the chat note, the
+	// VOICE ring, the offer toward the browser carrying no video m-line.
+	dialog := pbx.waitDialog(t)
+	waitBotMessage(t, probe, botId, "the degrades-to-voice note", isChatReply(callMsg, "Callee has no video — voice call."))
+	invite := waitBotMessage(t, probe, botId, "the bot's (voice) INVITE", func(m *rawMsg) bool {
+		return isSipInvite(m) && m.sip.XMedia == "voice" && m.sip.XCallStatus == "inviting"
+	})
+	callId := invite.sip.CallId
+	pinned := waitOfferSettled(t, &pcBox)
+	if strings.Contains(pinned.SDP, "m=video") {
+		t.Fatalf("the degraded call's offer toward the browser carries video:\n%s", pinned.SDP)
+	}
+
+	// The voice call completes: the mic crosses to the callee, the
+	// callee's voice to the browser.
+	micTrack, err := webrtc.NewTrackLocalStaticSample(webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus, ClockRate: 48000, Channels: 2}, "mic", "probe")
+	if err != nil {
+		t.Fatalf("the mic track: %v", err)
+	}
+	if _, err := user.AddTrack(botId, micTrack); err != nil {
+		t.Fatalf("attach the mic: %v", err)
+	}
+	spoken := opusVoice(4)
+	micCtx, stopMic := context.WithCancel(context.Background())
+	t.Cleanup(stopMic)
+	go streamSamples(micCtx, micTrack, spoken, 20*time.Millisecond, 20*time.Millisecond)
+	sip(map[string]any{"callId": callId, "response": map[string]any{"code": 200, "phrase": "OK"}})
+	streamCtx, stopStream := context.WithCancel(context.Background())
+	t.Cleanup(stopStream)
+	voice := opusVoice(4)
+	go pbx.streamOpus(streamCtx, voice)
+	hearAll(t, tprobe.waitTrackKind(t, webrtc.RTPCodecTypeAudio), voice)
+	heard := map[string]bool{}
+	deadline := time.Now().Add(testTimeout)
+	for len(heard) < len(spoken) {
+		for _, got := range pbx.waitRTP(t, 1) {
+			heard[string(got)] = true
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the callee heard %d of the %d distinct mic packets", len(heard), len(spoken))
+		}
+	}
+
+	if err := dialog.Bye(context.Background()); err != nil {
+		t.Fatalf("the callee's BYE: %v", err)
+	}
+	waitBotMessage(t, probe, botId, "the callee-hung-up line", isChatReply(callMsg, "Callee hung up."))
+}
+
+// TestSipBotInboundVideoCallEndToEnd covers the inbound video call: the
+// caller's offer carries audio AND video; the browser rings as a video
+// call; the 200 OK's answer carries the negotiated audio plus the video
+// section at the OFFER's payload type on the ONE muxed port (RFC 3264's
+// echo); media crosses both ways, the caller's camera to the browser and
+// the browser's to the caller; and the caller's BYE ends both legs.
+func TestSipBotInboundVideoCallEndToEnd(t *testing.T) {
+	net := newClientTestNet(t, ss.DefaultSubscriberAging)
+	bot := startBot(t, net, "bot", "2-bot", "", nil)
+	var pcBox atomic.Pointer[webrtc.PeerConnection]
+	user, probe, tprobe, _ := startUserProbeOn(t, net, "user", "1-user", func(c *rtc.RTCClientConfiguration) {
+		c.NewPeerConnection = tapPCFactory(&pcBox)
+	})
+	botId, userId := pairUp(t, bot, user)
+	pbx := newFakePBX(t, 200, true)
+	pbx.enableVideo(t, false) // the fake's own offer carries muxed video
+
+	dc := probe.waitDC(t, botId, msg_handler.DataChannelLabelMessages)
+	chat := func(text string) ss.MsgId {
+		t.Helper()
+		m := baseMsg(ss.WellKnownChIdMain, userId, botId)
+		m["plaintext"] = text
+		if err := dc.SendText(mustJSON(t, m)); err != nil {
+			t.Fatalf("SendText: %v", err)
+		}
+		return ss.MsgId(m["msgId"].(string))
+	}
+	sip := func(body map[string]any) {
+		t.Helper()
+		m := baseMsg(ss.WellKnownChIdMain, userId, botId)
+		m["mimeType"] = wireMimeSip
+		m["sip"] = body
+		if err := dc.SendText(mustJSON(t, m)); err != nil {
+			t.Fatalf("SendText: %v", err)
+		}
+	}
+
+	registerMsg := chat("/register 2001@" + pbx.addr + " passW_0rd")
+	waitBotMessage(t, probe, botId, "the registered reply", isChatReply(registerMsg, "Registered as"))
+
+	// Someone on the SIP network video-calls the registered number.
+	call := pbx.call(t, "2001")
+	invite := waitBotMessage(t, probe, botId, "the bot's video INVITE", func(m *rawMsg) bool {
+		return isSipInvite(m) && m.sip.XMedia == "video" && m.sip.XCallStatus == "inviting"
+	})
+	callId, inviteMsgId := invite.sip.CallId, invite.msgId
+	waitBotMessage(t, probe, botId, "the incoming-call line", func(m *rawMsg) bool {
+		return m.mimeType == wireMimePlaintext && strings.Contains(m.plaintext, "Incoming call from caller@")
+	})
+	call.waitRinging()
+
+	// The ring's settled offer is pinned to the offered video codec.
+	pinned := waitVideoOfferSettled(t, &pcBox)
+	if got := sdpVideoFormats(t, pinned.SDP); !slices.Equal(got, []string{"96"}) {
+		t.Fatalf("the ring's video pin is %v, want [96]:\n%s", got, pinned.SDP)
+	}
+
+	// The user picks up with mic and camera; the caller's 200 OK carries
+	// the answer: the audio pin and the video section at the offer's PT
+	// on the ONE muxed port.
+	spoken, filmed := acceptVideoCall(t, user, botId, sip, callId)
+	call.waitAnswered()
+	call.mu.Lock()
+	answer := call.answerSDP
+	call.mu.Unlock()
+	if got := sdpAudioFormats(t, answer); !slices.Equal(got, []string{"96", "101"}) {
+		t.Fatalf("the answer's audio formats are %v, want [96 101]:\n%s", got, answer)
+	}
+	if got := sdpVideoFormats(t, answer); !slices.Equal(got, []string{"102"}) {
+		t.Fatalf("the answer's video formats are %v, want the offer's PT echoed [102]:\n%s", got, answer)
+	}
+	if audioPort, videoPort := parseSDPMediaAddr(t, []byte(answer)).Port, sdpVideoPort(t, answer); audioPort != videoPort {
+		t.Fatalf("the answer's ports are (audio %d, video %d), want the one muxed port:\n%s", audioPort, videoPort, answer)
+	}
+	if !strings.Contains(answer, "a=rtpmap:102 VP8/90000") {
+		t.Fatalf("the answer lacks the VP8 rtpmap line:\n%s", answer)
+	}
+
+	// Media crosses byte for byte in both directions, audio and video
+	// alike.
+	streamCtx, stopStream := context.WithCancel(context.Background())
+	t.Cleanup(stopStream)
+	callerVoice, callerVideo := opusVoice(6), videoFrames(6)
+	go call.stream(streamCtx, callerVoice)
+	go call.streamVideo(streamCtx, callerVideo)
+	audioTrack := tprobe.waitTrackKind(t, webrtc.RTPCodecTypeAudio)
+	videoTrack := tprobe.waitTrackKind(t, webrtc.RTPCodecTypeVideo)
+	waitBotMessage(t, probe, botId, "the accepted amend", isCallStatusAmend(inviteMsgId, callId, "accepted"))
+	hearAll(t, audioTrack, callerVoice)
+	hearAll(t, videoTrack, callerVideo)
+	pbx.waitRecordedPT(t, pbxVideoPT, filmed)
+	heardMic := map[string]bool{}
+	deadline := time.Now().Add(testTimeout)
+	for len(heardMic) < len(spoken) {
+		for _, got := range pbx.waitRTP(t, 1) {
+			heardMic[string(got)] = true
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the caller heard %d of the %d distinct mic packets", len(heardMic), len(spoken))
+		}
+	}
+
+	// The caller hangs up: the browser leg is ended by the bot.
+	call.bye()
+	waitBotMessage(t, probe, botId, "the bot's BYE", isSipRequest(callId, "BYE"))
+	waitBotMessage(t, probe, botId, "the caller-hung-up line", func(m *rawMsg) bool {
+		return m.mimeType == wireMimePlaintext && strings.Contains(m.plaintext, "Caller hung up.")
+	})
+	waitBotMessage(t, probe, botId, "the ended amend", isCallStatusAmend(inviteMsgId, callId, "ended"))
+}
+
+// TestSipBotInboundVideoNoCommonVideoCodec covers the video offer
+// sharing nothing with the presumed video list: the answer still carries
+// a video m-line — the RFC 3264 parity — as the port-0 rejection naming
+// the offered formats, the browser rings as a VOICE call, and the call
+// completes voice-only.
+func TestSipBotInboundVideoNoCommonVideoCodec(t *testing.T) {
+	net := newClientTestNet(t, ss.DefaultSubscriberAging)
+	bot := startBot(t, net, "bot", "2-bot", "", nil)
+	user, probe, tprobe, _ := startUserProbe(t, net, "user", "1-user")
+	botId, userId := pairUp(t, bot, user)
+	pbx := newFakePBX(t, 200, true)
+
+	dc := probe.waitDC(t, botId, msg_handler.DataChannelLabelMessages)
+	chat := func(text string) ss.MsgId {
+		t.Helper()
+		m := baseMsg(ss.WellKnownChIdMain, userId, botId)
+		m["plaintext"] = text
+		if err := dc.SendText(mustJSON(t, m)); err != nil {
+			t.Fatalf("SendText: %v", err)
+		}
+		return ss.MsgId(m["msgId"].(string))
+	}
+	sip := func(body map[string]any) {
+		t.Helper()
+		m := baseMsg(ss.WellKnownChIdMain, userId, botId)
+		m["mimeType"] = wireMimeSip
+		m["sip"] = body
+		if err := dc.SendText(mustJSON(t, m)); err != nil {
+			t.Fatalf("SendText: %v", err)
+		}
+	}
+
+	registerMsg := chat("/register 2001@" + pbx.addr + " passW_0rd")
+	waitBotMessage(t, probe, botId, "the registered reply", isChatReply(registerMsg, "Registered as"))
+
+	// The caller offers video in a codec the presumed list does not name
+	// (MP4V-ES alone).
+	offer := fmt.Sprintf("v=0\r\no=- 0 0 IN IP4 %s\r\ns=fakepbx\r\nc=IN IP4 %s\r\nt=0 0\r\n"+
+		"m=audio %d RTP/AVP 96 101\r\na=rtpmap:96 opus/48000/2\r\na=rtpmap:101 telephone-event/8000\r\n"+
+		"m=video %d RTP/AVP 31\r\na=rtpmap:31 MP4V-ES/90000\r\n", pbx.ip, pbx.ip, pbx.rtpPort(), pbx.rtpPort())
+	call := pbx.callSDP(t, "2001", []byte(offer))
+
+	// The browser rings as a voice call; the caller hears the 180.
+	invite := waitBotMessage(t, probe, botId, "the bot's (voice) INVITE", func(m *rawMsg) bool {
+		return isSipInvite(m) && m.sip.XMedia == "voice" && m.sip.XCallStatus == "inviting"
+	})
+	callId := invite.sip.CallId
+	call.waitRinging()
+
+	// The accept's answer keeps the m-line parity: the video section
+	// rejected (port 0), the offered formats named.
+	micTrack, err := webrtc.NewTrackLocalStaticSample(webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus, ClockRate: 48000, Channels: 2}, "mic", "probe")
+	if err != nil {
+		t.Fatalf("the mic track: %v", err)
+	}
+	if _, err := user.AddTrack(botId, micTrack); err != nil {
+		t.Fatalf("attach the mic: %v", err)
+	}
+	spoken := opusVoice(4)
+	micCtx, stopMic := context.WithCancel(context.Background())
+	t.Cleanup(stopMic)
+	go streamSamples(micCtx, micTrack, spoken, 20*time.Millisecond, 20*time.Millisecond)
+	sip(map[string]any{"callId": callId, "response": map[string]any{"code": 200, "phrase": "OK"}})
+	call.waitAnswered()
+	call.mu.Lock()
+	answer := call.answerSDP
+	call.mu.Unlock()
+	if got := sdpVideoPort(t, answer); got != 0 {
+		t.Fatalf("the answer's video port is %d, want 0 (the rejection):\n%s", got, answer)
+	}
+	if got := sdpVideoFormats(t, answer); !slices.Equal(got, []string{"31"}) {
+		t.Fatalf("the answer's video formats are %v, want the offered [31]:\n%s", got, answer)
+	}
+	if got := sdpAudioFormats(t, answer); !slices.Equal(got, []string{"96", "101"}) {
+		t.Fatalf("the answer's audio formats are %v, want [96 101]:\n%s", got, answer)
+	}
+
+	// The voice call completes: the caller's voice crosses to the browser,
+	// the mic's to the caller.
+	streamCtx, stopStream := context.WithCancel(context.Background())
+	t.Cleanup(stopStream)
+	voice := opusVoice(4)
+	go call.stream(streamCtx, voice)
+	hearAll(t, tprobe.waitTrackKind(t, webrtc.RTPCodecTypeAudio), voice)
+	heard := map[string]bool{}
+	deadline := time.Now().Add(testTimeout)
+	for len(heard) < len(spoken) {
+		for _, got := range pbx.waitRTP(t, 1) {
+			heard[string(got)] = true
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the caller heard %d of the %d distinct mic packets", len(heard), len(spoken))
+		}
+	}
+
+	call.bye()
+	waitBotMessage(t, probe, botId, "the caller-hung-up line", func(m *rawMsg) bool {
+		return m.mimeType == wireMimePlaintext && strings.Contains(m.plaintext, "Caller hung up.")
+	})
 }

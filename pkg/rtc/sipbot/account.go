@@ -56,6 +56,10 @@ type account struct {
 	logger  *slog.Logger
 	dg      *diago.Diago
 	session UserSession
+	// stack is the SIP client factory the account was opened from — the
+	// dial path's video media sessions are built off its codec lists and
+	// bind-address logic (video.go).
+	stack sipStack
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -74,7 +78,7 @@ type account struct {
 // (someone dialing the registered AOR) — see inbound.go; onMessage its
 // inbound SIP MESSAGEs (someone texting it) — see message.go.
 func newAccount(ctx context.Context, logger *slog.Logger, stack sipStack, session UserSession, onInbound func(inDialog *diago.DialogServerSession), onMessage func(req *sip.Request, tx sip.ServerTransaction) error) (*account, error) {
-	a := &account{logger: logger, session: session}
+	a := &account{logger: logger, session: session, stack: stack}
 	a.ctx, a.cancel = context.WithCancel(ctx)
 	// The client's ctx is NOT the account's: the socket must outlive the
 	// registration by the de-REGISTER's round trip.
@@ -174,9 +178,14 @@ func (a *account) holdRegistration(t *diago.RegisterTransaction) {
 // unreachable from it.) One diago INVITE transaction carrying the
 // account's From and digest credential, answered when the callee
 // answers. onProgress reports the provisional responses (180 Ringing).
-// The call runs on the caller's goroutine — the dial blocks until the
-// final response, the ctx, or an error.
-func (a *account) dial(ctx context.Context, target string, onProgress func(code int)) (*diago.DialogClientSession, error) {
+// When video is set (the /video-call command) the INVITE's SDP offer is
+// the bot's own audio+video one, muxed on one RTP port: the media
+// session is built by hand and injected into the dialog before the
+// INVITE (video.go — the static-SDP injection seam; an audio-only call
+// keeps diago's native session construction). The call runs on the
+// caller's goroutine — the dial blocks until the final response, the
+// ctx, or an error.
+func (a *account) dial(ctx context.Context, target string, video bool, onProgress func(code int)) (*diago.DialogClientSession, error) {
 	uri := sip.Uri{}
 	to := target
 	if !hasHost(to) {
@@ -196,6 +205,19 @@ func (a *account) dial(ctx context.Context, target string, onProgress func(code 
 	dialog, err := a.dg.NewDialog(uri, diago.NewDialogOptions{})
 	if err != nil {
 		return nil, err
+	}
+	if video {
+		// The audio+video offer rides the injected session: diago's own
+		// media-session construction no-ops on a dialog whose session is
+		// preset, the INVITE carries its static LocalSDP verbatim, and
+		// diago's answer path negotiates on it untouched. A dial failure
+		// closes the dialog — and with it the session's sockets (the
+		// DialogMedia.Close of the joined errors below).
+		sess, err := a.stack.newVideoMediaSession(ctx, a.session)
+		if err != nil {
+			return nil, errors.Join(err, dialog.Close())
+		}
+		dialog.InitMediaSession(sess, nil, nil)
 	}
 	dialog.InviteRequest.SetDestination(a.session.proxyAddr())
 	if err := dialog.Invite(ctx, diago.InviteClientOptions{

@@ -46,7 +46,6 @@ import (
 	"github.com/pion/webrtc/v4"
 
 	"personal-site/pkg/models/ss"
-	"personal-site/pkg/rtc/msg_handler"
 )
 
 // inboundRingTimeout bounds how long an inbound call rings the browser:
@@ -56,10 +55,12 @@ import (
 const inboundRingTimeout = 60 * time.Second
 
 // inboundServe is the account's inbound-call callback (sipStack.open's
-// onInbound): one closure per account, binding the owning peer.
-func (h *sipHandler) inboundServe(peer ss.SubscriberId) func(inDialog *diago.DialogServerSession) {
+// onInbound): one closure per account, binding the owning peer — and
+// the account's session, whose route-source address the inbound video
+// call's hand-built media session binds (video.go's mediaIPs).
+func (h *sipHandler) inboundServe(peer ss.SubscriberId, session UserSession) func(inDialog *diago.DialogServerSession) {
 	return func(inDialog *diago.DialogServerSession) {
-		h.serveInbound(peer, inDialog)
+		h.serveInbound(peer, session, inDialog)
 	}
 }
 
@@ -72,7 +73,7 @@ func (h *sipHandler) inboundServe(peer ss.SubscriberId) func(inDialog *diago.Dia
 // diago hangs up and closes the dialog when its serve handler returns,
 // so the return IS the call's end (the ctx's done is the one signal for
 // every ending, ours included).
-func (h *sipHandler) serveInbound(peer ss.SubscriberId, inDialog *diago.DialogServerSession) {
+func (h *sipHandler) serveInbound(peer ss.SubscriberId, session UserSession, inDialog *diago.DialogServerSession) {
 	caller := callerOf(inDialog)
 	h.logger.Info("sipbot: inbound SIP call", "peer", peer, "from", caller)
 	w := h.writers.WriterFor(peer)
@@ -109,6 +110,42 @@ func (h *sipHandler) serveInbound(peer ss.SubscriberId, inDialog *diago.DialogSe
 		}
 		return
 	}
+	// The offer's video section decides the video: one matching the
+	// presumed video list rings the browser as a video call, any other
+	// video offer is answered with the port-0 rejection (the answer must
+	// carry a video m-line regardless — RFC 3264's parity). Either way
+	// the media session is built by hand and injected (video.go — the
+	// static-SDP injection seam): the 200 OK then carries OUR answer,
+	// audio and video both. A video-less offer keeps diago's native
+	// answer path. A session that will not build is a 480 before any
+	// ring.
+	if sel := selectVideoFromOffer(inDialog.InviteRequest.Body(), h.stack.videoCodecs); sel.offered {
+		sess, rtpSess, err := h.stack.newInboundVideoSession(context.Background(), session, inDialog.InviteRequest.Body(), codec, sel)
+		if err != nil {
+			ringCancel()
+			h.logger.Warn("sipbot: inbound video call, the media session would not build", "peer", peer, "err", err)
+			if rerr := inDialog.Respond(480, "Temporarily Unavailable", nil); rerr != nil {
+				h.logger.Warn("sipbot: inbound-call rejection not sent", "peer", peer, "err", rerr)
+			}
+			return
+		}
+		inDialog.InitMediaSession(sess, media.NewRTPPacketReaderSession(rtpSess), media.NewRTPPacketWriterSession(rtpSess))
+		// The injected path leaves the dialog's rtpSession unset, so its
+		// Close will not MonitorClose it — the monitor's goroutines would
+		// leak. Close it on the dialog's own hook (it runs first).
+		inDialog.OnClose(func() error { return rtpSess.Close() })
+		c.customMedia = true
+		if sel.ok {
+			if err := c.setVideo(sel.codec, sel.raddr); err != nil {
+				ringCancel()
+				h.logger.Warn("sipbot: inbound video call, the video track would not prepare", "peer", peer, "err", err)
+				if rerr := inDialog.Respond(480, "Temporarily Unavailable", nil); rerr != nil {
+					h.logger.Warn("sipbot: inbound-call rejection not sent", "peer", peer, "err", rerr)
+				}
+				return
+			}
+		}
+	}
 	// One call per peer, either direction — and this goroutine races both
 	// a second inbound INVITE and the peer's own /call, so the check IS
 	// the store (the /call side is equally atomic).
@@ -135,7 +172,16 @@ func (h *sipHandler) serveInbound(peer ss.SubscriberId, inDialog *diago.DialogSe
 		h.failInboundRing(peer, c, "attach", err)
 		return
 	}
-	callId, err := w.Invite(msg_handler.MediaVoice)
+	if c.videoOK {
+		if err := c.attachPinnedVideo(); err != nil {
+			if errors.Is(err, errCallEnded) {
+				return // see above
+			}
+			h.failInboundRing(peer, c, "attach-video", err)
+			return
+		}
+	}
+	callId, err := w.Invite(c.ringMedia())
 	if err != nil {
 		// The peer has no live session — nobody to ring.
 		h.failInboundRing(peer, c, "invite", err)
@@ -190,6 +236,9 @@ func (h *sipHandler) failInboundRing(peer ss.SubscriberId, c *peerCall, step str
 	if e.attached {
 		h.detachLater(context.Background(), e.track, c.w)
 	}
+	if e.attachedVideo {
+		h.detachLater(context.Background(), e.videoTrack, c.w)
+	}
 }
 
 // watchInbound relays the SIP side's own end of an inbound call — the
@@ -238,6 +287,9 @@ func (h *sipHandler) ringTimeout(peer ss.SubscriberId, c *peerCall, ringCtx cont
 	if e.attached {
 		h.detachLater(context.Background(), e.track, c.w)
 	}
+	if e.attachedVideo {
+		h.detachLater(context.Background(), e.videoTrack, c.w)
+	}
 	h.sayp(c, "No answer — the call was cancelled.")
 }
 
@@ -250,7 +302,17 @@ func (h *sipHandler) ringTimeout(peer ss.SubscriberId, c *peerCall, ringCtx cont
 // failure — or a call that ended while the ACK was awaited — the call
 // ends with the browser leg told.
 func (h *sipHandler) answerInbound(peer ss.SubscriberId, c *peerCall) {
-	if err := c.serverDialog.AnswerOptions(diago.AnswerOptions{Codecs: c.answerCodecs()}); err != nil {
+	// A video call's media session was built by hand and injected at ring
+	// time: Answer's early branch RespondSDPs its static answer (our
+	// audio+video SDP), ACK-awaited exactly like the native path's
+	// AnswerOptions, which an audio-only call keeps.
+	var err error
+	if c.customMedia {
+		err = c.serverDialog.Answer()
+	} else {
+		err = c.serverDialog.AnswerOptions(diago.AnswerOptions{Codecs: c.answerCodecs()})
+	}
+	if err != nil {
 		// The usual failure is the caller's CANCEL crossing before the
 		// answer landed; the dialog's ctx then ended and the watcher runs
 		// the teardown — the end here filters out. Otherwise (a media

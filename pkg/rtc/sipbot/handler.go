@@ -59,6 +59,7 @@ const (
 		"/unregister — drop the registration and the stored credential\n" +
 		"/my-number — show your registered SIP number — the one others can call you on\n" +
 		"/call <user@host> — phone a SIP subscriber (a bare user keeps your account's domain)\n" +
+		"/video-call <user@host> — phone with video (camera and microphone)\n" +
 		"/send <user@host> <message> — send a SIP text message\n" +
 		"/yellow-page — list the phone book: the example numbers you can call\n" +
 		"/test-call — phone the bot's configured test callee\n" +
@@ -68,12 +69,14 @@ const (
 	unknownCommand    = "Unrecognized command — try /help."
 	registerUsage     = "Usage: /register <user@host> <password> — e.g. /register 2001@sip.example.com passW_0rd."
 	callUsage         = "Usage: /call <user@host> — e.g. /call 1001@sip.example.com."
+	videoCallUsage    = "Usage: /video-call <user@host> — e.g. /video-call 1001@sip.example.com."
 	sendUsage         = "Usage: /send <user@host> <message> — e.g. /send 1001@sip.example.com Hello there."
 	notRegistered     = "Not registered — /register <user@host> <password> first."
 	noNumber          = "Not registered to a SIP registrar yet — /register <user@host> <password> to get a number."
 	noNumberPoolHint  = " Or just /call — when the bot's pool has a free account, it lends you one."
 	poolExhausted     = "The bot's pool of SIP accounts is empty — /register <user@host> <password> to use your own account."
 	testUnavailable   = "Test call unavailable — the bot has no testSIPContact configured."
+	calleeHasNoVideo  = "Callee has no video — voice call."
 )
 
 // hangupDetachDelay is how long the withdrawal of the call's track waits
@@ -160,7 +163,9 @@ func (h *sipHandler) HandleChatMessage(ctx context.Context, msg *msg_handler.Cha
 	case "/my-number":
 		h.myNumber(msg, w)
 	case "/call":
-		h.call(ctx, msg, w, fields[1:])
+		h.call(ctx, msg, w, fields[1:], false)
+	case "/video-call":
+		h.call(ctx, msg, w, fields[1:], true)
 	case "/send":
 		h.send(ctx, msg, w)
 	case "/yellow-page":
@@ -241,7 +246,7 @@ func (h *sipHandler) loanPooledAccount(ctx context.Context, peer ss.SubscriberId
 		h.logger.Info("sipbot: no pooled account for the session-start loan", "peer", peer)
 		return
 	}
-	a, err := newAccount(ctx, h.logger, h.stack, session, h.inboundServe(peer), h.inboundMessage(peer))
+	a, err := newAccount(ctx, h.logger, h.stack, session, h.inboundServe(peer, session), h.inboundMessage(peer))
 	if err != nil {
 		h.accountMu.Unlock()
 		h.pool.Release(session)
@@ -402,7 +407,7 @@ func (h *sipHandler) register(ctx context.Context, msg *msg_handler.ChatMessage,
 		h.say(peer, w, "The call in progress was ended.")
 	}
 	h.accountMu.Lock()
-	a, err := newAccount(ctx, h.logger, h.stack, session, h.inboundServe(peer), h.inboundMessage(peer))
+	a, err := newAccount(ctx, h.logger, h.stack, session, h.inboundServe(peer, session), h.inboundMessage(peer))
 	if err != nil {
 		h.accountMu.Unlock()
 		h.say(peer, w, fmt.Sprintf("Registration failed: %v.", err))
@@ -471,14 +476,22 @@ func (h *sipHandler) myNumber(msg *msg_handler.ChatMessage, w msg_handler.Respon
 	h.say(peer, w, hint)
 }
 
-// call is the /call command: with a registration in place and no call
-// standing, the SIP dial starts at once on its own goroutine — the
-// browser is rung only once the callee answered, with the answer's
-// codec selection (docs/sip-bot.md §7.1) — and the legs are joined.
-func (h *sipHandler) call(ctx context.Context, msg *msg_handler.ChatMessage, w msg_handler.ResponseWriter, args []string) {
+// call is the /call and /video-call commands: with a registration in
+// place and no call standing, the SIP dial starts at once on its own
+// goroutine — the browser is rung only once the callee answered, with
+// the answer's codec selection (docs/sip-bot.md §7.1) — and the legs are
+// joined. video asks the callee for a video call: the offer carries a
+// video m-line and the browser rings as a video call when the answer
+// keeps it (a callee that declines video gets a voice call and the user
+// a note — the answer's degradation, §7.1).
+func (h *sipHandler) call(ctx context.Context, msg *msg_handler.ChatMessage, w msg_handler.ResponseWriter, args []string, video bool) {
 	peer := msg.From
 	if len(args) != 1 {
-		h.say(peer, w, callUsage)
+		if video {
+			h.say(peer, w, videoCallUsage)
+		} else {
+			h.say(peer, w, callUsage)
+		}
 		return
 	}
 	if _, ok := h.calls.Load(peer); ok {
@@ -496,7 +509,7 @@ func (h *sipHandler) call(ctx context.Context, msg *msg_handler.ChatMessage, w m
 		h.say(peer, w, fmt.Sprintf("Registered as sip:%s (an account from the bot's pool).", a.session.AddressOfRecord))
 	}
 	dialCtx, dialCancel := context.WithCancel(ctx)
-	c := &peerCall{target: args[0], w: w, pendingCancel: dialCancel, accepted: make(chan struct{})}
+	c := &peerCall{target: args[0], video: video, w: w, pendingCancel: dialCancel, accepted: make(chan struct{})}
 	// The store, not the early check above, is the one-call gate: an
 	// inbound ring (its own goroutine) can slip in between the two, so
 	// the check IS the store here — the loser of the race backs out
@@ -522,7 +535,7 @@ func (h *sipHandler) testCall(ctx context.Context, msg *msg_handler.ChatMessage,
 		h.say(msg.From, w, testUnavailable)
 		return
 	}
-	h.call(ctx, msg, w, []string{h.testContact})
+	h.call(ctx, msg, w, []string{h.testContact}, false)
 }
 
 // send is the /send command: the message rides one pager-mode SIP
@@ -600,7 +613,7 @@ func (h *sipHandler) hangup(ctx context.Context, msg *msg_handler.ChatMessage, w
 // exist yet); an answered dialog watches for the callee's hangup.
 func (h *sipHandler) dial(a *account, peer ss.SubscriberId, c *peerCall, dialCtx context.Context) {
 	var rang atomic.Bool
-	dialog, err := a.dial(dialCtx, c.target, func(code int) {
+	dialog, err := a.dial(dialCtx, c.target, c.video, func(code int) {
 		if (code == 180 || code == 183) && rang.CompareAndSwap(false, true) {
 			h.logger.Info("sipbot: [dbg] ringing, no sayp")
 		}
@@ -632,6 +645,25 @@ func (h *sipHandler) dial(a *account, peer ss.SubscriberId, c *peerCall, dialCtx
 		}
 		h.failDialedCall(peer, c, dialog, err)
 		return
+	}
+	// A /video-call's answer decides the video: the callee's pick among
+	// the offered video codecs, on its own port or the shared one. No
+	// video in the answer degrades the call to voice — the ring is a
+	// voice ring and the chat says why.
+	if c.video {
+		videoCodec, videoRaddr, ok := selectVideoFromAnswer(dialog.InviteResponse.Body(), a.stack.videoCodecs)
+		if ok {
+			if err := c.setVideo(videoCodec, videoRaddr); err != nil {
+				if errors.Is(err, errCallEnded) {
+					h.hangupDialog(dialog) // see setCodec's errCallEnded above
+					return
+				}
+				h.failDialedCall(peer, c, dialog, err)
+				return
+			}
+		} else {
+			h.sayp(c, calleeHasNoVideo)
+		}
 	}
 	if err := c.setDialog(dialog); err != nil {
 		if errors.Is(err, errCallEnded) {
@@ -670,7 +702,19 @@ func (h *sipHandler) dial(a *account, peer ss.SubscriberId, c *peerCall, dialCtx
 		h.failDialedCall(peer, c, nil, fmt.Errorf("could not call you: %w", err))
 		return
 	}
-	callId, err := c.w.Invite(msg_handler.MediaVoice)
+	if c.videoOK {
+		// The video track joins with its own pin — the two attaches' offers
+		// are answered in order (the browser's perfect negotiator), the mic
+		// and the camera finding their transceivers by kind at accept.
+		if err := c.attachPinnedVideo(); err != nil {
+			if errors.Is(err, errCallEnded) {
+				return
+			}
+			h.failDialedCall(peer, c, nil, fmt.Errorf("could not call you: %w", err))
+			return
+		}
+	}
+	callId, err := c.w.Invite(c.ringMedia())
 	if err != nil {
 		h.failDialedCall(peer, c, nil, fmt.Errorf("could not call you: %w", err))
 		return
@@ -701,6 +745,9 @@ func (h *sipHandler) failDialedCall(peer ss.SubscriberId, c *peerCall, hangup si
 	h.hangupDialog(e.dialog)
 	if e.attached {
 		h.detachLater(context.Background(), e.track, c.w)
+	}
+	if e.attachedVideo {
+		h.detachLater(context.Background(), e.videoTrack, c.w)
 	}
 	h.sayp(c, fmt.Sprintf("Call failed: %v.", err))
 }
@@ -741,6 +788,9 @@ func (h *sipHandler) endBrowserLeg(ctx context.Context, w msg_handler.ResponseWr
 	if e.attached {
 		h.detachLater(ctx, e.track, w)
 	}
+	if e.attachedVideo {
+		h.detachLater(ctx, e.videoTrack, w)
+	}
 }
 
 // hangupDialog sends the dialog's termination without blocking the
@@ -764,7 +814,7 @@ func (h *sipHandler) hangupDialog(dialog sipLeg) {
 // detachLater withdraws the call's track after the hangup delay — see
 // the constant's comment; the music bot's handleHangup has the same
 // shape, and so does its reason.
-func (h *sipHandler) detachLater(ctx context.Context, track *webrtc.TrackLocalStaticSample, w msg_handler.ResponseWriter) {
+func (h *sipHandler) detachLater(ctx context.Context, track webrtc.TrackLocal, w msg_handler.ResponseWriter) {
 	go func() {
 		t := time.NewTimer(hangupDetachDelay)
 		defer t.Stop()
@@ -808,7 +858,7 @@ func (h *sipHandler) ensureAccount(ctx context.Context, peer ss.SubscriberId) (*
 		pooled = true
 		h.logger.Info("sipbot: loaned a pooled account", "peer", peer, "aor", session.AddressOfRecord)
 	}
-	a, err := newAccount(ctx, h.logger, h.stack, session, h.inboundServe(peer), h.inboundMessage(peer))
+	a, err := newAccount(ctx, h.logger, h.stack, session, h.inboundServe(peer, session), h.inboundMessage(peer))
 	if err != nil {
 		if pooled {
 			h.pool.Release(session)
@@ -835,31 +885,58 @@ func (h *sipHandler) setAccount(peer ss.SubscriberId, a *account) {
 	h.accounts.Store(peer, a)
 }
 
-// onMic is the inbound-media callback: the browser's mic track joins
-// the call's relay (the browser→SIP pump starts once both it and the
-// answered dialog exist) — but only when it speaks the call's codec:
-// the mic's m-line is answered with the codec pin, so anything else is
-// the failed presumption (docs/sip-bot.md §11.8) — drained, not
-// bridged, the sip-leg hearing silence while the log says why. The
-// receiver comes along for the negotiated telephone-event PT — the
-// pad's DTMF rides the mic's own read stream (dtmf.go).
+// onMic is the inbound-media callback: a browser track joins the call's
+// relay by kind — the mic the browser→SIP pump, the camera the
+// camera→SIP one (each starting once both it and the answered dialog
+// exist) — but only when it speaks the call's codec: the track's m-line
+// is answered with the codec pin, so anything else is the failed
+// presumption (docs/sip-bot.md §11.8) — drained, not bridged, the
+// sip-leg hearing silence while the log says why. The receiver comes
+// along for the negotiated telephone-event PT — the pad's DTMF rides
+// the mic's own read stream (dtmf.go).
 func (h *sipHandler) onMic(peer ss.SubscriberId, track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
-	h.logger.Info("sipbot: inbound track", "peer", peer, "codec", track.Codec().MimeType)
+	h.logger.Info("sipbot: inbound track", "peer", peer, "codec", track.Codec().MimeType, "kind", track.Kind())
+	if track.Kind() == webrtc.RTPCodecTypeVideo {
+		h.onCamera(peer, track)
+		return
+	}
 	v, ok := h.calls.Load(peer)
 	if !ok || !v.(*peerCall).micCodecOK(track.Codec().MimeType) {
 		if ok {
 			h.logger.Warn("sipbot: the mic is not the call's codec; draining it", "peer", peer, "codec", track.Codec().MimeType)
 		}
-		go func() {
-			for {
-				if _, _, err := track.ReadRTP(); err != nil {
-					return
-				}
-			}
-		}()
+		drainTrack(track)
 		return
 	}
 	v.(*peerCall).setMic(track, receiver)
+}
+
+// onCamera is the camera half of onMic: the browser's camera track joins
+// the call's relay when it speaks the call's negotiated video codec;
+// anything else (or a voice-only call's unexpected video) is drained.
+func (h *sipHandler) onCamera(peer ss.SubscriberId, track *webrtc.TrackRemote) {
+	v, ok := h.calls.Load(peer)
+	if !ok || !v.(*peerCall).cameraCodecOK(track.Codec().MimeType) {
+		if ok {
+			h.logger.Warn("sipbot: the camera is not the call's video codec; draining it", "peer", peer, "codec", track.Codec().MimeType)
+		}
+		drainTrack(track)
+		return
+	}
+	v.(*peerCall).setCamera(track)
+}
+
+// drainTrack reads a rejected inbound track to its end — an unread RTP
+// stream backs its interceptor chain up; the read keeps the peer
+// connection's demux flowing while the packets go nowhere.
+func drainTrack(track *webrtc.TrackRemote) {
+	go func() {
+		for {
+			if _, _, err := track.ReadRTP(); err != nil {
+				return
+			}
+		}
+	}()
 }
 
 // say answers the peer with a chat message, logging a failed send.

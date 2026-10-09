@@ -284,6 +284,20 @@
             </xsd:restriction>
           </xsd:simpleType>
         </xsd:attribute>
+        <!-- webrtcVideoCodecs is the presumed WebRTC video codec list
+             (docs/sip-bot.md §8): a comma-separated list of video codec
+             names — vp8, h264 — in the browsers' preference order; the
+             /video-call offer's video codec list, and the inbound video
+             call's selection order among the caller's offer. Unset
+             selects the default (vp8,h264). An unknown name fails the
+             startup. -->
+        <xsd:attribute name="webrtcVideoCodecs" use="optional">
+          <xsd:simpleType>
+            <xsd:restriction base="xsd:string">
+              <xsd:pattern value="[A-Za-z0-9]+(,[A-Za-z0-9]+)*" />
+            </xsd:restriction>
+          </xsd:simpleType>
+        </xsd:attribute>
         <!-- ipPreference selects the address family of every DNS
              resolution in the sip leg (the registrar's and the callees'
              hostnames): v4Only resolves A records only, v6Only AAAA

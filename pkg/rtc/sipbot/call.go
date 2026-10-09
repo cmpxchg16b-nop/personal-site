@@ -42,11 +42,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"strings"
 	"sync"
 
 	"github.com/emiago/diago"
 	"github.com/emiago/diago/media"
+	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v4"
 	pionmedia "github.com/pion/webrtc/v4/pkg/media"
 
@@ -109,6 +111,27 @@ type peerCall struct {
 	micOn    bool                           // the browser→SIP pump is running
 	ended    bool                           // an end path ran; later ones no-op
 
+	// The video half. video is the outbound call's intent (/video-call —
+	// inbound calls learn theirs from the caller's offer instead); videoOK
+	// says a video codec negotiated end to end (outbound: the callee's
+	// answer carried one; inbound: the caller's offer shared one with the
+	// presumed list). The rest is set by setVideo once it did: the
+	// negotiated codec at the sip-leg's payload type, the peer's video
+	// address (nil or the audio address: the media is muxed on the
+	// dialog's one socket), and the bot's video track toward the browser.
+	// customMedia marks the inbound call whose media session was built
+	// by hand and injected (video.go) — its Answer RespondSDPs the static
+	// answer where the native path builds one.
+	video         bool
+	videoOK       bool
+	videoCodec    media.Codec
+	videoRaddr    *net.UDPAddr
+	videoTrack    *webrtc.TrackLocalStaticRTP
+	attachedVideo bool                // the video track is on the wire (the pinned attach succeeded)
+	camera        *webrtc.TrackRemote // nil until the browser's camera arrives
+	cameraOn      bool                // the camera→SIP pump is running
+	customMedia   bool
+
 	// dtmfPT/dtmfOK are the webrtc-leg's negotiated telephone-event
 	// payload type (and whether one negotiated), learned from the mic's
 	// receiver at setMic: the pad's DTMF rides the mic's own RTP stream
@@ -128,6 +151,11 @@ type sipLeg interface {
 	AudioWriter(opts ...diago.AudioWriterOption) (io.Writer, error)
 	Context() context.Context
 	Hangup(ctx context.Context) error
+	// MediaSession is the dialog's media session — on a video call it is
+	// the bot's hand-built injected one (video.go); the relay's video
+	// writers write through it (the muxed port) or read its addresses off
+	// it (the demuxed fallback).
+	MediaSession() *media.MediaSession
 }
 
 // relay is the call's media bridge: the two payload passthroughs and the
@@ -142,11 +170,27 @@ type relay struct {
 	dialog   sipLeg
 	track    *webrtc.TrackLocalStaticSample
 	codec    media.Codec     // the call's codec — the browser-bound payloads' duration key
-	audioPT  uint8           // the sip-leg's negotiated audio payload type — anything else on the read stream is not audio (telephone-event)
+	audioPT  uint8           // the sip-leg's negotiated audio payload type — anything else on the read stream is not audio (telephone-event — or video)
 	accepted <-chan struct{} // the accept gate — activate closes it when the user picks up
 	dtmfCh   chan rune
 	stopCh   chan struct{}
 	stopOnce sync.Once
+
+	// video is nil on a voice-only call. On a video call it joins the
+	// video legs: the browser-bound track (the callee's video crosses
+	// byte for byte, the track re-stamping SSRC/PT), the sip-leg's
+	// negotiated video payload type (the read stream's PT dispatch), and
+	// the camera→SIP packet writer with its demuxed socket to close when
+	// the answer demuxed the video (video.go's writers).
+	video *relayVideo
+}
+
+// relayVideo is the relay's video half — see relay.video.
+type relayVideo struct {
+	track  *webrtc.TrackLocalStaticRTP
+	pt     uint8
+	writer *media.RTPPacketWriter
+	closer io.Closer // the demuxed socket; nil when the video is muxed
 }
 
 // errCallEnded is setDialog's and the ring steps' answer when the call
@@ -186,9 +230,46 @@ func (c *peerCall) codecParamsLocked() []webrtc.RTPCodecParameters {
 	return []webrtc.RTPCodecParameters{params, rtc.TelephoneEventCodec}
 }
 
+// setVideo pins the call's video: it stores the negotiated selection
+// (the codec at the sip-leg's payload type and the peer's video address)
+// and creates the video track with the codec's webrtc-leg capability —
+// setCodec's video twin. errCallEnded when the call already ended.
+func (c *peerCall) setVideo(codec media.Codec, raddr *net.UDPAddr) error {
+	params, ok := webrtcVideoCodecParams(codec)
+	if !ok {
+		return fmt.Errorf("sipbot: the negotiated video codec %q is not relayable", codec.Name)
+	}
+	track, err := webrtc.NewTrackLocalStaticRTP(params.RTPCodecCapability, "sip-video", "sipbot")
+	if err != nil {
+		return err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.ended {
+		return errCallEnded
+	}
+	c.videoCodec, c.videoOK, c.videoRaddr, c.videoTrack = codec, true, raddr, track
+	return nil
+}
+
+// ringMedia is the browser ring's media kind: video when a video codec
+// negotiated end to end (the browser rings as a video call), voice
+// otherwise — a video call the far end declined video on rings as a
+// voice call.
+func (c *peerCall) ringMedia() msg_handler.MediaKind {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.videoOK {
+		return msg_handler.MediaVideo
+	}
+	return msg_handler.MediaVoice
+}
+
 // attachPinned puts the call's track on the wire with the codec pin —
 // the ring's first step: the attach's renegotiation offers the browser
-// exactly the pinned codec list. errCallEnded when the call already
+// exactly the pinned codec list. A video call's video track follows
+// (attachPinnedVideo): two rapid offers, answered in order by the
+// browser's perfect negotiator. errCallEnded when the call already
 // ended (or ends while the attach is in flight — the just-attached track
 // is then withdrawn from here, the end's owner having seen attached ==
 // false).
@@ -214,6 +295,33 @@ func (c *peerCall) attachPinned() error {
 		return errCallEnded
 	}
 	c.attached = true
+	return nil
+}
+
+// attachPinnedVideo is attachPinned's video half: the video track joins
+// the wire pinned to the call's negotiated video codec. The browser
+// answers the two attaches' offers in order; at accept the mic joins the
+// audio transceiver and the camera the video one (pion's kind-based
+// reuse). errCallEnded exactly as attachPinned's.
+func (c *peerCall) attachPinnedVideo() error {
+	c.mu.Lock()
+	if c.ended || !c.videoOK {
+		c.mu.Unlock()
+		return errCallEnded
+	}
+	track := c.videoTrack
+	params, _ := webrtcVideoCodecParams(c.videoCodec)
+	c.mu.Unlock()
+	if err := c.w.AttachMediaWithCodecPreferences(track, []webrtc.RTPCodecParameters{params}); err != nil {
+		return err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.ended {
+		go func() { _ = c.w.DetachMedia(track) }()
+		return errCallEnded
+	}
+	c.attachedVideo = true
 	return nil
 }
 
@@ -265,17 +373,28 @@ func (c *peerCall) armRelay() error {
 }
 
 // armLocked builds the relay on leg and starts the SIP→browser pump (and
-// the browser→SIP one when the mic already arrived). mu held.
+// the browser→SIP one when the mic already arrived, the camera one when
+// the camera did). mu held.
 func (c *peerCall) armLocked(leg sipLeg) error {
 	r, err := newRelay(leg, c.track, c.codec, c.accepted)
 	if err != nil {
 		return err
+	}
+	if c.videoOK {
+		v, err := newRelayVideo(leg.MediaSession(), c.videoCodec, c.videoRaddr, c.videoTrack)
+		if err != nil {
+			return err
+		}
+		r.video = v
 	}
 	c.dialog = leg
 	c.relay = r
 	go r.pumpSIPToBrowser()
 	if c.mic != nil {
 		c.startMicPumpLocked()
+	}
+	if c.camera != nil && c.videoOK {
+		c.startCameraPumpLocked()
 	}
 	return nil
 }
@@ -316,6 +435,37 @@ func (c *peerCall) startMicPumpLocked() {
 	go c.relay.pumpBrowserToSIP(c.mic, c.dtmfPT, c.dtmfOK)
 }
 
+// cameraCodecOK reports whether an arriving camera speaks the call's
+// negotiated video codec — micCodecOK's video twin: the camera's m-line
+// is answered with the video pin, so anything else is the failed
+// presumption — drained, never bridged.
+func (c *peerCall) cameraCodecOK(mimeType string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.videoOK {
+		return false
+	}
+	params, ok := webrtcVideoCodecParams(c.videoCodec)
+	return ok && strings.EqualFold(params.MimeType, mimeType)
+}
+
+// setCamera notes the browser's camera track; the camera→SIP pump starts
+// once both it and the answered dialog's relay exist (setMic's shape).
+func (c *peerCall) setCamera(track *webrtc.TrackRemote) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.camera = track
+	if c.relay != nil && !c.cameraOn && c.videoOK {
+		c.startCameraPumpLocked()
+	}
+}
+
+// startCameraPumpLocked starts the camera→SIP pump. mu held.
+func (c *peerCall) startCameraPumpLocked() {
+	c.cameraOn = true
+	go c.relay.pumpCameraToSIP(c.camera)
+}
+
 // activate marks the webrtc-leg answered, opening the SIP→browser
 // pump's gate; false when the call ended meanwhile or the phase was
 // already past ringing.
@@ -337,11 +487,13 @@ func (c *peerCall) activate() bool {
 // (the ring steps and setCodec refuse a dead call), so the winner reads
 // them off the snapshot its own end() answered.
 type callEnd struct {
-	dialog   sipLeg
-	callId   string
-	phase    callPhase
-	track    *webrtc.TrackLocalStaticSample
-	attached bool
+	dialog        sipLeg
+	callId        string
+	phase         callPhase
+	track         *webrtc.TrackLocalStaticSample
+	attached      bool
+	videoTrack    *webrtc.TrackLocalStaticRTP
+	attachedVideo bool
 }
 
 // end runs the call's end exactly once, answering its snapshot for the
@@ -373,7 +525,7 @@ func (c *peerCall) endIf(allow func() bool) (callEnd, bool) {
 	if c.relay != nil {
 		c.relay.stop()
 	}
-	return callEnd{dialog: c.dialog, callId: c.callId, phase: c.phase, track: c.track, attached: c.attached}, true
+	return callEnd{dialog: c.dialog, callId: c.callId, phase: c.phase, track: c.track, attached: c.attached, videoTrack: c.videoTrack, attachedVideo: c.attachedVideo}, true
 }
 
 // answerCodecs is the inbound call's SDP answer pin: the selected codec
@@ -406,9 +558,33 @@ func newRelay(dialog sipLeg, track *webrtc.TrackLocalStaticSample, codec media.C
 	}, nil
 }
 
+// newRelayVideo builds the relay's video half for the answered dialog:
+// the camera→SIP writer picked by the answer's video address (the muxed
+// session writer, or the demuxed socket — video.go's newVideoWriter). A
+// demuxed socket that will not open fails the relay's construction (the
+// call's failure path reports it); the muxed writer is infallible.
+func newRelayVideo(sess *media.MediaSession, codec media.Codec, raddr *net.UDPAddr, track *webrtc.TrackLocalStaticRTP) (*relayVideo, error) {
+	writer, conn, err := newVideoWriter(sess, codec, raddr)
+	if err != nil {
+		return nil, err
+	}
+	v := &relayVideo{track: track, pt: codec.PayloadType, writer: writer}
+	if conn != nil {
+		v.closer = conn
+	}
+	return v, nil
+}
+
 // stop ends the relay; safe to call repeatedly.
 func (r *relay) stop() {
-	r.stopOnce.Do(func() { close(r.stopCh) })
+	r.stopOnce.Do(func() {
+		close(r.stopCh)
+		if r.video != nil && r.video.closer != nil {
+			// The demuxed-answer socket goes with the call (the muxed writer
+			// owns no socket — the dialog's Close closes the session's).
+			_ = r.video.closer.Close()
+		}
+	})
 }
 
 // stopped reports whether the relay was stopped — a pump start checks
@@ -461,8 +637,28 @@ func (r *relay) pumpSIPToBrowser() {
 		if r.stopped() {
 			return
 		}
+		if n == 0 {
+			continue // a keep-alive or a read-stats gate drop; the header is stale
+		}
 		payload := buf[:n]
 		if pktReader != nil && pktReader.PacketHeader.PayloadType != r.audioPT {
+			// Not audio: on a video call the muxed read stream also carries
+			// the callee's video — it crosses to the browser's video track
+			// byte for byte (the track re-stamps SSRC/PT, the packet's own
+			// sequence/timestamp/marker preserved). Anything else
+			// (telephone-event) drops as today.
+			if r.video == nil || pktReader.PacketHeader.PayloadType != r.video.pt {
+				continue
+			}
+			select {
+			case <-r.accepted:
+			default:
+				continue // the accept gate covers video too
+			}
+			pkt := &rtp.Packet{Header: pktReader.PacketHeader, Payload: payload}
+			if err := r.video.track.WriteRTP(pkt); err != nil {
+				return
+			}
 			continue
 		}
 		select {
@@ -524,6 +720,41 @@ func (r *relay) pumpBrowserToSIP(mic *webrtc.TrackRemote, dtmfPT uint8, dtmfOK b
 			continue
 		}
 		if _, err := writer.Write(pkt.Payload); err != nil {
+			return
+		}
+	}
+}
+
+// pumpCameraToSIP relays the browser's camera to the sip-leg: packets
+// read off the camera's remote track, re-packetized onto the call's
+// video writer (the muxed session socket, or the demuxed one —
+// video.go) at the negotiated video payload type. The payload crosses
+// byte for byte; the browser's own 90 kHz timestamp steps carry over as
+// the deltas (the writer's ticker is disabled — the camera is the
+// clock), the marker bit (the frame boundary) with them. It dies on the
+// track's end, exactly as the mic pump.
+func (r *relay) pumpCameraToSIP(camera *webrtc.TrackRemote) {
+	if r.stopped() {
+		return
+	}
+	var lastTS uint32
+	first := true
+	for {
+		pkt, _, err := camera.ReadRTP()
+		if err != nil {
+			return // the track or the connection ended
+		}
+		if r.stopped() {
+			return
+		}
+		var delta uint32
+		if first {
+			first = false
+		} else {
+			delta = pkt.Timestamp - lastTS
+		}
+		lastTS = pkt.Timestamp
+		if _, err := r.video.writer.WriteSamples(pkt.Payload, delta, pkt.Marker, r.video.pt); err != nil {
 			return
 		}
 	}

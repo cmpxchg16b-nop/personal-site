@@ -33,8 +33,9 @@ the SIP network the bot is a UAC (REGISTER + INVITE + MESSAGE)
 and a UAS (inbound INVITEs and MESSAGEs to a registered AOR); toward the browser it
 is a headless bot peer (the third policy bot on the three-layer bot
 stack). The user in the browser can thus phone an arbitrary SIP
-subscriber — and a SIP subscriber who dials the user's registered AOR
-rings the user's browser (§7.2) — and the two can exchange pager-mode
+subscriber — voice or video (§7.1's `/video-call`) — and a SIP
+subscriber who dials the user's registered AOR rings the user's browser
+(§7.2) — and the two can exchange pager-mode
 text messages (SIP MESSAGE, RFC 3428) both ways (§7.3):
 
 ```
@@ -112,6 +113,7 @@ Chat lines, exactly like the music bot's commands:
 | `/unregister`                        | cancel the registration (a SIP de-REGISTER goes out), drop the stored credential, and end any call in progress                                                                                                                                                                                                                                                                                                             |
 | `/my-number`                         | print the user's currently registered SIP address — the number others can dial to ring this chat (§7.2) — or answer that the user is not registered to a SIP registrar yet. Reads the LIVE registration: a stored credential whose registration has not run yet is not callable and reads as not-registered. A number loaned from the credential pool is marked as such.                                                   |
 | `/call <user@host>` (or bare `user`) | phone the callee through the SIP network and the user through the browser; one active call per chat user. A bare `user` is completed with the registered account's domain. Without a registration the bot falls back to the credential pool when one is configured and has one free (§5 — usually the session-start loan already stands), and says so; when the pool is empty (or absent), the answer points at /register. |
+| `/video-call <user@host>`            | `/call`'s video twin (§7.1): the SIP offer carries a video m-line alongside the audio one (muxed on the same RTP port), and the browser rings as a video call when the callee's answer keeps the video — as a voice call, with a chat note saying so, when it does not                                                                                                                                                     |
 | `/yellow-page`                       | print the yellow page — the phone book of example callable numbers from the configuration (the <sipBot/> element's <yellowPage/> child, §10), grouped by section: who to call, without memorizing numbers                                                                                                                                                                                                                  |
 | `/test-call`                         | phone the configured test callee (the `<sipBot/>` element's `testSIPContact`, e.g. `9664@192.168.1.2`) — a known-good subscriber of the SIP network the deployment tests against; answers unavailable when unconfigured                                                                                                                                                                                                    |
 | `/send <user@host> <message>`        | send `message` to the SIP subscriber as a pager-mode SIP MESSAGE (RFC 3428, §7.3) — a bare `user` is completed with the registered account's domain, and the account resolution (and pool fallback) is `/call`'s. The message's byte size is capped by the configurable `maxMessageBytes` (§10); an over-limit message is rejected in chat, never truncated and never sent.                                                |
@@ -368,12 +370,12 @@ sequenceDiagram
     U->>H: "/call 1001@sip.example.com"
     Note over H: session must be registered;<br/>one call per user
     H->>U: "Calling 1001@sip.example.com…"
-    H-->>P: INVITE sip:callee@… sent to the account's OWN server<br/>(registrar = default outbound proxy) — async<br/>SDP offer = the presumed WebRTC codec list (§8)
+    H-->>P: INVITE sip:callee@… sent to the account's OWN server<br/>(registrar = default outbound proxy) — async<br/>SDP offer = the presumed WebRTC codec list (§8)<br/>(/video-call: + the video m-line on the SAME port)
     P-->>H: 180 Ringing (no early media in v1)
-    P-->>H: 200 OK + SDP answer → codec C known
+    P-->>H: 200 OK + SDP answer → codec C known<br/>(+ the video selection, or its absence)
     Note over H: the call pins C; the speaker track<br/>is created with C's capability and the relay<br/>arms — its SIP→browser pump gated on the accept (§8)
-    H->>U: AttachMedia(track, pinned) — the bot's offer<br/>carries [C, telephone-event] (§9's pin)
-    H->>U: w.Invite(voice) — the browser rings
+    H->>U: AttachMedia(track, pinned) — the bot's offer<br/>carries [C, telephone-event] (§9's pin)<br/>(video accepted: + the pinned video track)
+    H->>U: w.Invite(voice | video) — the browser rings<br/>(video iff the callee's answer carried it; else the<br/>"Callee has no video — voice call." note)
     H->>U: "Callee answered."
     Note over U: the offer is answered at once — the track binds,<br/>but the accept gate holds the callee's audio:<br/>nothing is audible before the accept
     U->>H: 200 OK (user answered)
@@ -433,6 +435,33 @@ offers and accepts it), and the outbound INVITE's SDP offer always
 announces it toward the SIP network, so the browser's dial pad reaches
 an IVR the moment the call is up (§8).
 
+#### The video variant — `/video-call <aor>`
+
+`/video-call` is `/call`'s twin with a video m-line. The SIP INVITE's
+offer carries the audio section **and** a video section (the presumed
+WebRTC video codec list, §8) sharing the ONE RTP port — the muxed media
+the bot's single sip-leg socket serves. The callee's answer decides:
+
+- **Video accepted** — the answer's video section names a codec the
+  presumed video list carries: the selection (the answer's first
+  matching codec — the callee's pick — at the answer's payload type) is
+  learned, the browser rings as a **video call** (the webrtc-leg's
+  `X-Media: video` — the frontend's generic video path attaches the
+  camera at accept, no frontend change), and the ring-time media offer
+  carries the pinned video m-line alongside the audio's (two attaches,
+  two rapid offers, answered in order by the browser's perfect
+  negotiator; the mic and the camera find their transceivers by kind).
+  The answer's video address is respected: a callee answering video on
+  its audio port gets the bot's camera stream on the shared (muxed)
+  socket; a callee answering on a port of its own (Asterisk's shape)
+  gets it there from a dedicated socket (§8's writers).
+- **Video declined** — the answer carries no video m-line or a rejected
+  (port 0) one: the call completes as a voice call, the browser rings
+  as such, and a chat note says so (`Callee has no video — voice call.`).
+
+Everything else — the SIP-leg-first ordering, the accept gate, the
+teardown matrix — is `/call`'s unchanged.
+
 ### Inbound — a SIP subscriber phones the user
 
 The reverse direction: someone on the SIP network dials the AOR a user
@@ -456,15 +485,15 @@ sequenceDiagram
     participant R as relay (media)
     participant U as User (browser)
 
-    P->>H: INVITE on the account's socket (diago UAS)<br/>SDP offer [S] → C = presumed-preferred of [S]
+    P->>H: INVITE on the account's socket (diago UAS)<br/>SDP offer [S] → C = presumed-preferred of [S]<br/>(a video m-line selects the video codec too, §7.2)
     Note over H: one call per user, either direction:<br/>busy → 486 Busy Here; no live session →<br/>480 (the Invite fails); no common codec → 488
-    H->>U: AttachMedia(track with C's capability, pinned)<br/>— the offer carries [C, telephone-event] (§9's pin)
+    H->>U: AttachMedia(track with C's capability, pinned)<br/>— the offer carries [C, telephone-event] (§9's pin)<br/>(a matched video codec: + the pinned video track)
     H->>P: 180 Ringing
-    H->>U: w.Invite(voice) — the browser rings<br/>(Server.WriterFor — §9's unsolicited path)
+    H->>U: w.Invite(voice | video) — the browser rings<br/>(Server.WriterFor — §9's unsolicited path)
     H->>U: "Incoming call from <caller>…"
     Note over H: ring timeout (60 s) arms: 480 to the caller,<br/>CANCEL to the browser
     U->>H: 200 OK (user clicked accept)
-    H->>P: 200 OK + SDP answer [C] (diago AnswerOptions,<br/>ACK-awaited) → relay arms (§8)
+    H->>P: 200 OK + SDP answer [C] (diago AnswerOptions,<br/>ACK-awaited) → relay arms (§8)<br/>(video: the injected session's static answer — the<br/>video section, or its port-0 rejection)
     U->>H: mic offer (follows the accept by getUserMedia latency)
     H->>U: answer pinned to [C, telephone-event]<br/>→ OnTrack fires → the mic pump starts
     Note over R: both pumps run, payloads crossing byte for byte
@@ -514,6 +543,22 @@ announced it (diago's negotiation intersects the pinned codec list),
 and the webrtc-leg negotiates it unconditionally — the capability
 travels from the SIP network through the bot to the browser's dial pad
 (§8).
+
+#### The inbound video variant
+
+An inbound INVITE whose offer carries a video m-line is the video call's
+reverse direction: the video selection runs at INVITE time beside the
+audio one — the first codec of the presumed **video** list the offer
+carries, at the offer's payload type (the answer echoes it — RFC 3264),
+the offered fmtp adopted for the answer's echo. The browser then rings
+as a video call (a video codec matched) or a voice one (none did), and
+the 200 OK's answer carries the video section — the selected codec on
+the shared port — or the port-0 rejection naming the offered formats
+(the RFC 3264 m-line parity holds either way). The frontend needs
+nothing new: the ring kind is the webrtc-leg's own `X-Media`, and
+useCallMedia's generic video path does the rest. The sip-leg mechanics
+the video section rides on — the hand-built media session, the muxed
+socket — are §8's.
 
 Inbound calls are to a **registered** identity: the INVITE arrives on
 the account's socket, so the account exists by construction. A pooled
@@ -714,6 +759,84 @@ the `CodecAudioG722` constant (PT 9, its 8000 Hz **RTP** clock), the SDP
 generator's canonical `a=rtpmap:9 G722/8000` line, and the parser's
 static-PT-9 shorthand (third_party/diago/PATCHES.md).
 
+### Video: the static-SDP injection seam and the muxed sip-leg media
+
+A video call is the audio call's twin with a second m-line — and video
+is where diago's own machinery stops: its SDP generator speaks audio
+only, so the bot's video SDP (the `/video-call` offer, the inbound video
+call's answer) is **generated by the bot and injected** through diago's
+own exported seams — no behavioral diago patch beyond one parser fix
+(below):
+
+- **The seam.** A `media.MediaSession` built by hand — the account's
+  bind/external IPs mirroring diago's `WithTransport` computation
+  (video.go's `mediaIPs`), the codec list, `Mode: sendrecv` — then
+  `Init()` (opens the RTP/RTCP sockets, assigning the one port), the
+  bot's own SDP generated off the session's addresses (diago's
+  `generateSDPForAudio` shape replicated: same head, same audio section,
+  plus the video section), `InitWithSDP(it)` — which pins the session's
+  `LocalSDP` to the static bytes — and `dialog.InitMediaSession(sess,
+…)` before the INVITE/answer. diago's media-session construction
+  no-ops on a dialog whose session is preset, so the wire carries OUR
+  SDP, while the dialog's own close path owns the session's sockets.
+  Outbound, diago's answer path then negotiates and runs its RTPSession
+  on the injected session untouched (`MediaProps.Codec` is the audio
+  selection exactly as on the native path). Inbound, the bot runs the
+  answer path's steps itself (`RemoteSDP(offer)` — the audio
+  negotiation and the remote address; the answer generated with the
+  audio section from the negotiated filter — today's pinned answer
+  exactly — and the video section or its port-0 rejection; the dialog's
+  `Answer` then RespondSDPs the static answer, ACK-awaited as the
+  native path's), and the RTPSession it creates is closed on the
+  dialog's `OnClose` hook (the injected path leaves the dialog's
+  rtpSession unset, so its Close alone would leak the monitor
+  goroutines).
+- **The read-stats gate trick**: the RTPSession's read path drops a
+  packet whose PT names none of `sess.Codecs` on an SSRC switch — with
+  muxed audio+video (two SSRCs alternating) every video packet would
+  hit it. The video codecs are appended to `sess.Codecs` after
+  `InitWithSDP` (an exported field); the audio negotiation is
+  unaffected (the answer's audio codecs never name-match the video
+  entries).
+- **The muxed relay**: audio, video, and telephone-event share the
+  session's one socket and port toward the peer. The SIP→browser pump
+  dispatches on the arriving packet's PT: the negotiated audio PT is
+  today's path; the negotiated video PT crosses to the call's video
+  track (`TrackLocalStaticRTP.WriteRTP` — SSRC/PT re-stamped, the
+  packet's own sequence/timestamp/marker preserved — the payload again
+  byte for byte), through the same accept gate; anything else drops.
+  The camera→SIP pump re-packetizes the browser's camera packets at the
+  negotiated video PT with `RTPPacketWriter.WriteSamples` — the 20 ms
+  ticker disabled, the browser's own 90 kHz timestamp steps carried as
+  the deltas, the frame-boundary marker passed through.
+- **The writers**: the muxed sink marshals the packet onto the session's
+  own socket toward the negotiated remote address
+  (`MediaSession.WriteRTPRaw` — it shares no buffer with the audio
+  writer and UDP writes are datagram-atomic, so the two writers race
+  safely); a peer that answered video on a port of its own gets a
+  dedicated socket on the session's local IP sending there (the RTP
+  source port is unconstrained — caveat 28's symmetric-RTP note). The
+  demuxed socket closes with the relay; the muxed socket is the
+  dialog's own.
+- **The presumed WebRTC video codec list** (`webrtcVideoCodecs`, §10;
+  default `vp8,h264`) mirrors the audio one's role: the /video-call
+  offer's video section, and the inbound video call's selection order.
+  VP8 first (every browser, royalty-free, no fmtp), H.264 second (the
+  SIP world's common denominator, pinned to constrained-baseline
+  packetization-mode 1 — `42e01f` — on both legs). The sip-leg's video
+  PTs (102+) are the bot's constants, clear of the audio offer's
+  0/8/9/96/101; the webrtc-leg's are pion's own — the legs are separate
+  PT spaces and the relay re-stamps, exactly as for audio. A customized
+  audio list must keep the PT spaces disjoint.
+- **Patch 4 (the one parser fix)**: the vendored sdp package's
+  `MediaDescription` refused any SDP carrying more than one m-line
+  TOTAL — its type-filtering loop was dead code — so every audio+video
+  SDP failed `RemoteSDP`/`InitWithSDP`, both directions, with no
+  exported seam around it (diago's own answer path calls them). The
+  guard now counts only m-lines of the requested type; single-m-line
+  SDPs (all upstream ever parses) behave byte-identically
+  (third_party/diago/PATCHES.md).
+
 ## 9. Framework extensions: bot-originated `Cancel`/`Bye`, the unsolicited-send path, session lifecycle hooks, and the codec pin
 
 An SBC terminates signalling: when the **callee** ends or refuses the
@@ -889,6 +1012,10 @@ pool, cfg)` and reusing `stereoOpusPCFactory` — its MediaEngine (opus
   validated at startup (an unknown one fails the wiring); the list is
   the presumed browser capability, in the browsers' preference order —
   trim it to match a deployment whose WebRTC clients differ —
+  `webrtcVideoCodecs`, the video twin (§8): the presumed WebRTC video
+  codec list (`vp8,h264` — the default when unset): the `/video-call`
+  offer's video codec list, and the inbound video call's selection
+  order among the caller's offer — same validation, same trim lever —
   `ipPreference`, the address family every DNS resolution in the sip
   leg honors: `v6Only`, `v4Only`, or `default` (the default); and
   `upstreamDNSResolver`, the upstream DNS resolver (host[:port], the
@@ -908,7 +1035,9 @@ pool, cfg)` and reusing `stereoOpusPCFactory` — its MediaEngine (opus
   (`ParseIPPreference` — the pool's discipline), carried by
   `Configuration.IPPreference` / `Configuration.UpstreamDNSResolver`.
 - `sipbot.Configuration`: `Logger`, `TestSIPContact`, `WebRTCCodecs`
-  (the presumed codec list; nil selects the default), `IPPreference`,
+  (the presumed codec list; nil selects the default),
+  `WebRTCVideoCodecs` (the presumed video codec list; nil selects the
+  default), `IPPreference`,
   `UpstreamDNSResolver`, `MaxMessageBytes` (the /send size cap; zero
   selects the default), and the sip-leg
   knobs — `Transport` (default `udp`), `ExternalHost` (default empty; the
@@ -1140,14 +1269,16 @@ where a choice had to be made:
     an ephemeral port) and lives for the bot's lifetime — the process,
     in the shipped wiring.
 21. **diago is vendored**: `third_party/diago` is v0.32.2 plus local
-    patches (§8, §7.3), selected by a `replace` in `go.mod`. Upgrading
+    patches (§8, §11.21), selected by a `replace` in `go.mod`. Upgrading
     diago now means re-checking the patches against the new release —
     their touch points are the SDP generator and the codec matcher (the
     per-codec `Fmtp`; upstream through v0.40.0 still hardcodes the opus
     fmtp), the codec vocabulary (the G.722 constant, its canonical
-    rtpmap line, its static-PT parse shorthand), and the MESSAGE hook
+    rtpmap line, its static-PT parse shorthand), the MESSAGE hook
     (the `OnMessage` registration and the per-transport client
-    accessor) — so the
+    accessor), and the SDP parser's media-line
+    count guard (the per-type counting — the video calls'
+    audio+video SDPs) — so the
     fork stays load-bearing. The vendored copy is a nested module:
     invisible to the repo's `go test ./...`, so the sipbot suite's
     wire-level SDP assertions (the offer's and the answer's codec
@@ -1179,24 +1310,53 @@ where a choice had to be made:
     quoted-printable are not decoded. Encrypted CPIM is out of scope
     entirely (415) — there is no key infrastructure to decrypt with.
 
+25. **No PLI/FIR/NACK crosses in v1** (either direction): the pinned
+    webrtc-leg video m-line carries no rtcp-fb and the bot forwards no
+    RTCP, so a decoder needing a keyframe waits for the sender's
+    periodic one (browsers keyframe at stream start, which follows the
+    answer — the first picture always lands). A follow-up could forward
+    PLI (pion's WriteRTCP ↔ the session's WriteRTCP).
+26. **H.264 profile interop is nominal**: `42e01f` (constrained
+    baseline, packetization-mode 1) is pinned on both legs — an endpoint
+    sending an incompatible profile yields forwarded-but-undecodable
+    video. The VP8-first default order minimizes the exposure.
+27. **The muxed read flip-flops diago's single-SSRC read stats** —
+    cosmetic only (the RRs alternate SSRC).
+28. **The demuxed-answer fallback's source port differs**: a peer that
+    answered video on a port of its own gets the bot's video from a
+    dedicated socket — same local IP, an ephemeral source port (the
+    video RTP's source is unconstrained). A symmetric-RTP peer latching
+    its video target from the received source would break; the
+    deployment is direct-routed (caveat 9), and the muxed answer — the
+    common case — needs none of it.
+29. **A mid-call re-INVITE on an inbound video call fails**: the
+    injected path leaves the dialog's rtpSession unset, which diago's
+    replaceRTPSessionUnsafe needs. Audio-only calls keep the native
+    path (unaffected); mid-call media changes are caveat 4's territory
+    anyway.
+30. **A caller reusing one PT for two codecs across m-lines** (legal in
+    classic SDP) confuses the vendored sdp package's flattened
+    attribute parse — a pre-existing diago shape, unchanged by patch 4.
+
 ## 12. Package layout and testing
 
 `pkg/rtc/sipbot/`:
 
-| file            | contents                                                                                                                                                                                                                      |
-| --------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `sipbot.go`     | package doc, `Configuration`, `New` (wires the msg_handler.Server), `sipStack` (the per-account SIP client factory), `codecAudioOpusStereo` (the sip-leg's opus with the RFC 7587 stereo fmtp)                                |
-| `session.go`    | `UserSession`, `UserSessionStorage`, `OnMemoryUserSessionStorage`                                                                                                                                                             |
-| `pool.go`       | `SIPCredentialPool` (+ the `SIPCredential`/`SIPCredentialRange` config shapes): the lazy, mutex-free account pool — the atomic cursor, the release channel, the range parsing                                                 |
-| `yellowpage.go` | the yellow page: the YellowPageSection/YellowPageContact config shapes and the /yellow-page listing's rendering                                                                                                               |
-| `dns.go`        | the `ipPreference` machinery: the IPPreference type and its parse, and the filtering DNS reverse proxy (miekg/dns) the account UAs' resolver dials                                                                            |
-| `handler.go`    | `sipHandler` — the `BotMessageHandler`: CLI dispatch (/my-number reads the live registration), registration lifecycle (incl. the session-start pool loan), call policy, hangup matrix                                         |
-| `inbound.go`    | the inbound call: the account socket's INVITE → the browser's ring → the 200 OK relay-arming; the ring timeout, the dialog watcher, the UAS-side termination verbs                                                            |
-| `account.go`    | per-user SIP account runtime: the registration's lifecycle (REGISTER at birth, de-REGISTER at the end — no expiry, no refresh), the diago `Invite` dial path, and the inbound-INVITE routing callback                         |
-| `call.go`       | per-call state + the relay: the two passthrough pump goroutines, the call's pinned codec, the `sipLeg` interface over both dialog types, track/dialog wiring, teardown                                                        |
-| `codecs.go`     | the relay's codec vocabulary: the pion↔diago codec mapping, the presumed WebRTC codec list's parse/validation, the SDP codec-list reads (the INVITE's offer, the browser's mic offer), packet-duration helpers (the opus TOC) |
-| `dtmf.go`       | the relay's DTMF vocabulary: the RFC 4733 event payload's parse and digit mapping, the negotiated telephone-event PT's discovery, the END retransmissions' deduper                                                            |
-| `message.go`    | SIP MESSAGE (RFC 3428, §7.3): the account's outbound send (identity stamping, registrar routing, digest retry), the inbound handler (media-type dispatch, the 415/480/200 answers), the reduced message/cpim render           |
+| file            | contents                                                                                                                                                                                                                                                                   |
+| --------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `sipbot.go`     | package doc, `Configuration`, `New` (wires the msg_handler.Server), `sipStack` (the per-account SIP client factory), `codecAudioOpusStereo` (the sip-leg's opus with the RFC 7587 stereo fmtp)                                                                             |
+| `session.go`    | `UserSession`, `UserSessionStorage`, `OnMemoryUserSessionStorage`                                                                                                                                                                                                          |
+| `pool.go`       | `SIPCredentialPool` (+ the `SIPCredential`/`SIPCredentialRange` config shapes): the lazy, mutex-free account pool — the atomic cursor, the release channel, the range parsing                                                                                              |
+| `yellowpage.go` | the yellow page: the YellowPageSection/YellowPageContact config shapes and the /yellow-page listing's rendering                                                                                                                                                            |
+| `dns.go`        | the `ipPreference` machinery: the IPPreference type and its parse, and the filtering DNS reverse proxy (miekg/dns) the account UAs' resolver dials                                                                                                                         |
+| `handler.go`    | `sipHandler` — the `BotMessageHandler`: CLI dispatch (/my-number reads the live registration), registration lifecycle (incl. the session-start pool loan), call policy, hangup matrix                                                                                      |
+| `inbound.go`    | the inbound call: the account socket's INVITE → the browser's ring → the 200 OK relay-arming; the ring timeout, the dialog watcher, the UAS-side termination verbs                                                                                                         |
+| `account.go`    | per-user SIP account runtime: the registration's lifecycle (REGISTER at birth, de-REGISTER at the end — no expiry, no refresh), the diago `Invite` dial path, and the inbound-INVITE routing callback                                                                      |
+| `call.go`       | per-call state + the relay: the two passthrough pump goroutines, the call's pinned codec, the `sipLeg` interface over both dialog types, track/dialog wiring, teardown                                                                                                     |
+| `codecs.go`     | the relay's codec vocabulary: the pion↔diago codec mapping, the presumed WebRTC codec list's parse/validation, the SDP codec-list reads (the INVITE's offer, the browser's mic offer), packet-duration helpers (the opus TOC)                                              |
+| `video.go`      | the video half: the presumed WebRTC video codec list's parse/validation, the video codec mapping, the video SDP reads (the answer's pick, the offer's echo) and generators, the hand-built media sessions (the static-SDP injection seam), the muxed/demuxed video writers |
+| `dtmf.go`       | the relay's DTMF vocabulary: the RFC 4733 event payload's parse and digit mapping, the negotiated telephone-event PT's discovery, the END retransmissions' deduper                                                                                                         |
+| `message.go`    | SIP MESSAGE (RFC 3428, §7.3): the account's outbound send (identity stamping, registrar routing, digest retry), the inbound handler (media-type dispatch, the 415/480/200 answers), the reduced message/cpim render                                                        |
 
 `third_party/diago/` sits beside the package: diago v0.32.2 vendored
 with the local patches (§8, §11.21), wired by `go.mod`'s
@@ -1282,3 +1442,22 @@ the predicate did not expect is visible without a rerun), and the
 fake's handler errors are dropped once teardown begins — a de-REGISTER
 arriving mid-shutdown fails its response on a closing server, and a
 t.Errorf from sipgo's goroutine after the test completed would panic.
+Video adds its own (§8's subsection): the vocabulary's units (the
+presumed-list parse, the SDP generators' offer/answer shapes — the one
+shared port, the rejection line, the fmtp echo — the two selections'
+tables), and five integration tests against the fake PBX, whose answers
+and own offers gained a video section (muxed, or demuxed on a second
+recording socket): /video-call end to end (the offer's muxed audio+video
+assertion, the video ring, the pinned video m-line, media both ways,
+the callee's BYE), the demuxed answer (the camera's packets land on the
+answer's OTHER port, never on the audio one, while the callee's video
+still crosses), the callee-declines-video degradation (the voice ring,
+the chat note, the voice-only call), the inbound video call end to end
+(the offer-driven video ring, the answer's video section echoing the
+offered PT on the muxed port, media both ways, the caller's BYE), and
+the inbound no-common-video-codec call (the port-0 rejection, the voice
+ring, the working voice call). The probe's camera writes raw RTP (a
+TrackLocalStaticRTP — WriteRTP bypasses pion's payloader, which would
+prepend the VP8 payload descriptor) so the payloads cross byte for
+byte; the video tracks are identified by Kind, their firing order being
+the streams' own.

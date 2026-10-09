@@ -171,6 +171,13 @@ type SipBotXML struct {
 	// among the caller's offer. Parsed and validated at wiring time with
 	// sipbot.ParseWebRTCCodecs (see cmd/server).
 	WebRTCCodecs string `xml:"webrtcCodecs,attr"`
+	// WebRTCVideoCodecs is the raw webrtcVideoCodecs attribute: the
+	// presumed WebRTC video codec list as a comma-separated list of
+	// video codec names ("vp8,h264" — empty selects the default): the
+	// /video-call offer's video codec list, and the inbound video call's
+	// selection order among the caller's offer. Parsed and validated at
+	// wiring time with sipbot.ParseWebRTCVideoCodecs (see cmd/server).
+	WebRTCVideoCodecs string `xml:"webrtcVideoCodecs,attr"`
 	// MaxMessageBytes is the raw maxMessageBytes attribute: the
 	// byte-size cap of one /send message's body — a SIP MESSAGE rides
 	// UDP, so the body must leave room for the SIP header block inside

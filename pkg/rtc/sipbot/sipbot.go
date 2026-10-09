@@ -151,6 +151,16 @@ type Configuration struct {
 	// the IPPreference discipline.
 	WebRTCCodecs []string
 
+	// WebRTCVideoCodecs is the presumed WebRTC video codec list
+	// (docs/sip-bot.md §8): the video codecs the browser is presumed to
+	// support, in the browsers' own preference order — the /video-call
+	// offer's video codec list, and the inbound video call's selection
+	// order among the caller's offer. Names are the video codec
+	// vocabulary's ("vp8", "h264" — case-insensitive; validate with
+	// ParseWebRTCVideoCodecs). Nil selects the default list. New panics
+	// on an unknown name, the WebRTCCodecs discipline.
+	WebRTCVideoCodecs []string
+
 	// MaxMessageBytes is the byte-size cap of one /send message's body
 	// (docs/sip-bot.md §7.3): a SIP MESSAGE rides UDP, so the body must
 	// leave room for the SIP header block inside one datagram. Zero
@@ -210,6 +220,22 @@ func New(client *rtc.HeadlessRTCClient, storage UserSessionStorage, pool *SIPCre
 		stack.audioCodecs = append(stack.audioCodecs, codec)
 	}
 	stack.codecs = append(append([]media.Codec{}, stack.audioCodecs...), media.CodecTelephoneEvent8000)
+	// The presumed WebRTC video codec list is the /video-call offer's
+	// video section and the inbound video call's selection order — the
+	// audio list's video twin (video.go), with the same misconfiguration
+	// discipline: cmd/server validates with ParseWebRTCVideoCodecs at
+	// startup, so a panic here means a programmatic caller skipped it.
+	videoNames := config.WebRTCVideoCodecs
+	if videoNames == nil {
+		videoNames = defaultWebRTCVideoCodecs
+	}
+	for _, name := range videoNames {
+		codec, ok := sipVideoCodecByName(strings.ToLower(name))
+		if !ok {
+			panic(fmt.Sprintf("sipbot: unknown webrtc video codec %q", name))
+		}
+		stack.videoCodecs = append(stack.videoCodecs, codec)
+	}
 	// A non-default ipPreference needs the bot's filtering DNS proxy
 	// (dns.go) on its explicit upstream resolver. The proxy is shared
 	// by every account and lives for the bot's lifetime (the process,
@@ -259,10 +285,13 @@ type sipStack struct {
 	dnsProxy     *filteringResolver
 	// audioCodecs is the presumed WebRTC codec list (the inbound call's
 	// selection order among the caller's offer); codecs is the sip-leg's
-	// offer list — audioCodecs plus telephone-event. Built by New from
-	// the Configuration's WebRTCCodecs.
+	// offer list — audioCodecs plus telephone-event; videoCodecs is the
+	// presumed WebRTC video codec list (the /video-call offer's video
+	// section, the inbound video call's selection order). Built by New
+	// from the Configuration's WebRTCCodecs and WebRTCVideoCodecs.
 	audioCodecs []media.Codec
 	codecs      []media.Codec
+	videoCodecs []media.Codec
 }
 
 // open materializes one account's SIP client: a diago whose UA is named

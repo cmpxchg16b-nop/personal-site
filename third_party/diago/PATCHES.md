@@ -70,3 +70,23 @@ error)` option; `NewDiago` registers `server.OnMessage` through the
   behavior are the transport's own.
 
 No other behavior changes; diago's dialog machinery is untouched.
+
+## Patch 4: multi-media SDP parsing (the m-line count guard is per type)
+
+Upstream `SessionDescription.MediaDescription` refuses any SDP carrying
+more than ONE m-line total (`if len(values) > 1`), so every audio+video
+SDP fails to parse — and with it `MediaSession.InitWithSDP` and
+`MediaSession.RemoteSDP`, the two seams a video call's negotiation runs
+through (both directions: the offer/answer the bot parses itself, and
+the callee's answer diago's own client answer path parses). The
+type-filtering loop below the guard shows the intent was per-type
+counting; as written it is dead code for multi-media SDPs. The sip
+bot's /video-call and inbound video calls bridge exactly those, so the
+guard now counts only m-lines OF THE REQUESTED TYPE:
+
+- `media/sdp/sdp.go` `MediaDescription`: a second m-line of the same
+  media type still errors; m-lines of other types are skipped. A
+  single-m-line SDP (everything upstream ever parses) behaves
+  byte-identically.
+
+No other behavior changes; SDP generation is untouched.

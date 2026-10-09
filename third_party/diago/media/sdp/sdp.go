@@ -70,21 +70,25 @@ func (m *MediaDescription) String() string {
 func (sd SessionDescription) MediaDescription(mediaType string) (MediaDescription, error) {
 	values := sd.Values("m")
 	md := MediaDescription{}
-	if len(values) > 1 {
-		return md, fmt.Errorf("more than 1 media line for type %q", mediaType)
-	}
 
+	// The count guard applies to lines OF THE REQUESTED TYPE: a
+	// multi-media SDP (an audio+video call) must still yield each of its
+	// sections — with the upstream guard on the total m-line count the
+	// type-filtering loop was dead code and every audio+video SDP failed
+	// to parse. (Local patch — see PATCHES.md.)
 	var v string
 	for _, val := range values {
 		ind := strings.Index(val, " ")
 		if ind < 1 {
 			continue
 		}
-		media := val[:ind]
-		if media == mediaType {
-			v = val
-			break
+		if val[:ind] != mediaType {
+			continue
 		}
+		if v != "" {
+			return md, fmt.Errorf("more than 1 media line for type %q", mediaType)
+		}
+		v = val
 	}
 
 	if v == "" {
