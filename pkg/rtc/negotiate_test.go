@@ -238,7 +238,7 @@ func newSSTestNet(t *testing.T, subA, subB ss.SubscriberId) *ssTestNet {
 		provOut: make(chan *ss.SignallingEvent, 16),
 	}
 
-	provider := ss.NewSimpleOnMemorySSProvider()
+	provider := ss.NewSimpleOnMemorySSProvider(nil)
 	go provider.Run(ctx, net.provIn, net.provOut)
 	t.Cleanup(provider.Shutdown)
 	t.Cleanup(cancel)

@@ -177,7 +177,8 @@ func (cmd *ServeCmd) Run(cli *CLI) error {
 	// development the browser's origin is the frontend dev server proxying
 	// /api/* here, which the default origin check would reject.
 	ssHandler := pkgapiwebsocketss.NewWebSocketSSHandler(
-		context.Background(), pkgmodelsss.NewSimpleOnMemorySSProviderWithAging(cmd.SSAging), sm)
+		context.Background(), pkgmodelsss.NewSimpleOnMemorySSProviderWithAging(
+			cmd.SSAging, pkgmodelsss.NewOnMemoryGroupRepository()), sm)
 	ssHandler.Upgrader.CheckOrigin = pkgapiwebsocketss.CheckOriginAllowing(allowedOrigins)
 	muxHandlerDyn.Handle("/api/ss/ws", ssHandler)
 

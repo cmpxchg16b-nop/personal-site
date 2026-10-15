@@ -1,11 +1,14 @@
 package ss
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"slices"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -14,9 +17,10 @@ import (
 
 // harness wires a provider to buffered in/out channels for a test.
 type harness struct {
-	p   *SimpleOnMemorySSProvider
-	in  chan *SignallingEvent
-	out chan *SignallingEvent
+	p      *SimpleOnMemorySSProvider
+	groups *OnMemoryGroupRepository
+	in     chan *SignallingEvent
+	out    chan *SignallingEvent
 }
 
 func startProvider(t *testing.T) *harness {
@@ -27,10 +31,11 @@ func startProvider(t *testing.T) *harness {
 func startProviderWithAging(t *testing.T, aging time.Duration) *harness {
 	t.Helper()
 	h := &harness{
-		p:   NewSimpleOnMemorySSProviderWithAging(aging),
-		in:  make(chan *SignallingEvent, 8),
-		out: make(chan *SignallingEvent, 8),
+		groups: NewOnMemoryGroupRepository(),
+		in:     make(chan *SignallingEvent, 8),
+		out:    make(chan *SignallingEvent, 8),
 	}
+	h.p = NewSimpleOnMemorySSProviderWithAging(aging, h.groups)
 	go h.p.Run(context.Background(), h.in, h.out)
 	t.Cleanup(h.p.Shutdown)
 	return h
@@ -353,6 +358,119 @@ func TestRegisterSameTupleFreshId(t *testing.T) {
 	// re-registering its configured id) is still a refresh, not an
 	// eviction of itself.
 	h.mustRegisterFrom(t, addr, second.SubscriberId, "alice")
+}
+
+// TestGroupAsVirtualSubscriber checks the virtual-subscriber semantics
+// (see docs/group-chat.md): a group is the first instance of a virtual
+// subscriber — never registered, living in the group repository — yet it
+// appears in the channel's member listing and its profile resolves with
+// subscriberType "group"; every actual (registered) subscriber is a
+// "person"; a group's subscriber id is held — an explicit registration
+// of it is rejected with ErrorCodeSubscriberIdTakenByGroup and the
+// automatic assignment skips it; and an SDP offer relayed to a group is
+// dropped with the "group chat unimplemented" log and a
+// SubscriberNotFound reply.
+func TestGroupAsVirtualSubscriber(t *testing.T) {
+	h := startProvider(t)
+
+	profile := func(sub SubscriberId) *SignallingEvent {
+		t.Helper()
+		h.in <- &SignallingEvent{
+			From:  EPAddr{UserId: "u-q", UserSessionId: "s-q"},
+			MsgId: MsgId("m-q-" + string(sub)),
+			C2SEv: &ClientToSSEv{UserProfileQuery: &ClientToSSUserProfileQuery{
+				SubscriberId: sub,
+				ChannelId:    WellKnownChIdMain,
+			}},
+		}
+		return h.recvOut(t)
+	}
+
+	// A registered subscriber is a person.
+	h.mustRegister(t, "alice", "alice")
+	reply := profile("alice")
+	if reply.S2CEv == nil || reply.S2CEv.Profile == nil ||
+		reply.S2CEv.Profile.SubscriberType != SubscriberTypePerson {
+		t.Fatalf("person profile = %+v, want subscriberType %q", reply, SubscriberTypePerson)
+	}
+
+	// A group is never registered: it lives in the group repository — a
+	// virtual subscriber — yet its profile resolves, with subscriberType
+	// "group".
+	if err := h.groups.CreateGroup(context.Background(), &Group{
+		ChannelId: WellKnownChIdMain, SubscriberId: "team", Name: "team",
+	}); err != nil {
+		t.Fatalf("CreateGroup: %v", err)
+	}
+	if err := h.groups.CreateGroup(context.Background(), &Group{
+		ChannelId: WellKnownChIdMain, SubscriberId: "1000", Name: "auto-blocker",
+	}); err != nil {
+		t.Fatalf("CreateGroup: %v", err)
+	}
+	reply = profile("team")
+	if reply.S2CEv == nil || reply.S2CEv.Profile == nil ||
+		reply.S2CEv.Profile.SubscriberType != SubscriberTypeGroup ||
+		reply.S2CEv.Profile.Username != "team" {
+		t.Fatalf("group profile = %+v, want subscriberType %q", reply, SubscriberTypeGroup)
+	}
+
+	// Nobody can register a subscriber id a group holds.
+	h.in <- registerEvent("team", WellKnownChIdMain, "teamster")
+	reply = h.recvOut(t)
+	if reply.S2CEv == nil || reply.S2CEv.Err == nil ||
+		reply.S2CEv.Err.ErrorCode != ErrorCodeSubscriberIdTakenByGroup {
+		t.Fatalf("register-on-group-id reply = %+v, want error code %d",
+			reply, ErrorCodeSubscriberIdTakenByGroup)
+	}
+
+	// The automatic assignment skips ids a group holds (group "1000").
+	h.in <- registerEventFrom(EPAddr{UserId: "u-auto", UserSessionId: "s-auto"},
+		"", WellKnownChIdMain, "auto")
+	ack := h.recvOut(t)
+	if ack.S2CEv == nil || ack.S2CEv.Err != nil || ack.S2CEv.RegisterResult == nil ||
+		ack.S2CEv.RegisterResult.SubscriberId != "1001" {
+		t.Fatalf("auto register ack = %+v, want subscriber 1001 (1000 is a group)", ack)
+	}
+
+	// The member listing carries the groups (virtual subscribers)
+	// alongside the actual subscribers, sorted by subscriber id.
+	h.in <- &SignallingEvent{
+		From:  EPAddr{UserId: "u-q", UserSessionId: "s-q"},
+		MsgId: "m-list",
+		C2SEv: &ClientToSSEv{ListChannelMembers: &ClientToSSListChannelMembers{ChannelId: WellKnownChIdMain}},
+	}
+	res := h.recvOut(t)
+	if res.S2CEv == nil || res.S2CEv.ChannelMbsListResult == nil {
+		t.Fatalf("list reply = %+v, want a channelMbsListResult", res)
+	}
+	if want := []SubscriberId{"1000", "1001", "alice", "team"}; !slices.Equal(res.S2CEv.ChannelMbsListResult.Members, want) {
+		t.Fatalf("members = %v, want %v", res.S2CEv.ChannelMbsListResult.Members, want)
+	}
+
+	// An SDP offer relayed to a group is undeliverable: it is logged as
+	// the unimplemented group-chat path and answered SubscriberNotFound.
+	var logBuf bytes.Buffer
+	original := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, nil)))
+	t.Cleanup(func() { slog.SetDefault(original) })
+	h.in <- &SignallingEvent{
+		From:  EPAddr{UserId: "u-alice", UserSessionId: "s-alice"},
+		MsgId: "m-relay-group",
+		C2CEv: &ClientToClientEv{
+			FromSubscriber: "alice",
+			ToSubscriber:   "team",
+			ChannelId:      WellKnownChIdMain,
+			SessionDesc:    &webrtc.SessionDescription{Type: webrtc.SDPTypeOffer, SDP: "v=0\r\n"},
+		},
+	}
+	reply = h.recvOut(t)
+	if reply.S2CEv == nil || reply.S2CEv.Err == nil ||
+		reply.S2CEv.Err.ErrorCode != ErrorCodeSubscriberNotFound {
+		t.Fatalf("relay-to-group reply = %+v, want error code %d", reply, ErrorCodeSubscriberNotFound)
+	}
+	if !strings.Contains(logBuf.String(), "group chat unimplemented") {
+		t.Fatalf("relay-to-group log = %q, want the group-chat-unimplemented line", logBuf.String())
+	}
 }
 
 func TestQueryProfile(t *testing.T) {
@@ -882,7 +1000,7 @@ func TestMalformedEventDropped(t *testing.T) {
 }
 
 func TestShutdownStopsRun(t *testing.T) {
-	p := NewSimpleOnMemorySSProvider()
+	p := NewSimpleOnMemorySSProvider(nil)
 	in := make(chan *SignallingEvent)
 	out := make(chan *SignallingEvent, 1)
 	done := make(chan struct{})
@@ -904,7 +1022,7 @@ func TestShutdownStopsRun(t *testing.T) {
 }
 
 func TestClosedInMsgStopsRun(t *testing.T) {
-	p := NewSimpleOnMemorySSProvider()
+	p := NewSimpleOnMemorySSProvider(nil)
 	in := make(chan *SignallingEvent)
 	out := make(chan *SignallingEvent)
 	done := make(chan struct{})

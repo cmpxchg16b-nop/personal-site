@@ -82,9 +82,10 @@ type ssErrView struct {
 }
 
 type userProfileView struct {
-	SubscriberId string `json:"subscriberId"`
-	ChannelId    string `json:"channelId"`
-	Username     string `json:"username"`
+	SubscriberId   string `json:"subscriberId"`
+	ChannelId      string `json:"channelId"`
+	Username       string `json:"username"`
+	SubscriberType string `json:"subscriberType"`
 }
 
 type registerResultView struct {
@@ -372,6 +373,10 @@ func TestSSRegisterAndProfile(t *testing.T) {
 	profile := reply.S2CEv.Profile
 	if profile.SubscriberId != "alice" || profile.ChannelId != ssMainChannelId || profile.Username != alice.username {
 		t.Errorf("profile = %+v, want alice in the main channel with her session username %q", profile, alice.username)
+	}
+	// A registration naming no type is an ordinary user agent.
+	if profile.SubscriberType != "person" {
+		t.Errorf("profile subscriberType = %q, want %q", profile.SubscriberType, "person")
 	}
 
 	// Querying an unknown subscriber answers SubscriberNotFound.

@@ -80,7 +80,7 @@ func newClientTestNet(t *testing.T, aging time.Duration) *clientTestNet {
 	ctx, cancel := context.WithCancel(context.Background())
 	net := &clientTestNet{
 		ctx:     ctx,
-		prov:    ss.NewSimpleOnMemorySSProviderWithAging(aging),
+		prov:    ss.NewSimpleOnMemorySSProviderWithAging(aging, nil),
 		provIn:  make(chan *ss.SignallingEvent, 64),
 		provOut: make(chan *ss.SignallingEvent, 64),
 		routes:  map[ss.UserId]chan *ss.SignallingEvent{},

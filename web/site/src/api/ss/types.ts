@@ -21,6 +21,15 @@ export type ChannelId = string;
 // A msg id uniquely identify a message in global, and also for correlate request and reply. must be treated opaquely.
 export type MsgId = string;
 
+// Classifies a subscriber: the kind of entity behind a (channel id,
+// subscriber id) pair. "person" is an ordinary user agent — a browser
+// client or a bot; every registered subscriber is a person. "group" is a
+// group chat (see docs/group-chat.md): a virtual subscriber — groups are
+// never registered, no one can register as a group; a group exists purely
+// as a group-repository entry that the SS blends into member listings and
+// resolves in profile queries.
+export type SubscriberType = "person" | "group";
+
 // Wellknown service id for signalling server
 export const WELLKNOWN_SVC_ID_SS: ServiceId =
   "253dc952-a55b-4d01-a885-c5e240e95fdb";
@@ -134,6 +143,9 @@ export enum ErrorCode {
 
   // no subscriber id is free in the automatic assignment range 1000-1999 (all are registered)
   NoSubscriberIdAvailable,
+
+  // the subscriber id is virtually occupied by a group (see docs/group-chat.md) in the given channel
+  SubscriberIdTakenByGroup,
 }
 
 export interface SSToClientErrEv {
@@ -149,6 +161,9 @@ export interface UserProfile {
   subscriberId: SubscriberId;
   channelId: ChannelId;
   username: string;
+  // What kind of entity the subscriber is: "person" for a registered
+  // subscriber, "group" for a virtual one (see docs/group-chat.md).
+  subscriberType: SubscriberType;
 }
 
 // The profile data the SS holds about a channel.

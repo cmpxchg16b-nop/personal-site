@@ -19,6 +19,7 @@ package ss
 
 import (
 	"context"
+	"log/slog"
 	"sort"
 	"strconv"
 	"sync"
@@ -62,6 +63,23 @@ const (
 	// WellKnownChIdMain is the well-known channel id of the main channel;
 	// a SS implementation should at least implement the main channel.
 	WellKnownChIdMain ChannelId = "f887f5b0-7b78-4ceb-a051-f42879f9d98e"
+)
+
+// SubscriberType classifies a subscriber: the kind of entity behind a
+// (channel id, subscriber id) pair. It is never part of a registration —
+// a client always registers as a person; groups are virtual (see
+// docs/group-chat.md).
+type SubscriberType string
+
+const (
+	// SubscriberTypePerson is an ordinary user agent — a browser client
+	// or a bot. Every registered subscriber is a person.
+	SubscriberTypePerson SubscriberType = "person"
+
+	// SubscriberTypeGroup is a group chat: a virtual subscriber that lives
+	// in a GroupRepository and is blended into member listings and
+	// profile queries by the SS. No one can register as a group.
+	SubscriberTypeGroup SubscriberType = "group"
 )
 
 // EPAddr is a packed address struct. When the message is constructed in
@@ -187,6 +205,11 @@ const (
 	// ErrorCodeNoSubscriberIdAvailable: no subscriber id is free in the
 	// automatic assignment range 1000-1999 (all are registered).
 	ErrorCodeNoSubscriberIdAvailable
+
+	// ErrorCodeSubscriberIdTakenByGroup: the subscriber id is held by a
+	// group — a virtual subscriber (see docs/group-chat.md) — in the
+	// given channel.
+	ErrorCodeSubscriberIdTakenByGroup
 )
 
 // SSToClientErrEv carries a well-defined error code plus a descriptive,
@@ -262,6 +285,11 @@ type UserProfile struct {
 	SubscriberId SubscriberId `json:"subscriberId"`
 	ChannelId    ChannelId    `json:"channelId"`
 	Username     string       `json:"username"`
+
+	// SubscriberType is what kind of entity the subscriber is: a person
+	// for a registered subscriber, a group for a virtual one (see
+	// docs/group-chat.md).
+	SubscriberType SubscriberType `json:"subscriberType"`
 }
 
 // ChannelProfile is the profile data the SS holds about a channel.
@@ -370,7 +398,13 @@ type SignallingServiceProvider interface {
 // entries, while every other operation just tests the validity of the
 // specific subscriber before using it.
 type SimpleOnMemorySSProvider struct {
-	aging        time.Duration
+	aging time.Duration
+
+	// groups holds the channel's groups — the virtual subscribers —
+	// injected as an interface (see docs/group-chat.md); the provider
+	// never relies on a concrete implementation.
+	groups GroupRepository
+
 	shutdownCh   chan struct{}
 	shutdownOnce sync.Once
 }
@@ -391,19 +425,24 @@ const (
 )
 
 // NewSimpleOnMemorySSProvider constructs a SimpleOnMemorySSProvider with
-// the default subscriber aging. Call Run to start processing events.
-func NewSimpleOnMemorySSProvider() *SimpleOnMemorySSProvider {
-	return NewSimpleOnMemorySSProviderWithAging(DefaultSubscriberAging)
+// the default subscriber aging and the given group repository (nil
+// selects a fresh in-memory one). Call Run to start processing events.
+func NewSimpleOnMemorySSProvider(groups GroupRepository) *SimpleOnMemorySSProvider {
+	return NewSimpleOnMemorySSProviderWithAging(DefaultSubscriberAging, groups)
 }
 
 // NewSimpleOnMemorySSProviderWithAging constructs a
 // SimpleOnMemorySSProvider whose subscriber registrations expire after
-// aging without activity. A non-positive aging selects the default.
-func NewSimpleOnMemorySSProviderWithAging(aging time.Duration) *SimpleOnMemorySSProvider {
+// aging without activity, over the given group repository (nil selects a
+// fresh in-memory one). A non-positive aging selects the default.
+func NewSimpleOnMemorySSProviderWithAging(aging time.Duration, groups GroupRepository) *SimpleOnMemorySSProvider {
 	if aging <= 0 {
 		aging = DefaultSubscriberAging
 	}
-	return &SimpleOnMemorySSProvider{aging: aging, shutdownCh: make(chan struct{})}
+	if groups == nil {
+		groups = NewOnMemoryGroupRepository()
+	}
+	return &SimpleOnMemorySSProvider{aging: aging, groups: groups, shutdownCh: make(chan struct{})}
 }
 
 // Shutdown asks Run to stop. It is idempotent and safe to call before,
@@ -487,16 +526,33 @@ func (p *SimpleOnMemorySSProvider) handleRegister(ctx context.Context, channels 
 			"channel not found; currently only the main channel is implemented, please specify the correct channel id"))
 	}
 	now := time.Now()
+	// The channel's groups — virtual subscribers — hold their subscriber
+	// ids: nobody can register an id a group holds (groups are never
+	// registered themselves — see docs/group-chat.md).
+	groupIds := map[SubscriberId]bool{}
+	groups, gerr := p.groups.GetGroupsByChannelId(ctx, reg.ChannelId)
+	if gerr != nil && ctx.Err() != nil {
+		return false
+	}
+	for _, g := range groups {
+		groupIds[g.SubscriberId] = true
+	}
 	// An empty subscriber id asks the SS to assign one, sequentially,
 	// from the automatic assignment range; the assigned id is echoed in
 	// the registerResult reply. Empty always creates a fresh subscriber,
 	// even from an already-registered tuple.
 	if reg.SubscriberId == "" {
-		reg.SubscriberId = ch.assignSubscriberId(now, p.aging)
+		reg.SubscriberId = ch.assignSubscriberId(now, p.aging, func(id SubscriberId) bool {
+			return groupIds[id]
+		})
 		if reg.SubscriberId == "" {
 			return p.send(ctx, outMsg, replyErr(ev, ErrorCodeNoSubscriberIdAvailable,
 				"no subscriber id is available in the automatic assignment range 1000-1999"))
 		}
+	}
+	if groupIds[reg.SubscriberId] {
+		return p.send(ctx, outMsg, replyErr(ev, ErrorCodeSubscriberIdTakenByGroup,
+			"the subscriber id in the given channel is already taken by a group"))
 	}
 	// A client registers exactly once per incarnation — a browser page
 	// load mints a fresh subscriber id (a reload is a new incarnation; see
@@ -598,15 +654,31 @@ func (p *SimpleOnMemorySSProvider) handleQueryProfile(ctx context.Context, chann
 	if !ok {
 		return p.send(ctx, outMsg, replyErr(ev, ErrorCodeChannelNotFound, "channel not found"))
 	}
+	// A group is a virtual subscriber: resolve its profile from the group
+	// repository first, then the channel's actual (registered)
+	// subscribers, until a hit (see docs/group-chat.md).
+	g, gerr := p.groups.GetGroupBySubscriberId(ctx, query.ChannelId, query.SubscriberId)
+	if gerr != nil && ctx.Err() != nil {
+		return false
+	}
+	if g != nil {
+		return p.send(ctx, outMsg, reply(ev, &SSToClientEv{Profile: &UserProfile{
+			SubscriberId:   g.SubscriberId,
+			ChannelId:      g.ChannelId,
+			Username:       g.Name,
+			SubscriberType: SubscriberTypeGroup,
+		}}))
+	}
 	sub := ch.live(query.SubscriberId, time.Now(), p.aging)
 	if sub == nil {
 		return p.send(ctx, outMsg, replyErr(ev, ErrorCodeSubscriberNotFound,
 			"subscriber not found in the given channel"))
 	}
 	return p.send(ctx, outMsg, reply(ev, &SSToClientEv{Profile: &UserProfile{
-		SubscriberId: sub.id,
-		ChannelId:    query.ChannelId,
-		Username:     sub.username,
+		SubscriberId:   sub.id,
+		ChannelId:      query.ChannelId,
+		Username:       sub.username,
+		SubscriberType: SubscriberTypePerson,
 	}}))
 }
 
@@ -648,7 +720,9 @@ const channelMembersPageSize = 64
 // and each carrying a fresh MsgId with InReplyTo pointing at the
 // request. Even an empty channel yields one (empty, final) page, so the
 // client always observes hasMore=false. Members are listed sorted by
-// subscriber id, so pages are stable.
+// subscriber id, so pages are stable. The members are the channel's
+// actual (registered) subscribers plus its groups' subscriber ids — the
+// virtual subscribers (see docs/group-chat.md).
 func (p *SimpleOnMemorySSProvider) handleListChannelMembers(ctx context.Context, channels map[ChannelId]*channelState, ev *SignallingEvent, outMsg chan<- *SignallingEvent) bool {
 	req := ev.C2SEv.ListChannelMembers
 	ch, ok := channels[req.ChannelId]
@@ -659,6 +733,15 @@ func (p *SimpleOnMemorySSProvider) handleListChannelMembers(ctx context.Context,
 	members := make([]SubscriberId, 0, len(ch.subscribers))
 	for id := range ch.subscribers {
 		members = append(members, id)
+	}
+	groups, gerr := p.groups.GetGroupsByChannelId(ctx, req.ChannelId)
+	if gerr != nil && ctx.Err() != nil {
+		return false
+	}
+	for _, g := range groups {
+		if _, registered := ch.subscribers[g.SubscriberId]; !registered {
+			members = append(members, g.SubscriberId)
+		}
 	}
 	sort.Slice(members, func(i, j int) bool { return members[i] < members[j] })
 	for start := 0; ; start += channelMembersPageSize {
@@ -725,6 +808,18 @@ func (p *SimpleOnMemorySSProvider) handleRelay(ctx context.Context, channels map
 	}
 	to := ch.live(c2c.ToSubscriber, now, p.aging)
 	if to == nil {
+		// The destination is no actual subscriber — but it may be a
+		// virtual one, a group (see docs/group-chat.md): one is visible
+		// in member listings, so a client can try to open a session with
+		// it (e.g. the browser reconciles a peer session per member when
+		// the user opens a group chat). Relaying to a group is not
+		// implemented yet: the offer is undeliverable — logged — and
+		// answered like any unroutable destination.
+		g, gerr := p.groups.GetGroupBySubscriberId(ctx, c2c.ChannelId, c2c.ToSubscriber)
+		if gerr == nil && g != nil && c2c.SessionDesc != nil && c2c.SessionDesc.Type == webrtc.SDPTypeOffer {
+			slog.Default().Warn("group chat unimplemented (todo): dropping an SDP offer addressed to a group",
+				"channelId", c2c.ChannelId, "groupSubscriberId", c2c.ToSubscriber, "fromSubscriber", c2c.FromSubscriber)
+		}
 		return p.send(ctx, outMsg, replyErr(ev, ErrorCodeSubscriberNotFound,
 			"to subscriber not found in the given channel"))
 	}
@@ -818,15 +913,16 @@ func newChannelState(name string) *channelState {
 // assignSubscriberId picks the next free subscriber id in the automatic
 // assignment range, scanning sequentially from where the last assignment
 // left off and wrapping around at most once; expired ids on the way are
-// freed by live. It returns "" when every id in the range is taken.
-func (ch *channelState) assignSubscriberId(now time.Time, aging time.Duration) SubscriberId {
+// freed by live, and ids held by a group (the occupied predicate) are
+// skipped. It returns "" when every id in the range is taken.
+func (ch *channelState) assignSubscriberId(now time.Time, aging time.Duration, occupied func(SubscriberId) bool) SubscriberId {
 	for i := 0; i < autoSubscriberIdRangeEnd-autoSubscriberIdRangeStart; i++ {
 		id := SubscriberId(strconv.Itoa(ch.nextAutoId))
 		ch.nextAutoId++
 		if ch.nextAutoId >= autoSubscriberIdRangeEnd {
 			ch.nextAutoId = autoSubscriberIdRangeStart
 		}
-		if ch.live(id, now, aging) == nil {
+		if ch.live(id, now, aging) == nil && !occupied(id) {
 			return id
 		}
 	}

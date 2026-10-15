@@ -30,7 +30,7 @@ const (
 
 func startTestServer(t *testing.T) *httptest.Server {
 	t.Helper()
-	provider := ss.NewSimpleOnMemorySSProvider()
+	provider := ss.NewSimpleOnMemorySSProvider(nil)
 	sm := pkgsession.NewOnMemorySessionManager()
 	h := NewWebSocketSSHandler(context.Background(), provider, sm)
 	// The real session middleware builds the request-scoped session object

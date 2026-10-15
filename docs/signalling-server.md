@@ -8,20 +8,20 @@ exists, and all state lives in process memory.
 
 ## Components
 
-| Layer            | Location                           | Role                                                                                                                                                                                                      |
-| ---------------- | ---------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Wire prototype   | `web/site/src/api/ss/types.ts`     | The browser-side TypeScript prototype; the source of truth for the wire format.                                                                                                                           |
-| Model            | `pkg/models/ss`                    | Go wire types (field- and JSON-compatible with the prototype), the `SignallingServiceProvider` interface, and `SimpleOnMemorySSProvider`.                                                                 |
-| Negotiator       | `web/site/src/api/ss/negotiate.ts` | Browser-side MDN perfect negotiation over the c2c relay (the prototype).                                                                                                                                  |
-| Negotiator       | `pkg/rtc`                          | The Go counterpart of `negotiate.ts` on `pion/webrtc`: `Negotiator` interface + `PerfectNegotiator`, reading from and writing to Go channels.                                                             |
-| Headless client  | `pkg/rtc` (`client.go`)            | `HeadlessRTCClient` — the Go counterpart of `useSignalling` + `usePeerSessions`: a bot peer driving one session per channel member, over a caller-supplied channel pair (see below).                      |
-| Client transport | `pkg/rtc` (`transport.go`)         | `SignallingTransport`, the client's SSProxy: pumps a channel pair to/from the SS; `WebSocketSignallingTransport` is the production one.                                                                   |
-| Echo bot         | `pkg/rtc/echobot`                  | The reference data-channel stack of an echo-purpose bot on `HeadlessRTCClient`: serves the well-known `dcmsg`/`dcbin` labels (see below).                                                                 |
-| Bot DC layer     | `pkg/rtc/msg_handler`              | The data-channel layer of a bot: `Server` serves `dcmsg`/`dcbin` (echo rule, transfer reassembly and acks, the call log's status amends) and distills frames into bot messages for a `BotMessageHandler`. |
-| Music bot        | `pkg/rtc/musicbot`                 | A music-purpose `BotMessageHandler`: chat CLI (`/help`, `/list-songs`, `/play`), voice calls answered with a song of the injected songbook (PCMU or opus, see `pkg/models/audiosource`), video declined.  |
-| Transport        | `pkg/api/websocket_ss`             | `WebSocketSSHandler`, an `http.Handler` bridging WebSocket connections to a provider.                                                                                                                     |
-| Wiring           | `cmd/server/main.go`               | Mounts the handler at `/api/ss/ws`, backed by the in-memory provider; when the configuration document carries an `<echoBot/>` or `<musicBot/>` element, also hosts the bots as clients of the endpoint.   |
-| E2E tests        | `e2e/websocket_ss_test.go`         | Drives the real server binary over WebSocket with deliberately independent wire views.                                                                                                                    |
+| Layer            | Location                           | Role                                                                                                                                                                                                                                                                |
+| ---------------- | ---------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Wire prototype   | `web/site/src/api/ss/types.ts`     | The browser-side TypeScript prototype; the source of truth for the wire format.                                                                                                                                                                                     |
+| Model            | `pkg/models/ss`                    | Go wire types (field- and JSON-compatible with the prototype), the `SignallingServiceProvider` interface, `SimpleOnMemorySSProvider`, and the `GroupRepository` interface + `OnMemoryGroupRepository` (groups — the virtual subscribers; see `docs/group-chat.md`). |
+| Negotiator       | `web/site/src/api/ss/negotiate.ts` | Browser-side MDN perfect negotiation over the c2c relay (the prototype).                                                                                                                                                                                            |
+| Negotiator       | `pkg/rtc`                          | The Go counterpart of `negotiate.ts` on `pion/webrtc`: `Negotiator` interface + `PerfectNegotiator`, reading from and writing to Go channels.                                                                                                                       |
+| Headless client  | `pkg/rtc` (`client.go`)            | `HeadlessRTCClient` — the Go counterpart of `useSignalling` + `usePeerSessions`: a bot peer driving one session per channel member, over a caller-supplied channel pair (see below).                                                                                |
+| Client transport | `pkg/rtc` (`transport.go`)         | `SignallingTransport`, the client's SSProxy: pumps a channel pair to/from the SS; `WebSocketSignallingTransport` is the production one.                                                                                                                             |
+| Echo bot         | `pkg/rtc/echobot`                  | The reference data-channel stack of an echo-purpose bot on `HeadlessRTCClient`: serves the well-known `dcmsg`/`dcbin` labels (see below).                                                                                                                           |
+| Bot DC layer     | `pkg/rtc/msg_handler`              | The data-channel layer of a bot: `Server` serves `dcmsg`/`dcbin` (echo rule, transfer reassembly and acks, the call log's status amends) and distills frames into bot messages for a `BotMessageHandler`.                                                           |
+| Music bot        | `pkg/rtc/musicbot`                 | A music-purpose `BotMessageHandler`: chat CLI (`/help`, `/list-songs`, `/play`), voice calls answered with a song of the injected songbook (PCMU or opus, see `pkg/models/audiosource`), video declined.                                                            |
+| Transport        | `pkg/api/websocket_ss`             | `WebSocketSSHandler`, an `http.Handler` bridging WebSocket connections to a provider.                                                                                                                                                                               |
+| Wiring           | `cmd/server/main.go`               | Mounts the handler at `/api/ss/ws`, backed by the in-memory provider; when the configuration document carries an `<echoBot/>` or `<musicBot/>` element, also hosts the bots as clients of the endpoint.                                                             |
+| E2E tests        | `e2e/websocket_ss_test.go`         | Drives the real server binary over WebSocket with deliberately independent wire views.                                                                                                                                                                              |
 
 ```mermaid
 graph TD
@@ -61,12 +61,15 @@ implementation must provide.
   otherwise. An **empty `subscriberId`** asks the SS to assign one,
   sequentially, from the automatic assignment range **1000-1999** (the
   assigned id comes back in `registerResult`; empty always creates a fresh
-  subscriber, even from an already-registered tuple). Clients picking
+  subscriber, even from an already-registered tuple; ids held by a group
+  are skipped). Clients picking
   their own subscriber ids are recommended to **preserve the 1000-1999
   range** for automatic registration. A subscriber id is bound to zero or
   one (user id, user session id, channel id) tuple: re-registration of a
   live id by the same tuple is a refresh (renewing `lastActive`), while
-  another tuple is rejected with `SubscriberIdIsRegistered`.
+  another tuple is rejected with `SubscriberIdIsRegistered` — and an id
+  held by a **group** — a virtual subscriber, see `docs/group-chat.md` —
+  is rejected with `SubscriberIdTakenByGroup`, whoever asks.
   **A registration is one incarnation of its client**: a client
   registers exactly once per incarnation (a browser page load mints a
   fresh, empty `subscriberId`), so any _other_ live registration of the
@@ -90,11 +93,16 @@ implementation must provide.
   another (user id, user session id) tuple — meaning the membership is
   gone and the client should re-register.
 - **`userProfileQuery {subscriberId, channelId}`** — answered with a
-  `profile {subscriberId, channelId, username}` reply.
+  `profile {subscriberId, channelId, username, subscriberType}` reply.
+  Resolution tries the group repository and the channel's registered
+  subscribers successively until a hit: a group — a virtual subscriber —
+  resolves with `subscriberType: "group"`, an actual subscriber (a
+  registered browser UA or bot) with `subscriberType: "person"`.
 - **`listChannelMembers {channelId}`** — answered with **one or more**
   `channelMbsListResult {channelId, members, hasMore}` messages, all
   `inReplyTo` the request. `members` is a page of subscriber ids (resolve
-  them via `userProfileQuery`). The client may time out on its own, or
+  them via `userProfileQuery`): the channel's actual subscribers **plus
+  its virtual subscribers'** (the groups') ids. The client may time out on its own, or
   keep reading until `hasMore` is `false`; even an empty channel yields
   one final empty page.
 - **`listChannels {}`** — dynamic channel discovery; carries no fields.
@@ -119,13 +127,14 @@ comes `from` the well-known SS service id, is addressed `to` the origin's
 `from`, and is correlated via `inReplyTo`. Errors pair a well-defined
 `errorCode` with a descriptive `errorMsg`:
 
-| Code | Name                       | Meaning                                                  |
-| ---- | -------------------------- | -------------------------------------------------------- |
-| 1    | `SubscriberIdIsRegistered` | subscriber id already registered                         |
-| 2    | `SubscriberNotFound`       | subscriber not found in the given channel                |
-| 3    | `ChannelNotFound`          | channel not found (only the main channel is implemented) |
-| 4    | `UsernameTaken`            | username already taken in the channel                    |
-| 5    | `NoSubscriberIdAvailable`  | no subscriber id free in the 1000-1999 auto-assign range |
+| Code | Name                       | Meaning                                                             |
+| ---- | -------------------------- | ------------------------------------------------------------------- |
+| 1    | `SubscriberIdIsRegistered` | subscriber id already registered                                    |
+| 2    | `SubscriberNotFound`       | subscriber not found in the given channel                           |
+| 3    | `ChannelNotFound`          | channel not found (only the main channel is implemented)            |
+| 4    | `UsernameTaken`            | username already taken in the channel                               |
+| 5    | `NoSubscriberIdAvailable`  | no subscriber id free in the 1000-1999 auto-assign range            |
+| 6    | `SubscriberIdTakenByGroup` | subscriber id held by a group (a virtual subscriber) in the channel |
 
 ### Client ↔ client relay (`c2CEv`)
 
@@ -147,6 +156,14 @@ subscriber's `from` at registration — and **rewrites the envelope's `to`**
 to the resolved destination. `from` and the payload pass through
 unchanged. An unknown channel yields a `ChannelNotFound` error; an
 unknown subscriber in it yields `SubscriberNotFound`.
+
+A **group** — a virtual subscriber (see `docs/group-chat.md`) — is not
+a relay destination: it has no learned address, so a c2c event addressed
+to one fails with `SubscriberNotFound` like any unroutable destination —
+and when the event carries an SDP **offer** (the shape of a client
+trying to open a session with the group, e.g. the user opening a group
+chat in the browser), the SS additionally logs `group chat unimplemented
+(todo)` to the console.
 
 `sessionDesc`/`rtcICECandidate` traffic is produced and consumed by the
 perfect negotiators on each end (`negotiate.ts` in the browser,
