@@ -1,7 +1,9 @@
 .DS_Store
 bin/
-.env
-.env.local
+/deployment/dn42/.env
+/.env
+/.env.local
+/.env.proxy
 /serverConfig.xml
 signing/key.pem
 coverage.out
