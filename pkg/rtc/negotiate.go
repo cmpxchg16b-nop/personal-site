@@ -53,8 +53,10 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/rand"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/pion/webrtc/v4"
@@ -182,30 +184,55 @@ type PerfectNegotiator struct {
 	// local carries the pion callbacks' work to the Negotiate loop; see
 	// localEvent.
 	local chan localEvent
+
+	// ICE recovery is owned by the Negotiate loop too. The timer channel is nil
+	// while no restart is scheduled, disabling that select case.
+	iceConnectedOnce   bool
+	iceRecovering      bool
+	iceRestartPending  bool
+	iceRestartAttempts int
+	iceRestartTimer    *time.Timer
+	iceRestartTimerC   <-chan time.Time
+
+	// These are fields rather than package constants so tests can shorten the
+	// waits and make jitter deterministic without changing production defaults.
+	iceDisconnectGrace time.Duration
+	iceRetryBase       time.Duration
+	iceRetryMax        time.Duration
+	iceRandom          func() float64
+	// iceStateReader follows n.pc across rebuilds. Tests replace it to model a
+	// transport failure while driving the real negotiation and offer path.
+	iceStateReader func() webrtc.ICEConnectionState
 }
 
-// localEventBuffer bounds how many callback deliveries may pile up
-// while the loop is busy; far more than a gathering round can produce.
-const localEventBuffer = 64
+const (
+	// localEventBuffer bounds how many callback deliveries may pile up while
+	// the loop is busy; far more than a gathering round can produce.
+	localEventBuffer = 64
 
-// localEvent is one piece of work a pion callback hands to the
-// Negotiate loop: either a pending negotiation-needed signal or one
-// locally gathered ICE candidate. Funneling both through a single
-// channel keeps every access of the perfect-negotiation state and the
-// PeerConnection on the loop goroutine, so the pattern's state machine
-// stays as single-threaded as its browser original.
+	defaultICEDisconnectGrace = 3 * time.Second
+	defaultICERetryBase       = 2 * time.Second
+	defaultICERetryMax        = 30 * time.Second
+)
+
+// localEvent is one piece of work a pion callback hands to the Negotiate
+// loop: negotiation-needed, a gathered candidate, or an ICE state change.
+// source identifies the originating connection, so any queued callback from a
+// connection replaced during glare cannot affect its replacement.
 type localEvent struct {
 	negotiationNeeded bool
 	candidate         *webrtc.ICECandidate
+	source            *webrtc.PeerConnection
+	iceState          *webrtc.ICEConnectionState
 }
 
 // NewPerfectNegotiator constructs a PerfectNegotiator negotiating on pc
 // between options.SelfSubscriber and options.PeerSubscriber.
 //
 // The caller keeps ownership of pc — tracks, OnTrack, data channels,
-// closing, etc. PerfectNegotiator only takes over OnNegotiationNeeded
-// and OnICECandidate, and it does so HERE, in the constructor, not in
-// Negotiate: pion drops a negotiation-needed event fired while no
+// closing, etc. PerfectNegotiator takes over OnNegotiationNeeded,
+// OnICECandidate, and OnICEConnectionStateChange, and it does so HERE, in the
+// constructor, not in Negotiate: pion drops a negotiation-needed event fired while no
 // handler is attached (the browser re-fires it on the next task), so
 // attaching in Negotiate would lose every pc change made between
 // construction and the loop's start. Construct the negotiator before
@@ -232,12 +259,19 @@ func NewPerfectNegotiator(pc *webrtc.PeerConnection, options PerfectNegotiatorOp
 		logger = slog.Default()
 	}
 	n := &PerfectNegotiator{
-		pc:      pc,
-		options: options,
-		logger:  logger,
-		Polite:  options.SelfSubscriber < options.PeerSubscriber,
-		local:   make(chan localEvent, localEventBuffer),
-		done:    make(chan struct{}),
+		pc:                 pc,
+		options:            options,
+		logger:             logger,
+		Polite:             options.SelfSubscriber < options.PeerSubscriber,
+		local:              make(chan localEvent, localEventBuffer),
+		done:               make(chan struct{}),
+		iceDisconnectGrace: defaultICEDisconnectGrace,
+		iceRetryBase:       defaultICERetryBase,
+		iceRetryMax:        defaultICERetryMax,
+		iceRandom:          rand.Float64,
+	}
+	n.iceStateReader = func() webrtc.ICEConnectionState {
+		return n.pc.ICEConnectionState()
 	}
 	n.attach(pc)
 	return n, nil
@@ -255,9 +289,19 @@ func (n *PerfectNegotiator) Negotiate(ctx context.Context, ssEvIn <-chan *ss.Sig
 	// through this run's done now.
 	n.done = make(chan struct{})
 	n.attach(n.pc)
+	n.stopICERestartTimer()
+	n.iceConnectedOnce = false
+	n.iceRecovering = false
+	n.iceRestartPending = false
+	n.iceRestartAttempts = 0
+	n.handleICEConnectionState(n.currentICEState())
 	defer func() {
 		n.pc.OnNegotiationNeeded(nil)
 		n.pc.OnICECandidate(nil)
+		n.pc.OnICEConnectionStateChange(nil)
+		n.stopICERestartTimer()
+		n.iceRecovering = false
+		n.iceRestartPending = false
 		close(n.done)
 	}()
 
@@ -274,25 +318,34 @@ func (n *PerfectNegotiator) Negotiate(ctx context.Context, ssEvIn <-chan *ss.Sig
 			n.handle(ctx, ev, ssEvOut)
 		case le := <-n.local:
 			n.handleLocal(ctx, le, ssEvOut)
+		case <-n.iceRestartTimerC:
+			n.handleICERestartTimer(ctx, ssEvOut)
 		}
 	}
 }
 
-// attach wires the negotiator's pion callbacks on pc: both only
-// funnel work into the Negotiate loop, aborting once done closes. The
-// done channel is captured by value — pion fires the callbacks on its
-// own goroutines, which must not read the (reassigned per run) field.
+// attach wires the negotiator's pion callbacks on pc: all funnel work into
+// the Negotiate loop, aborting once done closes. The done channel and pc are
+// captured by value — pion fires callbacks on its own goroutines, which must
+// not read the (reassigned per run) done field or confuse an old connection's
+// ICE state with the current one's.
 func (n *PerfectNegotiator) attach(pc *webrtc.PeerConnection) {
 	done := n.done
 	pc.OnNegotiationNeeded(func() {
 		select {
-		case n.local <- localEvent{negotiationNeeded: true}:
+		case n.local <- localEvent{source: pc, negotiationNeeded: true}:
 		case <-done:
 		}
 	})
 	pc.OnICECandidate(func(candidate *webrtc.ICECandidate) {
 		select {
-		case n.local <- localEvent{candidate: candidate}:
+		case n.local <- localEvent{source: pc, candidate: candidate}:
+		case <-done:
+		}
+	})
+	pc.OnICEConnectionStateChange(func(state webrtc.ICEConnectionState) {
+		select {
+		case n.local <- localEvent{source: pc, iceState: &state}:
 		case <-done:
 		}
 	})
@@ -300,9 +353,16 @@ func (n *PerfectNegotiator) attach(pc *webrtc.PeerConnection) {
 
 // handleLocal runs one piece of work handed over by a pion callback.
 func (n *PerfectNegotiator) handleLocal(ctx context.Context, le localEvent, ssEvOut chan<- *ss.SignallingEvent) {
+	if le.source != nil && le.source != n.pc {
+		return
+	}
 	switch {
+	case le.iceState != nil:
+		n.handleICEConnectionState(*le.iceState)
 	case le.negotiationNeeded:
-		n.makeOffer(ctx, ssEvOut)
+		// A media/data-channel renegotiation can satisfy a pending ICE restart;
+		// there is no reason to send a second restart offer immediately after it.
+		n.makeOffer(ctx, ssEvOut, n.iceRestartPending)
 	case le.candidate != nil:
 		// ToJSON yields exactly the browser-compatible
 		// ICECandidateInit wire shape.
@@ -317,35 +377,42 @@ func (n *PerfectNegotiator) handleLocal(ctx context.Context, le localEvent, ssEv
 	}
 }
 
-// makeOffer is the negotiation-needed path: create an offer, set it
-// locally, and push it to the peer.
-func (n *PerfectNegotiator) makeOffer(ctx context.Context, ssEvOut chan<- *ss.SignallingEvent) {
-	// pion fires negotiation-needed only from the stable state, but the
-	// event is processed asynchronously through the loop: an incoming
-	// offer may have been applied in the meantime. Offering outside the
-	// stable state would corrupt the exchange, and pion re-fires
-	// negotiation-needed once the state returns to stable, so skipping
-	// here is safe.
+// makeOffer creates an offer, sets it locally, and pushes it to the peer.
+// iceRestart requests fresh ICE credentials. Its bool reports whether an offer
+// reached the wire; a pending ICE restart stays latched until that happens.
+func (n *PerfectNegotiator) makeOffer(ctx context.Context, ssEvOut chan<- *ss.SignallingEvent, iceRestart bool) bool {
+	// pion fires negotiation-needed only from the stable state, but the event
+	// is processed asynchronously: an incoming offer may have been applied in
+	// the meantime. Unlike ordinary negotiation-needed (which pion re-fires), a
+	// custom ICE-restart request must remain pending when this guard fails.
 	if n.pc.SignalingState() != webrtc.SignalingStateStable {
-		return
+		return false
 	}
 	n.makingOffer = true
 	defer func() { n.makingOffer = false }()
-	offer, err := n.pc.CreateOffer(nil)
+	var options *webrtc.OfferOptions
+	if iceRestart {
+		options = &webrtc.OfferOptions{ICERestart: true}
+	}
+	offer, err := n.pc.CreateOffer(options)
 	if err != nil {
-		n.logger.Error("rtc: create offer", "err", err)
-		return
+		n.logger.Error("rtc: create offer", "iceRestart", iceRestart, "err", err)
+		return false
 	}
 	if err := n.pc.SetLocalDescription(offer); err != nil {
-		n.logger.Error("rtc: set local description", "err", err)
-		return
+		n.logger.Error("rtc: set local description", "iceRestart", iceRestart, "err", err)
+		return false
 	}
 	local := n.pc.LocalDescription()
 	if local == nil {
-		return
+		return false
 	}
-	n.logger.Info("rtc: send offer", "peer", n.options.PeerSubscriber, "sdp", sdpSummary(local.SDP))
+	n.logger.Info("rtc: send offer", "peer", n.options.PeerSubscriber, "iceRestart", iceRestart, "sdp", sdpSummary(local.SDP))
 	n.sendToPeer(ctx, ssEvOut, &ss.ClientToClientEv{SessionDesc: local})
+	if iceRestart {
+		n.iceRestartPending = false
+	}
+	return true
 }
 
 // handle handles one inbound signalling event; non-c2c or foreign-peer
@@ -362,6 +429,11 @@ func (n *PerfectNegotiator) handle(ctx context.Context, ev *ss.SignallingEvent, 
 		n.handleSessionDesc(ctx, c2c.SessionDesc, ssEvOut)
 	} else if c2c.RTCICECandidate != nil {
 		n.handleICECandidate(c2c.RTCICECandidate)
+	} else if c2c.ICERestartRequest && n.Polite {
+		// Only the polite peer originates automated restart offers. The
+		// requester retains its watchdog, so there is no local retry timer here.
+		n.iceRestartPending = true
+		n.makeOffer(ctx, ssEvOut, true)
 	}
 }
 
@@ -423,6 +495,13 @@ func (n *PerfectNegotiator) handleSessionDesc(ctx context.Context, desc *webrtc.
 		n.logger.Info("rtc: send answer", "peer", n.options.PeerSubscriber, "sdp", sdpSummary(local.SDP))
 		n.sendToPeer(ctx, ssEvOut, &ss.ClientToClientEv{SessionDesc: local})
 	}
+
+	// An ICE-restart timer can fire while another offer/answer is in flight.
+	// Pion has no browser-style restartIce() latch, so retry the pending offer
+	// explicitly as soon as the remote description returns us to stable.
+	if n.iceRestartPending && n.pc.SignalingState() == webrtc.SignalingStateStable {
+		n.makeOffer(ctx, ssEvOut, true)
+	}
 }
 
 // handleICECandidate applies one inbound trickle ICE candidate.
@@ -434,6 +513,123 @@ func (n *PerfectNegotiator) handleICECandidate(candidate *webrtc.ICECandidateIni
 			n.logger.Error("rtc: add ice candidate", "err", err)
 		}
 	}
+}
+
+// handleICEConnectionState arms recovery only after an initially usable
+// connection. Disconnected gets a grace period; failed accelerates any pending
+// attempt. Checking is deliberately not an outcome: the active watchdog keeps
+// running until ICE connects or the session shuts down.
+func (n *PerfectNegotiator) handleICEConnectionState(state webrtc.ICEConnectionState) {
+	switch state {
+	case webrtc.ICEConnectionStateConnected, webrtc.ICEConnectionStateCompleted:
+		if n.iceRecovering {
+			n.logger.Info("rtc: ICE recovered", "peer", n.options.PeerSubscriber, "restarts", n.iceRestartAttempts)
+		}
+		n.iceConnectedOnce = true
+		n.iceRecovering = false
+		n.iceRestartPending = false
+		n.iceRestartAttempts = 0
+		n.stopICERestartTimer()
+	case webrtc.ICEConnectionStateDisconnected:
+		if !n.iceConnectedOnce || n.iceRecovering {
+			return
+		}
+		n.iceRecovering = true
+		n.logger.Info("rtc: ICE disconnected, restart scheduled", "peer", n.options.PeerSubscriber, "delay", n.iceDisconnectGrace)
+		n.scheduleICERestart(n.iceDisconnectGrace)
+	case webrtc.ICEConnectionStateFailed:
+		if !n.iceConnectedOnce || (n.iceRecovering && n.iceRestartAttempts > 0) {
+			return
+		}
+		n.iceRecovering = true
+		n.stopICERestartTimer()
+		n.scheduleICERestart(0)
+	case webrtc.ICEConnectionStateClosed:
+		n.iceRecovering = false
+		n.iceRestartPending = false
+		n.stopICERestartTimer()
+	}
+}
+
+// handleICERestartTimer requests one restart offer and schedules the next
+// watchdog regardless of whether signaling was stable. The pending latch keeps
+// the request alive across an in-flight offer/answer; only a connected state or
+// teardown cancels the retry sequence.
+func (n *PerfectNegotiator) handleICERestartTimer(ctx context.Context, ssEvOut chan<- *ss.SignallingEvent) {
+	n.iceRestartTimer = nil
+	n.iceRestartTimerC = nil
+	if !n.iceRecovering {
+		return
+	}
+	state := n.currentICEState()
+	switch state {
+	case webrtc.ICEConnectionStateConnected, webrtc.ICEConnectionStateCompleted:
+		// The timer and pion's connected/completed callback can become ready
+		// together. Do not restart a healthy transport merely because the timer
+		// won the select before that callback was processed.
+		n.handleICEConnectionState(state)
+		return
+	case webrtc.ICEConnectionStateClosed:
+		n.handleICEConnectionState(webrtc.ICEConnectionStateClosed)
+		return
+	}
+
+	if n.Polite {
+		n.iceRestartPending = true
+		n.logger.Info("rtc: restarting ICE", "peer", n.options.PeerSubscriber, "attempt", n.iceRestartAttempts+1)
+		n.makeOffer(ctx, ssEvOut, true)
+	} else {
+		n.logger.Info("rtc: requesting ICE restart", "peer", n.options.PeerSubscriber, "attempt", n.iceRestartAttempts+1)
+		n.sendToPeer(ctx, ssEvOut, &ss.ClientToClientEv{ICERestartRequest: true})
+	}
+	delay := n.nextICERestartDelay()
+	n.iceRestartAttempts++
+	n.scheduleICERestart(delay)
+}
+
+func (n *PerfectNegotiator) currentICEState() webrtc.ICEConnectionState {
+	if n.iceStateReader != nil {
+		return n.iceStateReader()
+	}
+	return n.pc.ICEConnectionState()
+}
+
+func (n *PerfectNegotiator) scheduleICERestart(delay time.Duration) {
+	if !n.iceRecovering || n.iceRestartTimer != nil {
+		return
+	}
+	n.iceRestartTimer = time.NewTimer(delay)
+	n.iceRestartTimerC = n.iceRestartTimer.C
+}
+
+func (n *PerfectNegotiator) stopICERestartTimer() {
+	if n.iceRestartTimer != nil {
+		n.iceRestartTimer.Stop()
+		n.iceRestartTimer = nil
+	}
+	n.iceRestartTimerC = nil
+}
+
+// nextICERestartDelay returns base*2^attempt, nominally capped, with independent
+// ±20% jitter so two peers do not retry in lockstep. The loop avoids exponent
+// overflow on a connection that remains down for a long time.
+func (n *PerfectNegotiator) nextICERestartDelay() time.Duration {
+	delay := n.iceRetryBase
+	for i := 0; i < n.iceRestartAttempts && delay < n.iceRetryMax; i++ {
+		if delay > n.iceRetryMax/2 {
+			delay = n.iceRetryMax
+			break
+		}
+		delay *= 2
+	}
+	if delay > n.iceRetryMax {
+		delay = n.iceRetryMax
+	}
+	random := n.iceRandom
+	if random == nil {
+		random = rand.Float64
+	}
+	return time.Duration(float64(delay) * (0.8 + 0.4*random()))
 }
 
 // rebuildPeerConnection swaps the local peer connection for a fresh
@@ -457,8 +653,12 @@ func (n *PerfectNegotiator) rebuildPeerConnection() error {
 	n.makingOffer = false
 	n.ignoreOffer = false
 	n.isSettingRemoteAnswerPending = false
+	// The replacement has fresh ICE credentials already; an additional restart
+	// offer would be redundant. Keep the recovery watchdog until it connects.
+	n.iceRestartPending = false
 	old.OnNegotiationNeeded(nil)
 	old.OnICECandidate(nil)
+	old.OnICEConnectionStateChange(nil)
 	n.attach(fresh)
 	if err := old.Close(); err != nil {
 		n.logger.Warn("rtc: close replaced peer connection", "err", err)
@@ -505,11 +705,12 @@ func (n *PerfectNegotiator) sendToPeer(ctx context.Context, ssEvOut chan<- *ss.S
 		To:    ss.EPAddr{ServiceId: ss.WellKnownSvcIdSS},
 		MsgId: newMsgId(),
 		C2CEv: &ss.ClientToClientEv{
-			FromSubscriber:  n.options.SelfSubscriber,
-			ToSubscriber:    n.options.PeerSubscriber,
-			ChannelId:       n.options.ChannelId,
-			SessionDesc:     payload.SessionDesc,
-			RTCICECandidate: payload.RTCICECandidate,
+			FromSubscriber:    n.options.SelfSubscriber,
+			ToSubscriber:      n.options.PeerSubscriber,
+			ChannelId:         n.options.ChannelId,
+			SessionDesc:       payload.SessionDesc,
+			RTCICECandidate:   payload.RTCICECandidate,
+			ICERestartRequest: payload.ICERestartRequest,
 		},
 	}
 	select {

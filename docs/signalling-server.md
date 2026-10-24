@@ -133,7 +133,7 @@ Addressed by `{channelId, fromSubscriber, toSubscriber}` and carries
 `sessionDesc` and `rtcICECandidate` (modelled with
 `github.com/pion/webrtc/v4` types — `webrtc.SessionDescription` and
 `webrtc.ICECandidateInit` — which marshal to the exact browser JSON
-shapes), plus out-of-band `ping`/`pong`.
+shapes), `iceRestartRequest`, plus out-of-band `ping`/`pong`.
 
 Think of a subscriber id as an IP address and the channel as the VLAN it
 lives in: a subscriber id alone does not determine an endpoint, only
@@ -151,8 +151,16 @@ unknown subscriber in it yields `SubscriberNotFound`.
 `sessionDesc`/`rtcICECandidate` traffic is produced and consumed by the
 perfect negotiators on each end (`negotiate.ts` in the browser,
 `pkg/rtc` in Go). The pattern is the MDN perfect negotiation — the
-lexicographically smaller subscriber id is the polite peer — with two
-Go-side points the pattern leaves to the implementation:
+lexicographically smaller subscriber id is the polite peer.
+
+ICE auto-recovery gives automated restart offers a single owner: either side
+can detect a dead transport, but only the polite peer originates the restart.
+An impolite peer sends `iceRestartRequest` and retries that request with capped
+backoff until ICE reconnects; the polite peer answers the request with its
+normal restart-offer path. This avoids a simultaneous-restart glare rebuilding
+only one side of an established pion session.
+
+Two Go-side points the pattern leaves to the implementation:
 
 - **Yielding to a colliding offer**: pion cannot roll a pending local
   offer back (the browser's implicit rollback has no pion counterpart),

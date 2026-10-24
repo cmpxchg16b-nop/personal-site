@@ -18,6 +18,7 @@
  * wires one negotiator per peer to it.
  */
 
+import { IceRestartController } from "./ice_restart";
 import {
   WELLKNOWN_SVC_ID_SS,
   type ChannelId,
@@ -102,8 +103,9 @@ export class PerfectNegotiator implements RTCNegotiator {
   /**
    * @param pc the peer connection to negotiate on. The caller keeps
    *   ownership of it — tracks, `ontrack`, data channels, closing, etc.
-   *   PerfectNegotiator only takes over `onnegotiationneeded` and
-   *   `onicecandidate` for the duration of negotiate().
+   *   PerfectNegotiator only takes over `onnegotiationneeded`,
+   *   `onicecandidate`, and `oniceconnectionstatechange` for the duration of
+   *   negotiate().
    */
   constructor(
     private readonly pc: RTCPeerConnection,
@@ -151,6 +153,21 @@ export class PerfectNegotiator implements RTCNegotiator {
         rtcICECandidate: candidate ?? { candidate: "" },
       }).catch(console.error);
     };
+    const onRestartError = (err: unknown) =>
+      console.error(`${this.tag()}: ICE restart failed`, err);
+    const iceRestart = new IceRestartController(this.pc, {
+      // Only the polite peer originates automated restart offers. Letting both
+      // sides offer together would create glare on every shared outage.
+      restart: this.polite
+        ? () => this.pc.restartIce()
+        : () => {
+            this.sendToPeer({ iceRestartRequest: true }).catch(onRestartError);
+          },
+      onRestartError,
+    });
+    this.pc.oniceconnectionstatechange = () =>
+      iceRestart.handleState(this.pc.iceConnectionState);
+    iceRestart.handleState(this.pc.iceConnectionState);
 
     // Incoming half: consume signalling events until the stream closes.
     try {
@@ -164,6 +181,8 @@ export class PerfectNegotiator implements RTCNegotiator {
     } finally {
       this.pc.onnegotiationneeded = null;
       this.pc.onicecandidate = null;
+      this.pc.oniceconnectionstatechange = null;
+      iceRestart.close();
       reader.releaseLock();
       writer.releaseLock();
       this.writer = undefined;
@@ -221,6 +240,10 @@ export class PerfectNegotiator implements RTCNegotiator {
             throw err;
           }
         }
+      } else if (c2c.iceRestartRequest && this.polite) {
+        // restartIce() latches through any in-flight negotiation. The
+        // requester keeps the recovery watchdog, so one request is enough.
+        this.pc.restartIce();
       }
     } catch (err) {
       logSdp(this.tag(), "FAILED", c2c.sessionDesc, {
@@ -242,7 +265,10 @@ export class PerfectNegotiator implements RTCNegotiator {
 
   /** Wraps a c2c payload into the SS envelope and queues it for sending. */
   private async sendToPeer(
-    payload: Pick<ClientToClientEv, "sessionDesc" | "rtcICECandidate">,
+    payload: Pick<
+      ClientToClientEv,
+      "sessionDesc" | "rtcICECandidate" | "iceRestartRequest"
+    >,
   ): Promise<void> {
     if (!this.writer) {
       return;

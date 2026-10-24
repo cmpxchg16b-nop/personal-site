@@ -255,6 +255,9 @@ export interface ClientToClientEv {
    */
   rtcICECandidate?: RTCIceCandidateInit;
 
+  /** Asks the polite peer to originate an ICE-restart offer. */
+  iceRestartRequest?: boolean;
+
   /** out of band ping message */
   ping?: PingPongMsg;
 

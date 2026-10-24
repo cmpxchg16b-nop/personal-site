@@ -314,6 +314,11 @@ type ClientToClientEv struct {
 	// same JSON shape as the browser's RTCIceCandidateInit.
 	RTCICECandidate *webrtc.ICECandidateInit `json:"rtcICECandidate,omitempty"`
 
+	// ICERestartRequest asks the polite peer to originate an ICE-restart
+	// offer. Automated recovery gives only that peer restart-offer ownership,
+	// preventing simultaneous restarts from colliding.
+	ICERestartRequest bool `json:"iceRestartRequest,omitempty"`
+
 	// Ping is an out-of-band ping message.
 	Ping *PingPongMsg `json:"ping,omitempty"`
 
