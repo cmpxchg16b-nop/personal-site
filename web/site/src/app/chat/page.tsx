@@ -40,13 +40,25 @@ const NO_UNREAD: Record<string, number> = {};
 export default function ChatPage() {
   // Latency monitor: the latest answered ping of the signalling server
   // connection, re-measured once a second.
-  const { channels, me } = useSignalling();
+  const {
+    channels,
+    me,
+    listingRevision,
+    completeMembershipChannelIds,
+    registrationFailed,
+  } = useSignalling();
 
   // The peer sessions, and their live connection states by channel and
   // peer — the open conversation's presence line renders the latter (the
   // SS listing's online flag only says the peer's signalling client is
   // connected, nearly always true).
-  const { sessions, connectionStates } = usePeerSessions(me, channels);
+  const { sessions, connectionStates } = usePeerSessions(
+    me,
+    channels,
+    listingRevision,
+    completeMembershipChannelIds,
+    registrationFailed,
+  );
   const { dcMsgs, sendTo } = useDataChannel(me, sessions);
   const { sendFile, getFileByFileId } = useBinaryDataChannel(sessions);
 

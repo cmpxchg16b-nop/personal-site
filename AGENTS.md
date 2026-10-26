@@ -2,14 +2,14 @@
 
 ## Session-note workflow for substantial work
 
-For a large change or other substantial task — for example, cross-subsystem
-work, protocol or lifecycle changes, uncertain debugging, or a multi-step
-implementation — use one or more session notes as the task's living record:
+Every task must be completed end to end: start with a session note and finish
+by writing the outcome back to that note. Stopping a review loop or any other
+subtask does not stop the task. Use one or more session notes as the task's
+living record:
 
 1. **Start a new note.** Create the next numbered file in
    `.ai/memory/sessions/` (for example, `40.md`), with the usual `title` and
-   `date` frontmatter. Record the request, scope, and current status. Trivial or
-   tightly scoped changes do not require a session note.
+   `date` frontmatter. Record the request, scope, and current status.
 2. **Investigate before designing.** Read the relevant implementation and
    tests. Distinguish verified facts from assumptions and initial leads. Record
    useful findings, especially anything that could change the design.
@@ -32,3 +32,14 @@ implementation — use one or more session notes as the task's living record:
 
 The note or notes are part of the deliverable, not an optional postscript. Keep
 them factual and concise enough to remain useful to the next session.
+
+## Code-review rules
+
+1. Reviews must not be overly theoretical. Every reported issue must be
+   reproducible or confirmed directly from the code, with concrete evidence.
+2. The reviewer should make the first review round as comprehensive as possible
+   to minimize review rounds and avoid repeated, endless reworks.
+3. Minimize the number of review rounds; never maximize them. Seven rounds is a
+   hard maximum, not a target or an expected number of rounds.
+4. Use at most seven review rounds. If issues remain after the seventh round,
+   the reviewer should fix them directly instead of requesting another rework.

@@ -45,11 +45,72 @@ import { useICEServers } from "@/hooks/useICEServers";
 import { PerfectNegotiator } from "./negotiate";
 import type { SSProxy } from "./proxy";
 import { useSSProxy } from "./react";
-import type { ChannelId, ChatChannel, ChatUser, SubscriberId } from "./types";
+import type {
+  ChannelId,
+  ChatChannel,
+  ChatUser,
+  SignallingEvent,
+  SubscriberId,
+} from "./types";
 
 // peerKey indexes the session of one (channel, peer subscriber) pair.
 function peerKey(channelId: ChannelId, subscriberId: SubscriberId): string {
   return `${channelId}:${subscriberId}`;
+}
+
+// inboxKey includes the recipient so pre-registration traffic for different
+// incarnations cannot share an inbox.
+function inboxKey(
+  channelId: ChannelId,
+  self: SubscriberId,
+  peer: SubscriberId,
+): string {
+  return JSON.stringify([channelId, self, peer]);
+}
+
+// PeerInbox decouples a peer's input from the session's lifetime: an early
+// offer and membership can create the inbox in either order, and the eventual
+// negotiator reads every queued event from that one stream.
+interface PeerInbox {
+  readonly channelId: ChannelId;
+  readonly self: SubscriberId;
+  readonly peer: SubscriberId;
+  readonly stream: ReadableStream<SignallingEvent>;
+  absentListings: number;
+  enqueue(event: SignallingEvent): void;
+  close(): void;
+}
+
+function createPeerInbox(
+  channelId: ChannelId,
+  self: SubscriberId,
+  peer: SubscriberId,
+): PeerInbox {
+  let controller!: ReadableStreamDefaultController<SignallingEvent>;
+  let closed = false;
+  const stream = new ReadableStream<SignallingEvent>({
+    start: (c) => {
+      controller = c;
+    },
+    cancel: () => {
+      closed = true;
+    },
+  });
+  return {
+    channelId,
+    self,
+    peer,
+    stream,
+    absentListings: 0,
+    enqueue(event) {
+      if (!closed) controller.enqueue(event);
+    },
+    close() {
+      if (closed) return;
+      closed = true;
+      controller.close();
+    },
+  };
 }
 
 // PeerChannelHandler is called as a session's channel of the subscribed
@@ -209,6 +270,7 @@ function startPeerSession(
   self: SubscriberId,
   peer: SubscriberId,
   iceServers: RTCIceServer[],
+  inbox: PeerInbox,
   hooks: SessionHooks,
 ): PeerSession {
   const pc = new RTCPeerConnection({ iceServers });
@@ -258,9 +320,8 @@ function startPeerSession(
     selfSubscriber: self,
     peerSubscriber: peer,
   });
-  const inStream = proxy.getReadStream();
   void negotiator
-    .negotiate(inStream, proxy.getWriteStream())
+    .negotiate(inbox.stream, proxy.getWriteStream())
     .catch((err) =>
       console.error(`peersessions: negotiation with ${peer} failed`, err),
     );
@@ -268,10 +329,10 @@ function startPeerSession(
   session.close = () => {
     // The state handler goes first: close()'s queued "closed" event must
     // not report — a teardown is announced through onSessionClosed.
-    // Cancelling the inbound stream ends negotiate(), which releases its
-    // stream locks; closing the connection stops ICE and its events.
+    // Closing the inbox ends negotiate(), which releases its stream locks;
+    // closing the connection stops ICE and its events.
     pc.onconnectionstatechange = null;
-    void inStream.cancel();
+    inbox.close();
     pc.close();
     hooks.onSessionClosed(channelId, peer);
   };
@@ -290,6 +351,11 @@ function startPeerSession(
  * created with the configured servers (with none when the query fails —
  * local-network peers still connect).
  *
+ * `listingRevision` advances after every successful listing, including an
+ * unchanged one. `completeMembershipChannelIds` limits omission evidence to
+ * channels whose member pages and profiles fully resolved. A definitive
+ * `registrationFailed` ends the pre-registration pending window.
+ *
  * The returned connectionStates map carries every session's live
  * RTCPeerConnection.connectionState (channelId → peer → state), for the
  * UI's presence line; a session's entry appears with its first state
@@ -298,9 +364,17 @@ function startPeerSession(
 export function usePeerSessions(
   me: ChatUser | null,
   channels: ChatChannel[],
+  listingRevision = 0,
+  completeMembershipChannelIds: readonly ChannelId[] = [],
+  registrationFailed = false,
 ): { sessions: PeerSessions; connectionStates: PeerConnectionStates } {
   const proxy = useSSProxy();
   const sessionsRef = useRef(new Map<string, PeerSession>());
+  const peerInboxesRef = useRef(new Map<string, PeerInbox>());
+  // The async demux needs the latest address; teardown also uses the latest
+  // lifecycle to distinguish initial registration from a real replacement.
+  const lifecycleRef = useRef({ proxy, me, registrationFailed });
+  lifecycleRef.current = { proxy, me, registrationFailed };
   const [connectionStates, setConnectionStates] =
     useState<PeerConnectionStates>({});
   // The consumers' channel subscriptions by label, the teardown
@@ -389,18 +463,95 @@ export function usePeerSessions(
     return iceServersQuery.isError ? [] : null;
   }, [iceServersQuery.data, iceServersQuery.isError]);
 
+  // A polite peer can offer before our membership listing has created the
+  // impolite session. Route every inbound c2c event through a per-peer inbox:
+  // either that offer or membership creates the inbox first, and both paths
+  // then use the same stream, so neither ordering loses SDP or candidates.
+  // Answers/candidates without an inbox cannot start a session and are ignored.
+  useEffect(() => {
+    if (proxy === null) return;
+    const inboxes = peerInboxesRef.current;
+    const reader = proxy.getReadStream().getReader();
+    let live = true;
+    let readerActive = true;
+    void (async () => {
+      try {
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done || !live) return;
+          const c2c = value.c2CEv;
+          if (c2c === undefined) continue;
+          const current = lifecycleRef.current.me;
+          if (lifecycleRef.current.registrationFailed && current === null) {
+            continue;
+          }
+          if (
+            current?.subscriberId !== undefined &&
+            current.channelId !== undefined &&
+            (c2c.channelId !== current.channelId ||
+              c2c.toSubscriber !== current.subscriberId)
+          ) {
+            continue;
+          }
+          const key = inboxKey(
+            c2c.channelId,
+            c2c.toSubscriber,
+            c2c.fromSubscriber,
+          );
+          let inbox = inboxes.get(key);
+          if (inbox === undefined) {
+            if (c2c.sessionDesc?.type !== "offer") continue;
+            inbox = createPeerInbox(
+              c2c.channelId,
+              c2c.toSubscriber,
+              c2c.fromSubscriber,
+            );
+            inboxes.set(key, inbox);
+          }
+          if (c2c.sessionDesc?.type === "offer") {
+            // A fresh offer is newer liveness evidence than earlier listings.
+            inbox.absentListings = 0;
+          }
+          inbox.enqueue(value);
+        }
+      } catch (err) {
+        if (live) console.error("peersessions: signalling read failed", err);
+      } finally {
+        readerActive = false;
+        reader.releaseLock();
+      }
+    })();
+    return () => {
+      live = false;
+      if (readerActive) void reader.cancel().catch(() => {});
+      for (const inbox of inboxes.values()) inbox.close();
+      inboxes.clear();
+    };
+  }, [proxy]);
+
   // Sessions are bound to their connection and to the own subscription:
   // a proxy swap or an identity change tears every session down; the
   // reconcile effect below then rebuilds from the current listing.
   useEffect(() => {
     const sessions = sessionsRef.current;
+    const inboxes = peerInboxesRef.current;
     const channelWaiters = channelWaitersRef.current;
     const resetHandlers = resetHandlersRef.current;
     return () => {
+      const initialRegistration =
+        me === null &&
+        lifecycleRef.current.proxy === proxy &&
+        lifecycleRef.current.me !== null;
+      // Initial registration must not discard offers accepted while the
+      // recipient was unknown. Unmount and genuine proxy/identity replacement
+      // still tear everything down.
+      if (initialRegistration) return;
       for (const session of sessions.values()) {
         session.close();
       }
       sessions.clear();
+      for (const inbox of inboxes.values()) inbox.close();
+      inboxes.clear();
       // Anything still waiting on a channel is released, and the
       // consumers are told every session is gone.
       for (const byLabel of channelWaiters.values()) {
@@ -412,7 +563,7 @@ export function usePeerSessions(
       for (const cb of resetHandlers) cb(null);
       setConnectionStates({});
     };
-  }, [proxy, me]);
+  }, [proxy, me, registrationFailed]);
 
   // Reconcile the sessions with the current member listing: open one
   // session per newly seen member of the own channel, close the ones
@@ -426,12 +577,20 @@ export function usePeerSessions(
       proxy === null ||
       me === null ||
       me.channelId === undefined ||
-      me.subscriberId === undefined ||
-      iceServers === null
+      me.subscriberId === undefined
     ) {
       return;
     }
     const self = me.subscriberId;
+    const inboxes = peerInboxesRef.current;
+    // Registration validates offers accepted before the recipient was known.
+    for (const [key, inbox] of inboxes) {
+      if (inbox.channelId !== me.channelId || inbox.self !== self) {
+        inbox.close();
+        inboxes.delete(key);
+      }
+    }
+    if (iceServers === null) return;
     const want = new Set<string>();
     for (const channel of channels) {
       if (channel.id !== me.channelId) {
@@ -445,12 +604,20 @@ export function usePeerSessions(
         const key = peerKey(channel.id, peer);
         want.add(key);
         if (!sessions.has(key)) {
+          const id = inboxKey(channel.id, self, peer);
+          let inbox = inboxes.get(id);
+          if (inbox === undefined) {
+            inbox = createPeerInbox(channel.id, self, peer);
+            inboxes.set(id, inbox);
+          }
+          inbox.absentListings = 0;
           const session = startPeerSession(
             proxy,
             channel.id,
             self,
             peer,
             iceServers,
+            inbox,
             sessionHooks,
           );
           sessions.set(key, session);
@@ -464,9 +631,33 @@ export function usePeerSessions(
       if (!want.has(key)) {
         session.close();
         sessions.delete(key);
+        inboxes.delete(inboxKey(session.channelId, self, session.peer));
       }
     }
-  }, [proxy, me, channels, iceServers, sessionHooks]);
+    if (!completeMembershipChannelIds.includes(me.channelId)) return;
+    // One absent listing may have been assembled before the offer arrived.
+    // Retire only a pending inbox omitted by two consecutive own-channel
+    // listings; a fresh offer resets this evidence in the demux above.
+    for (const [key, inbox] of inboxes) {
+      if (sessions.has(peerKey(inbox.channelId, inbox.peer))) {
+        inbox.absentListings = 0;
+        continue;
+      }
+      inbox.absentListings += 1;
+      if (inbox.absentListings >= 2) {
+        inbox.close();
+        inboxes.delete(key);
+      }
+    }
+  }, [
+    proxy,
+    me,
+    channels,
+    listingRevision,
+    completeMembershipChannelIds,
+    iceServers,
+    sessionHooks,
+  ]);
 
   const getChannel = useCallback(
     (label: string, channelId: ChannelId, peer: SubscriberId) =>

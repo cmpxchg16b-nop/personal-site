@@ -148,12 +148,20 @@ export interface SignallingState {
    * available (no connection yet, or no round has succeeded).
    */
   channels: ChatChannel[];
+  /** Successful listing round on the current proxy; changes even when the
+   * channel array is unchanged. */
+  listingRevision: number;
+  /** Channels whose complete member pages and every member profile resolved. */
+  completeMembershipChannelIds: readonly ChannelId[];
+  /** Registration finished without a usable identity on the current proxy. */
+  registrationFailed: boolean;
 }
 
 // NO_CHANNELS is the stable empty list SignallingState.channels falls
 // back to, so consumers can depend on it without re-running effects on
 // every render.
 const NO_CHANNELS: ChatChannel[] = [];
+const NO_COMPLETE_MEMBERSHIP_CHANNELS: ChannelId[] = [];
 
 // PING_INTERVAL_MS is how often the SS is pinged while connected —
 // deliberately well below the server's default subscriber aging (10s), so
@@ -224,6 +232,13 @@ async function awaitReplyOn(
   }
 }
 
+interface PagedReplies {
+  events: SignallingEvent[];
+  // The reply that ended paging, or null on timeout/EOF. Callers decide
+  // whether that terminal reply proves successful completion.
+  terminal: SignallingEvent | null;
+}
+
 // awaitRepliesOn is the paged-reply counterpart of awaitReplyOn: it
 // collects every event correlated (via inReplyTo) to msgId until `done`
 // accepts one of them or the timeout fires; the stream is cancelled —
@@ -233,7 +248,7 @@ async function awaitRepliesOn(
   msgId: string,
   timeoutMs: number,
   done: (ev: SignallingEvent) => boolean,
-): Promise<SignallingEvent[]> {
+): Promise<PagedReplies> {
   const reader = stream.getReader();
   const collected: SignallingEvent[] = [];
   let timeoutId: number | undefined;
@@ -246,14 +261,14 @@ async function awaitRepliesOn(
         }),
       ]);
       if (raced === null || raced.done) {
-        return collected;
+        return { events: collected, terminal: null };
       }
       if (raced.value.inReplyTo !== msgId) {
         continue;
       }
       collected.push(raced.value);
       if (done(raced.value)) {
-        return collected;
+        return { events: collected, terminal: raced.value };
       }
     }
   } finally {
@@ -326,11 +341,21 @@ async function registerSubscriber(
 // false (an err page stops the read early), then listChannel per
 // discovered id, all in parallel. Channels whose resolution fails are
 // dropped from the result.
+interface ChannelListing {
+  channels: ChatChannel[];
+  completeMembershipChannelIds: ChannelId[];
+}
+
+interface ChannelResolution {
+  channel: ChatChannel;
+  membershipComplete: boolean;
+}
+
 async function listChannels(
   read: () => ReadableStream<SignallingEvent>,
   send: (ev: SignallingEvent) => Promise<void>,
   selfSubscriberId: SubscriberId | null,
-): Promise<ChatChannel[]> {
+): Promise<ChannelListing> {
   const listMsgId = crypto.randomUUID();
   const pagesPromise = awaitRepliesOn(
     read(),
@@ -347,15 +372,23 @@ async function listChannels(
     msgId: listMsgId,
     c2SEv: { listChannels: {} },
   });
-  const ids = (await pagesPromise).flatMap(
+  const pages = await pagesPromise;
+  const ids = pages.events.flatMap(
     (p) => p.s2CEv?.channelListResult?.channels ?? [],
   );
-  const channels = await Promise.all(
-    ids.map((channelId) =>
-      listChannel(read, send, channelId, selfSubscriberId),
-    ),
-  );
-  return channels.filter((c): c is ChatChannel => c !== null);
+  const resolved = (
+    await Promise.all(
+      ids.map((channelId) =>
+        listChannel(read, send, channelId, selfSubscriberId),
+      ),
+    )
+  ).filter((c): c is ChannelResolution => c !== null);
+  return {
+    channels: resolved.map((c) => c.channel),
+    completeMembershipChannelIds: resolved
+      .filter((c) => c.membershipComplete)
+      .map((c) => c.channel.id),
+  };
 }
 
 // listChannel resolves one channel id into a ChatChannel: a
@@ -372,7 +405,7 @@ async function listChannel(
   send: (ev: SignallingEvent) => Promise<void>,
   channelId: ChannelId,
   selfSubscriberId: SubscriberId | null,
-): Promise<ChatChannel | null> {
+): Promise<ChannelResolution | null> {
   const profileMsgId = crypto.randomUUID();
   const profilePromise = awaitReplyOn(
     read(),
@@ -405,9 +438,12 @@ async function listChannel(
     msgId: mbsMsgId,
     c2SEv: { listChannelMembers: { channelId } },
   });
-  const memberIds = (await mbsPromise)
+  const memberReplies = await mbsPromise;
+  const memberIds = memberReplies.events
     .flatMap((p) => p.s2CEv?.channelMbsListResult?.members ?? [])
     .filter((id) => id !== selfSubscriberId);
+  const pagesComplete =
+    memberReplies.terminal?.s2CEv?.channelMbsListResult?.hasMore === false;
 
   const members = await Promise.all(
     memberIds.map(async (subscriberId) => {
@@ -438,9 +474,15 @@ async function listChannel(
     }),
   );
   return {
-    id: profile.channelId,
-    name: profile.channelName,
-    members: members.filter((m): m is ChatUser => m !== null),
+    channel: {
+      id: profile.channelId,
+      name: profile.channelName,
+      members: members.filter((m): m is ChatUser => m !== null),
+    },
+    // A partial member page or a dropped profile is fine for best-effort UI,
+    // but cannot prove that an unrendered member is absent.
+    membershipComplete:
+      pagesComplete && members.every((member) => member !== null),
   };
 }
 
@@ -497,12 +539,17 @@ export function useSignalling(): SignallingState {
     proxy: SSProxy;
     me: ChatUser;
   } | null>(null);
+  const [registrationFailed, setRegistrationFailed] = useState<{
+    proxy: SSProxy;
+  } | null>(null);
   // The channel listing follows the same rule as lastPing: recorded
   // together with the proxy it was discovered on, so a stale listing
   // never outlives its connection.
   const [listed, setListed] = useState<{
     proxy: SSProxy;
     channels: ChatChannel[];
+    completeMembershipChannelIds: ChannelId[];
+    revision: number;
   } | null>(null);
 
   useEffect(() => {
@@ -665,6 +712,11 @@ export function useSignalling(): SignallingState {
         return null;
       }
     })();
+    void registration.then((reg) => {
+      if (live && (reg === null || reg.userId === null)) {
+        setRegistrationFailed({ proxy });
+      }
+    });
 
     // Renew the channel membership every CHANNEL_KEEPALIVE_INTERVAL_MS,
     // starting once the registration resolves. Fire-and-forget: the SS
@@ -722,21 +774,36 @@ export function useSignalling(): SignallingState {
       listing = true;
       try {
         const reg = await registration;
-        const channels = await listChannels(
+        const listing = await listChannels(
           () => proxy.getReadStream(),
           (ev) => writer.write(ev),
           reg?.subscriberId ?? null,
         );
         if (!live) return;
-        // Keep the previous listing's identity when nothing changed, so an
-        // unchanged round never re-renders consumers.
-        setListed((prev) =>
-          prev !== null &&
-          prev.proxy === proxy &&
-          sameChannels(prev.channels, channels)
-            ? prev
-            : { proxy, channels },
-        );
+        // Preserve an unchanged channel array for consumers that depend on
+        // its identity, but advance the revision on every successful round so
+        // lifecycle consumers also observe repeated membership evidence.
+        setListed((prev) => {
+          const current = prev !== null && prev.proxy === proxy ? prev : null;
+          if (
+            current !== null &&
+            sameChannels(current.channels, listing.channels)
+          ) {
+            return {
+              proxy,
+              channels: current.channels,
+              completeMembershipChannelIds:
+                listing.completeMembershipChannelIds,
+              revision: current.revision + 1,
+            };
+          }
+          return {
+            proxy,
+            channels: listing.channels,
+            completeMembershipChannelIds: listing.completeMembershipChannelIds,
+            revision: 1,
+          };
+        });
       } catch (err) {
         if (live) console.error("signalling: channel listing failed", err);
       } finally {
@@ -772,5 +839,15 @@ export function useSignalling(): SignallingState {
     me: proxy !== null && registered?.proxy === proxy ? registered.me : null,
     channels:
       proxy !== null && listed?.proxy === proxy ? listed.channels : NO_CHANNELS,
+    listingRevision:
+      proxy !== null && listed?.proxy === proxy ? listed.revision : 0,
+    completeMembershipChannelIds:
+      proxy !== null && listed?.proxy === proxy
+        ? listed.completeMembershipChannelIds
+        : NO_COMPLETE_MEMBERSHIP_CHANNELS,
+    registrationFailed:
+      proxy !== null &&
+      registered?.proxy !== proxy &&
+      registrationFailed?.proxy === proxy,
   };
 }
