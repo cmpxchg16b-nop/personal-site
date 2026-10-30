@@ -12,7 +12,7 @@ import { useTheme } from "@mui/material";
 // into for the chart; SPECTRUM_BIN_FRACTION is the share of the FFT's
 // bins used — voice energy concentrates in the lower bins, so the top
 // quarter (near-Nyquist hiss) is left out.
-const SPECTRUM_POINTS = 48;
+const SPECTRUM_POINTS = 192;
 const SPECTRUM_BIN_FRACTION = 0.75;
 
 type AudioSpectrumProps = {
