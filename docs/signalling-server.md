@@ -14,6 +14,7 @@ exists, and all state lives in process memory.
 | Model            | `pkg/models/ss`                    | Go wire types (field- and JSON-compatible with the prototype), the `SignallingServiceProvider` interface, and `SimpleOnMemorySSProvider`.                                                                 |
 | Negotiator       | `web/site/src/api/ss/negotiate.ts` | Browser-side MDN perfect negotiation over the c2c relay (the prototype).                                                                                                                                  |
 | Negotiator       | `pkg/rtc`                          | The Go counterpart of `negotiate.ts` on `pion/webrtc`: `Negotiator` interface + `PerfectNegotiator`, reading from and writing to Go channels.                                                             |
+| Recovery guide   | `docs/webrtc-reconnect.md`         | Browser and bot WebSocket reconnect, registration roaming, peer-session lifecycle, and ICE auto-restart policy.                                                                                           |
 | Headless client  | `pkg/rtc` (`client.go`)            | `HeadlessRTCClient` — the Go counterpart of `useSignalling` + `usePeerSessions`: a bot peer driving one session per channel member, over a caller-supplied channel pair (see below).                      |
 | Client transport | `pkg/rtc` (`transport.go`)         | `SignallingTransport`, the client's SSProxy: pumps a channel pair to/from the SS; `WebSocketSignallingTransport` is the production one.                                                                   |
 | Echo bot         | `pkg/rtc/echobot`                  | The reference data-channel stack of an echo-purpose bot on `HeadlessRTCClient`: serves the well-known `dcmsg`/`dcbin` labels (see below).                                                                 |
@@ -67,14 +68,14 @@ implementation must provide.
   one (user id, user session id, channel id) tuple: re-registration of a
   live id by the same tuple is a refresh (renewing `lastActive`), while
   another tuple is rejected with `SubscriberIdIsRegistered`.
-  **A registration is one incarnation of its client**: a client
-  registers exactly once per incarnation (a browser page load mints a
-  fresh, empty `subscriberId`), so any _other_ live registration of the
-  registrar's own (user id, user session id) tuple is a previous, dead
-  incarnation — the SS evicts it on the spot, freeing its subscriber id
-  and username for the successor. This makes an incarnation change
-  immediately visible to `listChannelMembers` (peers rebuild their stale
-  peer sessions at once, instead of after the aging interval) and keeps
+  **A fresh registration starts a new incarnation**: a browser page load
+  mints a fresh, empty `subscriberId`, while a replacement WebSocket in the
+  same page re-registers its current id as a roaming refresh. Any _other_
+  live registration of the registrar's own (user id, user session id) tuple
+  is therefore a previous, dead incarnation — the SS evicts it on the spot,
+  freeing its subscriber id and username for the successor. This makes an
+  incarnation change immediately visible to `listChannelMembers` (peers
+  rebuild their stale peer sessions at once, instead of after the aging interval) and keeps
   a dead registration from lingering on its successor's
   address-matched activity. The **`username`** is the subscriber's
   display name, but it is never the client's to choose: the WebSocket
@@ -105,11 +106,13 @@ implementation must provide.
 - **`channelProfileQuery {channelId}`** — answered with a
   `channelProfile {channelId, channelName}` reply; an unknown channel
   yields `ChannelNotFound`.
-- **`ping {pingId, sequenceNumber}`** — out-of-band liveness ping to the
-  SS itself (browsers cannot send protocol-level WebSocket pings). **No
-  registration is needed first.** Answered with a `pong` that keeps the
-  ping id and carries `ackSequenceNumber = sequenceNumber + 1`; the pong's
-  own sequence number is 0 (the SS keeps no per-session sequence space).
+- **`ping {pingId, sequenceNumber, ackSequenceNumber}`** — out-of-band
+  liveness ping to the SS itself (browsers cannot send protocol-level
+  WebSocket pings). All three fields are present in the wire type; clients
+  send `ackSequenceNumber: 0` in a new ping. **No registration is needed
+  first.** Answered with a `pong` that keeps the ping id and carries
+  `ackSequenceNumber = sequenceNumber + 1`; the pong's own sequence number
+  is 0 (the SS keeps no per-session sequence space).
 
 ### SS → client (`s2CEv`)
 
@@ -129,11 +132,24 @@ comes `from` the well-known SS service id, is addressed `to` the origin's
 
 ### Client ↔ client relay (`c2CEv`)
 
-Addressed by `{channelId, fromSubscriber, toSubscriber}` and carries
-`sessionDesc` and `rtcICECandidate` (modelled with
-`github.com/pion/webrtc/v4` types — `webrtc.SessionDescription` and
-`webrtc.ICECandidateInit` — which marshal to the exact browser JSON
-shapes), `iceRestartRequest`, plus out-of-band `ping`/`pong`.
+Addressed by the required `{channelId, fromSubscriber, toSubscriber}`
+fields. Its optional payload fields are:
+
+- **`sessionDesc {type, sdp}`** — an SDP offer/answer, modelled by pion's
+  `webrtc.SessionDescription` and the browser's
+  `RTCSessionDescriptionInit`.
+- **`rtcICECandidate {candidate, sdpMid, sdpMLineIndex, usernameFragment}`** —
+  a trickle ICE candidate, modelled by pion's `webrtc.ICECandidateInit` and
+  the browser's `RTCIceCandidateInit`. The latter three fields may be null
+  or omitted, depending on the client. An empty `candidate` string marks
+  end-of-candidates.
+- **`iceRestartRequest`** — a boolean; `true` asks the polite peer to
+  originate an ICE-restart offer. False/absent carries no request.
+- **`ping` / `pong`** — out-of-band messages, each with the full
+  `{pingId, sequenceNumber, ackSequenceNumber}` shape described above.
+
+The SDP and ICE structures use `github.com/pion/webrtc/v4` types, which
+marshal to the corresponding browser JSON shapes.
 
 Think of a subscriber id as an IP address and the channel as the VLAN it
 lives in: a subscriber id alone does not determine an endpoint, only
@@ -158,7 +174,9 @@ can detect a dead transport, but only the polite peer originates the restart.
 An impolite peer sends `iceRestartRequest` and retries that request with capped
 backoff until ICE reconnects; the polite peer answers the request with its
 normal restart-offer path. This avoids a simultaneous-restart glare rebuilding
-only one side of an established pion session.
+only one side of an established pion session. See
+[WebSocket and ICE auto-reconnect](webrtc-reconnect.md) for the state machine,
+retry timing, and interaction with socket reconnects.
 
 Two Go-side points the pattern leaves to the implementation:
 
@@ -202,18 +220,19 @@ and the owner of the message store) subscribes `dcmsg`, and
 session's live `connectionState` (channel → peer → state); the
 conversation header renders it — the presence line (Unconnected /
 Connecting / Connected / Disconnected) and the avatar dot (green only
-while connected) — in place of the listing's online flag, which only
-says the peer's signalling client is connected.
+while connected) — in place of the listing's online flag, which only says
+the peer's registration is still live and can remain so briefly after a
+socket disconnect.
 
 The Go side's counterpart is `HeadlessRTCClient` (`pkg/rtc/client.go`) —
 a headless peer, more of a bot than a full client. Its `Run` mirrors
 `Negotiator.Negotiate` and `SignallingServiceProvider.Run`: it serves a
 caller-supplied pair of channels (inbound/outbound `SignallingEvent`s),
 so the client knows nothing about WebSockets or authentication. It
-registers as a channel subscriber (SS-assigned or configured id, with
-the browser's retry-on-conflict), keeps the membership alive, renews the
-member listing, and reconciles one peer session per member. Data
-channels are dispatched by label to handlers registered with
+registers as a channel subscriber (SS-assigned or configured id, retrying
+a configured-id conflict once with an empty id), keeps the membership
+alive, renews the member listing, and reconciles one peer session per
+member. Data channels are dispatched by label to handlers registered with
 `HandleDataChannel` — the `http.ServeMux.Handle` shape; like the
 browser's `usePeerSessions`, the client hardcodes no label: `dcmsg`,
 `dcbin`, and any other protocol belong to the caller. Media mirrors the
@@ -307,7 +326,11 @@ subscriber id, ICE servers, the periodic knobs) map onto
   fresh subscriber id (see the signalling server's roaming notes), a
   reloaded peer is a new member — its old session is torn down and a
   fresh one negotiated, which is what makes reloads reconnect instead of
-  deadlocking on a stale session keyed by a resurrected id.
+  deadlocking on a stale session keyed by a resurrected id. In contrast,
+  a replacement WebSocket in the same browser page re-registers the same
+  id and preserves the existing peer connections, tracks, data channels,
+  and call state while signalling output waits for registration; see
+  [WebSocket and ICE auto-reconnect](webrtc-reconnect.md).
 - **ICE servers** come from `GET /api/iceServers` (the `<iceServer/>`
   entries of `serverConfig.xml`), so a deployment can steer peers at its
   own STUN/TURN instance.
@@ -548,23 +571,25 @@ target id or a kind mismatch makes the command a no-op.
   connection.
 
 **Roaming.** Registrations outlive connections (the prototype has no
-unregister message), and ping-session state (ping id, seq/ack chain) is
-purely client-side — so a client that quickly disconnects and reconnects
+unregister message), so a client that quickly disconnects and reconnects
 with the same identity **and the same subscriber id** keeps its
-registration, its profile stays queryable (even while it is offline), and
-in-flight ping sessions continue transparently on the new connection —
+registration, and its profile stays queryable even while it is offline —
 as long as it reconnects within the aging interval (below). The only
-requirement is that the reconnected client speaks first — any message
-(e.g. a liveness `ping`) re-learns its address onto the new connection,
-switch-style. A client that instead registers a **fresh** subscriber id
-(a new incarnation — every browser page load) replaces the tuple's
-previous registration on the spot (see `register`): roaming is for the
-same incarnation's connection blips, reincarnation for everything that
-rebuilds the client's peer connections — peers key their sessions by
-subscriber id and re-negotiate only for a member they see leave and
-return, so a resurrected dead incarnation's id would leave both sides
+requirement is that the reconnected client speaks first: any message
+(e.g. a registration or liveness `ping`) re-learns its address onto the
+new connection, switch-style. Ping-session state is client-side; the
+browser currently starts a fresh SS ping id and sequence on each socket,
+so its previous in-flight ping does not automatically resume. A client
+that instead registers a **fresh** subscriber id (a new incarnation —
+every browser page load) replaces the tuple's previous registration on
+the spot (see `register`). Roaming is for the same incarnation's
+connection blips, reincarnation for everything that rebuilds the
+client's peer connections — peers key their sessions by subscriber id,
+so resurrecting a dead page incarnation's id would leave both sides
 waiting forever (the polite peer already negotiated; the impolite fresh
-peer never offers).
+peer never offers). The browser's exact preservation/queueing behavior
+and the Go bot's rebuild behavior are covered in
+[WebSocket and ICE auto-reconnect](webrtc-reconnect.md).
 
 ## Subscriber aging
 
@@ -631,8 +656,8 @@ ordinary authenticated sessions.
 
 - **In-memory only.** Registrations are lost on restart.
 - **No unregister/leave message** in the prototype — registration state
-  lives until it ages out (see _Subscriber aging_) or the provider's
-  `Run` returns.
+  lives until a same-tuple new incarnation evicts it, it ages out (see
+  _Subscriber aging_), or the provider's `Run` returns.
 - **Malformed events are dropped silently** — the prototype defines no
   error code for them.
 - **Username format** (lowercase, no-space, valid DNS label) is declared
@@ -660,9 +685,15 @@ ordinary authenticated sessions.
   address re-learning across reconnects. (The suite drives identity
   through test-only headers mapped onto the session middleware's context
   values, keeping the dial sites unchanged.)
+- `web/site/src/api/ss/peersessions.test.tsx` covers browser roaming,
+  registration/EOF races, ordered signalling queues, and identity/membership
+  teardown; `web/site/src/api/ss/ice_restart.test.ts` and
+  `pkg/rtc/ice_restart_test.go` cover the matching ICE recovery state machines,
+  restart ownership, pending offers, backoff, and cancellation.
 - `e2e/websocket_ss_test.go` exercises the real built server binary:
   register + profile, a 3-round c2c ping/pong session (seq/ack chaining),
   RTC payload pass-through, the members list, c2s ping before
   registration, and handshake rejection without a session — all dialled
   with real issued session tokens. Its wire views are deliberately
-  independent copies, so accidental wire-format drift fails there.
+  independent copies, so accidental drift in the covered wire fields fails
+  there.

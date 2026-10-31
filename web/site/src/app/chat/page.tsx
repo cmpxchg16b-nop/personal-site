@@ -46,6 +46,7 @@ export default function ChatPage() {
     listingRevision,
     completeMembershipChannelIds,
     registrationFailed,
+    registrationReady,
   } = useSignalling();
 
   // The peer sessions, and their live connection states by channel and
@@ -58,6 +59,7 @@ export default function ChatPage() {
     listingRevision,
     completeMembershipChannelIds,
     registrationFailed,
+    registrationReady,
   );
   const { dcMsgs, sendTo } = useDataChannel(me, sessions);
   const { sendFile, getFileByFileId } = useBinaryDataChannel(sessions);

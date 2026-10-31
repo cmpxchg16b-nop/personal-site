@@ -26,6 +26,7 @@ import {
   createContext,
   useContext,
   useEffect,
+  useRef,
   useState,
   type ReactNode,
 } from "react";
@@ -137,24 +138,28 @@ export interface SignallingState {
    * The current user: `id` is the app-level user id the SS echoes in
    * every reply's `to` (populated server-side from the caller's
    * session), `name` the profile username, plus the signalling
-   * subscription (main channel, assigned subscriber id); null while not
-   * registered (no connection yet, or registration failed).
+   * subscription (main channel, assigned subscriber id); null before the
+   * first registration or after the current registration fails. Retained
+   * while a replacement socket refreshes the same in-page registration.
    */
   me: ChatUser | null;
   /**
    * The channels of the signalling server — id, name, and members with
    * resolved profiles (excluding the current user) — renewed every
-   * CHANNEL_LIST_INTERVAL_MS while connected; empty while no listing is
-   * available (no connection yet, or no round has succeeded).
+   * CHANNEL_LIST_INTERVAL_MS while connected; empty until the first listing
+   * or after a registration reset. Retained during socket reconnect.
    */
   channels: ChatChannel[];
-  /** Successful listing round on the current proxy; changes even when the
-   * channel array is unchanged. */
+  /** Hook-wide successful listing round; changes even when the channel array
+   * is unchanged and never resets on socket reconnect. */
   listingRevision: number;
   /** Channels whose complete member pages and every member profile resolved. */
   completeMembershipChannelIds: readonly ChannelId[];
   /** Registration finished without a usable identity on the current proxy. */
   registrationFailed: boolean;
+  /** The current proxy has completed its registration. Peer output and
+   * membership reconciliation wait for this during a roaming reconnect. */
+  registrationReady: boolean;
 }
 
 // NO_CHANNELS is the stable empty list SignallingState.channels falls
@@ -280,17 +285,22 @@ async function awaitRepliesOn(
 }
 
 // registerSubscriber registers this browser as a subscriber of the main
-// channel, reading the SS's reply on its own short-lived stream. The
-// registration always asks for a fresh auto-assigned subscriber id (the
+// channel, reading the SS's reply on its own short-lived stream. An initial
+// page registration asks for a fresh auto-assigned subscriber id (the
 // 1000-1999 range): a page load is a new incarnation, and a dead
-// incarnation's subscriber id must NOT be reused. Peer sessions are keyed
+// incarnation's subscriber id must NOT be reused. A replacement WebSocket in
+// the same page instead passes its current id, which the SS accepts as a
+// roaming refresh from the same authenticated session. Peer sessions are keyed
 // by subscriber id and rebuilt only when the member listing observes a
-// peer leaving and returning; re-registering the old id from the same
-// session cookie is a same-tuple refresh, so peers never see the leave,
-// keep their stale (dead) peer connection, and — the polite side having
-// negotiated already — never offer again. An impolite reincarnation then
-// waits forever (its fresh peer connection sits at signalingState "stable"
-// and ICE state "new", never connecting). A fresh id makes every reload a
+// peer leaving and returning. Reusing an id after a page reload would be a
+// same-tuple refresh, so peers would never see the leave, would keep their
+// stale (dead) peer connection, and — the polite side having negotiated
+// already — would never offer again. An impolite reincarnation would then
+// wait forever (its fresh peer connection would sit at signalingState
+// "stable" and ICE state "new", never connecting). A socket reconnect in the
+// same page is different: both peer connections stay alive and keep their
+// negotiators, so refreshing their existing id is exactly what they need.
+// A fresh id makes every reload a
 // brand-new member instead — the path that always worked; the SS evicts
 // the tuple's dead registration the moment its successor registers, so
 // peers tear their stale sessions down on their very next listing. The
@@ -302,6 +312,7 @@ async function awaitRepliesOn(
 async function registerSubscriber(
   read: () => ReadableStream<SignallingEvent>,
   send: (ev: SignallingEvent) => Promise<void>,
+  reconnectSubscriberId: SubscriberId = "",
 ): Promise<{ subscriberId: SubscriberId; userId: UserId | null } | null> {
   const msgId = crypto.randomUUID();
   const replyPromise = awaitReplyOn(read(), msgId, REGISTER_REPLY_TIMEOUT_MS);
@@ -313,7 +324,7 @@ async function registerSubscriber(
     msgId,
     c2SEv: {
       register: {
-        subscriberId: "",
+        subscriberId: reconnectSubscriberId,
         channelId: WELLKNOWN_CH_ID_MAIN,
         username: "",
       },
@@ -532,19 +543,21 @@ export function useSignalling(): SignallingState {
     proxy: SSProxy;
     ping: PingStat;
   } | null>(null);
-  // The current user follows the same rule as lastPing: recorded together
-  // with the proxy the registration happened on, so a stale identity never
-  // outlives its connection.
+  // The registration survives a socket reconnect: the replacement connection
+  // refreshes the same in-page subscriber incarnation instead of rebuilding
+  // its peer connections. A fresh page still starts with no retained id.
   const [registered, setRegistered] = useState<{
     proxy: SSProxy;
     me: ChatUser;
   } | null>(null);
+  const registeredRef = useRef(registered);
+  registeredRef.current = registered;
   const [registrationFailed, setRegistrationFailed] = useState<{
     proxy: SSProxy;
   } | null>(null);
-  // The channel listing follows the same rule as lastPing: recorded
-  // together with the proxy it was discovered on, so a stale listing
-  // never outlives its connection.
+  // Keep the last confirmed listing while a replacement socket registers and
+  // lists again. Clearing it would make usePeerSessions mistake a transport
+  // outage for every peer leaving. A changed/failed registration clears it.
   const [listed, setListed] = useState<{
     proxy: SSProxy;
     channels: ChatChannel[];
@@ -576,6 +589,7 @@ export function useSignalling(): SignallingState {
     }
     let live = true;
     const abort = new AbortController();
+    const reconnectSubscriberId = registeredRef.current?.me.subscriberId ?? "";
     // The ping loop's own stream; registration reads another one.
     const reader = proxy.getReadStream().getReader();
     const writer = proxy.getWriteStream().getWriter();
@@ -686,15 +700,25 @@ export function useSignalling(): SignallingState {
         );
         return null;
       }
-      if (!live) {
+      if (!live || proxy.destroyed) {
         return null;
       }
       try {
         const reg = await registerSubscriber(
           () => proxy.getReadStream(),
           (ev) => writer.write(ev),
+          reconnectSubscriberId,
         );
-        if (live && reg !== null && reg.userId !== null) {
+        if (live && !proxy.destroyed && reg !== null && reg.userId !== null) {
+          const previous = registeredRef.current;
+          if (
+            previous !== null &&
+            previous.me.subscriberId !== reg.subscriberId
+          ) {
+            // A different id is a new incarnation, not a roaming refresh. Do
+            // not let its reconciliation use the previous incarnation's list.
+            setListed(null);
+          }
           setRegistered({
             proxy,
             me: {
@@ -713,7 +737,11 @@ export function useSignalling(): SignallingState {
       }
     })();
     void registration.then((reg) => {
-      if (live && (reg === null || reg.userId === null)) {
+      if (live && !proxy.destroyed && (reg === null || reg.userId === null)) {
+        // This incarnation could not be re-established. Drop its retained
+        // identity/listing; a later socket starts with a fresh registration.
+        setRegistered(null);
+        setListed(null);
         setRegistrationFailed({ proxy });
       }
     });
@@ -779,29 +807,27 @@ export function useSignalling(): SignallingState {
           (ev) => writer.write(ev),
           reg?.subscriberId ?? null,
         );
-        if (!live) return;
+        if (!live || proxy.destroyed) return;
         // Preserve an unchanged channel array for consumers that depend on
-        // its identity, but advance the revision on every successful round so
-        // lifecycle consumers also observe repeated membership evidence.
+        // its identity, but advance one hook-wide revision on every successful
+        // round. Reconnect renders are not new membership evidence.
         setListed((prev) => {
-          const current = prev !== null && prev.proxy === proxy ? prev : null;
-          if (
-            current !== null &&
-            sameChannels(current.channels, listing.channels)
-          ) {
+          if (!live || proxy.destroyed) return prev;
+          const revision = (prev?.revision ?? 0) + 1;
+          if (prev !== null && sameChannels(prev.channels, listing.channels)) {
             return {
               proxy,
-              channels: current.channels,
+              channels: prev.channels,
               completeMembershipChannelIds:
                 listing.completeMembershipChannelIds,
-              revision: current.revision + 1,
+              revision,
             };
           }
           return {
             proxy,
             channels: listing.channels,
             completeMembershipChannelIds: listing.completeMembershipChannelIds,
-            revision: 1,
+            revision,
           };
         });
       } catch (err) {
@@ -836,18 +862,20 @@ export function useSignalling(): SignallingState {
   return {
     lastPing:
       proxy !== null && measured?.proxy === proxy ? measured.ping : null,
-    me: proxy !== null && registered?.proxy === proxy ? registered.me : null,
-    channels:
-      proxy !== null && listed?.proxy === proxy ? listed.channels : NO_CHANNELS,
-    listingRevision:
-      proxy !== null && listed?.proxy === proxy ? listed.revision : 0,
+    me:
+      proxy !== null &&
+      registered?.proxy !== proxy &&
+      registrationFailed?.proxy === proxy
+        ? null
+        : (registered?.me ?? null),
+    channels: listed?.channels ?? NO_CHANNELS,
+    listingRevision: listed?.revision ?? 0,
     completeMembershipChannelIds:
-      proxy !== null && listed?.proxy === proxy
-        ? listed.completeMembershipChannelIds
-        : NO_COMPLETE_MEMBERSHIP_CHANNELS,
+      listed?.completeMembershipChannelIds ?? NO_COMPLETE_MEMBERSHIP_CHANNELS,
     registrationFailed:
       proxy !== null &&
       registered?.proxy !== proxy &&
       registrationFailed?.proxy === proxy,
+    registrationReady: proxy !== null && registered?.proxy === proxy,
   };
 }

@@ -54,6 +54,7 @@ interface ProducerOverrides {
   listingRevision?: number;
   completeMembershipChannelIds?: readonly ChannelId[];
   registrationFailed?: boolean;
+  registrationReady?: boolean;
 }
 
 interface HookSlot {
@@ -148,6 +149,7 @@ class HookRuntime {
     listingRevision = 0,
     completeMembershipChannelIds: readonly ChannelId[] = [],
     registrationFailed = false,
+    registrationReady = true,
   ): PeerSessionsResult {
     this.index = 0;
     this.changedEffects = [];
@@ -159,6 +161,7 @@ class HookRuntime {
       listingRevision,
       completeMembershipChannelIds,
       registrationFailed,
+      registrationReady,
     );
     this.finishRender();
     return result;
@@ -186,8 +189,16 @@ class HookRuntime {
       [];
     const failed =
       overrides.registrationFailed ?? producer.registrationFailed ?? false;
+    const ready = overrides.registrationReady ?? signalling.registrationReady;
     // eslint-disable-next-line react-hooks/rules-of-hooks
-    const peers = usePeerSessions(me, channels, revision, complete, failed);
+    const peers = usePeerSessions(
+      me,
+      channels,
+      revision,
+      complete,
+      failed,
+      ready,
+    );
     this.finishRender();
     return { signalling, peers };
   }
@@ -202,7 +213,9 @@ class HookRuntime {
 
 class MockProxy {
   readonly outgoing: SignallingEvent[] = [];
+  destroyed = false;
   onSend: ((event: SignallingEvent) => void) | null = null;
+  onWrite: ((event: SignallingEvent) => void | Promise<void>) | null = null;
   private readonly readers = new Set<
     ReadableStreamDefaultController<SignallingEvent>
   >();
@@ -222,7 +235,8 @@ class MockProxy {
 
   getWriteStream(): WritableStream<SignallingEvent> {
     return new WritableStream<SignallingEvent>({
-      write: (event) => {
+      write: async (event) => {
+        await this.onWrite?.(event);
         this.outgoing.push(event);
         this.onSend?.(event);
       },
@@ -247,7 +261,15 @@ class MockProxy {
   }
 
   close(): void {
-    for (const reader of this.readers) reader.close();
+    this.destroyed = true;
+    for (const reader of this.readers) {
+      try {
+        reader.close();
+      } catch {
+        // Already closed by an earlier disconnect.
+      }
+    }
+    this.readers.clear();
   }
 }
 
@@ -555,7 +577,7 @@ describe("usePeerSessions startup lifecycle", () => {
     expect(pc.candidates).toEqual([candidate]);
   });
 
-  it("still discards a pending offer when the proxy changes before registration", async () => {
+  it("carries a pending offer across a proxy change into the same registration", async () => {
     const firstProxy = proxy;
     const sessions = runtime.render(null, []).sessions;
     sessions.subscribeChannel("dcmsg", () => {});
@@ -576,22 +598,14 @@ describe("usePeerSessions startup lifecycle", () => {
 
     expect(MockPeerConnection.instances).toHaveLength(1);
     const pc = MockPeerConnection.instances[0];
-    expect(pc.remoteDescription).toBeNull();
-    expect(pc.localDescription).toBeNull();
-
-    const freshOffer: RTCSessionDescriptionInit = {
-      type: "offer",
-      sdp: "fresh-proxy-offer",
-    };
-    secondProxy.receive(
-      c2c(peer.subscriberId, me.subscriberId, {
-        sessionDesc: freshOffer,
-      }),
-    );
-    await flushMicrotasks();
-    expect(pc.remoteDescription).toEqual(freshOffer);
+    expect(pc.remoteDescription?.sdp).toBe("old-proxy-offer");
     expect(pc.localDescription?.type).toBe("answer");
     expect(firstProxy.outgoing).toHaveLength(0);
+    expect(
+      secondProxy.outgoing.filter(
+        (event) => event.c2CEv?.sessionDesc?.type === "answer",
+      ),
+    ).toHaveLength(1);
   });
 
   it("retires an unadopted offer after two membership listings omit its sender", async () => {
@@ -658,6 +672,36 @@ describe("usePeerSessions startup lifecycle", () => {
     expect(pc.localDescription?.type).toBe("answer");
   });
 
+  it("does not count a proxy change as another membership omission", async () => {
+    const me = self("1000");
+    const sessions = runtime.render(me, []).sessions;
+    sessions.subscribeChannel("dcmsg", () => {});
+    const offer: RTCSessionDescriptionInit = {
+      type: "offer",
+      sdp: "offer-across-proxy-omission-check",
+    };
+    proxy.receive(
+      c2c(peer.subscriberId, me.subscriberId, { sessionDesc: offer }),
+    );
+    await flushMicrotasks();
+    const emptyListing = listing([]);
+    runtime.render(me, emptyListing, 1, [channelId]);
+    await flushMicrotasks();
+
+    const secondProxy = new MockProxy();
+    mocks.proxy.current = secondProxy;
+    proxy = secondProxy;
+    runtime.render(me, emptyListing, 1, [channelId]);
+    await flushMicrotasks();
+    runtime.render(me, listing([peer]), 2, [channelId]);
+    await flushMicrotasks();
+
+    expect(MockPeerConnection.instances).toHaveLength(1);
+    const pc = MockPeerConnection.instances[0];
+    expect(pc.remoteDescription).toEqual(offer);
+    expect(pc.localDescription?.type).toBe("answer");
+  });
+
   it("does not carry a pending offer into a new subscriber incarnation", async () => {
     const first = self("1000");
     const sessions = runtime.render(first, []).sessions;
@@ -692,6 +736,118 @@ describe("usePeerSessions startup lifecycle", () => {
     expect(pc.localDescription?.type).toBe("answer");
   });
 
+  it("restarts omission evidence after a subscriber identity reset", async () => {
+    const first = self("1000");
+    const emptyListing = listing([]);
+    runtime.render(first, emptyListing, 1, [channelId]);
+
+    const second = self("1001");
+    const sessions = runtime.render(second, []).sessions;
+    sessions.subscribeChannel("dcmsg", () => {});
+    const staleOffer: RTCSessionDescriptionInit = {
+      type: "offer",
+      sdp: "offer-expired-after-identity-reset",
+    };
+    proxy.receive(
+      c2c(peer.subscriberId, second.subscriberId, {
+        sessionDesc: staleOffer,
+      }),
+    );
+    await flushMicrotasks();
+    runtime.render(second, emptyListing, 1, [channelId]);
+    await flushMicrotasks();
+    runtime.render(second, emptyListing, 2, [channelId]);
+    await flushMicrotasks();
+    runtime.render(second, listing([peer]), 3, [channelId]);
+    await flushMicrotasks();
+
+    expect(MockPeerConnection.instances).toHaveLength(1);
+    const pc = MockPeerConnection.instances[0];
+    expect(pc.remoteDescription).toBeNull();
+    const freshOffer: RTCSessionDescriptionInit = {
+      type: "offer",
+      sdp: "fresh-offer-after-identity-reset",
+    };
+    proxy.receive(
+      c2c(peer.subscriberId, second.subscriberId, {
+        sessionDesc: freshOffer,
+      }),
+    );
+    await flushMicrotasks();
+    expect(pc.remoteDescription).toEqual(freshOffer);
+  });
+
+  it("preserves a peer session and queues signalling across a proxy reconnect", async () => {
+    const me = self("1000");
+    const firstProxy = proxy;
+    const { sessions } = runtime.render(me, listing([peer]), 1, [channelId]);
+    const onReset = vi.fn();
+    sessions.subscribeReset(onReset);
+    await flushMicrotasks();
+    expect(MockPeerConnection.instances).toHaveLength(1);
+    const pc = MockPeerConnection.instances[0];
+
+    firstProxy.close();
+    await flushMicrotasks();
+    mocks.proxy.current = null;
+    runtime.render(me, listing([peer]), 1, [channelId]);
+    await flushMicrotasks();
+
+    expect(pc.signalingState).not.toBe("closed");
+    expect(onReset).not.toHaveBeenCalled();
+    const candidate = { candidate: "candidate:during-reconnect", sdpMid: "0" };
+    pc.onicecandidate?.({ candidate: candidate as RTCIceCandidate });
+    await flushMicrotasks();
+    expect(firstProxy.outgoing).toHaveLength(0);
+
+    const secondProxy = new MockProxy();
+    mocks.proxy.current = secondProxy;
+    proxy = secondProxy;
+    runtime.render(me, listing([peer]), 1, [channelId]);
+    await flushMicrotasks();
+
+    expect(MockPeerConnection.instances).toHaveLength(1);
+    expect(pc.signalingState).not.toBe("closed");
+    expect(onReset).not.toHaveBeenCalled();
+    expect(
+      secondProxy.outgoing.filter(
+        (event) => event.c2CEv?.rtcICECandidate === candidate,
+      ),
+    ).toHaveLength(1);
+  });
+
+  it("retries a queued write when the proxy changes during a failed send", async () => {
+    const me = self("1000");
+    const firstProxy = proxy;
+    runtime.render(me, listing([peer]), 1, [channelId]);
+    await flushMicrotasks();
+    const pc = MockPeerConnection.instances[0];
+    let rejectWrite!: (err: Error) => void;
+    firstProxy.onWrite = () =>
+      new Promise<void>((_resolve, reject) => {
+        rejectWrite = reject;
+      });
+    const candidate = { candidate: "candidate:write-race", sdpMid: "0" };
+    pc.onicecandidate?.({ candidate: candidate as RTCIceCandidate });
+    await flushMicrotasks();
+
+    const secondProxy = new MockProxy();
+    mocks.proxy.current = secondProxy;
+    proxy = secondProxy;
+    runtime.render(me, listing([peer]), 1, [channelId]);
+    await flushMicrotasks();
+    expect(secondProxy.outgoing).toHaveLength(0);
+
+    rejectWrite(new Error("old socket closed"));
+    await flushMicrotasks();
+
+    expect(
+      secondProxy.outgoing.filter(
+        (event) => event.c2CEv?.rtcICECandidate === candidate,
+      ),
+    ).toHaveLength(1);
+  });
+
   it("keeps the polite membership-driven initial offer", async () => {
     const me = self("0-browser");
     const sessions = runtime.render(me, []).sessions;
@@ -720,6 +876,121 @@ const faultyListings = [
 ];
 
 describe("useSignalling membership and registration outcomes", () => {
+  it("retains the incarnation and queues output until roaming registration succeeds", async () => {
+    prepareProducer({ current: "complete" });
+    const initial = await producerAtRevision(1);
+    const firstProxy = proxy;
+    const onReset = vi.fn();
+    initial.peers.sessions.subscribeReset(onReset);
+    expect(MockPeerConnection.instances).toHaveLength(1);
+    const pc = MockPeerConnection.instances[0];
+
+    firstProxy.close();
+    await flushMicrotasks();
+    mocks.proxy.current = null;
+    const disconnected = runtime.renderWithSignalling(actualUseSignalling);
+    await flushMicrotasks();
+    expect(disconnected.signalling.me).toEqual(initial.signalling.me);
+    expect(disconnected.signalling.channels).toEqual(listing([peer]));
+    expect(pc.signalingState).not.toBe("closed");
+    expect(onReset).not.toHaveBeenCalled();
+    const candidate = { candidate: "candidate:roaming", sdpMid: "0" };
+    pc.onicecandidate?.({ candidate: candidate as RTCIceCandidate });
+    await flushMicrotasks();
+
+    // Hold the replacement's registration: an open socket alone is not
+    // permission to flush c2c traffic after the old registration may have aged.
+    const secondProxy = new MockProxy();
+    secondProxy.onSend = (request) => {
+      if (request.c2SEv?.register) return;
+      firstProxy.onSend?.(request);
+    };
+    mocks.proxy.current = secondProxy;
+    proxy = secondProxy;
+    runtime.renderWithSignalling(actualUseSignalling);
+    await flushMicrotasks();
+    const pending = runtime.renderWithSignalling(actualUseSignalling);
+    await flushMicrotasks();
+
+    const registrations = secondProxy.outgoing.filter(
+      (event) => event.c2SEv?.register,
+    );
+    expect(registrations).toHaveLength(1);
+    expect(registrations[0].c2SEv?.register?.subscriberId).toBe("1000");
+    expect(pending.signalling.registrationReady).toBe(false);
+    expect(
+      secondProxy.outgoing.filter((event) => event.c2CEv?.rtcICECandidate),
+    ).toHaveLength(0);
+
+    // EOF while that registration is pending is another transport outage, not
+    // a definitive registration failure that may discard the incarnation.
+    secondProxy.close();
+    await flushMicrotasks();
+    mocks.proxy.current = null;
+    const interrupted = runtime.renderWithSignalling(actualUseSignalling);
+    await flushMicrotasks();
+    expect(interrupted.signalling.me).toEqual(initial.signalling.me);
+    expect(interrupted.signalling.channels).toEqual(listing([peer]));
+    expect(pc.signalingState).not.toBe("closed");
+    expect(onReset).not.toHaveBeenCalled();
+
+    const thirdProxy = new MockProxy();
+    thirdProxy.onSend = firstProxy.onSend;
+    mocks.proxy.current = thirdProxy;
+    proxy = thirdProxy;
+    runtime.renderWithSignalling(actualUseSignalling);
+    await flushMicrotasks();
+    const reconnected = runtime.renderWithSignalling(actualUseSignalling);
+    await flushMicrotasks();
+
+    const thirdRegistrations = thirdProxy.outgoing.filter(
+      (event) => event.c2SEv?.register,
+    );
+    expect(thirdRegistrations).toHaveLength(1);
+    expect(thirdRegistrations[0].c2SEv?.register?.subscriberId).toBe("1000");
+    expect(reconnected.signalling.registrationReady).toBe(true);
+    expect(reconnected.signalling.me).toEqual(initial.signalling.me);
+    expect(reconnected.signalling.channels).toEqual(listing([peer]));
+    expect(
+      thirdProxy.outgoing.filter(
+        (event) => event.c2CEv?.rtcICECandidate === candidate,
+      ),
+    ).toHaveLength(1);
+    expect(MockPeerConnection.instances).toHaveLength(1);
+    expect(pc.signalingState).not.toBe("closed");
+    expect(onReset).not.toHaveBeenCalled();
+  });
+
+  it("does not replace a good listing with an EOF-derived empty listing", async () => {
+    prepareProducer({ current: "complete" });
+    const initial = await producerAtRevision(1);
+    const firstProxy = proxy;
+    const pc = MockPeerConnection.instances[0];
+    const respond = firstProxy.onSend;
+    firstProxy.onSend = (request) => {
+      if (request.c2SEv?.listChannels) return;
+      respond?.(request);
+    };
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(
+      firstProxy.outgoing.filter((event) => event.c2SEv?.listChannels).length,
+    ).toBeGreaterThan(1);
+
+    firstProxy.close();
+    await flushMicrotasks();
+    mocks.proxy.current = null;
+    const disconnected = runtime.renderWithSignalling(actualUseSignalling);
+    await flushMicrotasks();
+
+    expect(disconnected.signalling.channels).toEqual(
+      initial.signalling.channels,
+    );
+    expect(disconnected.signalling.listingRevision).toBe(
+      initial.signalling.listingRevision,
+    );
+    expect(pc.signalingState).not.toBe("closed");
+  });
+
   it.each(faultyListings)(
     "$title does not produce membership-expiry authority",
     async ({ mode }) => {
@@ -785,6 +1056,7 @@ describe("useSignalling membership and registration outcomes", () => {
       listingRevision: failed.signalling.listingRevision + 1,
       completeMembershipChannelIds: [channelId],
       registrationFailed: false,
+      registrationReady: true,
     });
     await flushMicrotasks();
 

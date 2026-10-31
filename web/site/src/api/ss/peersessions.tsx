@@ -10,9 +10,9 @@
  * ride the SS's client-to-client relay, so once the channel listing
  * shows a peer, negotiation follows automatically. Sessions track the
  * membership: they appear as the listing discovers members and
- * disappear when members drop out; a proxy swap (reconnect) or an
- * identity change tears every session down and rebuilds from the
- * current listing.
+ * disappear when members drop out. A signalling reconnect keeps the
+ * sessions and their media alive; an identity change tears every session
+ * down and rebuilds from the current listing.
  *
  * What a session carries is decided by the consumers, by data-channel
  * label: useDataChannel subscribes "dcmsg" (JSON DCMsgs),
@@ -113,6 +113,98 @@ function createPeerInbox(
   };
 }
 
+// A peer's signalling output outlives any one proxy. Writes made while the
+// WebSocket is down stay ordered and resolve once a replacement proxy sends
+// them, so PerfectNegotiator does not lose SDP or candidates during reconnect.
+interface PeerSignallingOutput {
+  stream: WritableStream<SignallingEvent>;
+  setProxy(proxy: SSProxy | null): void;
+  close(): void;
+}
+
+function createPeerSignallingOutput(
+  initialProxy: SSProxy | null,
+): PeerSignallingOutput {
+  interface PendingWrite {
+    event: SignallingEvent;
+    resolve: () => void;
+    reject: (err: Error) => void;
+  }
+
+  let proxy = initialProxy;
+  let closed = false;
+  let flushing = false;
+  let flushAgain = false;
+  const pending: PendingWrite[] = [];
+
+  const flush = async () => {
+    if (flushing) return;
+    flushing = true;
+    try {
+      while (!closed && proxy !== null && pending.length > 0) {
+        const next = pending[0];
+        const writer = proxy.getWriteStream().getWriter();
+        try {
+          await writer.write(next.event);
+        } catch {
+          // Keep the event at the head of the queue. A proxy swap retries it;
+          // later writes cannot overtake it.
+          break;
+        } finally {
+          writer.releaseLock();
+        }
+        pending.shift();
+        next.resolve();
+      }
+    } finally {
+      flushing = false;
+      if (flushAgain && !closed) {
+        flushAgain = false;
+        void flush();
+      }
+    }
+  };
+
+  const stream = new WritableStream<SignallingEvent>({
+    write: (event) => {
+      if (closed) {
+        return Promise.reject(
+          new Error("peersessions: signalling output is closed"),
+        );
+      }
+      return new Promise<void>((resolve, reject) => {
+        pending.push({ event, resolve, reject });
+        void flush();
+      });
+    },
+  });
+
+  return {
+    stream,
+    setProxy(next) {
+      if (closed) return;
+      const changed = proxy !== next;
+      proxy = next;
+      if (flushing) {
+        // The old attempt may reject after this swap and break its loop.
+        // Re-run against the latest proxy once that attempt has settled.
+        if (changed) flushAgain = true;
+        return;
+      }
+      void flush();
+    },
+    close() {
+      if (closed) return;
+      closed = true;
+      proxy = null;
+      flushAgain = false;
+      const err = new Error("peersessions: signalling output is closed");
+      for (const write of pending) write.reject(err);
+      pending.length = 0;
+    },
+  };
+}
+
 // PeerChannelHandler is called as a session's channel of the subscribed
 // label appears — created locally by the polite peer, or received via
 // ondatachannel — so the consumer can wire its handlers on it. The
@@ -135,7 +227,7 @@ export type PeerTrackHandler = (
 
 // SessionResetHandler is notified when peer sessions go away: `dropped`
 // names one closed session, or null when every session was torn down
-// (a proxy swap or an identity change).
+// (an identity change or the whole hook unmounting).
 export type SessionResetHandler = (
   dropped: { channelId: ChannelId; peer: SubscriberId } | null,
 ) => void;
@@ -232,6 +324,7 @@ interface PeerSession {
   // Creates the session's channel of a label — polite sessions only;
   // a label already present is a no-op.
   createChannel: (label: string) => void;
+  setProxy: (proxy: SSProxy | null) => void;
   close: () => void;
 }
 
@@ -265,7 +358,7 @@ interface SessionHooks {
 // (the first creation triggers the initial negotiation), an impolite
 // one receives them via ondatachannel; both are reported through hooks.
 function startPeerSession(
-  proxy: SSProxy,
+  proxy: SSProxy | null,
   channelId: ChannelId,
   self: SubscriberId,
   peer: SubscriberId,
@@ -281,6 +374,7 @@ function startPeerSession(
     polite: self < peer,
     channels: new Map(),
     createChannel: () => {},
+    setProxy: () => {},
     close: () => {},
   };
 
@@ -315,13 +409,15 @@ function startPeerSession(
   pc.onconnectionstatechange = () =>
     hooks.onConnectionState(channelId, peer, pc.connectionState);
 
+  const output = createPeerSignallingOutput(proxy);
+  session.setProxy = output.setProxy;
   const negotiator = new PerfectNegotiator(pc, {
     channelId,
     selfSubscriber: self,
     peerSubscriber: peer,
   });
   void negotiator
-    .negotiate(inbox.stream, proxy.getWriteStream())
+    .negotiate(inbox.stream, output.stream)
     .catch((err) =>
       console.error(`peersessions: negotiation with ${peer} failed`, err),
     );
@@ -332,6 +428,7 @@ function startPeerSession(
     // Closing the inbox ends negotiate(), which releases its stream locks;
     // closing the connection stops ICE and its events.
     pc.onconnectionstatechange = null;
+    output.close();
     inbox.close();
     pc.close();
     hooks.onSessionClosed(channelId, peer);
@@ -343,8 +440,9 @@ function startPeerSession(
  * Brings up a WebRTC peer connection to every fellow member of the
  * current user's channel. `me` and `channels` are the useSignalling
  * state: sessions appear as the listing discovers members and disappear
- * when members drop out; a proxy swap (reconnect) or an identity change
- * tears every session down and rebuilds from the current listing.
+ * when members drop out. A proxy swap keeps existing sessions alive and
+ * reconnects their signalling; an identity change tears every session down
+ * and rebuilds from the current listing.
  *
  * The ICE servers are loaded via the useICEServers query; no session is
  * brought up before the query settles, so every peer connection is
@@ -367,10 +465,12 @@ export function usePeerSessions(
   listingRevision = 0,
   completeMembershipChannelIds: readonly ChannelId[] = [],
   registrationFailed = false,
+  registrationReady = true,
 ): { sessions: PeerSessions; connectionStates: PeerConnectionStates } {
   const proxy = useSSProxy();
   const sessionsRef = useRef(new Map<string, PeerSession>());
   const peerInboxesRef = useRef(new Map<string, PeerInbox>());
+  const countedListingRevisionRef = useRef<number | null>(null);
   // The async demux needs the latest address; teardown also uses the latest
   // lifecycle to distinguish initial registration from a real replacement.
   const lifecycleRef = useRef({ proxy, me, registrationFailed });
@@ -468,6 +568,17 @@ export function usePeerSessions(
   // either that offer or membership creates the inbox first, and both paths
   // then use the same stream, so neither ordering loses SDP or candidates.
   // Answers/candidates without an inbox cannot start a session and are ignored.
+  //
+  // Do not send c2c traffic on a replacement socket until its roaming
+  // registration has succeeded; the server may already have aged out the old
+  // registration even though the WebSocket itself is open.
+  useEffect(() => {
+    const outputProxy = registrationReady ? proxy : null;
+    for (const session of sessionsRef.current.values()) {
+      session.setProxy(outputProxy);
+    }
+  }, [proxy, registrationReady]);
+
   useEffect(() => {
     if (proxy === null) return;
     const inboxes = peerInboxesRef.current;
@@ -524,14 +635,15 @@ export function usePeerSessions(
     return () => {
       live = false;
       if (readerActive) void reader.cancel().catch(() => {});
-      for (const inbox of inboxes.values()) inbox.close();
-      inboxes.clear();
     };
   }, [proxy]);
 
-  // Sessions are bound to their connection and to the own subscription:
-  // a proxy swap or an identity change tears every session down; the
-  // reconcile effect below then rebuilds from the current listing.
+  // Sessions belong to the subscriber incarnation, not to one WebSocket.
+  // A proxy swap therefore leaves them alone; a real identity change or
+  // unmount still tears everything down before reconciliation rebuilds.
+  const wasUnregistered = me === null;
+  const selfChannelId = me?.channelId;
+  const selfSubscriberId = me?.subscriberId;
   useEffect(() => {
     const sessions = sessionsRef.current;
     const inboxes = peerInboxesRef.current;
@@ -539,13 +651,12 @@ export function usePeerSessions(
     const resetHandlers = resetHandlersRef.current;
     return () => {
       const initialRegistration =
-        me === null &&
-        lifecycleRef.current.proxy === proxy &&
-        lifecycleRef.current.me !== null;
+        wasUnregistered && lifecycleRef.current.me !== null;
       // Initial registration must not discard offers accepted while the
-      // recipient was unknown. Unmount and genuine proxy/identity replacement
-      // still tear everything down.
+      // recipient was unknown. Unmount and genuine identity replacement still
+      // tear everything down.
       if (initialRegistration) return;
+      countedListingRevisionRef.current = null;
       for (const session of sessions.values()) {
         session.close();
       }
@@ -563,7 +674,7 @@ export function usePeerSessions(
       for (const cb of resetHandlers) cb(null);
       setConnectionStates({});
     };
-  }, [proxy, me, registrationFailed]);
+  }, [wasUnregistered, selfChannelId, selfSubscriberId, registrationFailed]);
 
   // Reconcile the sessions with the current member listing: open one
   // session per newly seen member of the own channel, close the ones
@@ -575,6 +686,7 @@ export function usePeerSessions(
     const sessions = sessionsRef.current;
     if (
       proxy === null ||
+      !registrationReady ||
       me === null ||
       me.channelId === undefined ||
       me.subscriberId === undefined
@@ -635,6 +747,10 @@ export function usePeerSessions(
       }
     }
     if (!completeMembershipChannelIds.includes(me.channelId)) return;
+    // Only a newly completed listing is omission evidence. Proxy, identity
+    // object, and ICE-server effect reruns may reuse the same retained listing.
+    if (countedListingRevisionRef.current === listingRevision) return;
+    countedListingRevisionRef.current = listingRevision;
     // One absent listing may have been assembled before the offer arrived.
     // Retire only a pending inbox omitted by two consecutive own-channel
     // listings; a fresh offer resets this evidence in the demux above.
@@ -655,6 +771,7 @@ export function usePeerSessions(
     channels,
     listingRevision,
     completeMembershipChannelIds,
+    registrationReady,
     iceServers,
     sessionHooks,
   ]);
