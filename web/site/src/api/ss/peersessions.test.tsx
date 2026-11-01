@@ -833,11 +833,7 @@ describe("usePeerSessions startup lifecycle", () => {
     runtime.render(me, listing([peer]), 1, [channelId]);
     await flushMicrotasks();
     const pc = MockPeerConnection.instances[0];
-    let rejectWrite!: (err: Error) => void;
-    firstProxy.onWrite = () =>
-      new Promise<void>((_resolve, reject) => {
-        rejectWrite = reject;
-      });
+    firstProxy.onWrite = () => new Promise<void>(() => {});
     const candidate = { candidate: "candidate:write-race", sdpMid: "0" };
     pc.onicecandidate?.({ candidate: candidate as RTCIceCandidate });
     await flushMicrotasks();
@@ -847,14 +843,31 @@ describe("usePeerSessions startup lifecycle", () => {
     proxy = secondProxy;
     runtime.render(me, listing([peer]), 1, [channelId]);
     await flushMicrotasks();
-    expect(secondProxy.outgoing).toHaveLength(0);
-
-    rejectWrite(new Error("old socket closed"));
-    await flushMicrotasks();
-
+    // The old attempt never settles. A proxy swap must cancel it rather than
+    // letting every later ICE message remain blocked behind it.
     expect(
       secondProxy.outgoing.filter(
         (event) => event.c2CEv?.rtcICECandidate === candidate,
+      ),
+    ).toHaveLength(1);
+
+    const secondCandidate = {
+      candidate: "candidate:second-write-race",
+      sdpMid: "0",
+    };
+    secondProxy.onWrite = () => new Promise<void>(() => {});
+    pc.onicecandidate?.({
+      candidate: secondCandidate as RTCIceCandidate,
+    });
+    await flushMicrotasks();
+    const thirdProxy = new MockProxy();
+    mocks.proxy.current = thirdProxy;
+    proxy = thirdProxy;
+    runtime.render(me, listing([peer]), 1, [channelId]);
+    await flushMicrotasks();
+    expect(
+      thirdProxy.outgoing.filter(
+        (event) => event.c2CEv?.rtcICECandidate === secondCandidate,
       ),
     ).toHaveLength(1);
   });

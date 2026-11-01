@@ -52,7 +52,9 @@ channelId)` tuple, the SS accepts this as a roaming refresh. A new page load
    in-memory output queue. SDP, candidates, and restart requests produced while
    disconnected wait there. Output remains detached until registration on the
    current replacement socket succeeds, because an open WebSocket alone does not
-   prove that the subscriber registration is still valid.
+   prove that the subscriber registration is still valid. A proxy swap also
+   cancels an unsettled write on the old transport, so repeated network changes
+   cannot leave later ICE messages blocked behind it.
 4. **Resume and reconcile.** Once registration succeeds, queued events flush in
    order and normal negotiation continues. A peer still in `have-local-offer`
    also retransmits that offer, because a stale socket may have consumed the

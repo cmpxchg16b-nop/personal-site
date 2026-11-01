@@ -135,6 +135,7 @@ function createPeerSignallingOutput(
   let closed = false;
   let flushing = false;
   let flushAgain = false;
+  let cancelWrite: (() => void) | null = null;
   const pending: PendingWrite[] = [];
 
   const flush = async () => {
@@ -144,13 +145,20 @@ function createPeerSignallingOutput(
       while (!closed && proxy !== null && pending.length > 0) {
         const next = pending[0];
         const writer = proxy.getWriteStream().getWriter();
+        const cancelled = new Promise<void>((_resolve, reject) => {
+          cancelWrite = () =>
+            reject(new Error("peersessions: signalling proxy changed"));
+        });
         try {
-          await writer.write(next.event);
+          // A stale network write may never settle. setProxy rejects this race
+          // so its replacement is not blocked behind the old transport.
+          await Promise.race([writer.write(next.event), cancelled]);
         } catch {
           // Keep the event at the head of the queue. A proxy swap retries it;
           // later writes cannot overtake it.
           break;
         } finally {
+          cancelWrite = null;
           writer.releaseLock();
         }
         pending.shift();
@@ -186,9 +194,10 @@ function createPeerSignallingOutput(
       const changed = proxy !== next;
       proxy = next;
       if (flushing) {
-        // The old attempt may reject after this swap and break its loop.
-        // Re-run against the latest proxy once that attempt has settled.
-        if (changed) flushAgain = true;
+        if (changed) {
+          flushAgain = true;
+          cancelWrite?.();
+        }
         return;
       }
       void flush();
@@ -198,6 +207,7 @@ function createPeerSignallingOutput(
       closed = true;
       proxy = null;
       flushAgain = false;
+      cancelWrite?.();
       const err = new Error("peersessions: signalling output is closed");
       for (const write of pending) write.reject(err);
       pending.length = 0;
