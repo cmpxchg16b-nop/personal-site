@@ -233,7 +233,7 @@
        none (host candidates only); keepAliveInterval, memberListInterval,
        replyTimeout and reconnectInterval are Go duration strings (e.g.
        "5s") with code-side defaults — keep the keepalive well below the
-       server's subscriber aging (the ss-aging flag, default 10s).
+       server's subscriber aging (the ss-aging flag, default 30s).
   <echoBot
     url="wss://example.com/api/ss/ws"
     jwt=""

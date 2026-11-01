@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { WELLKNOWN_CH_ID_MAIN } from "./types";
+import { ErrorCode, WELLKNOWN_CH_ID_MAIN } from "./types";
 import type { SignallingState } from "./react";
 import type {
   ChannelId,
@@ -462,8 +462,8 @@ function prepareProducer(
       );
       return;
     }
-    // Leave pings unanswered: unrelated pong traffic would continually
-    // re-arm the paged-listing timeout this harness needs to reach.
+    // Leave pings unanswered by default; reconnect regressions answer them to
+    // prove unrelated traffic does not extend request deadlines.
   };
 }
 
@@ -961,6 +961,204 @@ describe("useSignalling membership and registration outcomes", () => {
     expect(onReset).not.toHaveBeenCalled();
   });
 
+  it("retains the UI and retries roaming registration after a transient failure", async () => {
+    prepareProducer({ current: "complete" });
+    const initial = await producerAtRevision(1);
+    const firstProxy = proxy;
+    const onReset = vi.fn();
+    initial.peers.sessions.subscribeReset(onReset);
+    const pc = MockPeerConnection.instances[0];
+    firstProxy.close();
+    await flushMicrotasks();
+    mocks.proxy.current = null;
+    runtime.renderWithSignalling(actualUseSignalling);
+    await flushMicrotasks();
+
+    const secondProxy = new MockProxy();
+    let registrationAttempts = 0;
+    secondProxy.onSend = (request) => {
+      if (request.c2SEv?.register) {
+        registrationAttempts += 1;
+        if (registrationAttempts > 2) {
+          secondProxy.respond(request, {
+            registerResult: { channelId, subscriberId: "1000" },
+          });
+        }
+        return; // The first two attempts time out on an open socket.
+      }
+      if (request.c2SEv?.ping) {
+        secondProxy.respond(request, {
+          pong: {
+            pingId: request.c2SEv.ping.pingId,
+            sequenceNumber: 0,
+            ackSequenceNumber: request.c2SEv.ping.sequenceNumber + 1,
+          },
+        });
+        return;
+      }
+      firstProxy.onSend?.(request);
+    };
+    mocks.proxy.current = secondProxy;
+    proxy = secondProxy;
+    runtime.renderWithSignalling(actualUseSignalling);
+    await vi.advanceTimersByTimeAsync(5000);
+    await flushMicrotasks();
+    const failed = runtime.renderWithSignalling(actualUseSignalling);
+    await flushMicrotasks();
+
+    expect(failed.signalling.registrationReady).toBe(false);
+    expect(failed.signalling.me).toEqual(initial.signalling.me);
+    expect(failed.signalling.channels).toEqual(initial.signalling.channels);
+    expect(pc.signalingState).not.toBe("closed");
+    expect(onReset).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(2000);
+    await vi.advanceTimersByTimeAsync(5000);
+    await flushMicrotasks();
+    const stillFailed = runtime.renderWithSignalling(actualUseSignalling);
+    expect(stillFailed.signalling.registrationReady).toBe(false);
+    expect(stillFailed.signalling.me).toEqual(initial.signalling.me);
+    expect(stillFailed.signalling.channels).toEqual(
+      initial.signalling.channels,
+    );
+    expect(pc.signalingState).not.toBe("closed");
+    expect(onReset).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(2000);
+    await flushMicrotasks();
+    const recovered = runtime.renderWithSignalling(actualUseSignalling);
+    await flushMicrotasks();
+
+    const registrations = secondProxy.outgoing.filter(
+      (event) => event.c2SEv?.register,
+    );
+    expect(registrations).toHaveLength(3);
+    expect(
+      registrations.map((event) => event.c2SEv?.register?.subscriberId),
+    ).toEqual(["1000", "1000", "1000"]);
+    expect(recovered.signalling.registrationReady).toBe(true);
+    expect(recovered.signalling.me).toEqual(initial.signalling.me);
+    expect(recovered.signalling.channels).toEqual(initial.signalling.channels);
+    expect(pc.signalingState).not.toBe("closed");
+    expect(onReset).not.toHaveBeenCalled();
+  });
+
+  it("falls back to a fresh incarnation only after an explicit id conflict", async () => {
+    prepareProducer({ current: "complete" });
+    const initial = await producerAtRevision(1);
+    const firstProxy = proxy;
+    const onReset = vi.fn();
+    initial.peers.sessions.subscribeReset(onReset);
+    const firstPC = MockPeerConnection.instances[0];
+    firstProxy.close();
+    await flushMicrotasks();
+    mocks.proxy.current = null;
+    runtime.renderWithSignalling(actualUseSignalling);
+    await flushMicrotasks();
+
+    const secondProxy = new MockProxy();
+    secondProxy.onSend = (request) => {
+      if (request.c2SEv?.register) {
+        if (request.c2SEv.register.subscriberId === "1000") {
+          secondProxy.respond(request, {
+            err: {
+              errorCode: ErrorCode.SubscriberIdIsRegistered,
+              errorMsg: "claimed by another session",
+            },
+          });
+        } else {
+          secondProxy.respond(request, {
+            registerResult: { channelId, subscriberId: "1001" },
+          });
+        }
+        return;
+      }
+      firstProxy.onSend?.(request);
+    };
+    mocks.proxy.current = secondProxy;
+    proxy = secondProxy;
+    runtime.renderWithSignalling(actualUseSignalling);
+    await flushMicrotasks();
+    const conflicted = runtime.renderWithSignalling(actualUseSignalling);
+    await flushMicrotasks();
+
+    expect(conflicted.signalling.registrationReady).toBe(false);
+    expect(conflicted.signalling.me).toEqual(initial.signalling.me);
+    expect(conflicted.signalling.channels).toEqual(initial.signalling.channels);
+    expect(firstPC.signalingState).not.toBe("closed");
+    expect(onReset).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(2000);
+    await flushMicrotasks();
+    const recovered = runtime.renderWithSignalling(actualUseSignalling);
+    await flushMicrotasks();
+
+    const registrations = secondProxy.outgoing.filter(
+      (event) => event.c2SEv?.register,
+    );
+    expect(
+      registrations.map((event) => event.c2SEv?.register?.subscriberId),
+    ).toEqual(["1000", ""]);
+    expect(recovered.signalling.registrationReady).toBe(true);
+    expect(recovered.signalling.me?.subscriberId).toBe("1001");
+    expect(firstPC.signalingState).toBe("closed");
+    expect(onReset).toHaveBeenCalled();
+    expect(MockPeerConnection.instances).toHaveLength(2);
+  });
+
+  it("retains a confirmed listing through an open-socket listing timeout", async () => {
+    prepareProducer({ current: "complete" });
+    const initial = await producerAtRevision(1);
+    const firstProxy = proxy;
+    const onReset = vi.fn();
+    initial.peers.sessions.subscribeReset(onReset);
+    const pc = MockPeerConnection.instances[0];
+    firstProxy.close();
+    await flushMicrotasks();
+    mocks.proxy.current = null;
+    runtime.renderWithSignalling(actualUseSignalling);
+    await flushMicrotasks();
+
+    const secondProxy = new MockProxy();
+    secondProxy.onSend = (request) => {
+      if (request.c2SEv?.register) {
+        secondProxy.respond(request, {
+          registerResult: { channelId, subscriberId: "1000" },
+        });
+        return;
+      }
+      if (request.c2SEv?.ping) {
+        secondProxy.respond(request, {
+          pong: {
+            pingId: request.c2SEv.ping.pingId,
+            sequenceNumber: 0,
+            ackSequenceNumber: request.c2SEv.ping.sequenceNumber + 1,
+          },
+        });
+        return;
+      }
+      if (request.c2SEv?.listChannels) return;
+      firstProxy.onSend?.(request);
+    };
+    mocks.proxy.current = secondProxy;
+    proxy = secondProxy;
+    runtime.renderWithSignalling(actualUseSignalling);
+    await flushMicrotasks();
+    const registered = runtime.renderWithSignalling(actualUseSignalling);
+    expect(registered.signalling.registrationReady).toBe(true);
+
+    await vi.advanceTimersByTimeAsync(5000);
+    await flushMicrotasks();
+    const timedOut = runtime.renderWithSignalling(actualUseSignalling);
+
+    expect(timedOut.signalling.channels).toEqual(initial.signalling.channels);
+    expect(timedOut.signalling.listingRevision).toBe(
+      initial.signalling.listingRevision,
+    );
+    expect(pc.signalingState).not.toBe("closed");
+    expect(onReset).not.toHaveBeenCalled();
+  });
+
   it("does not replace a good listing with an EOF-derived empty listing", async () => {
     prepareProducer({ current: "complete" });
     const initial = await producerAtRevision(1);
@@ -996,11 +1194,13 @@ describe("useSignalling membership and registration outcomes", () => {
     async ({ mode }) => {
       prepareProducer({ current: mode });
       runtime.renderWithSignalling(actualUseSignalling);
+      await vi.advanceTimersByTimeAsync(5000);
+      await flushMicrotasks();
+      const result = runtime.renderWithSignalling(actualUseSignalling);
 
-      const result = await producerAtRevision(1);
-
-      // The UI remains best-effort, but the partial result is not authoritative.
-      expect(result.signalling.channels).toEqual(listing([]));
+      // A partial round is not published as a new listing at all.
+      expect(result.signalling.listingRevision).toBe(0);
+      expect(result.signalling.channels).toEqual([]);
       expect(result.signalling.completeMembershipChannelIds).toEqual([]);
     },
   );
@@ -1018,13 +1218,15 @@ describe("useSignalling membership and registration outcomes", () => {
       };
       proxy.receive(c2c(peer.subscriberId, "1000", { sessionDesc: offer }));
 
-      await producerAtRevision(1);
-      expect(MockPeerConnection.instances).toHaveLength(0);
-      await producerAtRevision(2);
+      // Two failed rounds produce no successful revision and no membership
+      // evidence against the pending offer.
+      await vi.advanceTimersByTimeAsync(10_000);
+      await flushMicrotasks();
+      runtime.renderWithSignalling(actualUseSignalling);
       expect(MockPeerConnection.instances).toHaveLength(0);
 
       current.current = "complete";
-      const complete = await producerAtRevision(3);
+      const complete = await producerAtRevision(1);
       await flushMicrotasks();
 
       expect(MockPeerConnection.instances).toHaveLength(1);

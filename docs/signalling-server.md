@@ -598,9 +598,12 @@ activity from its learned address — including c2s liveness pings — and
 explicitly by `channelKeepAlive`, so a client that pings periodically
 keeps its registration alive. A
 registration whose `lastActive` is longer ago than the aging interval
-(the `--ss-aging` server flag, default `10s`) is considered invalid:
+(the `--ss-aging` server flag, default `30s`) is considered invalid:
 profile queries answer `SubscriberNotFound`, relays fail, and the
-subscriber id and username are free again. Expiration is **lazy** —
+subscriber id and username are free again. The default leaves room for an
+ordinary WiFi/network switch without a membership flap; its tradeoff is
+that a genuinely departed subscriber can remain listed for that long.
+Expiration is **lazy** —
 there is no timer: the list-members operation does an all-at-once
 mark-and-sweep of a channel's expired entries, while every other
 operation just tests the validity of the specific subscriber before

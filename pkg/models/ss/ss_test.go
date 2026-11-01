@@ -809,6 +809,12 @@ func TestChannelKeepAliveRenewsMembership(t *testing.T) {
 	}
 }
 
+func TestDefaultSubscriberAgingSupportsNetworkRoaming(t *testing.T) {
+	if got, want := DefaultSubscriberAging, 30*time.Second; got != want {
+		t.Fatalf("DefaultSubscriberAging = %s, want %s", got, want)
+	}
+}
+
 // TestSubscriberAging checks that a registration expires when the
 // subscriber is idle longer than the aging interval, that any activity —
 // here c2s liveness pings — keeps it valid, and that an expired

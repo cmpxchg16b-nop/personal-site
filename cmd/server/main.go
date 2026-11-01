@@ -66,7 +66,7 @@ type ServeCmd struct {
 	// SSAging is the subscriber aging interval of the in-memory signalling
 	// provider: a registration expires when the subscriber is idle longer
 	// than this.
-	SSAging time.Duration `name:"ss-aging" help:"Signalling subscriber aging interval." env:"SS_AGING" default:"10s"`
+	SSAging time.Duration `name:"ss-aging" help:"Signalling subscriber aging interval." env:"SS_AGING" default:"30s"`
 	// HealthzProbe makes the process a health probe instead of a server: it
 	// GETs the running server's /api/healthz on the loopback address and
 	// exits 0 on success, non-zero otherwise. The container image's

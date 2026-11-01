@@ -132,7 +132,7 @@
                                time.Duration strings (e.g. "5s"); keep
                                the keepalive well below the server's
                                subscriber aging (the ss-aging flag,
-                               default 10s).
+                               default 30s).
                * reconnectInterval  how long to wait before re-estab-
                                lishing a lost signalling connection. -->
         <xsd:element name="echoBot" type="botClientType" minOccurs="0" />

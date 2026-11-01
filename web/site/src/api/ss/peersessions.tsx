@@ -644,6 +644,10 @@ export function usePeerSessions(
   const wasUnregistered = me === null;
   const selfChannelId = me?.channelId;
   const selfSubscriberId = me?.subscriberId;
+  // A failed attempt with a retained previous identity is a roaming retry,
+  // not an incarnation reset. Only failure with no usable identity ends the
+  // pre-registration pending window.
+  const registrationReset = registrationFailed && wasUnregistered;
   useEffect(() => {
     const sessions = sessionsRef.current;
     const inboxes = peerInboxesRef.current;
@@ -674,7 +678,7 @@ export function usePeerSessions(
       for (const cb of resetHandlers) cb(null);
       setConnectionStates({});
     };
-  }, [wasUnregistered, selfChannelId, selfSubscriberId, registrationFailed]);
+  }, [wasUnregistered, selfChannelId, selfSubscriberId, registrationReset]);
 
   // Reconcile the sessions with the current member listing: open one
   // session per newly seen member of the own channel, close the ones

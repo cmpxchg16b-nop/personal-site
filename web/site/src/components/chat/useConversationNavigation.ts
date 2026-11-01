@@ -27,10 +27,10 @@ export function useConversationNavigation(
 
   const selected: ConversationRef | null = useMemo(() => {
     const ref = parseConversationKey(conversationParam);
-    // Only known users other than yourself, reached from a known
-    // channel, are openable. While disconnected the listing is empty and
-    // nothing is openable; the query param survives, so the conversation
-    // reopens once the listing returns.
+    // Only known users other than yourself, reached from a known channel,
+    // are openable. Before the first confirmed registration/listing nothing
+    // is openable; the query param survives so the conversation opens once
+    // they arrive. A reconnect retains those confirmed inputs instead.
     if (
       ref === null ||
       me === null ||

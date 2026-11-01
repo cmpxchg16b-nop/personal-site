@@ -158,7 +158,7 @@ version:
   path is not whitelisted): the endpoint stamps the session's subject
   and session id onto every event and overrides the display name with
   the token's username claim. Registrations live in process memory and
-  age out lazily (`--ss-aging`, default `10s`) unless the client keeps
+  age out lazily (`--ss-aging`, default `30s`) unless the client keeps
   them alive. ICE servers come from `GET /api/iceServers` — public
   bootstrap data serving the `<iceServer/>` entries of
   `serverConfig.xml`.

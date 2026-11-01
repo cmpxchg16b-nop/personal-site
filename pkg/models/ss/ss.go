@@ -381,8 +381,9 @@ type SimpleOnMemorySSProvider struct {
 }
 
 // DefaultSubscriberAging is the default aging interval of a
-// SimpleOnMemorySSProvider.
-const DefaultSubscriberAging = 10 * time.Second
+// SimpleOnMemorySSProvider. It leaves room for ordinary network roaming while
+// still bounding how long a dead registration can remain discoverable.
+const DefaultSubscriberAging = 30 * time.Second
 
 // mainChannelName is the profile name of the well-known main channel.
 const mainChannelName = "main"

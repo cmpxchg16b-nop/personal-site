@@ -33,7 +33,10 @@ A replacement socket goes through these steps:
    `register` request. For the same authenticated `(userId, userSessionId,
 channelId)` tuple, the SS accepts this as a roaming refresh. A new page load
    still sends an empty `subscriberId`, deliberately creating a fresh
-   incarnation rather than resurrecting a dead one.
+   incarnation rather than resurrecting a dead one. If the profile/registration
+   attempt times out or fails on an open socket, the retained incarnation is not
+   cleared: the browser retries every **2 seconds**. Only an explicit
+   `SubscriberIdIsRegistered` conflict abandons that id for a fresh incarnation.
 2. **Keep UI and WebRTC state.** The last confirmed identity and channel listing
    stay available while the socket is down and roaming registration is pending.
    Existing `RTCPeerConnection`s, their tracks and data channels, and the phone
@@ -47,7 +50,9 @@ channelId)` tuple, the SS accepts this as a roaming refresh. A new page load
    order and normal negotiation continues. Fresh membership listings then
    reconcile actual arrivals and departures. Async registration/listing results
    from a socket that has already died are discarded instead of overwriting the
-   retained state.
+   retained state. Incomplete listing pages or unresolved channel/member
+   profiles fail the whole listing round for the same reason: a partial outage
+   must not masquerade as an empty roster.
 
 This also covers repeated disconnects, including a second socket failure while
 its registration or membership listing is still pending. The browser does not
@@ -82,7 +87,7 @@ Implementation: `cmd/server/main.go` (`startBotClient`) and `pkg/rtc/client.go`.
 A subscriber registration is not owned by the WebSocket. A same-tuple
 new-incarnation registration with a different id evicts it immediately;
 otherwise it remains in the in-memory SS provider until it ages out or the
-provider stops. The default aging interval is **10 seconds**, configurable with
+provider stops. The default aging interval is **30 seconds**, configurable with
 `--ss-aging`.
 
 While that registration remains valid:
@@ -164,16 +169,17 @@ Implementation: `web/site/src/api/ss/ice_restart.ts` and `negotiate.ts`, plus
 
 ## Timing reference
 
-| Knob                                              | Default                    |
-| ------------------------------------------------- | -------------------------- |
-| Browser retry after an established socket drops   | Immediate                  |
-| Browser retry after a failed connection attempt   | 2s fixed                   |
-| Go bot `reconnectInterval`                        | 5s, configurable per bot   |
-| Browser registration reply timeout                | 5s                         |
-| Browser ping / channel keepalive / member listing | 1s / 5s / 5s               |
-| SS subscriber aging                               | 10s (`--ss-aging`)         |
-| ICE disconnected grace                            | 3s                         |
-| ICE retry base / nominal cap                      | 2s / 30s, with ±20% jitter |
+| Knob                                               | Default                    |
+| -------------------------------------------------- | -------------------------- |
+| Browser retry after an established socket drops    | Immediate                  |
+| Browser retry after a failed connection attempt    | 2s fixed                   |
+| Go bot `reconnectInterval`                         | 5s, configurable per bot   |
+| Browser registration reply timeout                 | 5s                         |
+| Browser retry after transient registration failure | 2s fixed                   |
+| Browser ping / channel keepalive / member listing  | 1s / 5s / 5s               |
+| SS subscriber aging                                | 30s (`--ss-aging`)         |
+| ICE disconnected grace                             | 3s                         |
+| ICE retry base / nominal cap                       | 2s / 30s, with ±20% jitter |
 
 ## Guarantees and limits
 
@@ -181,8 +187,9 @@ Implementation: `web/site/src/api/ss/ice_restart.ts` and `negotiate.ts`, plus
   are not durable storage or an exactly-once replay protocol. A page reload
   loses them, and events already handed to a failed network stack cannot be
   recalled or guaranteed delivered.
-- Roaming does not hide a real identity change, registration failure, peer
-  departure, or server-side loss of state.
+- Roaming retries transient registration failures without clearing confirmed
+  UI state, but it does not hide an explicit id conflict, a real identity
+  change, peer departure, or unrecoverable server-side loss of state.
 - ICE recovery cannot manufacture a viable network path. STUN/TURN, firewall,
   device, and remote-availability failures still require their own resolution.
 - The browser's preservation behavior and the Go bot's rebuild behavior are

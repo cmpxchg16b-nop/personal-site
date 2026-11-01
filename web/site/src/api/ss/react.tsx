@@ -34,6 +34,7 @@ import {
 import { fetchProfile, ProfileApiError } from "@/api/profile";
 import { DEFAULT_SS_URL, getSSProxy, type SSProxy } from "./proxy";
 import {
+  ErrorCode,
   WELLKNOWN_CH_ID_MAIN,
   WELLKNOWN_SVC_ID_SS,
   type ChannelId,
@@ -155,7 +156,8 @@ export interface SignallingState {
   listingRevision: number;
   /** Channels whose complete member pages and every member profile resolved. */
   completeMembershipChannelIds: readonly ChannelId[];
-  /** Registration finished without a usable identity on the current proxy. */
+  /** The latest registration attempt on the current proxy failed. A retained
+   * previous identity may still be present while roaming retries continue. */
   registrationFailed: boolean;
   /** The current proxy has completed its registration. Peer output and
    * membership reconciliation wait for this during a roaming reconnect. */
@@ -169,7 +171,7 @@ const NO_CHANNELS: ChatChannel[] = [];
 const NO_COMPLETE_MEMBERSHIP_CHANNELS: ChannelId[] = [];
 
 // PING_INTERVAL_MS is how often the SS is pinged while connected —
-// deliberately well below the server's default subscriber aging (10s), so
+// deliberately well below the server's default subscriber aging (30s), so
 // the pings double as registration keepalive.
 const PING_INTERVAL_MS = 1000;
 
@@ -181,6 +183,11 @@ const PONG_TIMEOUT_MS = 3000;
 // reply.
 const REGISTER_REPLY_TIMEOUT_MS = 5000;
 
+// REGISTER_RETRY_INTERVAL_MS pauses between transient registration attempts on
+// one open socket. Retrying here avoids sacrificing the retained incarnation
+// merely because a dial succeeded before the network was ready to answer.
+const REGISTER_RETRY_INTERVAL_MS = 2000;
+
 // CHANNEL_LIST_TIMEOUT_MS bounds the wait for one listing round's page
 // reads (channel list, member list) and each of its profile replies.
 const CHANNEL_LIST_TIMEOUT_MS = 5000;
@@ -191,7 +198,7 @@ const CHANNEL_LIST_INTERVAL_MS = 5000;
 
 // CHANNEL_KEEPALIVE_INTERVAL_MS is how often the browser renews its
 // channel membership once registered — deliberately well below the
-// server's default subscriber aging (10s), like the pings.
+// server's default subscriber aging (30s), like the pings.
 const CHANNEL_KEEPALIVE_INTERVAL_MS = 5000;
 
 // redirectToLogin bounces to the login page, with redirect_if_succeed set
@@ -214,14 +221,12 @@ async function awaitReplyOn(
 ): Promise<SignallingEvent | null> {
   const reader = stream.getReader();
   let timeoutId: number | undefined;
+  const timeout = new Promise<null>((resolve) => {
+    timeoutId = window.setTimeout(() => resolve(null), timeoutMs);
+  });
   try {
     for (;;) {
-      const raced = await Promise.race([
-        reader.read(),
-        new Promise<null>((resolve) => {
-          timeoutId = window.setTimeout(() => resolve(null), timeoutMs);
-        }),
-      ]);
+      const raced = await Promise.race([reader.read(), timeout]);
       if (raced === null || raced.done) {
         return null;
       }
@@ -257,14 +262,12 @@ async function awaitRepliesOn(
   const reader = stream.getReader();
   const collected: SignallingEvent[] = [];
   let timeoutId: number | undefined;
+  const timeout = new Promise<null>((resolve) => {
+    timeoutId = window.setTimeout(() => resolve(null), timeoutMs);
+  });
   try {
     for (;;) {
-      const raced = await Promise.race([
-        reader.read(),
-        new Promise<null>((resolve) => {
-          timeoutId = window.setTimeout(() => resolve(null), timeoutMs);
-        }),
-      ]);
+      const raced = await Promise.race([reader.read(), timeout]);
       if (raced === null || raced.done) {
         return { events: collected, terminal: null };
       }
@@ -307,13 +310,24 @@ async function awaitRepliesOn(
 // registration's display name is not the client's to choose: the server
 // stamps the session's username onto the register event. Resolves to the
 // registered subscriber id and the caller's user id — which the SS echoes
-// in the reply's `to`, populated server-side from the session — or null
-// when registration failed.
+// in the reply's `to`, populated server-side from the session. The attempt
+// separates a transient failure from an explicit id conflict, which is the only
+// response that may make the caller abandon a retained roaming id.
+interface SubscriberRegistration {
+  subscriberId: SubscriberId;
+  userId: UserId | null;
+}
+
+interface RegistrationAttempt {
+  registration: SubscriberRegistration | null;
+  idConflict: boolean;
+}
+
 async function registerSubscriber(
   read: () => ReadableStream<SignallingEvent>,
   send: (ev: SignallingEvent) => Promise<void>,
   reconnectSubscriberId: SubscriberId = "",
-): Promise<{ subscriberId: SubscriberId; userId: UserId | null } | null> {
+): Promise<RegistrationAttempt> {
   const msgId = crypto.randomUUID();
   const replyPromise = awaitReplyOn(read(), msgId, REGISTER_REPLY_TIMEOUT_MS);
   await send({
@@ -333,25 +347,33 @@ async function registerSubscriber(
   const reply = await replyPromise;
   if (!reply) {
     console.warn("signalling: registration timed out");
-    return null;
+    return { registration: null, idConflict: false };
   }
   const result = reply.s2CEv?.registerResult;
   if (result) {
     console.info(`signalling: registered as subscriber ${result.subscriberId}`);
     return {
-      subscriberId: result.subscriberId,
-      userId: reply.to.userId ?? null,
+      registration: {
+        subscriberId: result.subscriberId,
+        userId: reply.to.userId ?? null,
+      },
+      idConflict: false,
     };
   }
   console.error("signalling: registration failed", reply.s2CEv?.err ?? reply);
-  return null;
+  return {
+    registration: null,
+    idConflict:
+      reply.s2CEv?.err?.errorCode === ErrorCode.SubscriberIdIsRegistered,
+  };
 }
 
 // listChannels discovers the server's channels, resolving each into a
 // ChatChannel: one listChannels request, reading pages until hasMore is
 // false (an err page stops the read early), then listChannel per
-// discovered id, all in parallel. Channels whose resolution fails are
-// dropped from the result.
+// discovered id, all in parallel. A missing terminal page or any incomplete
+// channel/member/profile resolution fails the whole round, so the caller can
+// retain its last confirmed listing instead of publishing a partial outage.
 interface ChannelListing {
   channels: ChatChannel[];
   completeMembershipChannelIds: ChannelId[];
@@ -384,21 +406,24 @@ async function listChannels(
     c2SEv: { listChannels: {} },
   });
   const pages = await pagesPromise;
+  if (pages.terminal?.s2CEv?.channelListResult?.hasMore !== false) {
+    throw new Error("signalling: channel list did not complete");
+  }
   const ids = pages.events.flatMap(
     (p) => p.s2CEv?.channelListResult?.channels ?? [],
   );
-  const resolved = (
-    await Promise.all(
-      ids.map((channelId) =>
-        listChannel(read, send, channelId, selfSubscriberId),
-      ),
-    )
-  ).filter((c): c is ChannelResolution => c !== null);
+  const resolved = await Promise.all(
+    ids.map((channelId) =>
+      listChannel(read, send, channelId, selfSubscriberId),
+    ),
+  );
+  if (resolved.some((c) => c === null || !c.membershipComplete)) {
+    throw new Error("signalling: channel membership did not fully resolve");
+  }
+  const channels = resolved.filter((c): c is ChannelResolution => c !== null);
   return {
-    channels: resolved.map((c) => c.channel),
-    completeMembershipChannelIds: resolved
-      .filter((c) => c.membershipComplete)
-      .map((c) => c.channel.id),
+    channels: channels.map((c) => c.channel),
+    completeMembershipChannelIds: channels.map((c) => c.channel.id),
   };
 }
 
@@ -665,86 +690,92 @@ export function useSignalling(): SignallingState {
       }
     })();
 
-    // Register the subscriber, and keep measuring latency. Registration
-    // is best-effort: a failure is logged and never stops the pings or
-    // the listing. The promise resolves to this browser's registration
-    // (null when registration failed); listing rounds await it so the
-    // current user is excluded from the members from the first round on.
-    const registration: Promise<{
-      subscriberId: SubscriberId;
-      userId: UserId | null;
-    } | null> = (async () => {
-      // The login guard: registration needs an authenticated session (the
-      // WS handshake is not on the JWT whitelist), and a session can die
-      // mid-connection — expired or logged out elsewhere. Check the
-      // profile before registering; a 401 bounces to the login page. The
-      // profile's username is only reused below as `me`'s display name —
-      // the registration itself carries no username: the server stamps
-      // the session's own.
-      let name = "";
-      try {
-        const profile = await fetchProfile(abort.signal);
-        name = profile.username.trim() || profile.subject_id;
-      } catch (err) {
-        if (err instanceof DOMException && err.name === "AbortError")
-          return null;
-        // The session is gone (e.g. expired or logged out elsewhere
-        // mid-connection): bounce to the login page.
-        if (err instanceof ProfileApiError && err.status === 401) {
-          redirectToLogin();
-          return null;
-        }
-        console.error(
-          "signalling: cannot load /api/profile for registration",
-          err,
-        );
-        return null;
-      }
-      if (!live || proxy.destroyed) {
-        return null;
-      }
-      try {
-        const reg = await registerSubscriber(
-          () => proxy.getReadStream(),
-          (ev) => writer.write(ev),
-          reconnectSubscriberId,
-        );
-        if (live && !proxy.destroyed && reg !== null && reg.userId !== null) {
-          const previous = registeredRef.current;
-          if (
-            previous !== null &&
-            previous.me.subscriberId !== reg.subscriberId
-          ) {
-            // A different id is a new incarnation, not a roaming refresh. Do
-            // not let its reconciliation use the previous incarnation's list.
-            setListed(null);
+    // Register the subscriber, and keep measuring latency. A retained
+    // incarnation retries transient failures on this same open proxy; listing
+    // and keepalive wait for success rather than replacing confirmed state with
+    // an empty/unfiltered result. Initial-registration failure still resolves
+    // null so the unauthenticated/empty initial UI can report that outcome.
+    const registration: Promise<SubscriberRegistration | null> = (async () => {
+      let requestedSubscriberId = reconnectSubscriberId;
+      for (;;) {
+        if (!live || proxy.destroyed) return null;
+        // Registration needs an authenticated session. The profile's username
+        // is only the local display name; the server stamps its own onto the
+        // wire registration.
+        let name: string | null = null;
+        try {
+          const profile = await fetchProfile(abort.signal);
+          name = profile.username.trim() || profile.subject_id;
+        } catch (err) {
+          if (err instanceof DOMException && err.name === "AbortError")
+            return null;
+          if (err instanceof ProfileApiError && err.status === 401) {
+            redirectToLogin();
+            return null;
           }
-          setRegistered({
-            proxy,
-            me: {
-              id: reg.userId,
-              name,
-              online: true,
-              channelId: WELLKNOWN_CH_ID_MAIN,
-              subscriberId: reg.subscriberId,
-            },
-          });
+          console.error(
+            "signalling: cannot load /api/profile for registration",
+            err,
+          );
         }
-        return reg;
-      } catch (err) {
-        if (live) console.error("signalling: registration failed", err);
-        return null;
+        if (!live || proxy.destroyed) return null;
+        if (name !== null) {
+          try {
+            const attempt = await registerSubscriber(
+              () => proxy.getReadStream(),
+              (ev) => writer.write(ev),
+              requestedSubscriberId,
+            );
+            const reg = attempt.registration;
+            if (
+              live &&
+              !proxy.destroyed &&
+              reg !== null &&
+              reg.userId !== null
+            ) {
+              const previous = registeredRef.current;
+              if (
+                previous !== null &&
+                previous.me.subscriberId !== reg.subscriberId
+              ) {
+                // Only an explicit conflict fallback should reach this identity
+                // change. The old listing is not valid for the new incarnation.
+                setListed(null);
+              }
+              setRegistered({
+                proxy,
+                me: {
+                  id: reg.userId,
+                  name,
+                  online: true,
+                  channelId: WELLKNOWN_CH_ID_MAIN,
+                  subscriberId: reg.subscriberId,
+                },
+              });
+              setRegistrationFailed(null);
+              return reg;
+            }
+            if (attempt.idConflict && requestedSubscriberId !== "") {
+              // The old id is definitively unavailable (for example, another
+              // session claimed it while the server was down). Only now start
+              // a fresh incarnation; timeouts and transient errors keep roaming.
+              console.warn(
+                `signalling: subscriber ${requestedSubscriberId} is registered elsewhere; requesting a fresh id`,
+              );
+              requestedSubscriberId = "";
+            }
+          } catch (err) {
+            if (live) console.error("signalling: registration failed", err);
+          }
+        }
+        if (!live || proxy.destroyed) return null;
+        setRegistrationFailed({ proxy });
+        if (registeredRef.current === null) return null;
+        await new Promise<void>((resolve) => {
+          window.setTimeout(resolve, REGISTER_RETRY_INTERVAL_MS);
+        });
       }
     })();
-    void registration.then((reg) => {
-      if (live && !proxy.destroyed && (reg === null || reg.userId === null)) {
-        // This incarnation could not be re-established. Drop its retained
-        // identity/listing; a later socket starts with a fresh registration.
-        setRegistered(null);
-        setListed(null);
-        setRegistrationFailed({ proxy });
-      }
-    });
 
     // Renew the channel membership every CHANNEL_KEEPALIVE_INTERVAL_MS,
     // starting once the registration resolves. Fire-and-forget: the SS
@@ -862,12 +893,7 @@ export function useSignalling(): SignallingState {
   return {
     lastPing:
       proxy !== null && measured?.proxy === proxy ? measured.ping : null,
-    me:
-      proxy !== null &&
-      registered?.proxy !== proxy &&
-      registrationFailed?.proxy === proxy
-        ? null
-        : (registered?.me ?? null),
+    me: registered?.me ?? null,
     channels: listed?.channels ?? NO_CHANNELS,
     listingRevision: listed?.revision ?? 0,
     completeMembershipChannelIds:

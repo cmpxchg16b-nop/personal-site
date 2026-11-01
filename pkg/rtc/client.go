@@ -154,7 +154,7 @@ var errPeerSessionGone = errors.New("rtc: peer session is gone")
 
 // Defaults of the client's periodic activities, mirroring the browser
 // client: the keepalive and the listing run well below the SS's default
-// subscriber aging (10s), so a live client never ages out and membership
+// subscriber aging (30s), so a live client never ages out and membership
 // changes are picked up quickly.
 const (
 	defaultKeepAliveInterval  = 5 * time.Second
