@@ -26,6 +26,13 @@ replacement immediately. If a connection attempt itself fails, the provider
 retries after a fixed **2 seconds**; this loop does not use ICE's exponential
 backoff.
 
+A network switch can instead leave a stale socket that still reports `OPEN`.
+The browser therefore pings the SS every second and recycles the proxy when a
+pong does not arrive within **3 seconds** of that ping. Ping bookkeeping records
+the pending request before the asynchronous write so a fast pong cannot be lost.
+This gives ICE recovery a working signalling path even when the browser never
+receives a socket close event.
+
 A replacement socket goes through these steps:
 
 1. **Reconnect with the same subscriber id.** `useSignalling` keeps the current
@@ -47,7 +54,11 @@ channelId)` tuple, the SS accepts this as a roaming refresh. A new page load
    current replacement socket succeeds, because an open WebSocket alone does not
    prove that the subscriber registration is still valid.
 4. **Resume and reconcile.** Once registration succeeds, queued events flush in
-   order and normal negotiation continues. Fresh membership listings then
+   order and normal negotiation continues. A peer still in `have-local-offer`
+   also retransmits that offer, because a stale socket may have consumed the
+   original write without delivering it. Identical unresolved offers are
+   coalesced, while the retransmitted `localDescription` includes candidates
+   gathered since the original send. Fresh membership listings then
    reconcile actual arrivals and departures. Async registration/listing results
    from a socket that has already died are discarded instead of overwriting the
    retained state. Incomplete listing pages or unresolved channel/member
@@ -174,6 +185,7 @@ Implementation: `web/site/src/api/ss/ice_restart.ts` and `negotiate.ts`, plus
 | Browser retry after an established socket drops    | Immediate                  |
 | Browser retry after a failed connection attempt    | 2s fixed                   |
 | Go bot `reconnectInterval`                         | 5s, configurable per bot   |
+| Browser SS pong/liveness timeout                   | 3s (recycles the socket)   |
 | Browser registration reply timeout                 | 5s                         |
 | Browser retry after transient registration failure | 2s fixed                   |
 | Browser ping / channel keepalive / member listing  | 1s / 5s / 5s               |

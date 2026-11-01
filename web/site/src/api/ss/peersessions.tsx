@@ -410,12 +410,24 @@ function startPeerSession(
     hooks.onConnectionState(channelId, peer, pc.connectionState);
 
   const output = createPeerSignallingOutput(proxy);
-  session.setProxy = output.setProxy;
   const negotiator = new PerfectNegotiator(pc, {
     channelId,
     selfSubscriber: self,
     peerSubscriber: peer,
   });
+  session.setProxy = (next) => {
+    output.setProxy(next);
+    if (next !== null) {
+      void negotiator
+        .retransmitPendingOffer()
+        .catch((err) =>
+          console.error(
+            `peersessions: cannot retransmit offer to ${peer} after reconnect`,
+            err,
+          ),
+        );
+    }
+  };
   void negotiator
     .negotiate(inbox.stream, output.stream)
     .catch((err) =>

@@ -236,6 +236,7 @@ class MockProxy {
   getWriteStream(): WritableStream<SignallingEvent> {
     return new WritableStream<SignallingEvent>({
       write: async (event) => {
+        if (this.destroyed) throw new Error("mock proxy is closed");
         await this.onWrite?.(event);
         this.outgoing.push(event);
         this.onSend?.(event);
@@ -251,13 +252,16 @@ class MockProxy {
     request: SignallingEvent,
     event: NonNullable<SignallingEvent["s2CEv"]>,
   ): void {
-    this.receive({
+    const reply: SignallingEvent = {
       from: {},
       to: { userId: "user" },
       msgId: crypto.randomUUID(),
       inReplyTo: request.msgId,
       s2CEv: event,
-    });
+    };
+    // Real socket replies arrive after the send continuation has recorded its
+    // pending request; synchronous delivery would make pongs look unanswered.
+    queueMicrotask(() => queueMicrotask(() => this.receive(reply)));
   }
 
   close(): void {
@@ -462,8 +466,15 @@ function prepareProducer(
       );
       return;
     }
-    // Leave pings unanswered by default; reconnect regressions answer them to
-    // prove unrelated traffic does not extend request deadlines.
+    if (event?.ping) {
+      proxy.respond(request, {
+        pong: {
+          pingId: event.ping.pingId,
+          sequenceNumber: 0,
+          ackSequenceNumber: event.ping.sequenceNumber + 1,
+        },
+      });
+    }
   };
 }
 
@@ -876,6 +887,17 @@ const faultyListings = [
 ];
 
 describe("useSignalling membership and registration outcomes", () => {
+  it("keeps a healthy socket open while pongs are answered", async () => {
+    prepareProducer({ current: "complete" });
+    runtime.renderWithSignalling(actualUseSignalling);
+    await flushMicrotasks();
+    await vi.advanceTimersByTimeAsync(1000);
+    await flushMicrotasks();
+    const result = runtime.renderWithSignalling(actualUseSignalling);
+    expect(result.signalling.lastPing).not.toBeNull();
+    expect(proxy.destroyed).toBe(false);
+  });
+
   it("retains the incarnation and queues output until roaming registration succeeds", async () => {
     prepareProducer({ current: "complete" });
     const initial = await producerAtRevision(1);
@@ -957,6 +979,170 @@ describe("useSignalling membership and registration outcomes", () => {
       ),
     ).toHaveLength(1);
     expect(MockPeerConnection.instances).toHaveLength(1);
+    expect(pc.signalingState).not.toBe("closed");
+    expect(onReset).not.toHaveBeenCalled();
+  });
+
+  it("retransmits a polite peer's pending restart offer on the replacement socket", async () => {
+    prepareProducer({ current: "complete" });
+    const respond = proxy.onSend;
+    const respondAsPoliteSelf = (request: SignallingEvent) => {
+      if (request.c2SEv?.register) {
+        proxy.respond(request, {
+          registerResult: { channelId, subscriberId: "0" },
+        });
+        return;
+      }
+      respond?.(request);
+    };
+    proxy.onSend = respondAsPoliteSelf;
+    const initial = await producerAtRevision(1);
+    initial.peers.sessions.subscribeChannel("dcmsg", () => {});
+    await flushMicrotasks();
+    const firstProxy = proxy;
+    const pc = MockPeerConnection.instances[0];
+    firstProxy.receive(
+      c2c(peer.subscriberId, "0", {
+        sessionDesc: { type: "answer", sdp: "initial-answer" },
+      }),
+    );
+    await flushMicrotasks();
+    expect(pc.signalingState).toBe("stable");
+    pc.restartIce = vi.fn(() => {
+      queueMicrotask(() =>
+        pc.onnegotiationneeded?.(new Event("negotiationneeded")),
+      );
+    });
+    const respondWithPings = firstProxy.onSend;
+    firstProxy.onSend = (request) => {
+      if (request.c2SEv?.ping) return;
+      respondWithPings?.(request);
+    };
+    pc.iceConnectionState = "connected";
+    pc.oniceconnectionstatechange?.();
+    pc.iceConnectionState = "disconnected";
+    pc.oniceconnectionstatechange?.();
+
+    await vi.advanceTimersByTimeAsync(3000);
+    await flushMicrotasks();
+    expect(pc.signalingState).toBe("have-local-offer");
+    await vi.advanceTimersByTimeAsync(1000);
+    await flushMicrotasks();
+    expect(firstProxy.destroyed).toBe(true);
+    mocks.proxy.current = null;
+    runtime.renderWithSignalling(actualUseSignalling);
+    await flushMicrotasks();
+
+    const secondProxy = new MockProxy();
+    secondProxy.onSend = respondAsPoliteSelf;
+    mocks.proxy.current = secondProxy;
+    proxy = secondProxy;
+    runtime.renderWithSignalling(actualUseSignalling);
+    await flushMicrotasks();
+    runtime.renderWithSignalling(actualUseSignalling);
+    await flushMicrotasks();
+
+    expect(
+      secondProxy.outgoing.filter(
+        (event) => event.c2CEv?.sessionDesc?.type === "offer",
+      ),
+    ).toHaveLength(1);
+  });
+
+  it("does not duplicate a pending offer already queued for the replacement", async () => {
+    vi.useFakeTimers();
+    const me = self("0");
+    const sessions = runtime.render(me, listing([peer])).sessions;
+    sessions.subscribeChannel("dcmsg", () => {});
+    await flushMicrotasks();
+    const pc = MockPeerConnection.instances[0];
+    proxy.receive(
+      c2c(peer.subscriberId, me.subscriberId, {
+        sessionDesc: { type: "answer", sdp: "initial-answer" },
+      }),
+    );
+    await flushMicrotasks();
+    expect(pc.signalingState).toBe("stable");
+    pc.restartIce = vi.fn(() => {
+      queueMicrotask(() =>
+        pc.onnegotiationneeded?.(new Event("negotiationneeded")),
+      );
+    });
+    mocks.proxy.current = null;
+    runtime.render(me, listing([peer]));
+    pc.iceConnectionState = "connected";
+    pc.oniceconnectionstatechange?.();
+    pc.iceConnectionState = "disconnected";
+    pc.oniceconnectionstatechange?.();
+    await vi.advanceTimersByTimeAsync(3000);
+    await flushMicrotasks();
+    expect(pc.signalingState).toBe("have-local-offer");
+    pc.onicecandidate?.({
+      candidate: { candidate: "candidate:gathered-offline" } as RTCIceCandidate,
+    });
+    pc.localDescription = {
+      ...pc.localDescription!,
+      sdp: "offer-with-new-candidates",
+    };
+
+    const secondProxy = new MockProxy();
+    mocks.proxy.current = secondProxy;
+    proxy = secondProxy;
+    runtime.render(me, listing([peer]));
+    await flushMicrotasks();
+
+    expect(
+      secondProxy.outgoing.filter(
+        (event) => event.c2CEv?.sessionDesc?.type === "offer",
+      ),
+    ).toHaveLength(1);
+    expect(
+      secondProxy.outgoing.filter((event) => event.c2CEv?.rtcICECandidate),
+    ).toHaveLength(1);
+  });
+
+  it("replaces an unresponsive open socket and resumes ICE restart signalling", async () => {
+    prepareProducer({ current: "complete" });
+    const initial = await producerAtRevision(1);
+    const firstProxy = proxy;
+    const onReset = vi.fn();
+    initial.peers.sessions.subscribeReset(onReset);
+    const pc = MockPeerConnection.instances[0];
+    const respond = firstProxy.onSend;
+    firstProxy.onSend = (request) => {
+      if (request.c2SEv?.ping) return; // A stale OPEN socket never answers.
+      respond?.(request);
+    };
+    pc.iceConnectionState = "connected";
+    pc.oniceconnectionstatechange?.();
+    pc.iceConnectionState = "disconnected";
+    pc.oniceconnectionstatechange?.();
+
+    await vi.advanceTimersByTimeAsync(4000);
+    await flushMicrotasks();
+
+    expect(firstProxy.destroyed).toBe(true);
+    expect(pc.signalingState).not.toBe("closed");
+    expect(onReset).not.toHaveBeenCalled();
+    mocks.proxy.current = null;
+    runtime.renderWithSignalling(actualUseSignalling);
+    await flushMicrotasks();
+
+    const secondProxy = new MockProxy();
+    secondProxy.onSend = respond;
+    mocks.proxy.current = secondProxy;
+    proxy = secondProxy;
+    runtime.renderWithSignalling(actualUseSignalling);
+    await flushMicrotasks();
+    runtime.renderWithSignalling(actualUseSignalling);
+    await vi.advanceTimersByTimeAsync(3000);
+    await flushMicrotasks();
+
+    expect(
+      secondProxy.outgoing.filter(
+        (event) => event.c2CEv?.iceRestartRequest === true,
+      ),
+    ).toHaveLength(1);
     expect(pc.signalingState).not.toBe("closed");
     expect(onReset).not.toHaveBeenCalled();
   });

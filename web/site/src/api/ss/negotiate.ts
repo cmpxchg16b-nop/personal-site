@@ -99,6 +99,7 @@ export class PerfectNegotiator implements RTCNegotiator {
   public readonly polite: boolean;
 
   private writer?: WritableStreamDefaultWriter<SignallingEvent>;
+  private pendingOffer?: Promise<void>;
 
   /**
    * @param pc the peer connection to negotiate on. The caller keeps
@@ -138,7 +139,10 @@ export class PerfectNegotiator implements RTCNegotiator {
       try {
         this.makingOffer = true;
         await this.pc.setLocalDescription();
-        await this.sendToPeer({ sessionDesc: this.localDescription() });
+        const description = this.localDescription();
+        if (description !== undefined) {
+          await this.sendOffer(description);
+        }
         logSdp(this.tag(), "send offer", this.localDescription());
       } catch (err) {
         console.error(err);
@@ -187,6 +191,21 @@ export class PerfectNegotiator implements RTCNegotiator {
       writer.releaseLock();
       this.writer = undefined;
     }
+  }
+
+  /**
+   * Re-sends the current local offer on a replacement signalling transport.
+   * A stale socket may have accepted the original write without delivering it;
+   * repeated restartIce() calls need not produce another negotiationneeded
+   * while this offer is pending. Reading localDescription now also includes
+   * candidates gathered since the original emission.
+   */
+  public async retransmitPendingOffer(): Promise<void> {
+    if (this.pc.signalingState !== "have-local-offer") return;
+    const description = this.localDescription();
+    if (description === undefined) return;
+    await this.sendOffer(description);
+    logSdp(this.tag(), "retransmit offer", description);
   }
 
   /** Handles one inbound signalling event; non-c2c or foreign-peer events are ignored. */
@@ -251,6 +270,28 @@ export class PerfectNegotiator implements RTCNegotiator {
         polite: this.polite,
       });
       console.error(err);
+    }
+  }
+
+  // sendOffer coalesces retransmission with the current local-offer write.
+  // Candidate gathering can change SDP while that write is pending, but those
+  // candidates already use trickle. Once the write settles (including on a
+  // stale socket), reconnect may retransmit the latest localDescription.
+  private async sendOffer(
+    description: RTCSessionDescriptionInit,
+  ): Promise<void> {
+    if (this.pendingOffer !== undefined) {
+      await this.pendingOffer;
+      return;
+    }
+    const write = this.sendToPeer({ sessionDesc: description });
+    this.pendingOffer = write;
+    try {
+      await write;
+    } finally {
+      if (this.pendingOffer === write) {
+        this.pendingOffer = undefined;
+      }
     }
   }
 

@@ -175,8 +175,9 @@ const NO_COMPLETE_MEMBERSHIP_CHANNELS: ChannelId[] = [];
 // the pings double as registration keepalive.
 const PING_INTERVAL_MS = 1000;
 
-// PONG_TIMEOUT_MS bounds the wait for one ping's pong; on timeout the RTT
-// falls back to null until a later pong recovers it.
+// PONG_TIMEOUT_MS bounds the wait for one ping's pong. A socket can look OPEN
+// after a network switch while its old path is already dead, so timeout also
+// recycles the proxy instead of leaving ICE signalling on that stale path.
 const PONG_TIMEOUT_MS = 3000;
 
 // REGISTER_REPLY_TIMEOUT_MS bounds the wait for the SS's registration
@@ -628,7 +629,7 @@ export function useSignalling(): SignallingState {
     const getPending = () => pending;
 
     const doPing = async () => {
-      if (!live || pending) {
+      if (!live || proxy.destroyed || pending) {
         return; // the previous ping is still unanswered
       }
       const msgId = crypto.randomUUID();
@@ -640,18 +641,20 @@ export function useSignalling(): SignallingState {
         msgId,
         c2SEv: { ping: { pingId, sequenceNumber: seq, ackSequenceNumber: 0 } },
       };
+      pending = { msgId, seq, t0: performance.now() };
       try {
         await writer.write(ping);
       } catch (err) {
+        if (getPending()?.msgId === msgId) pending = null;
         if (live) console.error("signalling: ping write failed", err);
         return;
       }
-      pending = { msgId, seq, t0: performance.now() };
       window.setTimeout(() => {
         if (live && getPending()?.msgId === msgId) {
           pending = null;
           setMeasured(null);
-          console.warn("signalling: SS pong timed out");
+          console.warn("signalling: SS pong timed out; reconnecting");
+          proxy.close();
         }
       }, PONG_TIMEOUT_MS);
     };
