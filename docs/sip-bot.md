@@ -10,9 +10,8 @@ The sip bot is a **session border controller (SBC)** between two voice
 networks that share nothing but this host:
 
 - the site's **WebRTC voice network** — the chat subsystem's phone
-  sessions, where a call is an in-band SIP-subset dialog over the pair's
-  `dcmsg` data channel plus an audio m-line on the pair's long-lived P2P
-  peer connection (see `docs/signalling-server.md`, `docs/music-bot.md`);
+  sessions, where a call is a SIP-subset dialog over the pair's WebSocket
+  c2c relay plus an audio m-line on the pair's long-lived P2P connection (see `docs/signalling-server.md`, `docs/music-bot.md`);
 - an external **SIP voice network** — any RFC 3261 registrar/Proxy the
   bot can reach over UDP (an Asterisk/FreeSWITCH/Kamailio, a residential
   VoIP provider, …).
@@ -41,9 +40,9 @@ text messages (SIP MESSAGE, RFC 3428) both ways (§7.3):
 ```
 browser ──(WebRTC: DTLS-SRTP)──▶ SIP BOT ──(SIP/RTP)──▶ PBX ──▶ callee
        ◀──                      ◀──(SIP INVITE to a registered AOR)──── caller
-dcmsg SIP-subset dialog          real SIP: REGISTER, INVITE (both
+WS SIP-subset dialog             real SIP: REGISTER, INVITE (both
 + renegotiated m-line            directions), BYE, MESSAGE (both
-chat text                        directions, §7.3); plain RTP media
+dcmsg chat text                  directions, §7.3); plain RTP media
         └──── one codec, negotiated end to end by the two UAs (§8) ────┘
 ```
 
@@ -56,7 +55,7 @@ chat is a telegram-style CLI.
 
 ```mermaid
 graph TD
-    A["sipHandler<br/>pkg/rtc/sipbot/handler.go<br/>message policy: CLI, registration<br/>lifecycle, call policy"] --> B["msg_handler.Server<br/>data-channel layer: dcmsg/dcbin decoding,<br/>echo rule, call-log amends"]
+    A["sipHandler<br/>pkg/rtc/sipbot/handler.go<br/>message policy: CLI, registration<br/>lifecycle, call policy"] --> B["msg_handler.Server<br/>messaging layer: dcmsg/dcbin + WS calls,<br/>echo rule, call-log amends"]
     B --> C["HeadlessRTCClient<br/>pkg/rtc: signalling, peer sessions,<br/>perfect negotiation, AddTrack/RemoveTrack"]
     C --> D["Signalling Server (WS relay)<br/>+ pion PeerConnection per peer"]
     A --> E["per-user account: REGISTER at birth, de-REGISTER at the end<br/>+ diago UAC (one SIP client per registered user)<br/>github.com/emiago/diago on sipgo"]
@@ -396,7 +395,7 @@ The reverse-propagation cases:
   no longer a failure but the callee-hangs-up case below.
 - **Callee hangs up**: the dialog's ctx ends → the relay stops → the
   browser leg gets `w.Bye(callId)`, the chat a `Callee hung up.` line.
-- **User hangs up** (BYE/CANCEL on dcmsg, or `/hangup`): the SIP dialog
+- **User hangs up** (BYE/CANCEL on the WS call relay, or `/hangup`): the SIP dialog
   gets `Hangup` (BYE after answer, CANCEL while it rings), the relay
   stops, the track detaches after the music bot's `hangupDetachDelay`
   (the browser is tearing down its side at the same instant; the
@@ -855,8 +854,8 @@ Cancel(callId string) error
 Bye(callId string) error
 ```
 
-Each sends the corresponding `application/x-sip` DCMsg and posts the
-Server's existing `sipDialogNote` (`callStatusCancelled` /
+Each sends the corresponding `application/x-sip` payload in `c2CEv.call`
+over WebSocket and posts the Server's existing `sipDialogNote` (`callStatusCancelled` /
 `callStatusEnded`), so the hub's `foldDialog` amends the INVITE's logged
 status exactly as it does for inbound dialog messages — the caller-side
 log duty stays the Server's, never the handler's. No handler-visible
@@ -874,8 +873,8 @@ gains the spontaneous counterpart:
 // WriterFor returns a ResponseWriter bound to the peer's current
 // session — the unsolicited-send path, for answering an event that is
 // not one of the peer's messages. The writer threads on no message and
-// is bound to no call; a peer with no live session yields a writer
-// whose sends all fail with ErrNoMessagingChannel.
+// is bound to no call. Chat sends require dcmsg; call sends require the
+// peer's WebSocket session, independently of dcmsg.
 func (s *Server) WriterFor(peer ss.SubscriberId) ResponseWriter
 ```
 

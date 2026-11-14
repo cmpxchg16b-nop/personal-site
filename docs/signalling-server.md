@@ -145,11 +145,17 @@ fields. Its optional payload fields are:
   end-of-candidates.
 - **`iceRestartRequest`** — a boolean; `true` asks the polite peer to
   originate an ICE-restart offer. False/absent carries no request.
+- **`call`** — the SIP-subset call dialog or `chatControl.sip` history
+  amendment described under _Phone sessions_. Its envelope retains
+  `mimeVersion/channelId/fromSubscriberId/toSubscriberId/creationTimestamp/
+msgId/inReplyTo/mimeType/plaintext`; those three address fields must match
+  the outer c2c addresses. See [transport map](signalling-transports.md).
 - **`ping` / `pong`** — out-of-band messages, each with the full
   `{pingId, sequenceNumber, ackSequenceNumber}` shape described above.
 
 The SDP and ICE structures use `github.com/pion/webrtc/v4` types, which
-marshal to the corresponding browser JSON shapes.
+marshal to the corresponding browser JSON shapes. The call structures mirror
+`ClientToClientCallEv` in `pkg/models/ss/ss.go` and `types.ts`.
 
 Think of a subscriber id as an IP address and the channel as the VLAN it
 lives in: a subscriber id alone does not determine an endpoint, only
@@ -206,10 +212,12 @@ next `ping`'s `sequenceNumber` is the ack of the last reply.
 
 ## In-band peer messaging (data channels)
 
-Discovery and session establishment go through the SS, but chat traffic
-itself never does: once the c2c relay has brokered the WebRTC handshake,
-the two browsers talk **directly and in-band** over a point-to-point peer
-connection. The browser-side session management lives in
+Discovery and all session signalling go through the SS; business chat and
+file traffic do not. Once the c2c relay has brokered the WebRTC handshake,
+the peers exchange those business payloads directly over their point-to-point
+peer connection, while call dialogs continue on the WS relay. See
+[WebRTC signalling and transport map](signalling-transports.md) for the full
+browser/bot/UA matrix. The browser-side session management lives in
 `web/site/src/api/ss/peersessions.tsx`: `usePeerSessions` owns the peer
 connections and hands their data channels out by label. Two sibling
 consumers build on it, decoupled from each other: `useDataChannel` in
@@ -243,15 +251,12 @@ arrive at the handler registered with `HandleTrack` — the counterpart of
 `PeerSessions.subscribeTracks`.
 
 A bot built on the client is three layers. The client is the bot client
-(above). `pkg/rtc/msg_handler` is the data-channel layer: its `Server`
-serves the two well-known labels and owns every sub-message protocol
-mechanic — the echo rule (every accepted message is bounced back verbatim
-with `echo` set; echoes and SIP dialog messages are never bounced), the
-strict FILE-frame reassembly (a gap, an overlap, or a mismatched `total`
-drops the transfer), the per-frame acknowledgement, and the call log's
-conditioning: the Server sniffs the call dialogs and amends the INVITEs
-of the bot's own outgoing calls as their status moves (the caller's
-X-Call-Status duty — below the interface, like the echo rule). It
+(above). `pkg/rtc/msg_handler` is the messaging layer: its `Server` serves
+the two well-known DataChannels plus the WS call relay and owns the
+sub-message mechanics — the dcmsg business echo rule, strict FILE-frame
+reassembly and per-frame acknowledgement, and the call log's conditioning:
+the Server sniffs WS call dialogs and amends the INVITEs of its own outgoing
+calls as their status moves (the caller's X-Call-Status duty). It
 distills the raw frames into bot messages — a plain-text chat line, one
 accepted chunk of a file transfer, a completely transferred file
 attachment, a call dialog message — and hands them to a
@@ -334,13 +339,10 @@ subscriber id, ICE servers, the periodic knobs) map onto
 - **ICE servers** come from `GET /api/iceServers` (the `<iceServer/>`
   entries of `serverConfig.xml`), so a deployment can steer peers at its
   own STUN/TURN instance.
-- **Echo.** A data channel does not echo; the recipient bounces every
-  message back with `echo: true` so the sender sees its own message.
-  Echoes are never echoed again. Both sides therefore build the same
-  history from the same frames. The one exception is the call protocol
-  (`application/x-sip`): like real SIP, a dialog message is never
-  bounced — the sender records its own copy at send time, so a call's
-  behavior never depends on an echo.
+- **Business echo.** A data channel does not echo; the recipient bounces
+  every accepted dcmsg business message with `echo: true`, never bouncing
+  an echo again. Call signalling is different: it travels on WS, has no
+  bounce, and each sender records its own successful write locally.
 
 Every frame is one JSON `DCMsg`: `mimeVersion` (`1.0`), `channelId`,
 `fromSubscriberId`, `toSubscriberId`, `creationTimestamp` (Unix seconds),
@@ -348,26 +350,24 @@ Every frame is one JSON `DCMsg`: `mimeVersion` (`1.0`), `channelId`,
 tag, and the body. Malformed frames are dropped silently, mirroring the
 SS's rule for malformed events.
 
-| `mimeType`                           | Body                                                                                                               | Meaning                                                                                                                                                                                                                                                                     |
-| ------------------------------------ | ------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `text/plain`                         | `plaintext`                                                                                                        | A plain-text chat line.                                                                                                                                                                                                                                                     |
-| `application/x-file-transfer-status` | `fileTransfer {fileId, kind, filename, fileMIMEType, fileSizeTotalBytes, fileSizeTransferred, fileTransferStatus}` | The UI state of a file transfer (`pending` → `running` → `done`). The file's bytes never travel in the message; the opaque, globally unique `fileId` is the handle a recipient passes back to fetch them.                                                                   |
-| `application/x-chat-control`         | `chatControl {subtype, targetMessageId, text?, fileTransfer?, sip?}`                                               | Mutates the UI state of one of the sender's earlier messages instead of adding a line — the result of something, never its cause.                                                                                                                                           |
-| `application/x-sip`                  | `sip {callId, method?/response?, X-Media?, X-Call-Status?}`                                                        | One message of a call's SIP-subset dialog (see _Phone sessions_): the caller's INVITE (stored, rendered as the call's log entry; its arrival rings the callee), the callee's response (`200 OK` / `603 Decline`), the caller's CANCEL, or either party's BYE. Never echoed. |
+| `mimeType`                           | Body                                                                                                               | Meaning                                                                                                                                                                                                   |
+| ------------------------------------ | ------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `text/plain`                         | `plaintext`                                                                                                        | A plain-text chat line.                                                                                                                                                                                   |
+| `application/x-file-transfer-status` | `fileTransfer {fileId, kind, filename, fileMIMEType, fileSizeTotalBytes, fileSizeTransferred, fileTransferStatus}` | The UI state of a file transfer (`pending` → `running` → `done`). The file's bytes never travel in the message; the opaque, globally unique `fileId` is the handle a recipient passes back to fetch them. |
+| `application/x-chat-control`         | `chatControl {subtype, targetMessageId, text?, fileTransfer?}`                                                     | Mutates the UI state of an earlier business message. `chatControl.sip` is not accepted on dcmsg; call-status amendments use `c2CEv.call` on WS.                                                           |
 
 Chat-control semantics: `delete` drops the target message; `amend`
-rewrites the target's body — `text` for a text message, `fileTransfer`
-for a file-transfer status, `sip` for a call's INVITE (which must also
-be an INVITE naming the target dialog's own `callId`) — while
-keeping its `msgId` and `creationTimestamp`, so an amendment never moves
+rewrites the target's body — `text` for a text message or `fileTransfer`
+for a file-transfer status — while keeping its `msgId` and
+`creationTimestamp`, so an amendment never moves
 or reattributes a message. Only the sender's own messages can be
 targeted; unknown targets and body-kind mismatches are no-ops. A chat
 control only ever mutates **UI state**: it is how one end tells the
 other "display this differently now", the _result_ of something that
-already happened — a file transfer's acknowledgements advancing, a call
-dialog's messages unfolding — never the _cause_; the actions themselves
-are their own frames (the `dcbin` acknowledgement frames, the SIP
-dialog's messages). The receiver applies a control message on
+already happened — a file transfer's acknowledgements advancing — never
+the _cause_; the actions themselves are their own frames (the `dcbin`
+acknowledgement frames). Call-status amendments use the separate WS call
+path described below. The receiver applies a business control message on
 arrival, the sender when its echo comes back, so both histories stay
 identical; control messages themselves are never stored.
 
@@ -441,8 +441,9 @@ connection as the messaging and binary channels — no dedicated
 connection is created for a call. Two deliberately separate layers:
 
 - **The session protocol — the cause.** The actions are a SIP subset
-  with the SDP body stripped: `application/x-sip` DCMsgs (body `sip`),
-  one per dialog action. The caller opens the dialog with an INVITE —
+  with the SDP body stripped, carried by `c2CEv.call` on WebSocket as
+  `application/x-sip` payloads (body `sip`), never on a DataChannel. The
+  caller opens the dialog with an INVITE —
   stored on both ends as the call's log entry; its arrival is what
   rings the callee. The callee answers the INVITE with a final
   response — `200 OK` (accept) or `603 Decline` (reject); the caller
@@ -459,11 +460,10 @@ connection is created for a call. Two deliberately separate layers:
   elsewhere: it rides the SS's client-to-client relay between the two
   ends' PerfectNegotiators as the pair's peer connection negotiates and
   renegotiates — these messages are pure dialog verbs. The subset also
-  omits SIP's ACK and CSeq (SCTP delivery is ordered and reliable, and
-  the state fold is order-independent) and — unlike every other DCMsg
-  kind — a dialog message is **never echoed**: like real SIP, each end
-  advances its own state from its own sends (recorded locally at send
-  time) and the peer's sends (received), never from a bounce. Each end
+  omits SIP's ACK and CSeq (the per-peer WS output is ordered, and the
+  state fold is order-independent). A dialog message is **never echoed**:
+  each end advances state from its own successful WS writes (recorded
+  locally) and the peer's relayed messages, never from a bounce. Each end
   folds the dialog's messages into its protocol state (`usePhoneCalls`)
   as the precedence maximum over `inviting` < `accepted` < `ended` <
   `cancelled` < `rejected`, so a cancel/accept race settles identically
@@ -475,12 +475,11 @@ connection is created for a call. Two deliberately separate layers:
   displays; it only ever follows the protocol state. When a session's
   protocol state has moved on from its logged status, the session's
   owner — the caller, the INVITE's author — reports the new UI state
-  with a chat-control `amend` of the INVITE (a `sip` body: the INVITE
-  again, `X-Call-Status` updated), exactly like a file transfer's
-  sender amends its status message as acknowledgements arrive. Chat
-  control is a separate layer with its own echo discipline and its
-  own-messages-only rule — the SIP dialog never echoes and never
-  depends on chat control.
+  with a `chatControl.sip` amendment in another `c2CEv.call` event on the
+  same ordered WS path (the INVITE again, `X-Call-Status` updated). This
+  avoids an amendment overtaking the INVITE on dcmsg. The receiver applies
+  the amendment; the caller applies its own after the write succeeds. The
+  dialog itself never depends on these UI amendments.
 
 Media and audio:
 

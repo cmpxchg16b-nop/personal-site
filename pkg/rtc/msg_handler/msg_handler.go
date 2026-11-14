@@ -1,10 +1,8 @@
-// Package msg_handler is the data-channel layer of a headless bot,
-// between the bot client (pkg/rtc's HeadlessRTCClient, which brokers the
-// peer sessions and dispatches their data channels by label) and the
-// bot's own message policy. Its Server serves a pair's two well-known
-// data channels and distills their raw frames into bot messages for a
-// BotMessageHandler — the way an http.Server distills a connection's
-// bytes into requests for an http.Handler.
+// Package msg_handler is the messaging layer of a headless bot, between
+// the bot client and its message policy. Chat and file business data come
+// from the pair's dcmsg/dcbin channels; call dialogs and call-status
+// amendments come from the WebSocket c2c relay. The Server distills all
+// of them into BotMessageHandler invocations.
 //
 // A "message" at this layer is a higher-level construct than a raw
 // data-channel frame:
@@ -22,8 +20,8 @@
 // The protocol mechanics stay with the Server, below the interface, and
 // are no concern of a BotMessageHandler: malformed frames are dropped
 // silently, every accepted message is bounced back to its sender with the
-// echo flag set (echoes and the call protocol excepted — the classical
-// conditioning of the messaging channel), inbound file streams are
+// echo flag set (dcmsg business messages only; WebSocket call events have
+// no echo), inbound file streams are
 // reassembled strictly and every accepted chunk is acknowledged. What the
 // bot DOES with a message is a BotMessageHandler's alone; it answers
 // through the ResponseWriter it is handed.
@@ -39,16 +37,11 @@ import (
 // http.Handler for the messages a Server distills from a pair's data
 // channels.
 //
-// The Server invokes the methods synchronously on the data channel's own
-// goroutine as messages arrive: invocations on one channel are serialized
-// and in order — a file's chunks arrive in order, and its HandleAttachment
-// follows the final HandleFileChunk — but different channels of one peer,
-// and different peers, run concurrently. State an implementation keeps
-// across invocations is its own concern, the way it is in any bot
-// framework; one guarantee helps: one transfer's chunks never overlap, so
-// per-transfer state keyed by file id needs no synchronization beyond a
-// concurrent map (sync.Map). A slow handler stalls its channel, like a
-// slow http.Handler stalls its connection.
+// HandleChatMessage and HandleCalling are serialized per peer across the
+// dcmsg and WebSocket inputs. A file's chunks arrive in order and its
+// HandleAttachment follows the final HandleFileChunk; different peers run
+// concurrently. A slow chat/call handler stalls only that peer's callback
+// stream, not the client hub or signalling transport.
 //
 // ctx is the peer session's context: it is canceled when the session ends
 // (the peer dropped out, or the client's Run ended).

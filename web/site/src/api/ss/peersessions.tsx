@@ -28,9 +28,10 @@
  *
  * Media tracks ride the same connection: consumers add and remove local
  * tracks (addTrack/removeTrack) and subscribe remote track arrivals
- * (subscribeTracks); the PerfectNegotiator renegotiates on its own, so
- * voice-call media needs no signalling work of its own — and no second
- * peer connection.
+ * (subscribeTracks); the PerfectNegotiator renegotiates on its own. SIP-
+ * subset call dialogs and chatControl.sip amendments have a separate
+ * subscribeCall/sendCall path on the same ordered per-peer WS output;
+ * they never enter the negotiator or a DataChannel.
  *
  * The ICE servers for the peer connections come from GET
  * /api/iceServers (the <iceServer/> entries of the server configuration
@@ -45,10 +46,12 @@ import { useICEServers } from "@/hooks/useICEServers";
 import { PerfectNegotiator } from "./negotiate";
 import type { SSProxy } from "./proxy";
 import { useSSProxy } from "./react";
+import { WELLKNOWN_SVC_ID_SS } from "./types";
 import type {
   ChannelId,
   ChatChannel,
   ChatUser,
+  ClientToClientCallEv,
   SignallingEvent,
   SubscriberId,
 } from "./types";
@@ -113,11 +116,23 @@ function createPeerInbox(
   };
 }
 
+// PendingCalls holds call events until both a matching subscriber incarnation
+// and its peer session exist. The self address is part of the key so events
+// accepted before registration cannot leak into a different incarnation.
+interface PendingCalls {
+  channelId: ChannelId;
+  self: SubscriberId;
+  peer: SubscriberId;
+  events: SignallingEvent[];
+  absentListings: number;
+}
+
 // A peer's signalling output outlives any one proxy. Writes made while the
 // WebSocket is down stay ordered and resolve once a replacement proxy sends
 // them, so PerfectNegotiator does not lose SDP or candidates during reconnect.
 interface PeerSignallingOutput {
   stream: WritableStream<SignallingEvent>;
+  write(event: SignallingEvent): Promise<void>;
   setProxy(proxy: SSProxy | null): void;
   close(): void;
 }
@@ -173,22 +188,22 @@ function createPeerSignallingOutput(
     }
   };
 
-  const stream = new WritableStream<SignallingEvent>({
-    write: (event) => {
-      if (closed) {
-        return Promise.reject(
-          new Error("peersessions: signalling output is closed"),
-        );
-      }
-      return new Promise<void>((resolve, reject) => {
-        pending.push({ event, resolve, reject });
-        void flush();
-      });
-    },
-  });
+  const write = (event: SignallingEvent): Promise<void> => {
+    if (closed) {
+      return Promise.reject(
+        new Error("peersessions: signalling output is closed"),
+      );
+    }
+    return new Promise<void>((resolve, reject) => {
+      pending.push({ event, resolve, reject });
+      void flush();
+    });
+  };
+  const stream = new WritableStream<SignallingEvent>({ write });
 
   return {
     stream,
+    write,
     setProxy(next) {
       if (closed) return;
       const changed = proxy !== next;
@@ -235,6 +250,10 @@ export type PeerTrackHandler = (
   ev: RTCTrackEvent,
 ) => void;
 
+// PeerCallHandler receives one call-signalling event before the WebRTC
+// negotiator's SDP/ICE demux. Call events never enter the negotiator.
+export type PeerCallHandler = (event: SignallingEvent) => void;
+
 // SessionResetHandler is notified when peer sessions go away: `dropped`
 // names one closed session, or null when every session was torn down
 // (an identity change or the whole hook unmounting).
@@ -251,10 +270,9 @@ export type PeerConnectionStates = Record<
   Record<SubscriberId, RTCPeerConnectionState>
 >;
 
-// PeerSessions is the peer-connection plumbing the data-channel
-// consumers (useDataChannel, useBinaryDataChannel) build on: one peer
-// connection per (channel, peer) pair, its data channels demanded by
-// label. The object is stable across renders.
+// PeerSessions is the peer-connection and c2c plumbing the consumers build
+// on: one connection per pair, DataChannels by label, and an independent
+// WebSocket call-signalling path. The object is stable across renders.
 export interface PeerSessions {
   /**
    * The session's channel of `label`, whatever its readyState; null
@@ -286,6 +304,20 @@ export interface PeerSessions {
    * channels themselves live and die with their session.
    */
   subscribeChannel(label: string, cb: PeerChannelHandler): () => void;
+  /**
+   * Subscribes to SIP-subset call dialogs and call-status amendments arriving
+   * on the WebSocket c2c relay. Returns the unsubscribe function.
+   */
+  subscribeCall(cb: PeerCallHandler): () => void;
+  /**
+   * Sends call signalling over this peer session's ordered WebSocket output.
+   * Rejects when the current identity or peer session is unavailable.
+   */
+  sendCall(
+    channelId: ChannelId,
+    peer: SubscriberId,
+    call: ClientToClientCallEv,
+  ): Promise<void>;
   /**
    * Subscribes to session teardowns; returns the unsubscribe function.
    */
@@ -324,6 +356,7 @@ export interface PeerSessions {
 interface PeerSession {
   pc: RTCPeerConnection;
   channelId: ChannelId;
+  self: SubscriberId;
   peer: SubscriberId;
   // true when this end creates the data channels (the smaller
   // subscriber id); false when they arrive via ondatachannel.
@@ -334,6 +367,7 @@ interface PeerSession {
   // Creates the session's channel of a label — polite sessions only;
   // a label already present is a no-op.
   createChannel: (label: string) => void;
+  sendSignalling: (event: SignallingEvent) => Promise<void>;
   setProxy: (proxy: SSProxy | null) => void;
   close: () => void;
 }
@@ -380,10 +414,13 @@ function startPeerSession(
   const session: PeerSession = {
     pc,
     channelId,
+    self,
     peer,
     polite: self < peer,
     channels: new Map(),
     createChannel: () => {},
+    sendSignalling: () =>
+      Promise.reject(new Error("peersessions: signalling output not ready")),
     setProxy: () => {},
     close: () => {},
   };
@@ -420,6 +457,7 @@ function startPeerSession(
     hooks.onConnectionState(channelId, peer, pc.connectionState);
 
   const output = createPeerSignallingOutput(proxy);
+  session.sendSignalling = output.write;
   const negotiator = new PerfectNegotiator(pc, {
     channelId,
     selfSubscriber: self,
@@ -492,6 +530,7 @@ export function usePeerSessions(
   const proxy = useSSProxy();
   const sessionsRef = useRef(new Map<string, PeerSession>());
   const peerInboxesRef = useRef(new Map<string, PeerInbox>());
+  const pendingCallsRef = useRef(new Map<string, PendingCalls>());
   const countedListingRevisionRef = useRef<number | null>(null);
   // The async demux needs the latest address; teardown also uses the latest
   // lifecycle to distinguish initial registration from a real replacement.
@@ -504,6 +543,7 @@ export function usePeerSessions(
   // opens or its session goes away (peer key → label → resolvers).
   const channelHandlersRef = useRef(new Map<string, Set<PeerChannelHandler>>());
   const trackHandlersRef = useRef(new Set<PeerTrackHandler>());
+  const callHandlersRef = useRef(new Set<PeerCallHandler>());
   const resetHandlersRef = useRef(new Set<SessionResetHandler>());
   const channelWaitersRef = useRef(
     new Map<string, Map<string, Set<(dc: RTCDataChannel | null) => void>>>(),
@@ -626,6 +666,35 @@ export function usePeerSessions(
           ) {
             continue;
           }
+          if (c2c.call !== undefined) {
+            const session = sessionsRef.current.get(
+              peerKey(c2c.channelId, c2c.fromSubscriber),
+            );
+            if (
+              session === undefined ||
+              session.self !== c2c.toSubscriber ||
+              callHandlersRef.current.size === 0
+            ) {
+              const key = inboxKey(
+                c2c.channelId,
+                c2c.toSubscriber,
+                c2c.fromSubscriber,
+              );
+              const pending = pendingCallsRef.current.get(key) ?? {
+                channelId: c2c.channelId,
+                self: c2c.toSubscriber,
+                peer: c2c.fromSubscriber,
+                events: [],
+                absentListings: 0,
+              };
+              pending.events.push(value);
+              pending.absentListings = 0;
+              pendingCallsRef.current.set(key, pending);
+            } else {
+              for (const cb of callHandlersRef.current) cb(value);
+            }
+            continue;
+          }
           const key = inboxKey(
             c2c.channelId,
             c2c.toSubscriber,
@@ -673,6 +742,7 @@ export function usePeerSessions(
   useEffect(() => {
     const sessions = sessionsRef.current;
     const inboxes = peerInboxesRef.current;
+    const pendingCalls = pendingCallsRef.current;
     const channelWaiters = channelWaitersRef.current;
     const resetHandlers = resetHandlersRef.current;
     return () => {
@@ -689,6 +759,7 @@ export function usePeerSessions(
       sessions.clear();
       for (const inbox of inboxes.values()) inbox.close();
       inboxes.clear();
+      pendingCalls.clear();
       // Anything still waiting on a channel is released, and the
       // consumers are told every session is gone.
       for (const byLabel of channelWaiters.values()) {
@@ -728,6 +799,11 @@ export function usePeerSessions(
         inboxes.delete(key);
       }
     }
+    for (const [key, pending] of pendingCallsRef.current) {
+      if (pending.channelId !== me.channelId || pending.self !== self) {
+        pendingCallsRef.current.delete(key);
+      }
+    }
     if (iceServers === null) return;
     const want = new Set<string>();
     for (const channel of channels) {
@@ -759,6 +835,13 @@ export function usePeerSessions(
             sessionHooks,
           );
           sessions.set(key, session);
+          const pending = pendingCallsRef.current.get(id);
+          if (pending !== undefined && callHandlersRef.current.size > 0) {
+            for (const event of pending.events) {
+              for (const cb of callHandlersRef.current) cb(event);
+            }
+            pendingCallsRef.current.delete(id);
+          }
           for (const label of channelHandlersRef.current.keys()) {
             session.createChannel(label);
           }
@@ -789,6 +872,16 @@ export function usePeerSessions(
       if (inbox.absentListings >= 2) {
         inbox.close();
         inboxes.delete(key);
+      }
+    }
+    for (const [key, pending] of pendingCallsRef.current) {
+      if (sessions.has(peerKey(pending.channelId, pending.peer))) {
+        pending.absentListings = 0;
+        continue;
+      }
+      pending.absentListings += 1;
+      if (pending.absentListings >= 2) {
+        pendingCallsRef.current.delete(key);
       }
     }
   }, [
@@ -851,6 +944,57 @@ export function usePeerSessions(
     },
     [],
   );
+  const subscribeCall = useCallback((cb: PeerCallHandler) => {
+    callHandlersRef.current.add(cb);
+    for (const [key, pending] of pendingCallsRef.current) {
+      if (sessionsRef.current.has(peerKey(pending.channelId, pending.peer))) {
+        for (const event of pending.events) cb(event);
+        pendingCallsRef.current.delete(key);
+      }
+    }
+    return () => {
+      callHandlersRef.current.delete(cb);
+    };
+  }, []);
+  const sendCall = useCallback(
+    (
+      channelId: ChannelId,
+      peer: SubscriberId,
+      call: ClientToClientCallEv,
+    ): Promise<void> => {
+      const me = lifecycleRef.current.me;
+      const self = me?.subscriberId;
+      const session = sessionsRef.current.get(peerKey(channelId, peer));
+      if (
+        self === undefined ||
+        me?.channelId !== channelId ||
+        session === undefined
+      ) {
+        return Promise.reject(
+          new Error(
+            `peersessions: no peer session for call signalling to ${peer}`,
+          ),
+        );
+      }
+      return session.sendSignalling({
+        from: {},
+        to: { serviceId: WELLKNOWN_SVC_ID_SS },
+        msgId: crypto.randomUUID(),
+        c2CEv: {
+          fromSubscriber: self,
+          toSubscriber: peer,
+          channelId,
+          call: {
+            ...call,
+            channelId,
+            fromSubscriberId: self,
+            toSubscriberId: peer,
+          },
+        },
+      });
+    },
+    [],
+  );
   const subscribeReset = useCallback((cb: SessionResetHandler) => {
     resetHandlersRef.current.add(cb);
     return () => {
@@ -892,6 +1036,8 @@ export function usePeerSessions(
       getChannel,
       whenOpenChannel,
       subscribeChannel,
+      subscribeCall,
+      sendCall,
       subscribeReset,
       addTrack,
       removeTrack,
@@ -901,6 +1047,8 @@ export function usePeerSessions(
       getChannel,
       whenOpenChannel,
       subscribeChannel,
+      subscribeCall,
+      sendCall,
       subscribeReset,
       addTrack,
       removeTrack,

@@ -103,6 +103,24 @@ func (f DataChannelHandlerFunc) ServeDataChannel(ctx context.Context, channelId 
 
 var _ DataChannelHandler = DataChannelHandlerFunc(nil)
 
+// CallSignallingHandler handles the SIP-subset call dialogs and call-status
+// amendments arriving on the WebSocket c2c relay. It is deliberately separate
+// from Negotiator: call events never enter the SDP/ICE negotiation stream.
+// Invocations are serialized per peer session and receive its context.
+type CallSignallingHandler interface {
+	ServeCallSignalling(ctx context.Context, channelId ss.ChannelId, peer ss.SubscriberId, call *ss.ClientToClientCallEv)
+}
+
+// CallSignallingHandlerFunc adapts a function to a CallSignallingHandler.
+type CallSignallingHandlerFunc func(ctx context.Context, channelId ss.ChannelId, peer ss.SubscriberId, call *ss.ClientToClientCallEv)
+
+// ServeCallSignalling implements CallSignallingHandler.
+func (f CallSignallingHandlerFunc) ServeCallSignalling(ctx context.Context, channelId ss.ChannelId, peer ss.SubscriberId, call *ss.ClientToClientCallEv) {
+	f(ctx, channelId, peer, call)
+}
+
+var _ CallSignallingHandler = CallSignallingHandlerFunc(nil)
+
 // TrackHandler handles one remote media track arriving on a peer session —
 // the counterpart of DataChannelHandler for the peer connection's OnTrack:
 // the peer's microphone (or any track the peer adds mid-session, once the
@@ -142,10 +160,16 @@ var (
 	// same client is still in flight.
 	ErrAlreadyRunning = errors.New("rtc: Run is already running")
 
-	// ErrNoPeerSession is returned by AddTrack when the client holds no
-	// peer session with the given subscriber (no Run is in flight, or the
-	// peer is not a channel member).
+	// ErrNoPeerSession is returned when the client holds no peer session with
+	// the given subscriber (or the peer is not a channel member).
 	ErrNoPeerSession = errors.New("rtc: no peer session with the given subscriber")
+
+	// ErrNoSignallingConnection is returned by SendCallSignalling while no
+	// registered WebSocket signalling run is active.
+	ErrNoSignallingConnection = errors.New("rtc: no active signalling connection")
+
+	// ErrNilCallSignalling is returned for a nil call payload or handler.
+	ErrNilCallSignalling = errors.New("rtc: nil call signalling")
 )
 
 // errPeerSessionGone answers a rebuild request that arrived after its
@@ -257,6 +281,10 @@ type HeadlessRTCClient struct {
 	// registered via trackHandlerNote; nil until one is registered. Owned
 	// by the hub goroutine.
 	trackHandler TrackHandler
+
+	// callHandler receives application call signalling before the negotiator.
+	// Owned by the hub goroutine and persistent across runs.
+	callHandler CallSignallingHandler
 }
 
 // NewHeadlessRTCClient constructs a HeadlessRTCClient whose peer sessions
@@ -387,6 +415,40 @@ func (c *HeadlessRTCClient) HandleDataChannelFunc(label string, handler func(ctx
 	c.HandleDataChannel(label, DataChannelHandlerFunc(handler))
 }
 
+// HandleCallSignalling registers the single handler for call events on the
+// WebSocket c2c relay. It panics on a duplicate registration and is safe to
+// call before or during Run.
+func (c *HeadlessRTCClient) HandleCallSignalling(handler CallSignallingHandler) {
+	if handler == nil {
+		panic(ErrNilCallSignalling)
+	}
+	ack := make(chan error, 1)
+	c.serviceChan <- callHandlerNote{handler: handler, ack: ack}
+	if err := <-ack; err != nil {
+		panic(err)
+	}
+}
+
+// HandleCallSignallingFunc registers a function as the call-signalling handler.
+func (c *HeadlessRTCClient) HandleCallSignallingFunc(handler func(ctx context.Context, channelId ss.ChannelId, peer ss.SubscriberId, call *ss.ClientToClientCallEv)) {
+	if handler == nil {
+		panic(ErrNilCallSignalling)
+	}
+	c.HandleCallSignalling(CallSignallingHandlerFunc(handler))
+}
+
+// SendCallSignalling sends a call dialog or status amendment over the peer
+// session's ordered WebSocket output. Addressing in the payload is normalized
+// to the active registration and session. No DataChannel is consulted.
+func (c *HeadlessRTCClient) SendCallSignalling(peer ss.SubscriberId, call *ss.ClientToClientCallEv) error {
+	if call == nil {
+		return ErrNilCallSignalling
+	}
+	reply := make(chan error, 1)
+	c.serviceChan <- sendCallNote{peer: peer, call: call, reply: reply}
+	return <-reply
+}
+
 // HandleTrack registers handler for the remote media tracks of every peer
 // session — the counterpart of HandleDataChannel for the peer
 // connection's OnTrack, and the mirror of the browser's
@@ -456,6 +518,11 @@ func (c *HeadlessRTCClient) RemoveTrack(peer ss.SubscriberId, track webrtc.Track
 	reply := make(chan error, 1)
 	c.serviceChan <- removeTrackNote{peer: peer, track: track, reply: reply}
 	return <-reply
+}
+
+// ChannelId reports the immutable channel this client registers in.
+func (c *HeadlessRTCClient) ChannelId() ss.ChannelId {
+	return c.channelId
 }
 
 // SubscriberId reports the subscriber id the client is registered as;
@@ -534,6 +601,19 @@ type announcedNote struct {
 	dc   *webrtc.DataChannel
 }
 
+// callHandlerNote registers the WebSocket call-signalling handler.
+type callHandlerNote struct {
+	handler CallSignallingHandler
+	ack     chan<- error
+}
+
+// sendCallNote queues one call event on a peer session's WebSocket output.
+type sendCallNote struct {
+	peer  ss.SubscriberId
+	call  *ss.ClientToClientCallEv
+	reply chan<- error
+}
+
 // trackHandlerNote registers the remote-media-track handler (HandleTrack).
 type trackHandlerNote struct {
 	handler TrackHandler
@@ -589,6 +669,8 @@ type peersNote struct{ reply chan<- []ss.SubscriberId }
 func (runNote) isClientNote()          {}
 func (handleNote) isClientNote()       {}
 func (announcedNote) isClientNote()    {}
+func (callHandlerNote) isClientNote()  {}
+func (sendCallNote) isClientNote()     {}
 func (trackHandlerNote) isClientNote() {}
 func (addTrackNote) isClientNote()     {}
 func (removeTrackNote) isClientNote()  {}
@@ -639,6 +721,15 @@ func (c *HeadlessRTCClient) hub() {
 				c.handleDataChannelNote(run, n)
 			case announcedNote:
 				c.handleAnnouncedNote(run, n)
+			case callHandlerNote:
+				if c.callHandler != nil {
+					n.ack <- errors.New("rtc: multiple call-signalling handler registrations")
+				} else {
+					c.callHandler = n.handler
+					n.ack <- nil
+				}
+			case sendCallNote:
+				c.handleSendCallNote(run, n)
 			case trackHandlerNote:
 				c.handleTrackHandlerNote(n)
 			case addTrackNote:
@@ -807,6 +898,32 @@ func (c *HeadlessRTCClient) handleInbound(run *clientRun, ev *ss.SignallingEvent
 		if c2c.ChannelId != c.channelId || c2c.ToSubscriber != run.self || c2c.FromSubscriber == run.self {
 			return
 		}
+		if c2c.Call != nil {
+			call := c2c.Call
+			if c.callHandler == nil ||
+				call.ChannelId != c2c.ChannelId ||
+				call.FromSubscriberId != c2c.FromSubscriber ||
+				call.ToSubscriberId != c2c.ToSubscriber {
+				return
+			}
+			sess := run.sessions[c2c.FromSubscriber]
+			if sess == nil {
+				// Only an INVITE can adopt a peer the member listing has not
+				// discovered yet; a stray response or BYE cannot.
+				if call.Sip == nil || call.Sip.Method != "INVITE" {
+					return
+				}
+				sess = c.startSession(run, c2c.FromSubscriber)
+				if sess == nil {
+					return
+				}
+			}
+			select {
+			case sess.calls <- callDelivery{handler: c.callHandler, call: call}:
+			case <-sess.ctx.Done():
+			}
+			return
+		}
 		sess := run.sessions[c2c.FromSubscriber]
 		if sess == nil {
 			if c2c.SessionDesc == nil || c2c.SessionDesc.Type != webrtc.SDPTypeOffer {
@@ -919,6 +1036,7 @@ func (c *HeadlessRTCClient) startSession(run *clientRun, peer ss.SubscriberId) *
 		polite:   polite,
 		in:       make(chan *ss.SignallingEvent, sessionChannelBuffer),
 		out:      make(chan *ss.SignallingEvent, sessionChannelBuffer),
+		calls:    make(chan callDelivery, sessionChannelBuffer),
 		pc:       pc,
 		channels: make(map[string]*webrtc.DataChannel),
 	}
@@ -950,6 +1068,7 @@ func (c *HeadlessRTCClient) startSession(run *clientRun, peer ss.SubscriberId) *
 	}
 	run.sessions[peer] = sess
 	go sess.run(nego, run.out, c.logger)
+	go sess.runCalls(c.channelId, c.logger)
 
 	// The polite side creates a channel per handled label (the first
 	// creation starts the negotiation); the impolite side's channels
@@ -1029,6 +1148,40 @@ func (c *HeadlessRTCClient) handleAnnouncedNote(run *clientRun, n announcedNote)
 		return
 	}
 	c.dispatchDataChannel(n.sess, n.dc, handler)
+}
+
+// handleSendCallNote queues call signalling behind earlier SDP/ICE/call
+// events of the same peer session. The DataChannel lifecycle is irrelevant.
+func (c *HeadlessRTCClient) handleSendCallNote(run *clientRun, n sendCallNote) {
+	if run == nil {
+		n.reply <- ErrNoSignallingConnection
+		return
+	}
+	sess := run.sessions[n.peer]
+	if sess == nil {
+		n.reply <- ErrNoPeerSession
+		return
+	}
+	call := *n.call
+	call.ChannelId = c.channelId
+	call.FromSubscriberId = run.self
+	call.ToSubscriberId = n.peer
+	ev := &ss.SignallingEvent{
+		To:    ss.EPAddr{ServiceId: ss.WellKnownSvcIdSS},
+		MsgId: newMsgId(),
+		C2CEv: &ss.ClientToClientEv{
+			FromSubscriber: run.self,
+			ToSubscriber:   n.peer,
+			ChannelId:      c.channelId,
+			Call:           &call,
+		},
+	}
+	select {
+	case sess.out <- ev:
+		n.reply <- nil
+	case <-sess.ctx.Done():
+		n.reply <- sess.ctx.Err()
+	}
 }
 
 // handleTrackHandlerNote registers the remote-media-track handler,
@@ -1299,14 +1452,21 @@ type peerSession struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	in  chan *ss.SignallingEvent // hub → session (drained eagerly by pumpIn)
-	out chan *ss.SignallingEvent // negotiator → session → transport
+	in    chan *ss.SignallingEvent // hub → negotiator (drained eagerly by pumpIn)
+	out   chan *ss.SignallingEvent // SDP/ICE/call → session → transport
+	calls chan callDelivery        // hub → ordered per-peer call handler
 
 	// Owned by the hub goroutine (pc is swapped by the glare rebuild);
 	// never touched elsewhere.
 	pc       *webrtc.PeerConnection
 	channels map[string]*webrtc.DataChannel
 	tracks   []sessionTrack
+}
+
+// callDelivery is one inbound call event and the handler current at receipt.
+type callDelivery struct {
+	handler CallSignallingHandler
+	call    *ss.ClientToClientCallEv
 }
 
 // sessionTrack is one local media track attached to the session's peer
@@ -1327,12 +1487,62 @@ func (sess *peerSession) run(nego Negotiator, sink chan<- *ss.SignallingEvent, l
 	negoIn := make(chan *ss.SignallingEvent)
 	go sess.pumpIn(negoIn)
 	go sess.pumpOut(sink)
-	// The negotiator sends on sess.out only from within Negotiate, so
-	// closing it after Negotiate returned is race-free.
+	// sess.out has multiple producers (negotiation and call signalling) and
+	// is never closed: teardown cancels the context, ending pumpOut instead.
 	err := nego.Negotiate(sess.ctx, negoIn, sess.out)
-	close(sess.out)
 	if err != nil && !errors.Is(err, context.Canceled) {
 		logger.Error("rtc: negotiator ended", "peer", sess.peer, "err", err)
+	}
+}
+
+// runCalls serializes call-handler invocations per peer session, independently
+// of negotiator backpressure. A panic is contained to one delivery.
+func (sess *peerSession) runCalls(channelId ss.ChannelId, logger *slog.Logger) {
+	handlerIn := make(chan callDelivery)
+	go sess.pumpCalls(handlerIn)
+	for {
+		select {
+		case delivery := <-handlerIn:
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						logger.Error("rtc: call-signalling handler panicked", "peer", sess.peer, "err", r)
+					}
+				}()
+				delivery.handler.ServeCallSignalling(sess.ctx, channelId, sess.peer, delivery.call)
+			}()
+		case <-sess.ctx.Done():
+			return
+		}
+	}
+}
+
+// pumpCalls drains the hub-facing call channel into an unbounded ordered
+// queue even while application code is blocked in a handler. In particular,
+// a handler may synchronously answer through SendCallSignalling without
+// forming a cycle through the client hub.
+func (sess *peerSession) pumpCalls(handlerIn chan<- callDelivery) {
+	var queue []callDelivery
+	for {
+		select {
+		case <-sess.ctx.Done():
+			return
+		default:
+		}
+		var out chan<- callDelivery
+		var first callDelivery
+		if len(queue) > 0 {
+			out = handlerIn
+			first = queue[0]
+		}
+		select {
+		case delivery := <-sess.calls:
+			queue = append(queue, delivery)
+		case out <- first:
+			queue = queue[1:]
+		case <-sess.ctx.Done():
+			return
+		}
 	}
 }
 
@@ -1368,12 +1578,28 @@ func (sess *peerSession) pumpIn(negoIn chan<- *ss.SignallingEvent) {
 	}
 }
 
-// pumpOut funnels the negotiator's outbound events to the run's outbound
-// channel, applying its backpressure to the negotiator alone.
+// pumpOut funnels session signalling to the run's outbound channel through
+// an unbounded ordered queue. A stalled transport therefore cannot stall the
+// client hub, and a handler can always post its synchronous call answer.
 func (sess *peerSession) pumpOut(sink chan<- *ss.SignallingEvent) {
-	for ev := range sess.out {
+	var queue []*ss.SignallingEvent
+	for {
 		select {
-		case sink <- ev:
+		case <-sess.ctx.Done():
+			return
+		default:
+		}
+		var out chan<- *ss.SignallingEvent
+		var first *ss.SignallingEvent
+		if len(queue) > 0 {
+			out = sink
+			first = queue[0]
+		}
+		select {
+		case ev := <-sess.out:
+			queue = append(queue, ev)
+		case out <- first:
+			queue = queue[1:]
 		case <-sess.ctx.Done():
 			return
 		}

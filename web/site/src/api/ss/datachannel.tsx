@@ -1,34 +1,32 @@
 "use client";
 
 /**
- * Data-channel messaging between channel members, over the signalling
- * server.
+ * Chat/call message state between channel members.
  *
- * useDataChannel is one of the two consumers of the peer sessions
- * usePeerSessions brings up (see peersessions.tsx) — one
- * RTCPeerConnection per fellow member of the current user's channel,
- * PerfectNegotiator-driven over the SS's client-to-client relay. It
- * subscribes the messaging data channel (dcmsg) of every session and
- * exchanges DCMsgs over it; the binary channel (dcbin) is
- * useBinaryDataChannel's business — the two are siblings over the
- * sessions primitive, decoupled from each other.
+ * useDataChannel owns the shared message store, but the transports are
+ * deliberately split: ordinary chat and file metadata use each peer
+ * session's dcmsg DataChannel, while SIP-subset call dialogs and their
+ * chatControl.sip history amendments use the WebSocket c2c call relay.
+ * useBinaryDataChannel owns dcbin independently.
  *
- * Messages are DCMsgs. DCMsg is agnostic to the on-the-wire format the
- * data channel (SCTP) carries — the codec (encodeDCMsg/decodeDCMsg) is
- * the only place that knows it; JSON today, but it could be XML or
- * anything else. A data channel does not echo its own messages back,
- * so the recipient bounces every message it accepts back to the sender
- * with the echo flag set: the sender's own messages arrive as echoes
- * over the same channel. The one exception is the call protocol
- * (application/x-sip): like real SIP, a dialog message is never
- * bounced — the sender records its own copy when it sends, so a
- * call's behavior never depends on an echo.
+ * A data channel does not echo its own business messages back, so the
+ * recipient bounces every accepted dcmsg message with echo set. Call
+ * signalling has no bounce: the sender records its local copy after the
+ * WebSocket write succeeds, and the receiver folds the relayed event
+ * directly. Legacy call frames arriving on dcmsg are dropped rather than
+ * forming a second signalling stack.
  */
 
 import { useCallback, useEffect, useState } from "react";
 
 import type { PeerSessions } from "./peersessions";
-import type { ChannelId, ChatUser, MsgId, SubscriberId } from "./types";
+import type {
+  ChannelId,
+  ChatUser,
+  ClientToClientCallEv,
+  MsgId,
+  SubscriberId,
+} from "./types";
 
 // DC_MSG_MIME_VERSION is the DCMsg format version, MIME-Version style.
 export const DC_MSG_MIME_VERSION = "1.0";
@@ -151,15 +149,12 @@ export const DC_SIP_RESPONSE_DECLINE = {
 export type DCSipResponse =
   typeof DC_SIP_RESPONSE_OK | typeof DC_SIP_RESPONSE_DECLINE;
 
-// DCSip is the body of a SIP-subset DCMsg: one message of a call's
-// dialog, addressed to the dialog's other party by callId. The messages
-// ARE the phone session protocol — they drive each end's session state.
-// They travel the data channel like any DCMsg, but — unlike any other
-// kind — are never echoed: the sender folds its own send in at send
-// time (see useDataChannel), so both ends fold the same messages into
-// their session state without any bounce. Only the INVITE is rendered
-// (the call's log entry) and only the INVITE is amendable (its
-// X-Call-Status, via chat control).
+// DCSip is the body of a SIP-subset call message: one message of a
+// dialog, addressed to the other party by callId. These messages ARE the
+// phone session protocol and travel only on the WebSocket c2c call relay.
+// There is no network echo: each sender folds its own successful write,
+// so both ends fold the same messages without a bounce. Only the INVITE
+// is rendered (the call's log entry) and amendable (X-Call-Status).
 export interface DCSip {
   /** the dialog's identifier — SIP's Call-ID header; minted by the
       caller with the INVITE, named by every later message of the
@@ -201,7 +196,8 @@ export interface DCChatControl {
   sip?: DCSip;
 }
 
-// DCMsg is a message carried over a WebRTC data channel.
+// DCMsg is the application's historical message envelope. Business kinds
+// travel on dcmsg; the call-only subset is embedded in c2CEv.call on WS.
 export interface DCMsg {
   /** version of the message format, MIME-Version style */
   mimeVersion: string;
@@ -234,10 +230,9 @@ export interface DCMsg {
   sip?: DCSip;
 }
 
-// DCMsgs maps channelId → sender subscriber id → the list of messages
-// received from that sender over the data channel, oldest first. The
-// own subscriber id's list holds the echoes of the messages we sent
-// (echo set), bounced back by their recipients.
+// DCMsgs maps channelId → sender subscriber id → messages, oldest first.
+// The own list holds business echoes bounced by recipients and local
+// copies of successful WebSocket call writes (echo set).
 export type DCMsgs = Record<ChannelId, Record<SubscriberId, DCMsg[]>>;
 
 // newDCMsg builds a plaintext DCMsg to toSubscriberId, minting a fresh
@@ -455,6 +450,24 @@ function decodeDCMsg(data: unknown): DCMsg | null {
   return msg;
 }
 
+// isCallSignalling identifies the two message shapes that belong on the
+// WebSocket call relay: the dialog itself and its INVITE history amendments.
+// Text/file chat control remains dcmsg business data.
+function isCallSignalling(msg: DCMsg): boolean {
+  return (
+    msg.mimeType === DC_MSG_MIME_SIP ||
+    (msg.mimeType === DC_MSG_MIME_CHAT_CONTROL &&
+      msg.chatControl?.sip !== undefined)
+  );
+}
+
+// decodeCallSignalling validates a c2c call payload with the same codec as
+// the historical message envelope. Only call signalling is accepted.
+function decodeCallSignalling(call: ClientToClientCallEv): DCMsg | null {
+  const msg = decodeDCMsg(JSON.stringify(call));
+  return msg !== null && isCallSignalling(msg) ? msg : null;
+}
+
 // DATA_CHANNEL_LABEL is the label of the messaging data channel every
 // pair of peers brings up.
 const DATA_CHANNEL_LABEL = "dcmsg";
@@ -540,33 +553,24 @@ function applyDCMsg(prev: DCMsgs, msg: DCMsg): DCMsgs {
 
 export interface UseDataChannelResult {
   /**
-   * Messages received from data channels so far: first key the channel
-   * id, second key the sender's subscriber id, oldest first. The own
-   * subscriber id's list holds our own sends (echo set): chat kinds
-   * arrive as echoes bounced back by their recipients; SIP messages are
-   * never echoed, so our own SIP sends are recorded at send time.
-   * Chat-control messages are applied on arrival — the target is
-   * deleted or amended in place — and never show up in the store.
+   * Messages received from dcmsg and the WebSocket call relay. The own
+   * subscriber list holds business echoes and local call copies (echo
+   * set). Chat controls amend/delete their targets instead of appearing
+   * as separate entries.
    */
   dcMsgs: DCMsgs;
   /**
-   * Sends one DCMsg on the data channel to msg.toSubscriberId. While no
-   * channel to that peer is open — not negotiated yet, or the peer is
-   * gone — the message is dropped with a warning. A SIP message that
-   * goes out is additionally recorded locally as our own send (echo
-   * set): SIP messages are never echoed back, so the call's state must
-   * advance from the send itself.
+   * Sends one message to msg.toSubscriberId. Business kinds use dcmsg;
+   * SIP and chatControl.sip use the peer session's ordered WebSocket
+   * output. A successful call write is recorded locally (echo set).
    */
   sendTo: (msg: DCMsg) => void;
 }
 
 /**
- * Exchanges DCMsgs over the messaging data channel (dcmsg) of the peer
- * sessions — one of the two consumers of the PeerSessions primitive
- * (see peersessions.tsx), decoupled from the other
- * (useBinaryDataChannel): both build on the same peer connections,
- * neither knowing the other. `me` is the useSignalling identity; the
- * echo check below needs it.
+ * Owns the message store and routes business messages over dcmsg and
+ * call signalling over WebSocket. `me` is the useSignalling identity;
+ * the business echo check needs it.
  */
 export function useDataChannel(
   me: ChatUser | null,
@@ -587,9 +591,13 @@ export function useDataChannel(
       (channelId, peer, dc) => {
         dc.onmessage = (e) => {
           const msg = decodeDCMsg(e.data);
-          // The data channel is bound to this pair by construction; a
-          // message claiming otherwise is dropped.
-          if (msg === null || msg.channelId !== channelId) {
+          // dcmsg is business data only. Legacy call frames are deliberately
+          // dropped rather than kept as a second signalling stack.
+          if (
+            msg === null ||
+            msg.channelId !== channelId ||
+            isCallSignalling(msg)
+          ) {
             return;
           }
           if (msg.echo === true) {
@@ -606,19 +614,51 @@ export function useDataChannel(
             return;
           }
           setDcMsgs((prev) => applyDCMsg(prev, msg));
-          // Bounce the message back so the sender sees its own message
-          // — except SIP messages: like real SIP, a dialog message is
-          // never bounced; the sender records its own sends (sendTo).
-          if (msg.mimeType !== DC_MSG_MIME_SIP) {
-            dc.send(encodeDCMsg({ ...msg, echo: true }));
-          }
+          // Bounce business data so the sender sees its own message.
+          dc.send(encodeDCMsg({ ...msg, echo: true }));
         };
       },
     );
   }, [sessions, me?.subscriberId]);
 
+  // Call signalling has no DataChannel echo: accepted inbound events fold
+  // straight into the same store, while sendTo records the local copy after
+  // the WebSocket write succeeds. Validate both layers of addressing because
+  // the shared socket is not inherently bound to one peer pair.
+  useEffect(() => {
+    return sessions.subscribeCall((event) => {
+      const c2c = event.c2CEv;
+      if (c2c?.call === undefined) return;
+      const msg = decodeCallSignalling(c2c.call);
+      if (
+        msg === null ||
+        msg.echo === true ||
+        msg.channelId !== c2c.channelId ||
+        msg.fromSubscriberId !== c2c.fromSubscriber ||
+        msg.toSubscriberId !== c2c.toSubscriber
+      ) {
+        return;
+      }
+      setDcMsgs((prev) => applyDCMsg(prev, msg));
+    });
+  }, [sessions]);
+
   const sendTo = useCallback(
     (msg: DCMsg) => {
+      if (isCallSignalling(msg)) {
+        void sessions
+          .sendCall(msg.channelId, msg.toSubscriberId, msg)
+          .then(() => {
+            setDcMsgs((prev) => applyDCMsg(prev, { ...msg, echo: true }));
+          })
+          .catch((err) => {
+            console.warn(
+              `datachannel: call signalling ${msg.msgId} not sent`,
+              err,
+            );
+          });
+        return;
+      }
       const dc = sessions.getChannel(
         DATA_CHANNEL_LABEL,
         msg.channelId,
@@ -633,13 +673,6 @@ export function useDataChannel(
         return;
       }
       dc.send(encodeDCMsg(msg));
-      // A SIP message is never echoed back (the receive path skips its
-      // bounce): record the sender's own copy locally, echo set, so the
-      // dialog's state advances from the send itself — never from a
-      // bounce.
-      if (msg.mimeType === DC_MSG_MIME_SIP) {
-        setDcMsgs((prev) => applyDCMsg(prev, { ...msg, echo: true }));
-      }
     },
     [sessions],
   );

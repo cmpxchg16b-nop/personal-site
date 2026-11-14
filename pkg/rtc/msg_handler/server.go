@@ -1,17 +1,15 @@
 package msg_handler
 
-// This file is the Server: the data-channel layer of a bot's stack. It
-// registers for the two well-known labels on a HeadlessRTCClient and owns
-// every protocol mechanic below the BotMessageHandler interface:
+// This file is the Server: the messaging layer of a bot's stack. It owns
+// the protocol mechanics below the BotMessageHandler interface:
 //
-//   - dcmsg (the messaging channel): decode and validation, the echo
-//     discipline (every accepted message is bounced back verbatim with
-//     echo set — echoes and the call protocol excepted), the
-//     file-transfer announcements the binary side correlates with, and
-//     the call log's conditioning: the Server sniffs the call dialogs and
-//     amends the INVITEs of the bot's own outgoing calls as their status
-//     moves (the caller's X-Call-Status duty) — below the interface,
-//     never the handler's, like the echo rule.
+//   - dcmsg (the messaging channel): business-message decode/validation,
+//     the echo discipline (every accepted business message is bounced back
+//     verbatim with echo set), and file-transfer announcements. Legacy call
+//     frames are dropped.
+//   - WebSocket call relay: SIP-subset dialogs and chatControl.sip status
+//     amendments, plus the call log's conditioning — the Server sniffs the
+//     dialog and amends INVITEs of its own outgoing calls as status moves.
 //   - dcbin (the binary channel): strict reassembly of inbound file
 //     streams (a gap, an overlap, or a mismatched total drops the
 //     transfer) and the acknowledgement of every accepted frame, so the
@@ -34,6 +32,7 @@ package msg_handler
 import (
 	"context"
 	"log/slog"
+	"sync"
 
 	"github.com/google/uuid"
 	"github.com/pion/webrtc/v4"
@@ -61,9 +60,9 @@ type Configuration struct {
 	Logger *slog.Logger
 }
 
-// Server is the data-channel layer of a bot: constructed with NewServer,
-// it serves a HeadlessRTCClient's two well-known data channels and hands
-// the distilled bot messages to its BotMessageHandler. It is safe for
+// Server is the messaging layer of a bot: constructed with NewServer, it
+// serves the two data channels plus the WebSocket call relay and hands
+// distilled bot messages to its BotMessageHandler. It is safe for
 // concurrent use; the client invokes it once per (session, label) on its
 // own goroutines, and the cross-channel state (the announcements ride
 // dcmsg but describe the files arriving on dcbin) is funneled through the
@@ -76,6 +75,11 @@ type Server struct {
 	// serviceChan carries every note to the hub goroutine — the only
 	// goroutine touching the peer registry.
 	serviceChan chan serverNote
+
+	// handlerLocks serializes each peer's chat/call callbacks now that they
+	// arrive on two transports (dcmsg and WebSocket). Different peers remain
+	// independent; locks live for the Server's lifetime.
+	handlerLocks sync.Map // map[ss.SubscriberId]*sync.Mutex
 }
 
 // peerRecord is the hub's record of a live session: the session's
@@ -231,6 +235,7 @@ func NewServer(client *rtc.HeadlessRTCClient, handler BotMessageHandler, config 
 	go s.hub()
 	client.HandleDataChannel(DataChannelLabelMessages, rtc.DataChannelHandlerFunc(s.serveMessages))
 	client.HandleDataChannel(DataChannelLabelBinary, rtc.DataChannelHandlerFunc(s.serveBinary))
+	client.HandleCallSignallingFunc(s.serveCall)
 	client.HandleTrack(rtc.TrackHandlerFunc(s.serveTrack))
 	return s
 }
@@ -292,7 +297,7 @@ func (s *Server) hub() {
 				status:      callStatusInviting,
 			}
 		case sipDialogNote:
-			s.foldDialog(peers, outCalls, n)
+			s.foldDialog(outCalls, n)
 		}
 	}
 }
@@ -322,13 +327,28 @@ func (s *Server) WriterFor(peer ss.SubscriberId) ResponseWriter {
 	reply := make(chan messagingReply, 1)
 	s.serviceChan <- messagingNote{peer: peer, reply: reply}
 	r := <-reply
+	channelId := r.channelId
+	if channelId == "" {
+		channelId = s.client.ChannelId()
+	}
 	return &responseWriter{
 		server:    s,
-		dc:        r.dcmsg,
-		channelId: r.channelId,
+		channelId: channelId,
 		self:      s.client.SubscriberId(),
 		peer:      peer,
 	}
+}
+
+// lockHandler serializes application callbacks for one peer across dcmsg and
+// WebSocket. The music bot's call state was written for one ordered dcmsg
+// callback stream; moving only its call frames must not introduce races with
+// text commands such as /play.
+func (s *Server) lockHandler(peer ss.SubscriberId) func() {
+	lock := &sync.Mutex{}
+	actual, _ := s.handlerLocks.LoadOrStore(peer, lock)
+	m := actual.(*sync.Mutex)
+	m.Lock()
+	return m.Unlock
 }
 
 // setOnTrack registers fn for the peer's inbound media tracks (a
@@ -369,7 +389,7 @@ func (s *Server) serveTrack(_ context.Context, _ ss.ChannelId, peer ss.Subscribe
 // maximum, settling a cancel/accept race identically on both ends, and a
 // terminal status drops the record — a terminal session is never revived.
 // Runs on the hub goroutine.
-func (s *Server) foldDialog(peers map[ss.SubscriberId]*peerRecord, outCalls map[ss.SubscriberId]map[string]*outgoingCall, n sipDialogNote) {
+func (s *Server) foldDialog(outCalls map[ss.SubscriberId]map[string]*outgoingCall, n sipDialogNote) {
 	call := outCalls[n.peer][n.callId]
 	if call == nil {
 		return // not one of the bot's own calls: its caller owns the log
@@ -380,10 +400,6 @@ func (s *Server) foldDialog(peers map[ss.SubscriberId]*peerRecord, outCalls map[
 	call.status = n.established
 	if callStatusTerminal(call.status) {
 		delete(outCalls[n.peer], n.callId)
-	}
-	entry := peers[n.peer]
-	if entry == nil {
-		return // the session is gone; nothing to amend on
 	}
 	msg := newDCMsgOut(call.channelId, call.self, n.peer)
 	msg.MimeType = dcMsgMimeChatControl
@@ -400,7 +416,7 @@ func (s *Server) foldDialog(peers map[ss.SubscriberId]*peerRecord, outCalls map[
 			XCallStatus: call.status,
 		},
 	}
-	if err := s.sendText(entry.dcmsg, msg.encode()); err != nil {
+	if err := s.sendCall(n.peer, msg); err != nil {
 		s.logger.Warn("msg_handler: call-status amend not sent",
 			"peer", n.peer, "callId", n.callId, "err", err)
 	}
@@ -493,9 +509,9 @@ func sipMessageOf(msg *dcMsgIn) *SipMessage {
 	return sip
 }
 
-// serveMessages is the dcmsg handler: decode and validation, the echo
-// discipline (bounce every accepted message back with echo set, except
-// echoes and the call protocol), the file-transfer announcement
+// serveMessages is the dcmsg business handler: decode and validation, the
+// echo discipline (bounce every accepted business message back with echo
+// set), the file-transfer announcement
 // bookkeeping the binary side correlates with — and the dispatch of the
 // distilled messages to the BotMessageHandler.
 func (s *Server) serveMessages(ctx context.Context, channelId ss.ChannelId, peer ss.SubscriberId, dc *webrtc.DataChannel) {
@@ -523,29 +539,9 @@ func (s *Server) serveMessages(ctx context.Context, channelId ss.ChannelId, peer
 			// apply.
 			return
 		}
-		if msg.from != peer {
-			return
-		}
-		if msg.mimeType == dcMsgMimeSip {
-			// The call protocol is never bounced; the dialog message goes
-			// straight to the handler. But the Server sniffs it first: the
-			// message may advance the logged status of one of the bot's own
-			// outgoing calls — the caller's duty, owned here (the messaging
-			// channel's conditioning, like the echo rule), never the
-			// handler's.
-			if established, ok := dialogStatusOf(msg.sip); ok {
-				s.serviceChan <- sipDialogNote{peer: peer, callId: msg.sip.callId, established: established}
-			}
-			s.handler.HandleCalling(ctx, sipMessageOf(msg), &responseWriter{
-				server:    s,
-				dc:        dc,
-				channelId: channelId,
-				self:      self,
-				peer:      peer,
-				inReplyTo: msg.msgId,
-				callId:    msg.sip.callId,
-				isInvite:  msg.sip.method == sipMethodInvite,
-			})
+		if msg.from != peer || msg.isCallSignalling() {
+			// Call signalling is WebSocket-only; legacy dcmsg call frames are
+			// dropped, never bounced or dispatched through a fallback path.
 			return
 		}
 		// The protocol's echo rule: bounce the message back verbatim, so
@@ -556,17 +552,18 @@ func (s *Server) serveMessages(ctx context.Context, channelId ss.ChannelId, peer
 		}
 		switch msg.mimeType {
 		case dcMsgMimePlaintext:
+			unlock := s.lockHandler(peer)
 			s.handler.HandleChatMessage(ctx, &ChatMessage{
 				Message: envelopeOf(msg),
 				Text:    msg.plaintext,
 			}, &responseWriter{
 				server:    s,
-				dc:        dc,
 				channelId: channelId,
 				self:      self,
 				peer:      peer,
 				inReplyTo: msg.msgId,
 			})
+			unlock()
 		case dcMsgMimeFileTransferStatus:
 			// Record the announcement, so the file's chunks and its
 			// attachment can be correlated back to it once the bytes
@@ -587,6 +584,30 @@ func (s *Server) serveMessages(ctx context.Context, channelId ss.ChannelId, peer
 				},
 			}
 		}
+	})
+}
+
+// serveCall handles WebSocket call signalling before the client's negotiator.
+// Dialog messages drive the same BotMessageHandler as before; status amends
+// are UI-only and need no bot callback. Neither shape is echoed.
+func (s *Server) serveCall(ctx context.Context, channelId ss.ChannelId, peer ss.SubscriberId, call *ss.ClientToClientCallEv) {
+	msg := decodeCallEvent(call)
+	if msg == nil || msg.echo || msg.mimeType != dcMsgMimeSip {
+		return
+	}
+	if established, ok := dialogStatusOf(msg.sip); ok {
+		s.serviceChan <- sipDialogNote{peer: peer, callId: msg.sip.callId, established: established}
+	}
+	unlock := s.lockHandler(peer)
+	defer unlock()
+	s.handler.HandleCalling(ctx, sipMessageOf(msg), &responseWriter{
+		server:    s,
+		channelId: channelId,
+		self:      s.client.SubscriberId(),
+		peer:      peer,
+		inReplyTo: msg.msgId,
+		callId:    msg.sip.callId,
+		isInvite:  msg.sip.method == sipMethodInvite,
 	})
 }
 
@@ -675,10 +696,9 @@ func (sess *binarySession) accept(ctx context.Context, f *fileFrame) {
 	// The messaging channel and the transfer's announcement, fresh from
 	// the hub per chunk: a glare rebuild swaps the channel mid-session,
 	// and a late announcement is picked up whenever it arrives.
-	dcmsg, announcement := sess.server.messagingChannel(sess.peer, fileId)
+	_, announcement := sess.server.messagingChannel(sess.peer, fileId)
 	w := &responseWriter{
 		server:    sess.server,
-		dc:        dcmsg,
 		channelId: sess.channelId,
 		self:      sess.self,
 		peer:      sess.peer,
@@ -718,6 +738,15 @@ func (sess *binarySession) accept(ctx context.Context, f *fileFrame) {
 		}
 		sess.server.handler.HandleAttachment(ctx, announcement, attachment, w)
 	}
+}
+
+// sendCall sends one call message over the peer's WebSocket session.
+func (s *Server) sendCall(peer ss.SubscriberId, msg *dcMsgOut) error {
+	call := msg.callEvent()
+	if call == nil {
+		return errEncode
+	}
+	return s.client.SendCallSignalling(peer, call)
 }
 
 // sendText sends one encoded DCMsg on the messaging channel.

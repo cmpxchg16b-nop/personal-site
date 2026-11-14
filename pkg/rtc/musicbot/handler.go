@@ -20,9 +20,9 @@ package musicbot
 // construction, and the CLI addresses songs by their Name.
 //
 // State discipline: per-peer call state lives in a sync.Map keyed by the
-// peer; a state's fields are touched only from the peer's serialized dcmsg
-// invocations (the framework's documented guarantee) and from the session
-// watcher, which only ever CompareAndDeletes — the hashReporter's
+// peer; a state's fields are touched only from the peer's serialized chat/call
+// callbacks (across dcmsg and WebSocket) and from the session watcher, which
+// only ever CompareAndDeletes — the hashReporter's
 // discipline. The player is an actor synchronizing its own pump.
 
 import (
@@ -69,7 +69,7 @@ const (
 const hangupDetachDelay = 500 * time.Millisecond
 
 // peerCall is one peer's call state — touched only on the peer's
-// serialized dcmsg goroutine and by the session watcher's
+// serialized chat/call callback stream and by the session watcher's
 // CompareAndDelete.
 type peerCall struct {
 	outgoing bool // the bot opened the call (it is the caller)

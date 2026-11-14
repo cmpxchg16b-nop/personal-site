@@ -25,10 +25,9 @@ package sipbot
 // Concurrency: the call's fields are either set before the state is
 // published (target, w — and callId before its first reader can win the
 // call's end) or gathered under mu — the SIP dial goroutine, the
-// callee's hangup watcher, and the peer's serialized dcmsg goroutine
-// genuinely meet on them, so a small mutex is the honest tool (the music
-// bot needs none only because every touch of its state is on the channel
-// goroutine).
+// callee's hangup watcher, and the peer's serialized chat/call callback
+// stream genuinely meet on them, so a small mutex is the honest tool (the
+// music bot needs none because its chat/call state has the same serialization).
 //
 // The ring's exact-once discipline: outbound the browser is rung only
 // after the callee answered, inbound the ring is the call's first act —
@@ -97,6 +96,12 @@ type peerCall struct {
 	// the SIP→browser pump's gate, which it reads off the relay. Created
 	// at construction, closed exactly once (activate's phase guard).
 	accepted chan struct{}
+
+	// answerDone is non-nil for an inbound SIP call and closes after the
+	// caller's 200/ACK and relay-arm sequence finishes (successfully or not).
+	// A browser BYE arriving immediately after its 200 waits for this before
+	// terminating the SIP leg; sending BYE into the pre-ACK window gets 481.
+	answerDone chan struct{}
 
 	mu       sync.Mutex
 	phase    callPhase
@@ -339,8 +344,8 @@ func (c *peerCall) setCallId(callId string) bool {
 }
 
 // callIdSnapshot reports the webrtc-leg dialog's id — "" before the
-// browser is rung. The dcmsg gates read it under the mutex: the ring's
-// INVITE and the peer's instant answer can cross the id's assignment.
+// browser is rung. Call handlers read it under the mutex: the ring's INVITE
+// and the peer's instant answer can cross the id's assignment.
 func (c *peerCall) callIdSnapshot() string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -480,6 +485,38 @@ func (c *peerCall) activate() bool {
 	return true
 }
 
+// endLocal ends a locally terminated call without crossing the SIP pre-ACK
+// window. The phase check and end are atomic: ringing (or an already finished
+// answer) ends immediately, so a later activate cannot slip between them.
+// Only an active inbound answer still in flight waits; answerDone is bounded
+// by diago's ACK timeout, and a SIP-side end releases the wait too.
+func (c *peerCall) endLocal() (callEnd, bool) {
+	c.mu.Lock()
+	if c.ended {
+		c.mu.Unlock()
+		return callEnd{}, false
+	}
+	if c.phase != phaseActive || c.answerDone == nil {
+		e, ok := c.endLocked()
+		c.mu.Unlock()
+		return e, ok
+	}
+	done := c.answerDone
+	dialog := c.serverDialog
+	select {
+	case <-done:
+		c.mu.Unlock()
+		return c.end()
+	default:
+	}
+	c.mu.Unlock()
+	select {
+	case <-done:
+	case <-dialog.Context().Done():
+	}
+	return c.end()
+}
+
 // callEnd is the end()'s snapshot for the winner's follow-up: the SIP
 // dialog to hang up, where the webrtc-leg stood ("" callId — the browser
 // was never rung — means no verbs exist to send), and the attached
@@ -517,7 +554,15 @@ func (c *peerCall) endRinging() (callEnd, bool) {
 func (c *peerCall) endIf(allow func() bool) (callEnd, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.ended || !allow() {
+	if !allow() {
+		return callEnd{}, false
+	}
+	return c.endLocked()
+}
+
+// endLocked is the exactly-once end bookkeeping with c.mu held.
+func (c *peerCall) endLocked() (callEnd, bool) {
+	if c.ended {
 		return callEnd{}, false
 	}
 	c.ended = true

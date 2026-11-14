@@ -277,11 +277,14 @@ func (h *sipHandler) loanPooledAccount(ctx context.Context, peer ss.SubscriberId
 func (h *sipHandler) HandlePeerSessionEnd(_ context.Context, peer ss.SubscriberId) {
 	if v, ok := h.calls.Load(peer); ok {
 		c := v.(*peerCall)
-		if e, ok := c.end(); ok {
-			h.calls.CompareAndDelete(peer, c)
-			h.hangupDialog(e.dialog)
-			h.logger.Info("sipbot: the session's end ended the call", "peer", peer, "callId", c.callId)
-		}
+		// Never wait for SIP ACK on the Server hub. The exactly-once end
+		// still runs after the inbound answer leaves its pre-ACK window.
+		go func() {
+			if e, ok := h.endLocally(peer, c); ok {
+				h.hangupDialog(e.dialog)
+				h.logger.Info("sipbot: the session's end ended the call", "peer", peer, "callId", c.callId)
+			}
+		}()
 	}
 	h.accountMu.Lock()
 	defer h.accountMu.Unlock()
@@ -374,11 +377,10 @@ func (h *sipHandler) handleHangup(ctx context.Context, sip *msg_handler.SipMessa
 	if c.callIdSnapshot() != sip.CallId {
 		return
 	}
-	e, ok := c.end()
+	e, ok := h.endLocally(peer, c)
 	if !ok {
 		return
 	}
-	h.calls.CompareAndDelete(peer, c)
 	h.hangupDialog(e.dialog)
 	if e.attached {
 		h.detachLater(ctx, e.track, c.w)
@@ -593,11 +595,10 @@ func (h *sipHandler) hangup(ctx context.Context, msg *msg_handler.ChatMessage, w
 		return
 	}
 	c := v.(*peerCall)
-	e, ok := c.end()
+	e, ok := h.endLocally(peer, c)
 	if !ok {
 		return
 	}
-	h.calls.CompareAndDelete(peer, c)
 	h.hangupDialog(e.dialog)
 	h.endBrowserLeg(ctx, w, e)
 	h.say(peer, w, "Hung up.")
@@ -757,13 +758,25 @@ func (h *sipHandler) failDialedCall(peer ss.SubscriberId, c *peerCall, hangup si
 // is hung up, the browser leg told, the track withdrawn on the hangup
 // delay, and the user told.
 func (h *sipHandler) endCall(ctx context.Context, peer ss.SubscriberId, c *peerCall) {
-	e, ok := c.end()
+	e, ok := h.endLocally(peer, c)
 	if !ok {
 		return
 	}
-	h.calls.CompareAndDelete(peer, c)
 	h.hangupDialog(e.dialog)
 	h.endBrowserLeg(ctx, c.w, e)
+}
+
+// endLocally is the common exactly-once local termination. A 200 OK and an
+// immediate local hangup can arrive back-to-back on the ordered WS relay;
+// every local path therefore leaves the inbound SIP pre-ACK window before
+// ending the dialog. Callers running on the Server hub invoke this asynchronously.
+func (h *sipHandler) endLocally(peer ss.SubscriberId, c *peerCall) (callEnd, bool) {
+	e, ok := c.endLocal()
+	if !ok {
+		return callEnd{}, false
+	}
+	h.calls.CompareAndDelete(peer, c)
+	return e, true
 }
 
 // endBrowserLeg terminates the call's webrtc-leg after its end: CANCEL

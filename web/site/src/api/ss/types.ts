@@ -222,6 +222,53 @@ export interface PingPongMsg {
   ackSequenceNumber: number;
 }
 
+// The call protocol's request methods and final INVITE responses.
+export type ClientToClientCallSipMethod = "INVITE" | "CANCEL" | "BYE";
+export type ClientToClientCallStatus =
+  "inviting" | "accepted" | "rejected" | "cancelled" | "ended";
+export type ClientToClientCallKind = "voice" | "video";
+
+export interface ClientToClientCallSipResponse {
+  code: 200 | 603;
+  phrase: "OK" | "Decline";
+}
+
+// One message of the call's SIP-subset dialog. SDP is deliberately absent:
+// WebRTC offer/answer and ICE use their own c2c fields below.
+export interface ClientToClientCallSip {
+  callId: string;
+  method?: ClientToClientCallSipMethod;
+  response?: ClientToClientCallSipResponse;
+  "X-Media"?: ClientToClientCallKind;
+  "X-Call-Status"?: ClientToClientCallStatus;
+}
+
+// A call-status amendment keeps the caller's INVITE history entry in sync.
+// It rides the same ordered WebSocket path as the dialog, never dcmsg.
+export interface ClientToClientCallChatControl {
+  subtype: "delete" | "amend";
+  targetMessageId: MsgId;
+  sip?: ClientToClientCallSip;
+}
+
+// The call-signalling payload relayed over WebSocket. Its shape is the
+// call-only subset of the application's historical DCMsg envelope, retaining
+// message ids and threading so existing dialog/history semantics do not move
+// to a second set of identifiers.
+export interface ClientToClientCallEv {
+  mimeVersion: string;
+  channelId: ChannelId;
+  fromSubscriberId: SubscriberId;
+  toSubscriberId: SubscriberId;
+  creationTimestamp: number;
+  msgId: MsgId;
+  inReplyTo?: MsgId;
+  mimeType: string;
+  plaintext: string;
+  chatControl?: ClientToClientCallChatControl;
+  sip?: ClientToClientCallSip;
+}
+
 // Client to Client signalling event, a signalling server will just simply pass it.
 export interface ClientToClientEv {
   fromSubscriber: SubscriberId;
@@ -257,6 +304,9 @@ export interface ClientToClientEv {
 
   /** Asks the polite peer to originate an ICE-restart offer. */
   iceRestartRequest?: boolean;
+
+  /** SIP-subset call dialog or call-status UI amendment, over WebSocket. */
+  call?: ClientToClientCallEv;
 
   /** out of band ping message */
   ping?: PingPongMsg;

@@ -290,6 +290,51 @@ type PingPongMsg struct {
 	AckSequenceNumber uint64 `json:"ackSequenceNumber"`
 }
 
+// ClientToClientCallSipResponse is a final response to a call INVITE.
+// The supported pairs are 200/OK and 603/Decline.
+type ClientToClientCallSipResponse struct {
+	Code   int    `json:"code"`
+	Phrase string `json:"phrase"`
+}
+
+// ClientToClientCallSip is one message of the call's SIP-subset dialog.
+// Method is INVITE, CANCEL, BYE, or empty when Response is set. SDP is
+// deliberately absent: SessionDesc and RTCICECandidate carry WebRTC
+// negotiation on the same WebSocket relay.
+type ClientToClientCallSip struct {
+	CallId      string                         `json:"callId"`
+	Method      string                         `json:"method,omitempty"`
+	Response    *ClientToClientCallSipResponse `json:"response,omitempty"`
+	XMedia      string                         `json:"X-Media,omitempty"`
+	XCallStatus string                         `json:"X-Call-Status,omitempty"`
+}
+
+// ClientToClientCallChatControl amends the caller's INVITE history entry.
+// It is call signalling, not dcmsg business data, and shares the dialog's
+// ordered WebSocket path so the amendment cannot overtake the INVITE.
+type ClientToClientCallChatControl struct {
+	Subtype         string                 `json:"subtype"`
+	TargetMessageId MsgId                  `json:"targetMessageId"`
+	Sip             *ClientToClientCallSip `json:"sip,omitempty"`
+}
+
+// ClientToClientCallEv is the call-only subset of the application's
+// historical DCMsg envelope. Keeping its ids and threading fields preserves
+// the dialog and history semantics without using a DataChannel.
+type ClientToClientCallEv struct {
+	MimeVersion       string                         `json:"mimeVersion"`
+	ChannelId         ChannelId                      `json:"channelId"`
+	FromSubscriberId  SubscriberId                   `json:"fromSubscriberId"`
+	ToSubscriberId    SubscriberId                   `json:"toSubscriberId"`
+	CreationTimestamp float64                        `json:"creationTimestamp"`
+	MsgId             MsgId                          `json:"msgId"`
+	InReplyTo         MsgId                          `json:"inReplyTo,omitempty"`
+	MimeType          string                         `json:"mimeType"`
+	Plaintext         string                         `json:"plaintext"`
+	ChatControl       *ClientToClientCallChatControl `json:"chatControl,omitempty"`
+	Sip               *ClientToClientCallSip         `json:"sip,omitempty"`
+}
+
 // ClientToClientEv is a client-to-client signalling event; a signalling
 // server simply passes it, rewriting only the envelope's To EPAddr to
 // the address (ChannelId, ToSubscriber) resolves to.
@@ -318,6 +363,9 @@ type ClientToClientEv struct {
 	// offer. Automated recovery gives only that peer restart-offer ownership,
 	// preventing simultaneous restarts from colliding.
 	ICERestartRequest bool `json:"iceRestartRequest,omitempty"`
+
+	// Call is a SIP-subset call dialog or call-status UI amendment.
+	Call *ClientToClientCallEv `json:"call,omitempty"`
 
 	// Ping is an out-of-band ping message.
 	Ping *PingPongMsg `json:"ping,omitempty"`

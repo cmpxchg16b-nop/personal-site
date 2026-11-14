@@ -212,17 +212,19 @@ func pairUp(t *testing.T, a, b *rtc.HeadlessRTCClient) (aId, bId ss.SubscriberId
 // wireProbe is a pair of rtc.DataChannelHandlers recording every opened
 // channel and every raw frame, per peer.
 type wireProbe struct {
-	mu     sync.Mutex
-	opened map[ss.SubscriberId]map[string]*webrtc.DataChannel // peer → label → channel
-	texts  map[ss.SubscriberId][]string                       // dcmsg frames
-	bins   map[ss.SubscriberId][][]byte                       // dcbin frames
+	mu      sync.Mutex
+	opened  map[ss.SubscriberId]map[string]*webrtc.DataChannel // peer → label → channel
+	texts   map[ss.SubscriberId][]string                       // dcmsg + WebSocket call messages
+	dcTexts map[ss.SubscriberId][]string                       // actual dcmsg frames only
+	bins    map[ss.SubscriberId][][]byte                       // dcbin frames
 }
 
 func newWireProbe() *wireProbe {
 	return &wireProbe{
-		opened: map[ss.SubscriberId]map[string]*webrtc.DataChannel{},
-		texts:  map[ss.SubscriberId][]string{},
-		bins:   map[ss.SubscriberId][][]byte{},
+		opened:  map[ss.SubscriberId]map[string]*webrtc.DataChannel{},
+		texts:   map[ss.SubscriberId][]string{},
+		dcTexts: map[ss.SubscriberId][]string{},
+		bins:    map[ss.SubscriberId][][]byte{},
 	}
 }
 
@@ -245,6 +247,7 @@ func (p *wireProbe) handler(label string) rtc.DataChannelHandler {
 			defer p.mu.Unlock()
 			if msg.IsString {
 				p.texts[peer] = append(p.texts[peer], string(msg.Data))
+				p.dcTexts[peer] = append(p.dcTexts[peer], string(msg.Data))
 			} else {
 				p.bins[peer] = append(p.bins[peer], msg.Data)
 			}
@@ -257,6 +260,28 @@ func (p *wireProbe) register(t *testing.T, c *rtc.HeadlessRTCClient) {
 	t.Helper()
 	c.HandleDataChannel(DataChannelLabelMessages, p.handler(DataChannelLabelMessages))
 	c.HandleDataChannel(DataChannelLabelBinary, p.handler(DataChannelLabelBinary))
+	c.HandleCallSignallingFunc(func(_ context.Context, _ ss.ChannelId, peer ss.SubscriberId, call *ss.ClientToClientCallEv) {
+		data, err := json.Marshal(call)
+		if err != nil {
+			t.Errorf("marshal call: %v", err)
+			return
+		}
+		p.mu.Lock()
+		p.texts[peer] = append(p.texts[peer], string(data))
+		p.mu.Unlock()
+	})
+}
+
+// sendCall sends a raw wire-shaped call message through WebSocket.
+func (p *wireProbe) sendCall(t *testing.T, c *rtc.HeadlessRTCClient, peer ss.SubscriberId, m map[string]any) {
+	t.Helper()
+	var call ss.ClientToClientCallEv
+	if err := json.Unmarshal([]byte(mustJSON(t, m)), &call); err != nil {
+		t.Fatalf("decode call fixture: %v", err)
+	}
+	if err := c.SendCallSignalling(peer, &call); err != nil {
+		t.Fatalf("SendCallSignalling: %v", err)
+	}
 }
 
 func (p *wireProbe) waitDC(t *testing.T, peer ss.SubscriberId, label string) *webrtc.DataChannel {
@@ -275,6 +300,12 @@ func (p *wireProbe) textsFrom(peer ss.SubscriberId) []string {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return slices.Clone(p.texts[peer])
+}
+
+func (p *wireProbe) dcTextsFrom(peer ss.SubscriberId) []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return slices.Clone(p.dcTexts[peer])
 }
 
 func (p *wireProbe) binsFrom(peer ss.SubscriberId) [][]byte {
@@ -571,7 +602,6 @@ func TestBotDeclinesCalls(t *testing.T) {
 	user, probe := startUserProbe(t, net, "user", "2-user")
 	botId, userId := pairUp(t, bot, user)
 
-	dc := probe.waitDC(t, botId, DataChannelLabelMessages)
 	sipMsg := func(body map[string]any) map[string]any {
 		m := baseMsg(ss.WellKnownChIdMain, userId, botId)
 		m["mimeType"] = "application/x-sip"
@@ -585,9 +615,7 @@ func TestBotDeclinesCalls(t *testing.T) {
 	}
 	send := func(m map[string]any) {
 		t.Helper()
-		if err := dc.SendText(mustJSON(t, m)); err != nil {
-			t.Fatalf("SendText: %v", err)
-		}
+		probe.sendCall(t, user, botId, m)
 	}
 
 	voiceCall := uuid.NewString()
@@ -616,6 +644,20 @@ func TestBotDeclinesCalls(t *testing.T) {
 	time.Sleep(300 * time.Millisecond)
 	if got := probe.textsFrom(botId); len(got) != 2 {
 		t.Fatalf("the dialog got more than its declines: %v", got[2:])
+	}
+
+	// Neither the WS answers nor a legacy dcmsg INVITE may produce any
+	// DataChannel call traffic or activate the removed fallback.
+	dc := probe.waitDC(t, botId, DataChannelLabelMessages)
+	if err := dc.SendText(mustJSON(t, invite(uuid.NewString(), "voice"))); err != nil {
+		t.Fatalf("legacy SendText: %v", err)
+	}
+	time.Sleep(300 * time.Millisecond)
+	if got := probe.dcTextsFrom(botId); len(got) != 0 {
+		t.Fatalf("call signalling appeared on dcmsg: %v", got)
+	}
+	if got := probe.textsFrom(botId); len(got) != 2 {
+		t.Fatalf("a legacy dcmsg INVITE activated the call handler: %v", got[2:])
 	}
 }
 

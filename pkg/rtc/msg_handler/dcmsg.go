@@ -1,13 +1,10 @@
 package msg_handler
 
-// This file is the Go mirror of the browser's messaging data channel
-// ("dcmsg") codec — web/site/src/api/ss/datachannel.tsx is the source of
-// truth. Every frame is one JSON DCMsg; the decode rules (malformed frames
-// are dropped silently) and the echo discipline (a recipient bounces every
-// accepted message back with the echo flag set — except the call protocol,
-// application/x-sip, which is never bounced) live here; what a bot does
-// beyond that lives behind the BotMessageHandler interface (server.go
-// dispatches it).
+// This file mirrors the browser's historical DCMsg envelope and dcmsg
+// business codec. The same envelope's call-only subset is embedded in
+// c2CEv.call on WebSocket; dcmsg receivers drop that subset. Validation
+// lives here so the two transports cannot drift; policy lives behind the
+// BotMessageHandler interface.
 //
 // The decode side works on the raw JSON fields, so a bounce re-encodes the
 // frame it actually received — unknown fields and exact number literals
@@ -69,23 +66,11 @@ const (
 	fileStatusDone    = "done"
 )
 
-// dcSipResponse is a SIP status line: the response code and its reason
-// phrase, one of the well-known pairs above.
-type dcSipResponse struct {
-	Code   int    `json:"code"`
-	Phrase string `json:"phrase"`
-}
-
-// dcSipBody is the wire form of a SIP-subset DCMsg body (the frontend's
-// DCSip): one message of a call's dialog. Exactly one of Method / Response
-// is set; the X-* extension headers belong to the INVITE alone.
-type dcSipBody struct {
-	CallId      string         `json:"callId"`
-	Method      string         `json:"method,omitempty"`
-	Response    *dcSipResponse `json:"response,omitempty"`
-	XMedia      string         `json:"X-Media,omitempty"`
-	XCallStatus string         `json:"X-Call-Status,omitempty"`
-}
+// The shared c2c call wire types are also used inside the historical DCMsg
+// builders. Aliasing them prevents the WebSocket and application codecs from
+// drifting while ResponseWriter's public API stays unchanged.
+type dcSipResponse = ss.ClientToClientCallSipResponse
+type dcSipBody = ss.ClientToClientCallSip
 
 // dcChatControlBody is the wire form of a chat-control DCMsg body (the
 // frontend's DCChatControl): an "amend" rewriting a text message's
@@ -157,6 +142,10 @@ type dcMsgIn struct {
 	// The validated bodies the Server acts on; nil unless the mimeType says so.
 	sip          *dcSipIn
 	fileTransfer *fileTransferBody
+
+	// sipChatControl marks application/x-chat-control carrying sip. Like the
+	// dialog itself, it belongs on WebSocket rather than dcmsg.
+	sipChatControl bool
 }
 
 // dcSipIn is the validated, normalized form of an inbound SIP body: a
@@ -251,6 +240,11 @@ func decodeDCMsg(data []byte) *dcMsgIn {
 		if raw == nil || !isWellFormedChatControlBody(raw) {
 			return nil
 		}
+		var body map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &body); err != nil {
+			return nil
+		}
+		msg.sipChatControl = body["sip"] != nil
 	case dcMsgMimeSip:
 		raw := fields["sip"]
 		if raw == nil {
@@ -261,6 +255,58 @@ func decodeDCMsg(data []byte) *dcMsgIn {
 			return nil
 		}
 		msg.sip = sip
+	}
+	return msg
+}
+
+// isCallSignalling reports whether the message belongs on the WebSocket call
+// relay rather than the messaging DataChannel.
+func (m *dcMsgIn) isCallSignalling() bool {
+	return m.mimeType == dcMsgMimeSip || m.sipChatControl
+}
+
+// callEvent converts an outbound call DCMsg to its WebSocket c2c payload.
+// Nil means the message is ordinary dcmsg business data.
+func (m *dcMsgOut) callEvent() *ss.ClientToClientCallEv {
+	if m.MimeType != dcMsgMimeSip &&
+		(m.MimeType != dcMsgMimeChatControl || m.ChatControl == nil || m.ChatControl.Sip == nil) {
+		return nil
+	}
+	ev := &ss.ClientToClientCallEv{
+		MimeVersion:       m.MimeVersion,
+		ChannelId:         m.ChannelId,
+		FromSubscriberId:  m.FromSubscriberId,
+		ToSubscriberId:    m.ToSubscriberId,
+		CreationTimestamp: m.CreationTimestamp,
+		MsgId:             m.MsgId,
+		InReplyTo:         m.InReplyTo,
+		MimeType:          m.MimeType,
+		Plaintext:         m.Plaintext,
+		Sip:               m.Sip,
+	}
+	if m.ChatControl != nil {
+		ev.ChatControl = &ss.ClientToClientCallChatControl{
+			Subtype:         m.ChatControl.Subtype,
+			TargetMessageId: m.ChatControl.TargetMessageId,
+			Sip:             m.ChatControl.Sip,
+		}
+	}
+	return ev
+}
+
+// decodeCallEvent validates one WebSocket call payload through the same
+// message codec. Non-call payloads and echoes are rejected by the Server.
+func decodeCallEvent(ev *ss.ClientToClientCallEv) *dcMsgIn {
+	if ev == nil {
+		return nil
+	}
+	data, err := json.Marshal(ev)
+	if err != nil {
+		return nil
+	}
+	msg := decodeDCMsg(data)
+	if msg == nil || !msg.isCallSignalling() {
+		return nil
 	}
 	return msg
 }

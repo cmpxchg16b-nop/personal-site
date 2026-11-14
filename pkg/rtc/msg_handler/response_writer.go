@@ -11,8 +11,8 @@ import (
 
 // ResponseWriter carries a bot's answers to the message being handled —
 // the counterpart of http.ResponseWriter: the Server hands one to every
-// BotMessageHandler invocation, bound to that message (its peer, its
-// messaging channel, its threading anchor, its call id), and the handler
+// BotMessageHandler invocation, bound to that message (its peer, threading
+// anchor and call id), and the handler
 // answers through it — or not at all. The Server's WriterFor is the
 // unsolicited counterpart: a writer bound to a peer but to no message,
 // for answering an event that is not one of the peer's messages.
@@ -55,9 +55,8 @@ type ResponseWriter interface {
 	// Decline) and the dialog's later messages arrive as SipMessages at
 	// HandleCalling. The INVITE's logged UI state then follows the dialog
 	// on its own — the Server, as the caller's side, amends it (see the
-	// Server's doc). ErrNoMessagingChannel is returned when the peer's
-	// messaging channel is not up, ErrInvalidMediaKind when media is not
-	// MediaVoice or MediaVideo.
+	// Server's doc). The INVITE uses WebSocket, not dcmsg; ErrInvalidMediaKind
+	// is returned when media is not MediaVoice or MediaVideo.
 	Invite(media MediaKind) (callId string, err error)
 
 	// Accept answers the incoming call's INVITE with 200 OK, offering the
@@ -67,30 +66,26 @@ type ResponseWriter interface {
 	// existing peer connection; the negotiators renegotiate on their own.
 	// The tracks are attached before the response is sent, so a failed
 	// attach (a gone session) sends nothing. ErrNotACall is returned when
-	// the handled message is not a call invitation, ErrNoMessagingChannel
-	// when the peer's messaging channel is not up.
+	// the handled message is not a call invitation. The response uses WS.
 	Accept(tracks ...webrtc.TrackLocal) error
 
 	// Reject answers the incoming call's INVITE with a final error
 	// response; the protocol defines one rejection, SipCodeDecline
-	// (SipPhraseDecline). ErrNotACall is returned when the handled
-	// message is not a call invitation, ErrNoMessagingChannel when the
-	// peer's messaging channel is not up.
+	// (SipPhraseDecline). ErrNotACall is returned when the handled message
+	// is not a call invitation. The response uses WebSocket, not dcmsg.
 	Reject(code int, phrase string) error
 
 	// Cancel aborts one of the bot's own still-ringing outgoing calls
 	// (the dialog's CANCEL); callId is the id the call's Invite returned.
 	// The INVITE's logged UI status folds to cancelled — the Server's
 	// caller-side duty, exactly as for an inbound CANCEL. ErrNoCallId is
-	// returned for an empty call id, ErrNoMessagingChannel when the peer's
-	// messaging channel is not up.
+	// returned for an empty call id. CANCEL uses WebSocket, not dcmsg.
 	Cancel(callId string) error
 
 	// Bye ends one of the bot's own established outgoing calls (the
 	// dialog's BYE); callId is the id the call's Invite returned. The
 	// INVITE's logged UI status folds to ended. ErrNoCallId is returned
-	// for an empty call id, ErrNoMessagingChannel when the peer's
-	// messaging channel is not up.
+	// for an empty call id. BYE uses WebSocket, not dcmsg.
 	Bye(callId string) error
 
 	// AttachMedia offers the given local media tracks to the peer on the
@@ -148,12 +143,10 @@ var (
 )
 
 // responseWriter is the Server's ResponseWriter, bound to one handled
-// message: the messaging channel it answers on (nil when the peer's
-// messaging channel never came up), the threading anchor for Reply, and
-// the dialog's call id when the handled message is a call message.
+// message's peer, threading anchor and optional call id. Reply and Amend
+// resolve the current dcmsg per send; call methods use the WS session.
 type responseWriter struct {
 	server    *Server
-	dc        *webrtc.DataChannel
 	channelId ss.ChannelId
 	self      ss.SubscriberId
 	peer      ss.SubscriberId
@@ -164,14 +157,15 @@ type responseWriter struct {
 
 // Reply implements ResponseWriter.
 func (w *responseWriter) Reply(text string) (ss.MsgId, error) {
-	if w.dc == nil {
+	dc, _ := w.server.messagingChannel(w.peer, "")
+	if dc == nil {
 		return "", ErrNoMessagingChannel
 	}
 	msg := newDCMsgOut(w.channelId, w.self, w.peer)
 	msg.MimeType = dcMsgMimePlaintext
 	msg.Plaintext = text
 	msg.InReplyTo = w.inReplyTo
-	if err := w.server.sendText(w.dc, msg.encode()); err != nil {
+	if err := w.server.sendText(dc, msg.encode()); err != nil {
 		return "", err
 	}
 	return msg.MsgId, nil
@@ -179,7 +173,8 @@ func (w *responseWriter) Reply(text string) (ss.MsgId, error) {
 
 // Amend implements ResponseWriter.
 func (w *responseWriter) Amend(target ss.MsgId, text string) error {
-	if w.dc == nil {
+	dc, _ := w.server.messagingChannel(w.peer, "")
+	if dc == nil {
 		return ErrNoMessagingChannel
 	}
 	msg := newDCMsgOut(w.channelId, w.self, w.peer)
@@ -189,14 +184,11 @@ func (w *responseWriter) Amend(target ss.MsgId, text string) error {
 		TargetMessageId: target,
 		Text:            text,
 	}
-	return w.server.sendText(w.dc, msg.encode())
+	return w.server.sendText(dc, msg.encode())
 }
 
 // Invite implements ResponseWriter.
 func (w *responseWriter) Invite(media MediaKind) (string, error) {
-	if w.dc == nil {
-		return "", ErrNoMessagingChannel
-	}
 	if media != MediaVoice && media != MediaVideo {
 		return "", ErrInvalidMediaKind
 	}
@@ -209,7 +201,7 @@ func (w *responseWriter) Invite(media MediaKind) (string, error) {
 		XMedia:      string(media),
 		XCallStatus: callStatusInviting,
 	}
-	if err := w.server.sendText(w.dc, msg.encode()); err != nil {
+	if err := w.server.sendCall(w.peer, msg); err != nil {
 		return "", err
 	}
 	// Record the outgoing call: the Server owns the caller's duty of
@@ -230,9 +222,6 @@ func (w *responseWriter) Accept(tracks ...webrtc.TrackLocal) error {
 	if !w.isInvite {
 		return ErrNotACall
 	}
-	if w.dc == nil {
-		return ErrNoMessagingChannel
-	}
 	// The tracks first: a failed attach (a gone session) sends no OK.
 	for _, track := range tracks {
 		if _, err := w.server.client.AddTrack(w.peer, track); err != nil {
@@ -245,7 +234,7 @@ func (w *responseWriter) Accept(tracks ...webrtc.TrackLocal) error {
 		CallId:   w.callId,
 		Response: &dcSipResponse{Code: sipResponseOKCode, Phrase: sipResponseOKPhrase},
 	}
-	return w.server.sendText(w.dc, msg.encode())
+	return w.server.sendCall(w.peer, msg)
 }
 
 // Reject implements ResponseWriter.
@@ -253,16 +242,13 @@ func (w *responseWriter) Reject(code int, phrase string) error {
 	if !w.isInvite {
 		return ErrNotACall
 	}
-	if w.dc == nil {
-		return ErrNoMessagingChannel
-	}
 	msg := newDCMsgOut(w.channelId, w.self, w.peer)
 	msg.MimeType = dcMsgMimeSip
 	msg.Sip = &dcSipBody{
 		CallId:   w.callId,
 		Response: &dcSipResponse{Code: code, Phrase: phrase},
 	}
-	return w.server.sendText(w.dc, msg.encode())
+	return w.server.sendCall(w.peer, msg)
 }
 
 // Cancel implements ResponseWriter.
@@ -282,13 +268,10 @@ func (w *responseWriter) terminate(callId, method, status string) error {
 	if callId == "" {
 		return ErrNoCallId
 	}
-	if w.dc == nil {
-		return ErrNoMessagingChannel
-	}
 	msg := newDCMsgOut(w.channelId, w.self, w.peer)
 	msg.MimeType = dcMsgMimeSip
 	msg.Sip = &dcSipBody{CallId: callId, Method: method}
-	if err := w.server.sendText(w.dc, msg.encode()); err != nil {
+	if err := w.server.sendCall(w.peer, msg); err != nil {
 		return err
 	}
 	w.server.serviceChan <- sipDialogNote{peer: w.peer, callId: callId, established: status}

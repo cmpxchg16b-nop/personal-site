@@ -4,15 +4,15 @@
 // per (channel, peer subscriber) pair. Two deliberately separate layers:
 //
 // - The session PROTOCOL — the cause. The actions are their own wire
-//   frames: a SIP subset (application/x-sip DCMsgs, see
-//   datachannel.tsx) with the SDP body stripped — the caller's INVITE
+//   frames: a SIP subset (c2CEv.call with application/x-sip payloads)
+//   over WebSocket, with the SDP body stripped — the caller's INVITE
 //   opens the dialog (also stored as the call's log entry), the callee
 //   answers it with a response (200 OK / 603 Decline), the caller
 //   callee answers it with a response (200 OK / 603 Decline), the
 //   caller aborts the ring with a CANCEL, either party hangs up with a
 //   BYE. Each end folds the dialog's messages into its state below —
-//   its own sends fold in at send time (a SIP message is never
-//   echoed), the peer's sends on arrival; media (useCallMedia) and the
+//   its own sends fold in after the WS write succeeds (there is no
+//   network echo), the peer's sends on arrival; media (useCallMedia) and the
 //   live indicators (the answer popup, the sidebar pills, the
 //   conversation strip) read this state.
 //
@@ -21,12 +21,9 @@
 //   only follows the protocol state, never leads it. When the protocol
 //   state of a session we OWN (we are the caller — the INVITE's author)
 //   has moved on from its logged status, this hook reports the new UI
-//   state with a chat-control amend, exactly like a file transfer's
-//   sender amends its status message as acknowledgements arrive. Chat
-//   control is a separate layer with its own echo discipline (the
-//   receiver applies the amend on arrival, we apply our own via its
-//   echo) and its own-messages-only rule — the SIP dialog itself never
-//   echoes and never depends on chat control.
+//   state with a chatControl.sip amend on the same ordered WebSocket
+//   call relay. The receiver applies the amend on arrival; we apply our
+//   own after the write succeeds. The dialog never depends on the amend.
 //
 // Both layers are decoupled from the peer connection's own signalling
 // state: the connection is usePeerSessions', shared with messaging and

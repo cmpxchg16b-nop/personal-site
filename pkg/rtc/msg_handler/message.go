@@ -97,7 +97,7 @@ type Attachment struct {
 }
 
 // SipMethod is a SIP-subset request's start line (the method field of a
-// dcmsg "application/x-sip" body).
+// WebSocket call event's "application/x-sip" body).
 type SipMethod string
 
 const (

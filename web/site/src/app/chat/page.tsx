@@ -26,12 +26,10 @@ import { usePhoneCalls } from "@/components/chat/usePhoneCalls";
 // The chat page: it owns all chat state. The sidebar's channels and
 // their members come live from the signalling server (useSignalling),
 // the peer connections to fellow members are usePeerSessions', and the
-// three data-channel consumers build on them — messages travel as DCMsgs
-// (useDataChannel), file bytes as binary frames (useBinaryDataChannel),
-// and voice-call media rides the same connections' tracks (useCallMedia)
-// while the calls themselves are invitation DCMsgs (usePhoneCalls). Our
-// own messages come back as echoes over the same channel. ChatApp under
-// it is a pure controlled component.
+// messaging and media consumers build on them — chat business messages
+// and call signalling share useDataChannel's store but travel on dcmsg
+// and WebSocket respectively; file bytes use dcbin, and call media rides
+// the peer connections' tracks. ChatApp is a pure controlled component.
 
 // NO_UNREAD is the stable empty unread-count record: the mock badge
 // source is gone and nothing computes unread counts yet.
@@ -75,10 +73,9 @@ export default function ChatPage() {
   // (see useChatMessages).
   const messages = useChatMessages(dcMsgs);
 
-  // The voice calls: the session protocol (invitations and session
-  // events) rides the messaging channel and usePhoneCalls folds it into
-  // the per-pair call states — the cause — while the log entries'
-  // statuses follow via chat-control amends — the UI state. Media of
+  // The voice calls: the session protocol rides the WebSocket call relay
+  // and usePhoneCalls folds it into per-pair call states — the cause —
+  // while log statuses follow via chatControl.sip on the same relay. Media of
   // the accepted calls rides the peer connections' tracks through the
   // audio graph (useCallMedia); the two volumes are the graph's gain
   // nodes (useCallVolumes).

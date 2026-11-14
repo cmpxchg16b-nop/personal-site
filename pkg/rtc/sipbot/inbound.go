@@ -98,6 +98,7 @@ func (h *sipHandler) serveInbound(peer ss.SubscriberId, session UserSession, inD
 		w:             w,
 		pendingCancel: ringCancel,
 		accepted:      make(chan struct{}),
+		answerDone:    make(chan struct{}),
 		dialog:        inDialog,
 	}
 	if err := c.setCodec(codec); err != nil {
@@ -302,6 +303,7 @@ func (h *sipHandler) ringTimeout(peer ss.SubscriberId, c *peerCall, ringCtx cont
 // failure — or a call that ended while the ACK was awaited — the call
 // ends with the browser leg told.
 func (h *sipHandler) answerInbound(peer ss.SubscriberId, c *peerCall) {
+	defer close(c.answerDone)
 	// A video call's media session was built by hand and injected at ring
 	// time: Answer's early branch RespondSDPs its static answer (our
 	// audio+video SDP), ACK-awaited exactly like the native path's

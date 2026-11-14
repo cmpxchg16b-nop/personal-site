@@ -442,17 +442,19 @@ func pairUp(t *testing.T, a, b *rtc.HeadlessRTCClient) (aId, bId ss.SubscriberId
 // wireProbe is a pair of rtc.DataChannelHandlers recording every opened
 // channel and every raw frame, per peer.
 type wireProbe struct {
-	mu     sync.Mutex
-	opened map[ss.SubscriberId]map[string]*webrtc.DataChannel // peer → label → channel
-	texts  map[ss.SubscriberId][]string                       // dcmsg frames
-	bins   map[ss.SubscriberId][][]byte                       // dcbin frames
+	mu      sync.Mutex
+	opened  map[ss.SubscriberId]map[string]*webrtc.DataChannel // peer → label → channel
+	texts   map[ss.SubscriberId][]string                       // dcmsg + WebSocket call messages
+	dcTexts map[ss.SubscriberId][]string                       // actual dcmsg frames only
+	bins    map[ss.SubscriberId][][]byte                       // dcbin frames
 }
 
 func newWireProbe() *wireProbe {
 	return &wireProbe{
-		opened: map[ss.SubscriberId]map[string]*webrtc.DataChannel{},
-		texts:  map[ss.SubscriberId][]string{},
-		bins:   map[ss.SubscriberId][][]byte{},
+		opened:  map[ss.SubscriberId]map[string]*webrtc.DataChannel{},
+		texts:   map[ss.SubscriberId][]string{},
+		dcTexts: map[ss.SubscriberId][]string{},
+		bins:    map[ss.SubscriberId][][]byte{},
 	}
 }
 
@@ -475,6 +477,7 @@ func (p *wireProbe) handler(label string) rtc.DataChannelHandler {
 			defer p.mu.Unlock()
 			if msg.IsString {
 				p.texts[peer] = append(p.texts[peer], string(msg.Data))
+				p.dcTexts[peer] = append(p.dcTexts[peer], string(msg.Data))
 			} else {
 				p.bins[peer] = append(p.bins[peer], msg.Data)
 			}
@@ -487,6 +490,28 @@ func (p *wireProbe) register(t *testing.T, c *rtc.HeadlessRTCClient) {
 	t.Helper()
 	c.HandleDataChannel(msg_handler.DataChannelLabelMessages, p.handler(msg_handler.DataChannelLabelMessages))
 	c.HandleDataChannel(msg_handler.DataChannelLabelBinary, p.handler(msg_handler.DataChannelLabelBinary))
+	c.HandleCallSignallingFunc(func(_ context.Context, _ ss.ChannelId, peer ss.SubscriberId, call *ss.ClientToClientCallEv) {
+		data, err := json.Marshal(call)
+		if err != nil {
+			t.Errorf("marshal call: %v", err)
+			return
+		}
+		p.mu.Lock()
+		p.texts[peer] = append(p.texts[peer], string(data))
+		p.mu.Unlock()
+	})
+}
+
+// sendCall sends a raw wire-shaped call message through WebSocket.
+func (p *wireProbe) sendCall(t *testing.T, c *rtc.HeadlessRTCClient, peer ss.SubscriberId, m map[string]any) {
+	t.Helper()
+	var call ss.ClientToClientCallEv
+	if err := json.Unmarshal([]byte(mustJSON(t, m)), &call); err != nil {
+		t.Fatalf("decode call fixture: %v", err)
+	}
+	if err := c.SendCallSignalling(peer, &call); err != nil {
+		t.Fatalf("SendCallSignalling: %v", err)
+	}
 }
 
 func (p *wireProbe) waitDC(t *testing.T, peer ss.SubscriberId, label string) *webrtc.DataChannel {
@@ -505,6 +530,12 @@ func (p *wireProbe) textsFrom(peer ss.SubscriberId) []string {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return slices.Clone(p.texts[peer])
+}
+
+func (p *wireProbe) dcTextsFrom(peer ss.SubscriberId) []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return slices.Clone(p.dcTexts[peer])
 }
 
 func (p *wireProbe) binsFrom(peer ss.SubscriberId) [][]byte {
@@ -931,16 +962,13 @@ func TestMusicBotDeclinesVideoCalls(t *testing.T) {
 	user, probe, tprobe := startUserProbe(t, net, "user", "1-user")
 	botId, userId := pairUp(t, bot, user)
 
-	dc := probe.waitDC(t, botId, msg_handler.DataChannelLabelMessages)
 	callId := uuid.NewString()
 	m := baseMsg(ss.WellKnownChIdMain, userId, botId)
 	m["mimeType"] = wireMimeSip
 	m["sip"] = map[string]any{
 		"callId": callId, "method": "INVITE", "X-Media": "video", "X-Call-Status": "inviting",
 	}
-	if err := dc.SendText(mustJSON(t, m)); err != nil {
-		t.Fatalf("SendText: %v", err)
-	}
+	probe.sendCall(t, user, botId, m)
 
 	// The 603 Decline names the dialog's call id; the INVITE is never
 	// bounced.
@@ -972,16 +1000,14 @@ func TestMusicBotAcceptsVoiceCall(t *testing.T) {
 	bot := startBot(t, net, "bot", "2-bot", testSongbook(t))
 	user, probe, tprobe := startUserProbe(t, net, "user", "1-user")
 	botId, userId := pairUp(t, bot, user)
+	probe.waitDC(t, botId, msg_handler.DataChannelLabelMessages)
 
-	dc := probe.waitDC(t, botId, msg_handler.DataChannelLabelMessages)
 	sipMsg := func(body map[string]any) ss.MsgId {
 		t.Helper()
 		m := baseMsg(ss.WellKnownChIdMain, userId, botId)
 		m["mimeType"] = wireMimeSip
 		m["sip"] = body
-		if err := dc.SendText(mustJSON(t, m)); err != nil {
-			t.Fatalf("SendText: %v", err)
-		}
+		probe.sendCall(t, user, botId, m)
 		return ss.MsgId(m["msgId"].(string))
 	}
 	invite := func(callId string) ss.MsgId {
@@ -1061,9 +1087,7 @@ func TestMusicBotPlayPhonesTheUser(t *testing.T) {
 		m := baseMsg(ss.WellKnownChIdMain, userId, botId)
 		m["mimeType"] = wireMimeSip
 		m["sip"] = body
-		if err := dc.SendText(mustJSON(t, m)); err != nil {
-			t.Fatalf("SendText: %v", err)
-		}
+		probe.sendCall(t, user, botId, m)
 	}
 
 	playMsg := chat("/play chiptune")
@@ -1110,6 +1134,12 @@ func TestMusicBotPlayPhonesTheUser(t *testing.T) {
 	waitBotMessage(t, probe, botId, "the fresh INVITE", func(m *rawMsg) bool {
 		return isSipInvite(m) && m.sip.CallId != "" && m.sip.CallId != callId
 	})
+	for _, frame := range probe.dcTextsFrom(botId) {
+		if decoded := decodeMsgRaw(frame); decoded != nil &&
+			(decoded.mimeType == wireMimeSip || decoded.ccSip != nil) {
+			t.Fatalf("call signalling appeared on dcmsg: %s", frame)
+		}
+	}
 }
 
 // TestMusicBotPlayUnknownSong covers the /play guard: an unknown song is
@@ -1164,9 +1194,7 @@ func TestMusicBotCallDeclined(t *testing.T) {
 	decline := baseMsg(ss.WellKnownChIdMain, userId, botId)
 	decline["mimeType"] = wireMimeSip
 	decline["sip"] = map[string]any{"callId": callId, "response": map[string]any{"code": 603, "phrase": "Decline"}}
-	if err := dc.SendText(mustJSON(t, decline)); err != nil {
-		t.Fatalf("SendText: %v", err)
-	}
+	probe.sendCall(t, user, botId, decline)
 	declineMsgId := ss.MsgId(decline["msgId"].(string))
 
 	// The bot's line and the Server's amend — either order (two
@@ -1184,7 +1212,7 @@ func TestMusicBotCallDeclined(t *testing.T) {
 // playSongAndAnswer drives the outbound call flow up to the answered
 // call: /play <song>, the INVITE, the 200 OK — returning the dialog's
 // call id.
-func playSongAndAnswer(t *testing.T, probe *wireProbe, dc *webrtc.DataChannel, botId, userId ss.SubscriberId, song string) string {
+func playSongAndAnswer(t *testing.T, user *rtc.HeadlessRTCClient, probe *wireProbe, dc *webrtc.DataChannel, botId, userId ss.SubscriberId, song string) string {
 	t.Helper()
 	m := baseMsg(ss.WellKnownChIdMain, userId, botId)
 	m["plaintext"] = "/play " + song
@@ -1199,9 +1227,7 @@ func playSongAndAnswer(t *testing.T, probe *wireProbe, dc *webrtc.DataChannel, b
 	answer := baseMsg(ss.WellKnownChIdMain, userId, botId)
 	answer["mimeType"] = wireMimeSip
 	answer["sip"] = map[string]any{"callId": callId, "response": map[string]any{"code": 200, "phrase": "OK"}}
-	if err := dc.SendText(mustJSON(t, answer)); err != nil {
-		t.Fatalf("SendText: %v", err)
-	}
+	probe.sendCall(t, user, botId, answer)
 	return callId
 }
 
@@ -1218,7 +1244,7 @@ func TestMusicBotPlaysPCMSongAsOpus(t *testing.T) {
 	botId, userId := pairUp(t, bot, user)
 	dc := probe.waitDC(t, botId, msg_handler.DataChannelLabelMessages)
 
-	playSongAndAnswer(t, probe, dc, botId, userId, "stereo")
+	playSongAndAnswer(t, user, probe, dc, botId, userId, "stereo")
 
 	track := tprobe.waitTrack(t, 1)
 	if track.Kind() != webrtc.RTPCodecTypeAudio {
@@ -1248,7 +1274,7 @@ func TestMusicBotPlaysFLACSong(t *testing.T) {
 	botId, userId := pairUp(t, bot, user)
 	dc := probe.waitDC(t, botId, msg_handler.DataChannelLabelMessages)
 
-	playSongAndAnswer(t, probe, dc, botId, userId, "flac")
+	playSongAndAnswer(t, user, probe, dc, botId, userId, "flac")
 
 	track := tprobe.waitTrack(t, 1)
 	if got := track.Codec().MimeType; got != webrtc.MimeTypeOpus {
@@ -1294,7 +1320,7 @@ func TestMusicBotPlaysOpusSong(t *testing.T) {
 	botId, userId := pairUp(t, bot, user)
 	dc := probe.waitDC(t, botId, msg_handler.DataChannelLabelMessages)
 
-	playSongAndAnswer(t, probe, dc, botId, userId, "radio")
+	playSongAndAnswer(t, user, probe, dc, botId, userId, "radio")
 
 	track := tprobe.waitTrack(t, 1)
 	if got := track.Codec().MimeType; got != webrtc.MimeTypeOpus {
@@ -1333,7 +1359,7 @@ func TestMusicBotStreamsRemoteOpusSong(t *testing.T) {
 	botId, userId := pairUp(t, bot, user)
 	dc := probe.waitDC(t, botId, msg_handler.DataChannelLabelMessages)
 
-	playSongAndAnswer(t, probe, dc, botId, userId, "stream")
+	playSongAndAnswer(t, user, probe, dc, botId, userId, "stream")
 
 	track := tprobe.waitTrack(t, 1)
 	k := syncRTPToSong(t, track, packets)
@@ -1359,7 +1385,7 @@ func TestMusicBotSwitchesSongFamilies(t *testing.T) {
 	botId, userId := pairUp(t, bot, user)
 	dc := probe.waitDC(t, botId, msg_handler.DataChannelLabelMessages)
 
-	playSongAndAnswer(t, probe, dc, botId, userId, "chiptune")
+	playSongAndAnswer(t, user, probe, dc, botId, userId, "chiptune")
 	pcmuTrack := tprobe.waitTrack(t, 1)
 	if got := pcmuTrack.Codec().MimeType; got != webrtc.MimeTypePCMU {
 		t.Fatalf("the first track's codec is %s, want %s", got, webrtc.MimeTypePCMU)
@@ -1391,15 +1417,11 @@ func TestMusicBotLoopsAShortSong(t *testing.T) {
 	bot := startBot(t, net, "bot", "2-bot", []*audiosource.AudioSourceData{muLawSong("tiny", 2)})
 	user, probe, tprobe := startUserProbe(t, net, "user", "1-user")
 	botId, userId := pairUp(t, bot, user)
-	dc := probe.waitDC(t, botId, msg_handler.DataChannelLabelMessages)
-
 	callId := uuid.NewString()
 	m := baseMsg(ss.WellKnownChIdMain, userId, botId)
 	m["mimeType"] = wireMimeSip
 	m["sip"] = map[string]any{"callId": callId, "method": "INVITE", "X-Media": "voice", "X-Call-Status": "inviting"}
-	if err := dc.SendText(mustJSON(t, m)); err != nil {
-		t.Fatalf("SendText: %v", err)
-	}
+	probe.sendCall(t, user, botId, m)
 	waitBotMessage(t, probe, botId, "the 200 OK", isSipResponse(callId, 200))
 
 	track := tprobe.waitTrack(t, 1)
@@ -1424,9 +1446,7 @@ func TestMusicBotEmptySongbook(t *testing.T) {
 	m := baseMsg(ss.WellKnownChIdMain, userId, botId)
 	m["mimeType"] = wireMimeSip
 	m["sip"] = map[string]any{"callId": callId, "method": "INVITE", "X-Media": "voice", "X-Call-Status": "inviting"}
-	if err := dc.SendText(mustJSON(t, m)); err != nil {
-		t.Fatalf("SendText: %v", err)
-	}
+	probe.sendCall(t, user, botId, m)
 	time.Sleep(300 * time.Millisecond)
 	for _, frame := range probe.textsFrom(botId) {
 		if decoded := decodeMsgRaw(frame); decoded != nil && decoded.sip != nil && decoded.sip.CallId == callId {

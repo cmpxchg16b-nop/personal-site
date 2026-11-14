@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -348,6 +349,168 @@ func TestHeadlessRTCClientConnectsToPeersThroughSS(t *testing.T) {
 	}
 	botProbe.waitGot(t, userId, "hi from user")
 	userProbe.waitGot(t, botId, "echo:hi from user")
+}
+
+// TestHeadlessRTCClientCallSignallingUsesWebSocket covers application call
+// routing independently of SDP/ICE and without registering any DataChannel
+// handler. The payload's ids survive while its addressing is bound to the
+// authenticated registration and selected peer session.
+func TestHeadlessRTCClientCallSignallingUsesWebSocket(t *testing.T) {
+	net := newClientTestNet(t, ss.DefaultSubscriberAging)
+	bot, _ := startTestClient(t, net, "bot", nil)
+	user, _ := startTestClient(t, net, "user", nil)
+	received := make(chan *ss.ClientToClientCallEv, 2)
+	user.HandleCallSignallingFunc(func(_ context.Context, channelId ss.ChannelId, peer ss.SubscriberId, call *ss.ClientToClientCallEv) {
+		if channelId != ss.WellKnownChIdMain {
+			t.Errorf("call channel = %q", channelId)
+		}
+		if peer != bot.SubscriberId() {
+			t.Errorf("call peer = %q, want %q", peer, bot.SubscriberId())
+		}
+		received <- call
+	})
+	botId := waitRegistered(t, bot)
+	userId := waitRegistered(t, user)
+	waitFor(t, "both call clients to hold a session", func() bool {
+		return slices.Contains(bot.Peers(), userId) && slices.Contains(user.Peers(), botId)
+	})
+
+	call := &ss.ClientToClientCallEv{
+		MimeVersion:       "1.0",
+		ChannelId:         "forged-channel",
+		FromSubscriberId:  "forged-from",
+		ToSubscriberId:    "forged-to",
+		CreationTimestamp: 1234.5,
+		MsgId:             "call-message-id",
+		MimeType:          "application/x-sip",
+		Sip: &ss.ClientToClientCallSip{
+			CallId: "call-id", Method: "INVITE", XMedia: "voice", XCallStatus: "inviting",
+		},
+	}
+	if err := bot.SendCallSignalling(userId, call); err != nil {
+		t.Fatalf("SendCallSignalling: %v", err)
+	}
+	select {
+	case got := <-received:
+		if got.ChannelId != ss.WellKnownChIdMain || got.FromSubscriberId != botId || got.ToSubscriberId != userId {
+			t.Fatalf("call addressing = (%q, %q, %q)", got.ChannelId, got.FromSubscriberId, got.ToSubscriberId)
+		}
+		if got.MsgId != "call-message-id" || got.Sip == nil || got.Sip.CallId != "call-id" {
+			t.Fatalf("call payload = %+v", got)
+		}
+	case <-time.After(testTimeout):
+		t.Fatal("timed out waiting for WebSocket call signalling")
+	}
+	if err := bot.SendCallSignalling("missing-peer", call); !errors.Is(err, ErrNoPeerSession) {
+		t.Fatalf("missing peer error = %v, want ErrNoPeerSession", err)
+	}
+	if err := bot.SendCallSignalling(userId, nil); !errors.Is(err, ErrNilCallSignalling) {
+		t.Fatalf("nil call error = %v, want ErrNilCallSignalling", err)
+	}
+}
+
+// TestHeadlessRTCClientCallHandlerCanAnswerUnderLoad crosses the old bounded
+// queue capacity while the first handler is blocked, then lets every handler
+// synchronously answer through the client hub. The eager call/output pumps
+// must keep that reentrant path free of deadlocks.
+func TestHeadlessRTCClientCallHandlerCanAnswerUnderLoad(t *testing.T) {
+	net := newClientTestNet(t, ss.DefaultSubscriberAging)
+	bot, _ := startTestClient(t, net, "bot", nil)
+	user, _ := startTestClient(t, net, "user", nil)
+	const count = 2 * sessionChannelBuffer
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	handlerErr := make(chan error, 1)
+	done := make(chan struct{})
+	var first sync.Once
+	var finished sync.Once
+	var handled atomic.Int32
+	user.HandleCallSignallingFunc(func(_ context.Context, _ ss.ChannelId, peer ss.SubscriberId, call *ss.ClientToClientCallEv) {
+		first.Do(func() {
+			close(entered)
+			<-release
+		})
+		if err := user.SendCallSignalling(peer, call); err != nil {
+			select {
+			case handlerErr <- err:
+			default:
+			}
+			return
+		}
+		if handled.Add(1) == count {
+			finished.Do(func() { close(done) })
+		}
+	})
+	botId := waitRegistered(t, bot)
+	userId := waitRegistered(t, user)
+	waitFor(t, "both load-test clients to hold a session", func() bool {
+		return slices.Contains(bot.Peers(), userId) && slices.Contains(user.Peers(), botId)
+	})
+	call := &ss.ClientToClientCallEv{MimeVersion: "1.0", MimeType: "application/x-sip", Sip: &ss.ClientToClientCallSip{CallId: "load", Method: "INVITE", XCallStatus: "inviting"}}
+	for i := 0; i < count; i++ {
+		call.MsgId = ss.MsgId(fmt.Sprintf("load-%02d", i))
+		if err := bot.SendCallSignalling(userId, call); err != nil {
+			t.Fatalf("send %d: %v", i, err)
+		}
+		if i == 0 {
+			select {
+			case <-entered:
+			case <-time.After(testTimeout):
+				t.Fatal("the first call handler was not entered")
+			}
+		}
+	}
+	// Let the provider and client hub deliver the whole burst while the first
+	// application callback is still blocked.
+	time.Sleep(100 * time.Millisecond)
+	close(release)
+	select {
+	case err := <-handlerErr:
+		t.Fatalf("synchronous handler answer: %v", err)
+	case <-done:
+	case <-time.After(testTimeout):
+		t.Fatalf("only %d/%d call handlers completed", handled.Load(), count)
+	}
+}
+
+// returningNegotiator exits immediately to prove sess.out is not owned or
+// closed by the negotiator now that call signalling shares it.
+type returningNegotiator struct{}
+
+func (returningNegotiator) Negotiate(context.Context, <-chan *ss.SignallingEvent, chan<- *ss.SignallingEvent) error {
+	return nil
+}
+
+func TestPeerSessionAcceptsCallOutputAfterNegotiatorReturns(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sink := make(chan *ss.SignallingEvent, 1)
+	sess := &peerSession{
+		in:     make(chan *ss.SignallingEvent),
+		out:    make(chan *ss.SignallingEvent, sessionChannelBuffer),
+		ctx:    ctx,
+		cancel: cancel,
+	}
+	done := make(chan struct{})
+	go func() {
+		sess.run(returningNegotiator{}, sink, testLogger(t))
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(testTimeout):
+		t.Fatal("returning negotiator did not return")
+	}
+	ev := &ss.SignallingEvent{MsgId: "after-negotiator"}
+	sess.out <- ev
+	select {
+	case got := <-sink:
+		if got != ev {
+			t.Fatalf("output = %p, want %p", got, ev)
+		}
+	case <-time.After(testTimeout):
+		t.Fatal("output did not flow after the negotiator returned")
+	}
 }
 
 // TestHeadlessRTCClientRegistersSubscriberId covers registration: an
@@ -720,6 +883,13 @@ func TestNewHeadlessRTCClientRejectsMisuse(t *testing.T) {
 	c.HandleDataChannelFunc("dcmsg", noop)
 	assertPanics(t, "a duplicate label registration", func() { c.HandleDataChannelFunc("dcmsg", noop) })
 	assertPanics(t, "a nil handler", func() { c.HandleDataChannel("dcbin", nil) })
+	if err := c.SendCallSignalling("nobody", &ss.ClientToClientCallEv{}); !errors.Is(err, ErrNoSignallingConnection) {
+		t.Fatalf("send without Run: got %v, want ErrNoSignallingConnection", err)
+	}
+	callNoop := func(context.Context, ss.ChannelId, ss.SubscriberId, *ss.ClientToClientCallEv) {}
+	c.HandleCallSignallingFunc(callNoop)
+	assertPanics(t, "a duplicate call handler", func() { c.HandleCallSignallingFunc(callNoop) })
+	assertPanics(t, "a nil call handler", func() { c.HandleCallSignalling(nil) })
 }
 
 // TestHeadlessRTCClientRunIsSingleFlight covers the double-Run guard.

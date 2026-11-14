@@ -252,15 +252,17 @@ func pairUp(t *testing.T, a, b *rtc.HeadlessRTCClient) (aId, bId ss.SubscriberId
 // wireProbe is a pair of rtc.DataChannelHandlers recording every opened
 // channel and every raw frame, per peer.
 type wireProbe struct {
-	mu     sync.Mutex
-	opened map[ss.SubscriberId]map[string]*webrtc.DataChannel // peer → label → channel
-	texts  map[ss.SubscriberId][]string                       // dcmsg frames
+	mu      sync.Mutex
+	opened  map[ss.SubscriberId]map[string]*webrtc.DataChannel // peer → label → channel
+	texts   map[ss.SubscriberId][]string                       // dcmsg + WebSocket call messages
+	dcTexts map[ss.SubscriberId][]string                       // actual dcmsg frames only
 }
 
 func newWireProbe() *wireProbe {
 	return &wireProbe{
-		opened: map[ss.SubscriberId]map[string]*webrtc.DataChannel{},
-		texts:  map[ss.SubscriberId][]string{},
+		opened:  map[ss.SubscriberId]map[string]*webrtc.DataChannel{},
+		texts:   map[ss.SubscriberId][]string{},
+		dcTexts: map[ss.SubscriberId][]string{},
 	}
 }
 
@@ -284,6 +286,7 @@ func (p *wireProbe) handler(label string) rtc.DataChannelHandler {
 			}
 			p.mu.Lock()
 			p.texts[peer] = append(p.texts[peer], string(msg.Data))
+			p.dcTexts[peer] = append(p.dcTexts[peer], string(msg.Data))
 			p.mu.Unlock()
 		})
 	})
@@ -293,6 +296,28 @@ func (p *wireProbe) handler(label string) rtc.DataChannelHandler {
 func (p *wireProbe) register(t *testing.T, c *rtc.HeadlessRTCClient) {
 	t.Helper()
 	c.HandleDataChannel(msg_handler.DataChannelLabelMessages, p.handler(msg_handler.DataChannelLabelMessages))
+	c.HandleCallSignallingFunc(func(_ context.Context, _ ss.ChannelId, peer ss.SubscriberId, call *ss.ClientToClientCallEv) {
+		data, err := json.Marshal(call)
+		if err != nil {
+			t.Errorf("marshal call: %v", err)
+			return
+		}
+		p.mu.Lock()
+		p.texts[peer] = append(p.texts[peer], string(data))
+		p.mu.Unlock()
+	})
+}
+
+// sendCall sends a raw wire-shaped call message through WebSocket.
+func (p *wireProbe) sendCall(t *testing.T, c *rtc.HeadlessRTCClient, peer ss.SubscriberId, m map[string]any) {
+	t.Helper()
+	var call ss.ClientToClientCallEv
+	if err := json.Unmarshal([]byte(mustJSON(t, m)), &call); err != nil {
+		t.Fatalf("decode call fixture: %v", err)
+	}
+	if err := c.SendCallSignalling(peer, &call); err != nil {
+		t.Fatalf("SendCallSignalling: %v", err)
+	}
 }
 
 func (p *wireProbe) waitDC(t *testing.T, peer ss.SubscriberId, label string) *webrtc.DataChannel {
@@ -311,6 +336,12 @@ func (p *wireProbe) textsFrom(peer ss.SubscriberId) []string {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return slices.Clone(p.texts[peer])
+}
+
+func (p *wireProbe) dcTextsFrom(peer ss.SubscriberId) []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return slices.Clone(p.dcTexts[peer])
 }
 
 // trackProbe records every remote track arriving at a client (the
@@ -1841,8 +1872,6 @@ func TestSipBotDeclinesIncomingCalls(t *testing.T) {
 	bot := startBot(t, net, "bot", "2-bot", "", nil)
 	user, probe, _, _ := startUserProbe(t, net, "user", "1-user")
 	botId, userId := pairUp(t, bot, user)
-
-	dc := probe.waitDC(t, botId, msg_handler.DataChannelLabelMessages)
 	for _, mediaKind := range []string{"voice", "video"} {
 		callId := uuid.NewString()
 		m := baseMsg(ss.WellKnownChIdMain, userId, botId)
@@ -1850,10 +1879,11 @@ func TestSipBotDeclinesIncomingCalls(t *testing.T) {
 		m["sip"] = map[string]any{
 			"callId": callId, "method": "INVITE", "X-Media": mediaKind, "X-Call-Status": "inviting",
 		}
-		if err := dc.SendText(mustJSON(t, m)); err != nil {
-			t.Fatalf("SendText: %v", err)
-		}
+		probe.sendCall(t, user, botId, m)
 		waitBotMessage(t, probe, botId, "the 603 Decline of the "+mediaKind+" call", isSipResponse(callId, 603))
+	}
+	if got := probe.dcTextsFrom(botId); len(got) != 0 {
+		t.Fatalf("call signalling appeared on dcmsg: %v", got)
 	}
 }
 
@@ -2008,9 +2038,7 @@ func TestSipBotCallEndToEnd(t *testing.T) {
 				m := baseMsg(ss.WellKnownChIdMain, userId, botId)
 				m["mimeType"] = wireMimeSip
 				m["sip"] = body
-				if err := dc.SendText(mustJSON(t, m)); err != nil {
-					t.Fatalf("SendText: %v", err)
-				}
+				probe.sendCall(t, user, botId, m)
 			}
 
 			registerMsg := chat("/register 2001@" + pbx.addr + " passW_0rd")
@@ -2194,9 +2222,7 @@ func TestSipBotCallHoldsCalleeAudioUntilAccept(t *testing.T) {
 	m := baseMsg(ss.WellKnownChIdMain, userId, botId)
 	m["mimeType"] = wireMimeSip
 	m["sip"] = map[string]any{"callId": callId, "response": map[string]any{"code": 200, "phrase": "OK"}}
-	if err := dc.SendText(mustJSON(t, m)); err != nil {
-		t.Fatalf("SendText: %v", err)
-	}
+	probe.sendCall(t, user, botId, m)
 	track := tprobe.waitTrack(t, 1)
 	heardVoice := map[string]bool{}
 	for len(heardVoice) < len(voice) {
@@ -2326,9 +2352,7 @@ func TestSipBotCallDTMF(t *testing.T) {
 		m := baseMsg(ss.WellKnownChIdMain, userId, botId)
 		m["mimeType"] = wireMimeSip
 		m["sip"] = body
-		if err := dc.SendText(mustJSON(t, m)); err != nil {
-			t.Fatalf("SendText: %v", err)
-		}
+		probe.sendCall(t, user, botId, m)
 	}
 
 	registerMsg := chat("/register 2001@" + pbx.addr + " passW_0rd")
@@ -2577,9 +2601,7 @@ func TestSipBotCallRoutesViaRegistrar(t *testing.T) {
 	sipMsg := baseMsg(ss.WellKnownChIdMain, userId, botId)
 	sipMsg["mimeType"] = wireMimeSip
 	sipMsg["sip"] = map[string]any{"callId": invite.sip.CallId, "response": map[string]any{"code": 200, "phrase": "OK"}}
-	if err := dc.SendText(mustJSON(t, sipMsg)); err != nil {
-		t.Fatalf("SendText: %v", err)
-	}
+	probe.sendCall(t, user, botId, sipMsg)
 	waitBotMessage(t, probe, botId, "the callee-answered line", isChatReply(callMsg, "Callee answered."))
 	hangupMsg := chat("/hangup")
 	waitBotMessage(t, probe, botId, "the hung-up reply", isChatReply(hangupMsg, "Hung up."))
@@ -2610,9 +2632,7 @@ func TestSipBotHangupCommand(t *testing.T) {
 		m := baseMsg(ss.WellKnownChIdMain, userId, botId)
 		m["mimeType"] = wireMimeSip
 		m["sip"] = body
-		if err := dc.SendText(mustJSON(t, m)); err != nil {
-			t.Fatalf("SendText: %v", err)
-		}
+		probe.sendCall(t, user, botId, m)
 	}
 
 	registerMsg := chat("/register 2001@" + pbx.addr + " passW_0rd")
@@ -2811,9 +2831,7 @@ func TestSipBotTestCall(t *testing.T) {
 		m := baseMsg(ss.WellKnownChIdMain, userId, botId)
 		m["mimeType"] = wireMimeSip
 		m["sip"] = body
-		if err := dc.SendText(mustJSON(t, m)); err != nil {
-			t.Fatalf("SendText: %v", err)
-		}
+		probe.sendCall(t, user, botId, m)
 	}
 
 	registerMsg := chat("/register 2001@" + pbx.addr + " passW_0rd")
@@ -3335,9 +3353,7 @@ func TestSipBotInboundCallEndToEnd(t *testing.T) {
 				m := baseMsg(ss.WellKnownChIdMain, userId, botId)
 				m["mimeType"] = wireMimeSip
 				m["sip"] = body
-				if err := dc.SendText(mustJSON(t, m)); err != nil {
-					t.Fatalf("SendText: %v", err)
-				}
+				probe.sendCall(t, user, botId, m)
 			}
 
 			registerMsg := chat("/register 2001@" + pbx.addr + " passW_0rd")
@@ -3527,9 +3543,7 @@ func TestSipBotInboundCallDeclined(t *testing.T) {
 		m := baseMsg(ss.WellKnownChIdMain, userId, botId)
 		m["mimeType"] = wireMimeSip
 		m["sip"] = body
-		if err := dc.SendText(mustJSON(t, m)); err != nil {
-			t.Fatalf("SendText: %v", err)
-		}
+		probe.sendCall(t, user, botId, m)
 	}
 
 	registerMsg := chat("/register 2001@" + pbx.addr + " passW_0rd")
@@ -3621,49 +3635,60 @@ func TestSipBotInboundCallBusy(t *testing.T) {
 	waitBotMessage(t, probe, botId, "the hung-up reply", isChatReply(hangupMsg, "Hung up."))
 }
 
-// TestSipBotInboundCallUserHangsUp covers the user hanging up an
-// answered inbound call: the caller's dialog gets the BYE.
+// TestSipBotInboundCallUserHangsUp covers both local termination inputs
+// immediately after the browser's 200: the SIP caller must see BYE only after
+// the inbound 200/ACK sequence has completed, never in the pre-ACK window.
 func TestSipBotInboundCallUserHangsUp(t *testing.T) {
-	net := newClientTestNet(t, ss.DefaultSubscriberAging)
-	bot := startBot(t, net, "bot", "2-bot", "", nil)
-	user, probe, _, _ := startUserProbe(t, net, "user", "1-user")
-	botId, userId := pairUp(t, bot, user)
-	pbx := newFakePBX(t, 200, true)
+	for _, tc := range []struct {
+		name   string
+		hangup func(sip func(map[string]any), chat func(string) ss.MsgId, invite *rawMsg)
+	}{
+		{"browser BYE", func(sip func(map[string]any), _ func(string) ss.MsgId, invite *rawMsg) {
+			sip(map[string]any{"callId": invite.sip.CallId, "method": "BYE"})
+		}},
+		{"chat hangup command", func(_ func(map[string]any), chat func(string) ss.MsgId, _ *rawMsg) {
+			chat("/hangup")
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			net := newClientTestNet(t, ss.DefaultSubscriberAging)
+			bot := startBot(t, net, "bot", "2-bot", "", nil)
+			user, probe, _, _ := startUserProbe(t, net, "user", "1-user")
+			botId, userId := pairUp(t, bot, user)
+			pbx := newFakePBX(t, 200, true)
 
-	dc := probe.waitDC(t, botId, msg_handler.DataChannelLabelMessages)
-	chat := func(text string) ss.MsgId {
-		t.Helper()
-		m := baseMsg(ss.WellKnownChIdMain, userId, botId)
-		m["plaintext"] = text
-		if err := dc.SendText(mustJSON(t, m)); err != nil {
-			t.Fatalf("SendText: %v", err)
-		}
-		return ss.MsgId(m["msgId"].(string))
+			dc := probe.waitDC(t, botId, msg_handler.DataChannelLabelMessages)
+			chat := func(text string) ss.MsgId {
+				t.Helper()
+				m := baseMsg(ss.WellKnownChIdMain, userId, botId)
+				m["plaintext"] = text
+				if err := dc.SendText(mustJSON(t, m)); err != nil {
+					t.Fatalf("SendText: %v", err)
+				}
+				return ss.MsgId(m["msgId"].(string))
+			}
+			sip := func(body map[string]any) {
+				t.Helper()
+				m := baseMsg(ss.WellKnownChIdMain, userId, botId)
+				m["mimeType"] = wireMimeSip
+				m["sip"] = body
+				probe.sendCall(t, user, botId, m)
+			}
+
+			registerMsg := chat("/register 2001@" + pbx.addr + " passW_0rd")
+			waitBotMessage(t, probe, botId, "the registered reply", isChatReply(registerMsg, "Registered as"))
+
+			call := pbx.call(t, "2001")
+			invite := waitBotMessage(t, probe, botId, "the bot's INVITE", isSipInvite)
+			call.waitRinging()
+			sip(map[string]any{"callId": invite.sip.CallId, "response": map[string]any{"code": 200, "phrase": "OK"}})
+			call.waitAnswered()
+
+			tc.hangup(sip, chat, invite)
+			pbx.waitForPBX(t, "the BYE at the caller", func() bool { return pbx.byes == 1 })
+			waitBotMessage(t, probe, botId, "the ended amend", isCallStatusAmend(invite.msgId, invite.sip.CallId, "ended"))
+		})
 	}
-	sip := func(body map[string]any) {
-		t.Helper()
-		m := baseMsg(ss.WellKnownChIdMain, userId, botId)
-		m["mimeType"] = wireMimeSip
-		m["sip"] = body
-		if err := dc.SendText(mustJSON(t, m)); err != nil {
-			t.Fatalf("SendText: %v", err)
-		}
-	}
-
-	registerMsg := chat("/register 2001@" + pbx.addr + " passW_0rd")
-	waitBotMessage(t, probe, botId, "the registered reply", isChatReply(registerMsg, "Registered as"))
-
-	call := pbx.call(t, "2001")
-	invite := waitBotMessage(t, probe, botId, "the bot's INVITE", isSipInvite)
-	call.waitRinging()
-	sip(map[string]any{"callId": invite.sip.CallId, "response": map[string]any{"code": 200, "phrase": "OK"}})
-	call.waitAnswered()
-
-	// The user hangs up: the caller's dialog gets the BYE, the log entry
-	// settles ended.
-	sip(map[string]any{"callId": invite.sip.CallId, "method": "BYE"})
-	pbx.waitForPBX(t, "the BYE at the caller", func() bool { return pbx.byes == 1 })
-	waitBotMessage(t, probe, botId, "the ended amend", isCallStatusAmend(invite.msgId, invite.sip.CallId, "ended"))
 }
 
 // ---------------------------------------------------------------------------
@@ -3819,9 +3844,7 @@ func TestSipBotVideoCallEndToEnd(t *testing.T) {
 		m := baseMsg(ss.WellKnownChIdMain, userId, botId)
 		m["mimeType"] = wireMimeSip
 		m["sip"] = body
-		if err := dc.SendText(mustJSON(t, m)); err != nil {
-			t.Fatalf("SendText: %v", err)
-		}
+		probe.sendCall(t, user, botId, m)
 	}
 
 	registerMsg := chat("/register 2001@" + pbx.addr + " passW_0rd")
@@ -3940,9 +3963,7 @@ func TestSipBotVideoCallDemuxedAnswer(t *testing.T) {
 		m := baseMsg(ss.WellKnownChIdMain, userId, botId)
 		m["mimeType"] = wireMimeSip
 		m["sip"] = body
-		if err := dc.SendText(mustJSON(t, m)); err != nil {
-			t.Fatalf("SendText: %v", err)
-		}
+		probe.sendCall(t, user, botId, m)
 	}
 
 	registerMsg := chat("/register 2001@" + pbx.addr + " passW_0rd")
@@ -4027,9 +4048,7 @@ func TestSipBotVideoCallCalleeDeclinesVideo(t *testing.T) {
 		m := baseMsg(ss.WellKnownChIdMain, userId, botId)
 		m["mimeType"] = wireMimeSip
 		m["sip"] = body
-		if err := dc.SendText(mustJSON(t, m)); err != nil {
-			t.Fatalf("SendText: %v", err)
-		}
+		probe.sendCall(t, user, botId, m)
 	}
 
 	registerMsg := chat("/register 2001@" + pbx.addr + " passW_0rd")
@@ -4126,9 +4145,7 @@ func TestSipBotInboundVideoCallEndToEnd(t *testing.T) {
 		m := baseMsg(ss.WellKnownChIdMain, userId, botId)
 		m["mimeType"] = wireMimeSip
 		m["sip"] = body
-		if err := dc.SendText(mustJSON(t, m)); err != nil {
-			t.Fatalf("SendText: %v", err)
-		}
+		probe.sendCall(t, user, botId, m)
 	}
 
 	registerMsg := chat("/register 2001@" + pbx.addr + " passW_0rd")
@@ -4232,9 +4249,7 @@ func TestSipBotInboundVideoNoCommonVideoCodec(t *testing.T) {
 		m := baseMsg(ss.WellKnownChIdMain, userId, botId)
 		m["mimeType"] = wireMimeSip
 		m["sip"] = body
-		if err := dc.SendText(mustJSON(t, m)); err != nil {
-			t.Fatalf("SendText: %v", err)
-		}
+		probe.sendCall(t, user, botId, m)
 	}
 
 	registerMsg := chat("/register 2001@" + pbx.addr + " passW_0rd")

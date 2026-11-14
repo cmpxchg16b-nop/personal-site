@@ -380,6 +380,28 @@ function c2c(
   };
 }
 
+function callPayload(
+  fromSubscriberId: string,
+  toSubscriberId: string,
+): NonNullable<NonNullable<SignallingEvent["c2CEv"]>["call"]> {
+  return {
+    mimeVersion: "1.0",
+    channelId,
+    fromSubscriberId,
+    toSubscriberId,
+    creationTimestamp: 1234.5,
+    msgId: crypto.randomUUID(),
+    mimeType: "application/x-sip",
+    plaintext: "",
+    sip: {
+      callId: "call-id",
+      method: "INVITE",
+      "X-Media": "voice",
+      "X-Call-Status": "inviting",
+    },
+  };
+}
+
 async function flushMicrotasks() {
   for (let i = 0; i < 20; i++) await Promise.resolve();
 }
@@ -786,6 +808,121 @@ describe("usePeerSessions startup lifecycle", () => {
     );
     await flushMicrotasks();
     expect(pc.remoteDescription).toEqual(freshOffer);
+  });
+
+  it("holds an early INVITE until its matching peer session can answer", async () => {
+    const me = self("1000");
+    const { sessions } = runtime.render(me, []);
+    const received: SignallingEvent[] = [];
+    sessions.subscribeCall((event) => received.push(event));
+    proxy.receive({
+      from: {},
+      to: {},
+      msgId: crypto.randomUUID(),
+      c2CEv: {
+        channelId,
+        fromSubscriber: peer.subscriberId,
+        toSubscriber: me.subscriberId,
+        call: callPayload(peer.subscriberId, me.subscriberId),
+      },
+    });
+    await flushMicrotasks();
+    expect(received).toHaveLength(0);
+    expect(MockPeerConnection.instances).toHaveLength(0);
+
+    runtime.render(me, listing([peer]));
+    await flushMicrotasks();
+    expect(received).toHaveLength(1);
+    expect(MockPeerConnection.instances).toHaveLength(1);
+    await sessions.sendCall(
+      channelId,
+      peer.subscriberId,
+      callPayload(me.subscriberId, peer.subscriberId),
+    );
+    expect(proxy.outgoing.filter((event) => event.c2CEv?.call)).toHaveLength(1);
+  });
+
+  it("drops a pre-registration call addressed to another incarnation", async () => {
+    const { sessions } = runtime.render(null, []);
+    const received: SignallingEvent[] = [];
+    sessions.subscribeCall((event) => received.push(event));
+    proxy.receive({
+      from: {},
+      to: {},
+      msgId: crypto.randomUUID(),
+      c2CEv: {
+        channelId,
+        fromSubscriber: peer.subscriberId,
+        toSubscriber: "1000",
+        call: callPayload(peer.subscriberId, "1000"),
+      },
+    });
+    await flushMicrotasks();
+    runtime.render(self("1001"), listing([peer]));
+    await flushMicrotasks();
+    expect(received).toHaveLength(0);
+  });
+
+  it("routes call signalling outside the negotiator and over the peer WebSocket output", async () => {
+    const me = self("1000");
+    const { sessions } = runtime.render(me, listing([peer]), 1, [channelId]);
+    const received: SignallingEvent[] = [];
+    sessions.subscribeCall((event) => received.push(event));
+    await flushMicrotasks();
+    expect(MockPeerConnection.instances).toHaveLength(1);
+    const pc = MockPeerConnection.instances[0];
+    const call: NonNullable<NonNullable<SignallingEvent["c2CEv"]>["call"]> = {
+      mimeVersion: "1.0",
+      channelId,
+      fromSubscriberId: peer.subscriberId,
+      toSubscriberId: me.subscriberId,
+      creationTimestamp: 1234.5,
+      msgId: "invite-message",
+      mimeType: "application/x-sip",
+      plaintext: "",
+      sip: {
+        callId: "call-id",
+        method: "INVITE",
+        "X-Media": "voice",
+        "X-Call-Status": "inviting",
+      },
+    };
+    proxy.receive({
+      from: {},
+      to: {},
+      msgId: "outer-call-event",
+      c2CEv: {
+        channelId,
+        fromSubscriber: peer.subscriberId,
+        toSubscriber: me.subscriberId,
+        call,
+      },
+    });
+    await flushMicrotasks();
+    expect(received).toHaveLength(1);
+    expect(received[0].c2CEv?.call).toEqual(call);
+    expect(pc.remoteDescription).toBeNull();
+    expect(pc.localDescription).toBeNull();
+
+    await sessions.sendCall(channelId, peer.subscriberId, {
+      ...call,
+      fromSubscriberId: "forged-from",
+      toSubscriberId: "forged-to",
+    });
+    const sent = proxy.outgoing.filter((event) => event.c2CEv?.call);
+    expect(sent).toHaveLength(1);
+    expect(sent[0].c2CEv).toMatchObject({
+      channelId,
+      fromSubscriber: me.subscriberId,
+      toSubscriber: peer.subscriberId,
+    });
+    expect(sent[0].c2CEv?.call).toMatchObject({
+      channelId,
+      fromSubscriberId: me.subscriberId,
+      toSubscriberId: peer.subscriberId,
+      msgId: "invite-message",
+    });
+    expect(pc.remoteDescription).toBeNull();
   });
 
   it("preserves a peer session and queues signalling across a proxy reconnect", async () => {

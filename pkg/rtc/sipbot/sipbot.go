@@ -13,9 +13,9 @@
 //     transfer reassembly, the call log's status amends).
 //   - this package's sipHandler — the message policy.
 //
-// The webrtc-leg (toward the browser) is the music bot's: a call is an
-// in-band SIP-subset dialog over the pair's dcmsg channel plus an opus
-// audio m-line renegotiated onto the pair's existing peer connection.
+// The webrtc-leg (toward the browser) is the music bot's: a call is a
+// SIP-subset dialog over the pair's WebSocket c2c relay plus an audio
+// m-line renegotiated onto the pair's existing peer connection.
 // The sip-leg (toward the SIP network) is a diago
 // (github.com/emiago/diago on sipgo) transaction user per REGISTERED
 // chat user — each /register opens a dedicated SIP client: its own UA,
