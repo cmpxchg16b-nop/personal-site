@@ -13,14 +13,23 @@ import (
 
 func newICERestartUnitNegotiator(t *testing.T) (*PerfectNegotiator, *webrtc.PeerConnection) {
 	t.Helper()
+	return newICERestartUnitNegotiatorWithRole(t, true)
+}
+
+func newICERestartUnitNegotiatorWithRole(t *testing.T, polite bool) (*PerfectNegotiator, *webrtc.PeerConnection) {
+	t.Helper()
 	pc, err := webrtc.NewPeerConnection(webrtc.Configuration{})
 	if err != nil {
 		t.Fatalf("NewPeerConnection: %v", err)
 	}
+	self, peer := ss.SubscriberId("alice"), ss.SubscriberId("bob")
+	if !polite {
+		self, peer = peer, self
+	}
 	n, err := NewPerfectNegotiator(pc, PerfectNegotiatorOptions{
 		ChannelId:      ss.WellKnownChIdMain,
-		SelfSubscriber: "alice",
-		PeerSubscriber: "bob",
+		SelfSubscriber: self,
+		PeerSubscriber: peer,
 		Logger:         testLogger(t),
 	})
 	if err != nil {
@@ -31,8 +40,10 @@ func newICERestartUnitNegotiator(t *testing.T) (*PerfectNegotiator, *webrtc.Peer
 	n.iceRetryBase = time.Hour
 	n.iceRetryMax = time.Hour
 	n.iceRandom = func() float64 { return 0.5 }
+	n.glareRetryDelay = time.Hour
 	t.Cleanup(func() {
 		n.stopICERestartTimer()
+		n.stopGlareRetryTimer()
 		_ = pc.Close()
 	})
 	return n, pc
@@ -129,7 +140,7 @@ func TestICERestartBackoff(t *testing.T) {
 	}
 }
 
-func TestICERestartStaysPendingOutsideStable(t *testing.T) {
+func TestICERestartRetransmitsOrdinaryOfferOutsideStable(t *testing.T) {
 	n, pc := newICERestartUnitNegotiator(t)
 	if _, err := pc.CreateDataChannel("chat", nil); err != nil {
 		t.Fatalf("CreateDataChannel: %v", err)
@@ -144,19 +155,201 @@ func TestICERestartStaysPendingOutsideStable(t *testing.T) {
 	if pc.SignalingState() != webrtc.SignalingStateHaveLocalOffer {
 		t.Fatalf("signaling state=%s, want have-local-offer", pc.SignalingState())
 	}
+	before := sdpICECredentials(pc.LocalDescription().SDP)
 
 	out := make(chan *ss.SignallingEvent, 1)
 	n.iceConnectedOnce = true
 	n.iceRecovering = true
 	n.handleICERestartTimer(context.Background(), out)
 	if !n.iceRestartPending {
-		t.Fatal("restart request was dropped outside stable signaling")
+		t.Fatal("ordinary pending offer incorrectly satisfied the latched ICE restart")
 	}
 	if n.iceRestartAttempts != 1 || n.iceRestartTimer == nil {
 		t.Fatal("restart watchdog was not retained")
 	}
-	if len(out) != 0 {
-		t.Fatal("an offer was sent outside stable signaling")
+	if len(out) != 1 {
+		t.Fatalf("retry emitted %d events, want the ordinary offer retransmitted", len(out))
+	}
+	ev := <-out
+	if ev.C2CEv == nil || ev.C2CEv.SessionDesc == nil ||
+		ev.C2CEv.SessionDesc.Type != webrtc.SDPTypeOffer ||
+		sdpICECredentials(ev.C2CEv.SessionDesc.SDP) != before {
+		t.Fatalf("event=%+v, want the same ordinary offer rather than a new negotiation", ev)
+	}
+}
+
+func TestICERestartImpoliteRetransmitsPendingOffer(t *testing.T) {
+	n, pc := newICERestartUnitNegotiatorWithRole(t, false)
+	if _, err := pc.CreateDataChannel("chat", nil); err != nil {
+		t.Fatalf("CreateDataChannel: %v", err)
+	}
+	offer, err := pc.CreateOffer(nil)
+	if err != nil {
+		t.Fatalf("CreateOffer: %v", err)
+	}
+	if err := pc.SetLocalDescription(offer); err != nil {
+		t.Fatalf("SetLocalDescription: %v", err)
+	}
+
+	out := make(chan *ss.SignallingEvent, 4)
+	n.iceConnectedOnce = true
+	n.iceRecovering = true
+	n.handleICERestartTimer(context.Background(), out)
+	var request, retransmitted bool
+	for len(out) > 0 {
+		ev := <-out
+		if ev.C2CEv == nil {
+			continue
+		}
+		request = request || ev.C2CEv.ICERestartRequest
+		if desc := ev.C2CEv.SessionDesc; desc != nil && desc.Type == webrtc.SDPTypeOffer &&
+			sdpICECredentials(desc.SDP) == sdpICECredentials(offer.SDP) {
+			retransmitted = true
+		}
+	}
+	if !request || !retransmitted {
+		t.Fatalf("impolite retry request=%v retransmitted=%v, want both", request, retransmitted)
+	}
+}
+
+func TestImpoliteGlareRetransmitsPendingOffer(t *testing.T) {
+	n, pc := newICERestartUnitNegotiatorWithRole(t, false)
+	if _, err := pc.CreateDataChannel("chat", nil); err != nil {
+		t.Fatalf("CreateDataChannel: %v", err)
+	}
+	localOffer, err := pc.CreateOffer(nil)
+	if err != nil {
+		t.Fatalf("CreateOffer(local): %v", err)
+	}
+	if err := pc.SetLocalDescription(localOffer); err != nil {
+		t.Fatalf("SetLocalDescription(local): %v", err)
+	}
+	remote, err := webrtc.NewPeerConnection(webrtc.Configuration{})
+	if err != nil {
+		t.Fatalf("NewPeerConnection(remote): %v", err)
+	}
+	t.Cleanup(func() { _ = remote.Close() })
+	if _, err := remote.CreateDataChannel("other", nil); err != nil {
+		t.Fatalf("CreateDataChannel(remote): %v", err)
+	}
+	remoteOffer, err := remote.CreateOffer(nil)
+	if err != nil {
+		t.Fatalf("CreateOffer(remote): %v", err)
+	}
+
+	out := make(chan *ss.SignallingEvent, 2)
+	n.handleSessionDesc(context.Background(), &remoteOffer, out)
+	if !n.ignoreOffer {
+		t.Fatal("impolite peer did not ignore the colliding remote offer")
+	}
+	if len(out) != 0 || n.glareRetryTimer == nil {
+		t.Fatal("ordinary glare must schedule, not immediately emit, a retry")
+	}
+	n.handleGlareRetryTimer(context.Background(), out)
+	if len(out) != 1 {
+		t.Fatalf("unresolved glare emitted %d events, want the local offer retransmitted", len(out))
+	}
+	if n.glareRetryTimer == nil {
+		t.Fatal("unresolved glare did not retain its spaced retry")
+	}
+	ev := <-out
+	if ev.C2CEv == nil || ev.C2CEv.SessionDesc == nil ||
+		sdpICECredentials(ev.C2CEv.SessionDesc.SDP) != sdpICECredentials(localOffer.SDP) {
+		t.Fatalf("glare response=%+v, want pending local offer", ev)
+	}
+}
+
+func TestICERestartRetransmitsUnansweredRestartOffer(t *testing.T) {
+	for _, tc := range []struct {
+		name              string
+		deliverFirstOffer bool
+	}{
+		{name: "first offer lost", deliverFirstOffer: false},
+		{name: "first answer lost", deliverFirstOffer: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			n, pc := newICERestartUnitNegotiator(t)
+			remote, err := webrtc.NewPeerConnection(webrtc.Configuration{})
+			if err != nil {
+				t.Fatalf("NewPeerConnection(remote): %v", err)
+			}
+			t.Cleanup(func() { _ = remote.Close() })
+			if _, err := pc.CreateDataChannel("chat", nil); err != nil {
+				t.Fatalf("CreateDataChannel: %v", err)
+			}
+			initialOffer, err := pc.CreateOffer(nil)
+			if err != nil {
+				t.Fatalf("CreateOffer(initial): %v", err)
+			}
+			if err := pc.SetLocalDescription(initialOffer); err != nil {
+				t.Fatalf("SetLocalDescription(initial): %v", err)
+			}
+			if err := remote.SetRemoteDescription(initialOffer); err != nil {
+				t.Fatalf("remote.SetRemoteDescription(initial): %v", err)
+			}
+			initialAnswer, err := remote.CreateAnswer(nil)
+			if err != nil {
+				t.Fatalf("CreateAnswer(initial): %v", err)
+			}
+			if err := remote.SetLocalDescription(initialAnswer); err != nil {
+				t.Fatalf("remote.SetLocalDescription(initial): %v", err)
+			}
+			if err := pc.SetRemoteDescription(initialAnswer); err != nil {
+				t.Fatalf("SetRemoteDescription(initial): %v", err)
+			}
+
+			answer := func(offer *ss.SignallingEvent) {
+				t.Helper()
+				if err := remote.SetRemoteDescription(*offer.C2CEv.SessionDesc); err != nil {
+					t.Fatalf("remote.SetRemoteDescription(restart): %v", err)
+				}
+				description, err := remote.CreateAnswer(nil)
+				if err != nil {
+					t.Fatalf("CreateAnswer(restart): %v", err)
+				}
+				if err := remote.SetLocalDescription(description); err != nil {
+					t.Fatalf("remote.SetLocalDescription(restart): %v", err)
+				}
+			}
+
+			out := make(chan *ss.SignallingEvent, 4)
+			n.iceConnectedOnce = true
+			n.iceRecovering = true
+			n.handleICERestartTimer(context.Background(), out)
+			if len(out) != 1 {
+				t.Fatalf("first restart emitted %d events, want one offer", len(out))
+			}
+			first := <-out
+			if first.C2CEv == nil || first.C2CEv.SessionDesc == nil || first.C2CEv.SessionDesc.Type != webrtc.SDPTypeOffer {
+				t.Fatalf("first event=%+v, want restart offer", first)
+			}
+			if tc.deliverFirstOffer {
+				answer(first) // the answer itself is not delivered to n
+			}
+
+			// Pion cannot create another offer in have-local-offer. The next
+			// watchdog must retransmit it, prompting an answer even when the
+			// remote already answered the first copy.
+			n.handleICERestartTimer(context.Background(), out)
+			if len(out) != 1 {
+				t.Fatalf("retry emitted %d events, want the pending offer retransmitted", len(out))
+			}
+			second := <-out
+			if second.C2CEv == nil || second.C2CEv.SessionDesc == nil ||
+				second.C2CEv.SessionDesc.Type != webrtc.SDPTypeOffer ||
+				sdpICECredentials(second.C2CEv.SessionDesc.SDP) != sdpICECredentials(first.C2CEv.SessionDesc.SDP) {
+				t.Fatalf("retransmission=%+v, want the same offer/credentials (newly gathered candidates are allowed)", second)
+			}
+
+			answer(second)
+			n.handleSessionDesc(context.Background(), remote.LocalDescription(), out)
+			if len(out) != 0 {
+				t.Fatal("answering the retransmitted restart offer triggered a redundant new offer")
+			}
+			if pc.SignalingState() != webrtc.SignalingStateStable {
+				t.Fatalf("local signaling state=%s, want stable", pc.SignalingState())
+			}
+		})
 	}
 }
 
@@ -217,9 +410,10 @@ func TestICERestartOfferRunsWhenAnswerRestoresStable(t *testing.T) {
 	n.iceConnectedOnce = true
 	n.iceRecovering = true
 	n.handleICERestartTimer(context.Background(), out)
-	if !n.iceRestartPending || len(out) != 0 {
-		t.Fatal("restart did not remain pending while the first offer was unanswered")
+	if !n.iceRestartPending || len(out) != 1 {
+		t.Fatal("ordinary offer was not retransmitted with the restart still latched")
 	}
+	<-out // the retransmitted ordinary offer, not a new ICE-restart offer
 	n.handleSessionDesc(context.Background(), remote.LocalDescription(), out)
 	if n.iceRestartPending {
 		t.Fatal("restart remained pending after its offer was sent")

@@ -84,16 +84,32 @@ The built-in echo/music bots use a different lifecycle today.
 for the configured `reconnectInterval` and starts another attempt. The default
 is **5 seconds**.
 
+The Go transport sends WebSocket protocol pings every **1 second** and uses
+pongs to extend a **3-second** read deadline. A missing pong therefore ends a
+half-open connection even when no close frame arrives. Any application-message
+or ping write failure also closes the socket immediately, waking the read loop;
+otherwise the write pump could exit while `Run` stayed blocked forever and the
+outer reconnect loop never ran.
+
 Every `HeadlessRTCClient.Run` tears down all of its peer sessions before it
 returns. Data-channel and track handler registrations survive for the next run,
 but peer connections do not. Consequently, a bot's WebSocket reconnect is
 currently a **rebuild**, not the browser's media-preserving roaming path.
 
+A correlated keepalive `SubscriberNotFound` or `ChannelNotFound` reply also ends
+the current run. Keepalive message ids carry a unique per-run prefix, so even an
+arbitrarily delayed reply is recognized without a finite correlation-history
+window. This is necessary when a TCP connection resumes after its SS registration
+has already aged out: continuing to write on that socket cannot relay anything.
+The outer loop reconnects and registers again. An unrelated c2c error, such as a
+destination subscriber leaving, does not tear down the sender's own run.
+
 A configured bot `subscriberId` is registered again on the next run. If the
 configuration left it empty, each run asks for a fresh automatically assigned
 id. A configured-id conflict is retried once with an empty id.
 
-Implementation: `cmd/server/main.go` (`startBotClient`) and `pkg/rtc/client.go`.
+Implementation: `cmd/server/main.go` (`startBotClient`), `pkg/rtc/client.go`,
+and `pkg/rtc/transport.go`.
 
 ### What the server preserves
 
@@ -151,6 +167,29 @@ The browser uses `RTCPeerConnection.restartIce()`, which retains the request
 across in-flight negotiation. The Go negotiator keeps an explicit pending latch
 and emits the restart offer once signalling can proceed.
 
+A retry must also retry the **signalling transaction**, not just the local API
+call. `restartIce()` need not emit another `negotiationneeded` while an offer is
+unanswered, and Pion cannot create a new offer in `have-local-offer`. On every
+watchdog retry, both implementations therefore retransmit the current pending
+local offer. The polite peer does the same when it receives an ICE-restart
+request. This covers a lost original offer and a lost answer: applying the
+duplicate offer makes the remote send another answer. An impolite peer also
+retransmits its own pending ordinary offer. After an impolite peer ignores a
+colliding offer, either implementation starts a spaced **2-second** retry only
+if that glare remains unresolved; normal glare converges without an immediate
+duplicate that could cause repeated rollback/rebuild. The delayed retry is still
+required when the impolite peer's ICE is healthy: the polite peer cannot roll
+back or rebuild and answer until it receives that offer, after which the active
+watchdog can finish ICE recovery. Retransmission reads the current
+`LocalDescription`, so it may include
+newly gathered candidates while retaining the same ICE credentials.
+
+Go additionally tracks whether that pending local offer already requested fresh
+ICE credentials. Retransmitting an ordinary offer leaves the restart latched, so
+its answer is followed by the required restart offer. Retransmitting an actual
+restart offer satisfies the latch and does not trigger a redundant second
+restart after its answer.
+
 An ICE restart renegotiates the transport on the existing peer connection; it
 is not a new phone session and does not intentionally drop tracks or data
 channels. It cannot succeed without usable local/remote candidates, and its SDP
@@ -173,6 +212,10 @@ Implementation: `web/site/src/api/ss/ice_restart.ts` and `negotiate.ts`, plus
   Browser c2c output waits for socket reconnection and registration readiness,
   then resumes. Media can remain interrupted until ICE itself recovers, but the
   WebSocket outage does not add a separate UI/call teardown.
+- **The socket looks healthy, but one SDP delivery is lost.** Later ICE watchdog
+  attempts retransmit the pending offer even if neither side installs a new
+  proxy. A single lost offer or answer therefore no longer leaves the polite
+  peer permanently stuck in `have-local-offer` with an ineffective restart timer.
 - **The peer really leaves or reloads.** This is not a roaming blip. Membership
   reconciliation removes the old session; a page reload's fresh subscriber id
   creates a new incarnation and negotiates a new peer connection.
@@ -187,20 +230,24 @@ Implementation: `web/site/src/api/ss/ice_restart.ts` and `negotiate.ts`, plus
 | Browser retry after an established socket drops    | Immediate                  |
 | Browser retry after a failed connection attempt    | 2s fixed                   |
 | Go bot `reconnectInterval`                         | 5s, configurable per bot   |
-| Browser SS pong/liveness timeout                   | 3s (recycles the socket)   |
+| Browser SS ping / pong liveness timeout            | 1s / 3s                    |
+| Go WebSocket ping / pong read deadline             | 1s / 3s                    |
 | Browser registration reply timeout                 | 5s                         |
 | Browser retry after transient registration failure | 2s fixed                   |
-| Browser ping / channel keepalive / member listing  | 1s / 5s / 5s               |
+| Browser channel keepalive / member listing         | 5s / 5s                    |
 | SS subscriber aging                                | 30s (`--ss-aging`)         |
 | ICE disconnected grace                             | 3s                         |
 | ICE retry base / nominal cap                       | 2s / 30s, with ±20% jitter |
+| Unresolved-glare offer retry                       | 2s, until stable or closed |
 
 ## Guarantees and limits
 
 - Browser signalling queues are **ordered, best-effort, and in memory**. They
   are not durable storage or an exactly-once replay protocol. A page reload
   loses them, and events already handed to a failed network stack cannot be
-  recalled or guaranteed delivered.
+  recall or guaranteed delivered. While ICE recovery remains active, pending
+  local offers are nevertheless retried with the watchdog rather than depending
+  on one delivery or on a WebSocket-proxy change.
 - Roaming retries transient registration failures without clearing confirmed
   UI state, but it does not hide an explicit id conflict, a real identity
   change, peer departure, or unrecoverable server-side loss of state.

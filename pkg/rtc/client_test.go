@@ -904,6 +904,90 @@ func TestHeadlessRTCClientRunIsSingleFlight(t *testing.T) {
 	}
 }
 
+func TestHeadlessRTCClientRunRejectsLostMembership(t *testing.T) {
+	for _, code := range []ss.ErrorCode{ss.ErrorCodeSubscriberNotFound, ss.ErrorCodeChannelNotFound} {
+		t.Run(fmt.Sprintf("error-code-%d", code), func(t *testing.T) {
+			c, err := NewHeadlessRTCClient(PerfectNegotiatorFactory, RTCClientConfiguration{
+				KeepAliveInterval:  20 * time.Millisecond,
+				MemberListInterval: time.Hour,
+				ReplyTimeout:       time.Second,
+				Logger:             testLogger(t),
+			})
+			if err != nil {
+				t.Fatalf("NewHeadlessRTCClient: %v", err)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			toSS := make(chan *ss.SignallingEvent, 16)
+			fromSS := make(chan *ss.SignallingEvent, 8)
+			done := make(chan error, 1)
+			go func() { done <- c.Run(ctx, fromSS, toSS) }()
+
+			nextOutbound := func() *ss.SignallingEvent {
+				t.Helper()
+				select {
+				case ev := <-toSS:
+					return ev
+				case <-time.After(testTimeout):
+					t.Fatal("timed out waiting for client signalling")
+					return nil
+				}
+			}
+			registration := nextOutbound()
+			if registration.C2SEv == nil || registration.C2SEv.Register == nil {
+				t.Fatalf("first event=%+v, want registration", registration)
+			}
+			registrationID := registration.MsgId
+			fromSS <- &ss.SignallingEvent{
+				InReplyTo: &registrationID,
+				S2CEv: &ss.SSToClientEv{RegisterResult: &ss.RegisterResult{
+					ChannelId: ss.WellKnownChIdMain, SubscriberId: "bot",
+				}},
+			}
+
+			var keepAliveIDs []ss.MsgId
+			for len(keepAliveIDs) < 17 {
+				ev := nextOutbound()
+				if ev.C2SEv != nil && ev.C2SEv.ChannelKeepAlive != nil {
+					keepAliveIDs = append(keepAliveIDs, ev.MsgId)
+				}
+			}
+
+			// The same error code for an unrelated c2c write (for example, its target
+			// left) must not tear down this client's own registration.
+			unrelatedID := ss.MsgId("unrelated-c2c")
+			fromSS <- &ss.SignallingEvent{
+				InReplyTo: &unrelatedID,
+				S2CEv: &ss.SSToClientEv{Err: &ss.SSToClientErrEv{
+					ErrorCode: ss.ErrorCodeSubscriberNotFound, ErrorMsg: "to subscriber not found",
+				}},
+			}
+			select {
+			case err := <-done:
+				t.Fatalf("unrelated c2c error ended Run: %v", err)
+			case <-time.After(30 * time.Millisecond):
+			}
+
+			// K1's failure remains authoritative even after enough later requests
+			// to exceed any fixed correlation-history window.
+			fromSS <- &ss.SignallingEvent{
+				InReplyTo: &keepAliveIDs[0],
+				S2CEv: &ss.SSToClientEv{Err: &ss.SSToClientErrEv{
+					ErrorCode: code, ErrorMsg: "membership is gone",
+				}},
+			}
+			select {
+			case err := <-done:
+				if err == nil || errors.Is(err, context.DeadlineExceeded) {
+					t.Fatalf("Run error=%v, want lost membership to trigger an outer reconnect", err)
+				}
+			case <-time.After(200 * time.Millisecond):
+				t.Fatal("delayed keepalive membership error was logged but never re-registered")
+			}
+		})
+	}
+}
+
 // TestHeadlessRTCClientRunEndsWhenInputCloses covers the clean end: the
 // provider shuts down, the inbound channel closes, and Run returns nil.
 func TestHeadlessRTCClientRunEndsWhenInputCloses(t *testing.T) {

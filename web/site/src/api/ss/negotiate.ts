@@ -19,6 +19,8 @@
  */
 
 import { IceRestartController } from "./ice_restart";
+
+const GLARE_RETRY_MS = 2_000;
 import {
   WELLKNOWN_SVC_ID_SS,
   type ChannelId,
@@ -100,6 +102,7 @@ export class PerfectNegotiator implements RTCNegotiator {
 
   private writer?: WritableStreamDefaultWriter<SignallingEvent>;
   private pendingOffer?: Promise<void>;
+  private glareRetryTimer?: ReturnType<typeof setTimeout>;
 
   /**
    * @param pc the peer connection to negotiate on. The caller keeps
@@ -162,11 +165,17 @@ export class PerfectNegotiator implements RTCNegotiator {
     const iceRestart = new IceRestartController(this.pc, {
       // Only the polite peer originates automated restart offers. Letting both
       // sides offer together would create glare on every shared outage.
-      restart: this.polite
-        ? () => this.pc.restartIce()
-        : () => {
-            this.sendToPeer({ iceRestartRequest: true }).catch(onRestartError);
-          },
+      restart: () => {
+        if (this.polite) {
+          this.pc.restartIce();
+        } else {
+          this.sendToPeer({ iceRestartRequest: true }).catch(onRestartError);
+        }
+        // restartIce() need not fire negotiationneeded while an offer is
+        // unanswered. Retry the actual signalling transaction as well, or a
+        // lost offer/answer leaves every later watchdog tick doing nothing.
+        void this.retransmitPendingOffer().catch(onRestartError);
+      },
       onRestartError,
     });
     this.pc.oniceconnectionstatechange = () =>
@@ -187,6 +196,7 @@ export class PerfectNegotiator implements RTCNegotiator {
       this.pc.onicecandidate = null;
       this.pc.oniceconnectionstatechange = null;
       iceRestart.close();
+      this.stopGlareRetryTimer();
       reader.releaseLock();
       writer.releaseLock();
       this.writer = undefined;
@@ -194,8 +204,8 @@ export class PerfectNegotiator implements RTCNegotiator {
   }
 
   /**
-   * Re-sends the current local offer on a replacement signalling transport.
-   * A stale socket may have accepted the original write without delivering it;
+   * Re-sends the current local offer on an ICE retry or replacement signalling
+   * transport. A socket may have accepted the original write without delivering it;
    * repeated restartIce() calls need not produce another negotiationneeded
    * while this offer is pending. Reading localDescription now also includes
    * candidates gathered since the original emission.
@@ -231,6 +241,10 @@ export class PerfectNegotiator implements RTCNegotiator {
 
         this.ignoreOffer = !this.polite && offerCollision;
         if (this.ignoreOffer) {
+          // The polite peer cannot yield until it receives our pending offer.
+          // Retry only a glare that stays unresolved: immediate duplicates can
+          // themselves keep the polite peer rolling back an ordinary glare.
+          this.scheduleGlareRetryTimer();
           return;
         }
         logSdp(this.tag(), `apply remote ${description.type}`, description, {
@@ -241,6 +255,9 @@ export class PerfectNegotiator implements RTCNegotiator {
         this.isSettingRemoteAnswerPending = description.type === "answer";
         await this.pc.setRemoteDescription(description);
         this.isSettingRemoteAnswerPending = false;
+        if (this.pc.signalingState === "stable") {
+          this.stopGlareRetryTimer();
+        }
         if (description.type === "offer") {
           // setLocalDescription() with no argument answers the offer;
           // for the polite peer on a collision it also implicitly rolls
@@ -260,9 +277,11 @@ export class PerfectNegotiator implements RTCNegotiator {
           }
         }
       } else if (c2c.iceRestartRequest && this.polite) {
-        // restartIce() latches through any in-flight negotiation. The
-        // requester keeps the recovery watchdog, so one request is enough.
+        // restartIce() latches through any in-flight negotiation. Also repeat
+        // an unanswered offer: the requester's original answer may be the
+        // message that was lost, and restartIce() alone need not emit SDP.
         this.pc.restartIce();
+        await this.retransmitPendingOffer();
       }
     } catch (err) {
       logSdp(this.tag(), "FAILED", c2c.sessionDesc, {
@@ -270,6 +289,29 @@ export class PerfectNegotiator implements RTCNegotiator {
         polite: this.polite,
       });
       console.error(err);
+    }
+  }
+
+  private scheduleGlareRetryTimer(): void {
+    if (
+      this.writer === undefined ||
+      this.glareRetryTimer !== undefined ||
+      this.pc.signalingState !== "have-local-offer"
+    ) {
+      return;
+    }
+    this.glareRetryTimer = setTimeout(() => {
+      this.glareRetryTimer = undefined;
+      void this.retransmitPendingOffer()
+        .catch(console.error)
+        .finally(() => this.scheduleGlareRetryTimer());
+    }, GLARE_RETRY_MS);
+  }
+
+  private stopGlareRetryTimer(): void {
+    if (this.glareRetryTimer !== undefined) {
+      clearTimeout(this.glareRetryTimer);
+      this.glareRetryTimer = undefined;
     }
   }
 

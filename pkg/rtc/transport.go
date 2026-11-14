@@ -38,10 +38,17 @@ type SignallingTransport interface {
 	Run(ctx context.Context, ssEvIn <-chan *ss.SignallingEvent, ssEvOut chan<- *ss.SignallingEvent) error
 }
 
-// DefaultWriteTimeout is the default bound on a single websocket write —
-// the client-side counterpart of the handler's DefaultWriteTimeout, so a
-// wedged socket cannot block the write pump forever.
-const DefaultWriteTimeout = 10 * time.Second
+const (
+	// DefaultWriteTimeout is the default bound on a single websocket write —
+	// the client-side counterpart of the handler's DefaultWriteTimeout, so a
+	// wedged socket cannot block the write pump forever.
+	DefaultWriteTimeout = 10 * time.Second
+
+	// DefaultPingInterval and DefaultPongTimeout mirror the browser proxy's
+	// liveness checks. Pings share the write pump; pongs extend the read deadline.
+	DefaultPingInterval = time.Second
+	DefaultPongTimeout  = 3 * time.Second
+)
 
 // WebSocketSignallingTransport is the production SignallingTransport: one
 // WebSocket connection to the signalling endpoint
@@ -66,6 +73,14 @@ type WebSocketSignallingTransport struct {
 	// WriteTimeout bounds a single websocket write. Non-positive selects
 	// DefaultWriteTimeout.
 	WriteTimeout time.Duration
+
+	// PingInterval is how often the write pump sends a WebSocket ping.
+	// Non-positive selects DefaultPingInterval.
+	PingInterval time.Duration
+
+	// PongTimeout bounds the wait for pong responses. Non-positive selects
+	// DefaultPongTimeout.
+	PongTimeout time.Duration
 }
 
 // Run implements SignallingTransport. A failed dial — including a
@@ -107,14 +122,39 @@ func (t *WebSocketSignallingTransport) Run(ctx context.Context, ssEvIn <-chan *s
 		}
 	}()
 
-	// Write pump: one goroutine per connection, like the server side.
+	// A pong proves that the server still reads this connection. Merely
+	// receiving application events is not enough to detect a half-open roaming
+	// path, so only pongs (and the initial deadline) arm this timer.
+	pongTimeout := t.pongTimeout()
+	_ = conn.SetReadDeadline(time.Now().Add(pongTimeout))
+	conn.SetPongHandler(func(string) error {
+		return conn.SetReadDeadline(time.Now().Add(pongTimeout))
+	})
+
+	// A failed write must close the socket: otherwise this write pump exits
+	// while Run remains blocked in ReadMessage and the caller never reconnects.
+	writeFailure := make(chan error, 1)
+	failWrite := func(err error) {
+		writeFailure <- err
+		_ = conn.Close()
+	}
+
+	// Write pump: the sole application/ping writer for this connection.
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
+		ping := time.NewTicker(t.pingInterval())
+		defer ping.Stop()
 		for {
 			select {
 			case <-done:
 				return
+			case <-ping.C:
+				deadline := time.Now().Add(t.writeTimeout())
+				if err := conn.WriteControl(websocket.PingMessage, nil, deadline); err != nil {
+					failWrite(fmt.Errorf("rtc: signalling ping: %w", err))
+					return
+				}
 			case ev, ok := <-ssEvIn:
 				if !ok {
 					return
@@ -125,6 +165,7 @@ func (t *WebSocketSignallingTransport) Run(ctx context.Context, ssEvIn <-chan *s
 				}
 				_ = conn.SetWriteDeadline(time.Now().Add(t.writeTimeout()))
 				if err := conn.WriteMessage(websocket.TextMessage, data); err != nil {
+					failWrite(fmt.Errorf("rtc: signalling write: %w", err))
 					return
 				}
 			}
@@ -137,6 +178,11 @@ func (t *WebSocketSignallingTransport) Run(ctx context.Context, ssEvIn <-chan *s
 		if err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
+			}
+			select {
+			case writeErr := <-writeFailure:
+				return writeErr
+			default:
 			}
 			return fmt.Errorf("rtc: signalling read: %w", err)
 		}
@@ -162,6 +208,20 @@ func (t *WebSocketSignallingTransport) writeTimeout() time.Duration {
 		return DefaultWriteTimeout
 	}
 	return t.WriteTimeout
+}
+
+func (t *WebSocketSignallingTransport) pingInterval() time.Duration {
+	if t.PingInterval <= 0 {
+		return DefaultPingInterval
+	}
+	return t.PingInterval
+}
+
+func (t *WebSocketSignallingTransport) pongTimeout() time.Duration {
+	if t.PongTimeout <= 0 {
+		return DefaultPongTimeout
+	}
+	return t.PongTimeout
 }
 
 var _ SignallingTransport = (*WebSocketSignallingTransport)(nil)

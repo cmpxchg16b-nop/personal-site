@@ -39,6 +39,7 @@ import (
 	"fmt"
 	"log/slog"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/pion/webrtc/v4"
@@ -556,8 +557,9 @@ func (c *HeadlessRTCClient) Peers() []ss.SubscriberId {
 // sends honor ctx cancellation, so a stopped consumer wedges the run until
 // canceled (exactly like a Negotiator). Run returns nil when ssEvIn is
 // closed, ctx.Err() when ctx is done, the registration's error when the SS
-// rejects (or never answers) the registration, and ErrAlreadyRunning when
-// a previous Run is still in flight.
+// rejects (or never answers) the registration, an error when a keepalive
+// reports that the membership is gone, and ErrAlreadyRunning when a previous
+// Run is still in flight.
 func (c *HeadlessRTCClient) Run(ctx context.Context, ssEvIn <-chan *ss.SignallingEvent, ssEvOut chan<- *ss.SignallingEvent) error {
 	if ssEvIn == nil || ssEvOut == nil {
 		return ErrNilSignallingChannels
@@ -689,11 +691,12 @@ type clientRun struct {
 	out    chan<- *ss.SignallingEvent
 	ack    chan<- error
 
-	self      ss.SubscriberId
-	keepAlive *time.Ticker
-	listing   *time.Ticker
-	round     *listingRound
-	sessions  map[ss.SubscriberId]*peerSession
+	self            ss.SubscriberId
+	keepAlive       *time.Ticker
+	keepAlivePrefix string
+	listing         *time.Ticker
+	round           *listingRound
+	sessions        map[ss.SubscriberId]*peerSession
 }
 
 // hub is the client's single stateful goroutine. While no Run is in
@@ -765,7 +768,10 @@ func (c *HeadlessRTCClient) hub() {
 				run = nil
 				continue
 			}
-			c.handleInbound(run, ev)
+			if err := c.handleInbound(run, ev); err != nil {
+				c.endRun(run, err)
+				run = nil
+			}
 		case <-keepAliveC:
 			c.sendKeepAlive(run)
 		case <-listingC:
@@ -790,12 +796,13 @@ func (c *HeadlessRTCClient) startRun(existing *clientRun, n runNote) *clientRun 
 	}
 	ctx, cancel := context.WithCancel(n.ctx)
 	run := &clientRun{
-		ctx:      ctx,
-		cancel:   cancel,
-		in:       n.in,
-		out:      n.out,
-		ack:      n.ack,
-		sessions: make(map[ss.SubscriberId]*peerSession),
+		ctx:             ctx,
+		cancel:          cancel,
+		in:              n.in,
+		out:             n.out,
+		ack:             n.ack,
+		sessions:        make(map[ss.SubscriberId]*peerSession),
+		keepAlivePrefix: "keepalive:" + string(newMsgId()) + ":",
 	}
 	self, err := c.register(run)
 	if err != nil {
@@ -892,11 +899,13 @@ func (c *HeadlessRTCClient) registerOnce(run *clientRun, id ss.SubscriberId) (as
 // session (a session-desc offer from a peer the listing has not
 // discovered yet adopts the peer — the browser reconciles the same race
 // within one listing interval, a headless client can simply not lose the
-// offer); a s2c reply feeds the in-flight listing round.
-func (c *HeadlessRTCClient) handleInbound(run *clientRun, ev *ss.SignallingEvent) {
+// offer); a s2c reply feeds the in-flight listing round. A keepalive reply
+// reporting lost membership returns an error so the caller can reconnect and
+// register again; unrelated c2c delivery errors remain non-fatal.
+func (c *HeadlessRTCClient) handleInbound(run *clientRun, ev *ss.SignallingEvent) error {
 	if c2c := ev.C2CEv; c2c != nil {
 		if c2c.ChannelId != c.channelId || c2c.ToSubscriber != run.self || c2c.FromSubscriber == run.self {
-			return
+			return nil
 		}
 		if c2c.Call != nil {
 			call := c2c.Call
@@ -904,34 +913,34 @@ func (c *HeadlessRTCClient) handleInbound(run *clientRun, ev *ss.SignallingEvent
 				call.ChannelId != c2c.ChannelId ||
 				call.FromSubscriberId != c2c.FromSubscriber ||
 				call.ToSubscriberId != c2c.ToSubscriber {
-				return
+				return nil
 			}
 			sess := run.sessions[c2c.FromSubscriber]
 			if sess == nil {
 				// Only an INVITE can adopt a peer the member listing has not
 				// discovered yet; a stray response or BYE cannot.
 				if call.Sip == nil || call.Sip.Method != "INVITE" {
-					return
+					return nil
 				}
 				sess = c.startSession(run, c2c.FromSubscriber)
 				if sess == nil {
-					return
+					return nil
 				}
 			}
 			select {
 			case sess.calls <- callDelivery{handler: c.callHandler, call: call}:
 			case <-sess.ctx.Done():
 			}
-			return
+			return nil
 		}
 		sess := run.sessions[c2c.FromSubscriber]
 		if sess == nil {
 			if c2c.SessionDesc == nil || c2c.SessionDesc.Type != webrtc.SDPTypeOffer {
-				return // a stray answer or candidate cannot start a session
+				return nil // a stray answer or candidate cannot start a session
 			}
 			sess = c.startSession(run, c2c.FromSubscriber)
 			if sess == nil {
-				return
+				return nil
 			}
 		}
 		// The session's inbound pump drains the channel eagerly, so this
@@ -940,19 +949,24 @@ func (c *HeadlessRTCClient) handleInbound(run *clientRun, ev *ss.SignallingEvent
 		case sess.in <- ev:
 		case <-run.ctx.Done():
 		}
-		return
+		return nil
 	}
 	if ev.S2CEv != nil {
 		if run.round != nil && ev.InReplyTo != nil && *ev.InReplyTo == run.round.msgId {
 			c.handleListingPage(run, ev)
-			return
+			return nil
 		}
 		if e := ev.S2CEv.Err; e != nil {
-			// An error reply to something uncorrelated — e.g. a keepalive
-			// whose membership expired.
+			ownKeepAlive := ev.InReplyTo != nil &&
+				strings.HasPrefix(string(*ev.InReplyTo), run.keepAlivePrefix)
+			if ownKeepAlive &&
+				(e.ErrorCode == ss.ErrorCodeSubscriberNotFound || e.ErrorCode == ss.ErrorCodeChannelNotFound) {
+				return fmt.Errorf("rtc: channel membership lost: %s (error code %d)", e.ErrorMsg, e.ErrorCode)
+			}
 			c.logger.Warn("rtc: signalling error", "code", e.ErrorCode, "err", e.ErrorMsg)
 		}
 	}
+	return nil
 }
 
 // listingRound tracks one in-flight listChannelMembers request: the
@@ -1411,13 +1425,17 @@ func (c *HeadlessRTCClient) dispatchTrack(sess *peerSession, track *webrtc.Track
 }
 
 // sendKeepAlive renews the client's channel membership. The SS answers
-// nothing on success; an error reply arrives uncorrelated and is logged
-// by the hub.
+// nothing on success; a correlated membership-gone error ends the run so the
+// caller can establish a fresh transport and register again.
 func (c *HeadlessRTCClient) sendKeepAlive(run *clientRun) {
-	c.sendToSS(run, &ss.ClientToSSEv{ChannelKeepAlive: &ss.ClientToSSChannelKeepAlive{
+	// The per-run prefix identifies keepalive replies without a bounded ID
+	// history: even an arbitrarily delayed failure must end this exact run,
+	// while same-coded errors for ordinary c2c UUIDs remain non-fatal.
+	msgId := ss.MsgId(run.keepAlivePrefix + string(newMsgId()))
+	c.sendToSSWithID(run, &ss.ClientToSSEv{ChannelKeepAlive: &ss.ClientToSSChannelKeepAlive{
 		ChannelId:    c.channelId,
 		SubscriberId: run.self,
-	}})
+	}}, msgId)
 }
 
 // sendToSS wraps a c2s payload into the SS envelope — addressed to the
@@ -1425,7 +1443,10 @@ func (c *HeadlessRTCClient) sendKeepAlive(run *clientRun) {
 // populate from the session — and queues it for sending. It reports false
 // when the run's context is done first.
 func (c *HeadlessRTCClient) sendToSS(run *clientRun, payload *ss.ClientToSSEv) (ss.MsgId, bool) {
-	msgId := newMsgId()
+	return c.sendToSSWithID(run, payload, newMsgId())
+}
+
+func (c *HeadlessRTCClient) sendToSSWithID(run *clientRun, payload *ss.ClientToSSEv, msgId ss.MsgId) (ss.MsgId, bool) {
 	ev := &ss.SignallingEvent{
 		To:    ss.EPAddr{ServiceId: ss.WellKnownSvcIdSS},
 		MsgId: msgId,

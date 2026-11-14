@@ -187,12 +187,21 @@ type PerfectNegotiator struct {
 
 	// ICE recovery is owned by the Negotiate loop too. The timer channel is nil
 	// while no restart is scheduled, disabling that select case.
-	iceConnectedOnce   bool
-	iceRecovering      bool
-	iceRestartPending  bool
-	iceRestartAttempts int
-	iceRestartTimer    *time.Timer
-	iceRestartTimerC   <-chan time.Time
+	iceConnectedOnce  bool
+	iceRecovering     bool
+	iceRestartPending bool
+	// iceLocalOfferRestart distinguishes an unanswered ICE-restart offer from
+	// an ordinary offer that still needs a restart after its answer arrives.
+	iceLocalOfferRestart bool
+	iceRestartAttempts   int
+	iceRestartTimer      *time.Timer
+	iceRestartTimerC     <-chan time.Time
+
+	// A glare retry is deliberately slower than the perfect-negotiation
+	// exchange. Immediate duplicates can make the polite peer rebuild forever.
+	glareRetryDelay  time.Duration
+	glareRetryTimer  *time.Timer
+	glareRetryTimerC <-chan time.Time
 
 	// These are fields rather than package constants so tests can shorten the
 	// waits and make jitter deterministic without changing production defaults.
@@ -213,6 +222,7 @@ const (
 	defaultICEDisconnectGrace = 3 * time.Second
 	defaultICERetryBase       = 2 * time.Second
 	defaultICERetryMax        = 30 * time.Second
+	defaultGlareRetryDelay    = 2 * time.Second
 )
 
 // localEvent is one piece of work a pion callback hands to the Negotiate
@@ -269,6 +279,7 @@ func NewPerfectNegotiator(pc *webrtc.PeerConnection, options PerfectNegotiatorOp
 		iceRetryBase:       defaultICERetryBase,
 		iceRetryMax:        defaultICERetryMax,
 		iceRandom:          rand.Float64,
+		glareRetryDelay:    defaultGlareRetryDelay,
 	}
 	n.iceStateReader = func() webrtc.ICEConnectionState {
 		return n.pc.ICEConnectionState()
@@ -290,9 +301,12 @@ func (n *PerfectNegotiator) Negotiate(ctx context.Context, ssEvIn <-chan *ss.Sig
 	n.done = make(chan struct{})
 	n.attach(n.pc)
 	n.stopICERestartTimer()
+	n.stopGlareRetryTimer()
 	n.iceConnectedOnce = false
 	n.iceRecovering = false
 	n.iceRestartPending = false
+	// iceLocalOfferRestart follows the PC's current local description and
+	// therefore survives a signalling-loop restart just like that description.
 	n.iceRestartAttempts = 0
 	n.handleICEConnectionState(n.currentICEState())
 	defer func() {
@@ -300,6 +314,7 @@ func (n *PerfectNegotiator) Negotiate(ctx context.Context, ssEvIn <-chan *ss.Sig
 		n.pc.OnICECandidate(nil)
 		n.pc.OnICEConnectionStateChange(nil)
 		n.stopICERestartTimer()
+		n.stopGlareRetryTimer()
 		n.iceRecovering = false
 		n.iceRestartPending = false
 		close(n.done)
@@ -320,6 +335,8 @@ func (n *PerfectNegotiator) Negotiate(ctx context.Context, ssEvIn <-chan *ss.Sig
 			n.handleLocal(ctx, le, ssEvOut)
 		case <-n.iceRestartTimerC:
 			n.handleICERestartTimer(ctx, ssEvOut)
+		case <-n.glareRetryTimerC:
+			n.handleGlareRetryTimer(ctx, ssEvOut)
 		}
 	}
 }
@@ -386,6 +403,12 @@ func (n *PerfectNegotiator) makeOffer(ctx context.Context, ssEvOut chan<- *ss.Si
 	// the meantime. Unlike ordinary negotiation-needed (which pion re-fires), a
 	// custom ICE-restart request must remain pending when this guard fails.
 	if n.pc.SignalingState() != webrtc.SignalingStateStable {
+		if iceRestart && n.retransmitPendingOffer(ctx, ssEvOut) && n.iceLocalOfferRestart {
+			// This offer already carries fresh ICE credentials. Its retransmission
+			// satisfies the latched request; an ordinary offer does not.
+			n.iceRestartPending = false
+			return true
+		}
 		return false
 	}
 	n.makingOffer = true
@@ -403,6 +426,7 @@ func (n *PerfectNegotiator) makeOffer(ctx context.Context, ssEvOut chan<- *ss.Si
 		n.logger.Error("rtc: set local description", "iceRestart", iceRestart, "err", err)
 		return false
 	}
+	n.iceLocalOfferRestart = iceRestart
 	local := n.pc.LocalDescription()
 	if local == nil {
 		return false
@@ -448,6 +472,10 @@ func (n *PerfectNegotiator) handleSessionDesc(ctx context.Context, desc *webrtc.
 	n.ignoreOffer = !n.Polite && offerCollision
 	if n.ignoreOffer {
 		n.logger.Info("rtc: ignore colliding offer", "peer", n.options.PeerSubscriber)
+		// The polite peer cannot yield and answer until it receives our pending
+		// offer. Retry only if the glare stays unresolved: an immediate duplicate
+		// can itself keep the polite peer rebuilding on an ordinary glare.
+		n.scheduleGlareRetryTimer()
 		return
 	}
 	n.logger.Info("rtc: apply remote description", "peer", n.options.PeerSubscriber,
@@ -498,7 +526,12 @@ func (n *PerfectNegotiator) handleSessionDesc(ctx context.Context, desc *webrtc.
 
 	// An ICE-restart timer can fire while another offer/answer is in flight.
 	// Pion has no browser-style restartIce() latch, so retry the pending offer
-	// explicitly as soon as the remote description returns us to stable.
+	// explicitly as soon as the remote description returns us to stable. The
+	// completed local offer no longer needs its restart marker.
+	if n.pc.SignalingState() == webrtc.SignalingStateStable {
+		n.iceLocalOfferRestart = false
+		n.stopGlareRetryTimer()
+	}
 	if n.iceRestartPending && n.pc.SignalingState() == webrtc.SignalingStateStable {
 		n.makeOffer(ctx, ssEvOut, true)
 	}
@@ -547,7 +580,9 @@ func (n *PerfectNegotiator) handleICEConnectionState(state webrtc.ICEConnectionS
 	case webrtc.ICEConnectionStateClosed:
 		n.iceRecovering = false
 		n.iceRestartPending = false
+		n.iceLocalOfferRestart = false
 		n.stopICERestartTimer()
+		n.stopGlareRetryTimer()
 	}
 }
 
@@ -581,10 +616,55 @@ func (n *PerfectNegotiator) handleICERestartTimer(ctx context.Context, ssEvOut c
 	} else {
 		n.logger.Info("rtc: requesting ICE restart", "peer", n.options.PeerSubscriber, "attempt", n.iceRestartAttempts+1)
 		n.sendToPeer(ctx, ssEvOut, &ss.ClientToClientEv{ICERestartRequest: true})
+		// An ordinary local offer can be the other half of a persistent glare.
+		// Asking for a restart does not make its lost answer reappear.
+		n.retransmitPendingOffer(ctx, ssEvOut)
 	}
 	delay := n.nextICERestartDelay()
 	n.iceRestartAttempts++
 	n.scheduleICERestart(delay)
+}
+
+// retransmitPendingOffer repeats an unanswered local offer without trying to
+// create another offer in have-local-offer. This covers both a lost offer and a
+// lost answer: the receiver applies the duplicate offer and sends a new answer.
+func (n *PerfectNegotiator) retransmitPendingOffer(ctx context.Context, ssEvOut chan<- *ss.SignallingEvent) bool {
+	if n.pc.SignalingState() != webrtc.SignalingStateHaveLocalOffer {
+		return false
+	}
+	local := n.pc.LocalDescription()
+	if local == nil || local.Type != webrtc.SDPTypeOffer {
+		return false
+	}
+	n.logger.Info("rtc: retransmit offer", "peer", n.options.PeerSubscriber,
+		"iceRestart", n.iceLocalOfferRestart, "sdp", sdpSummary(local.SDP))
+	n.sendToPeer(ctx, ssEvOut, &ss.ClientToClientEv{SessionDesc: local})
+	return true
+}
+
+// handleGlareRetryTimer retransmits only a glare that is still unresolved and
+// keeps a spaced retry active until an answer returns the PC to stable.
+func (n *PerfectNegotiator) handleGlareRetryTimer(ctx context.Context, ssEvOut chan<- *ss.SignallingEvent) {
+	n.stopGlareRetryTimer()
+	if n.retransmitPendingOffer(ctx, ssEvOut) {
+		n.scheduleGlareRetryTimer()
+	}
+}
+
+func (n *PerfectNegotiator) scheduleGlareRetryTimer() {
+	if n.glareRetryTimer != nil || n.pc.SignalingState() != webrtc.SignalingStateHaveLocalOffer {
+		return
+	}
+	n.glareRetryTimer = time.NewTimer(n.glareRetryDelay)
+	n.glareRetryTimerC = n.glareRetryTimer.C
+}
+
+func (n *PerfectNegotiator) stopGlareRetryTimer() {
+	if n.glareRetryTimer != nil {
+		n.glareRetryTimer.Stop()
+		n.glareRetryTimer = nil
+	}
+	n.glareRetryTimerC = nil
 }
 
 func (n *PerfectNegotiator) currentICEState() webrtc.ICEConnectionState {
@@ -653,6 +733,8 @@ func (n *PerfectNegotiator) rebuildPeerConnection() error {
 	n.makingOffer = false
 	n.ignoreOffer = false
 	n.isSettingRemoteAnswerPending = false
+	n.iceLocalOfferRestart = false
+	n.stopGlareRetryTimer()
 	// The replacement has fresh ICE credentials already; an additional restart
 	// offer would be redundant. Keep the recovery watchdog until it connects.
 	n.iceRestartPending = false

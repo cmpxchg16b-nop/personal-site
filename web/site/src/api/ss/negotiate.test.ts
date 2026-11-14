@@ -137,4 +137,110 @@ describe("PerfectNegotiator ICE recovery", () => {
       await close();
     }
   });
+
+  it("retransmits an unanswered offer on every retry without another negotiationneeded", async () => {
+    vi.useFakeTimers();
+    try {
+      const { pc, events, close } = startNegotiation("alice");
+      try {
+        pc.onnegotiationneeded?.(new Event("negotiationneeded"));
+        await flushMicrotasks();
+        expect(events).toHaveLength(1);
+        pc.signalingState = "have-local-offer";
+        // A real browser need not emit negotiationneeded again while this
+        // offer is unanswered. The old mock hid the stalled recovery path.
+        pc.restartIce.mockImplementation(() => {});
+
+        pc.setState("connected");
+        pc.setState("disconnected");
+        await vi.advanceTimersByTimeAsync(3_000);
+        await flushMicrotasks();
+        expect(events).toHaveLength(2);
+        expect(events[1].c2CEv?.sessionDesc?.sdp).toBe("offer-1");
+
+        await vi.advanceTimersByTimeAsync(2_500);
+        await flushMicrotasks();
+        expect(events).toHaveLength(3);
+        expect(events[2].c2CEv?.sessionDesc?.sdp).toBe("offer-1");
+      } finally {
+        await close();
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("retransmits a pending offer when the impolite peer requests recovery", async () => {
+    const { pc, events, inputController, close } = startNegotiation("alice");
+    try {
+      pc.onnegotiationneeded?.(new Event("negotiationneeded"));
+      await flushMicrotasks();
+      expect(events).toHaveLength(1);
+      pc.signalingState = "have-local-offer";
+      pc.restartIce.mockImplementation(() => {});
+
+      inputController.enqueue({
+        from: {},
+        to: {},
+        msgId: "restart-after-lost-answer",
+        c2CEv: {
+          fromSubscriber: "bob",
+          toSubscriber: "alice",
+          channelId: "main",
+          iceRestartRequest: true,
+        },
+      });
+      await flushMicrotasks();
+
+      expect(events).toHaveLength(2);
+      expect(events[1].c2CEv?.sessionDesc?.sdp).toBe("offer-1");
+    } finally {
+      await close();
+    }
+  });
+
+  it("retries an unresolved impolite glare without an immediate duplicate", async () => {
+    vi.useFakeTimers();
+    try {
+      const { pc, events, inputController, close } = startNegotiation("bob");
+      try {
+        pc.onnegotiationneeded?.(new Event("negotiationneeded"));
+        await flushMicrotasks();
+        expect(events).toHaveLength(1);
+        pc.signalingState = "have-local-offer";
+
+        inputController.enqueue({
+          from: {},
+          to: {},
+          msgId: "colliding-restart-offer",
+          c2CEv: {
+            fromSubscriber: "alice",
+            toSubscriber: "bob",
+            channelId: "main",
+            sessionDesc: { type: "offer", sdp: "remote-restart-offer" },
+          },
+        });
+        await flushMicrotasks();
+        expect(events).toHaveLength(1);
+
+        await vi.advanceTimersByTimeAsync(1_999);
+        expect(events).toHaveLength(1);
+        await vi.advanceTimersByTimeAsync(1);
+        await flushMicrotasks();
+        // The polite peer must eventually receive this offer so it can roll
+        // back, answer, and let the ICE watchdog finish after the glare.
+        expect(events).toHaveLength(2);
+        expect(events[1].c2CEv?.sessionDesc?.sdp).toBe("offer-1");
+
+        await vi.advanceTimersByTimeAsync(2_000);
+        await flushMicrotasks();
+        expect(events).toHaveLength(3);
+      } finally {
+        await close();
+      }
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
