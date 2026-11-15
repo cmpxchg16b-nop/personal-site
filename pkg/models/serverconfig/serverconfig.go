@@ -21,8 +21,12 @@ import (
 // against serverConfig.xsd in the project root), the global server
 // configuration document.
 type ServerConfigXML struct {
-	XMLName          xml.Name            `xml:"serverConfig"`
-	OIDCLoginOptions OIDCLoginOptionsXML `xml:"oidcLoginOptions"`
+	XMLName xml.Name `xml:"serverConfig"`
+	// UnknownMessageFlood controls whether the signalling hub floods events
+	// whose complete destination is absent from its CAM table. It defaults
+	// to false; incomplete destinations are always dropped.
+	UnknownMessageFlood bool                `xml:"unknownMessageFlood,attr"`
+	OIDCLoginOptions    OIDCLoginOptionsXML `xml:"oidcLoginOptions"`
 	// GithubOAuthLogin is nil when the document has no <githubOAuthLogin/>
 	// element; the Github OAuth login handler is wired only when the element
 	// is present.

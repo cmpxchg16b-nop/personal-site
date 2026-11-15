@@ -229,6 +229,10 @@ type SSToClientChannelListResult struct {
 
 // SSToClientEv is a signalling-server-to-client event.
 type SSToClientEv struct {
+	// Endpoint identifies the authenticated (user id, user session id) pair
+	// of this connection in the server's initial hello event.
+	Endpoint *EPAddr `json:"endpoint,omitempty"`
+
 	// Err is present only when an error occurred.
 	Err *SSToClientErrEv `json:"err,omitempty"`
 

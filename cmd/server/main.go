@@ -179,6 +179,9 @@ func (cmd *ServeCmd) Run(cli *CLI) error {
 	ssHandler := pkgapiwebsocketss.NewWebSocketSSHandler(
 		context.Background(), pkgmodelsss.NewSimpleOnMemorySSProviderWithAging(cmd.SSAging), sm)
 	ssHandler.Upgrader.CheckOrigin = pkgapiwebsocketss.CheckOriginAllowing(allowedOrigins)
+	if serverCfg != nil {
+		ssHandler.UnknownMessageFlood = serverCfg.UnknownMessageFlood
+	}
 	muxHandlerDyn.Handle("/api/ss/ws", ssHandler)
 
 	// The ICE servers endpoint serves the <iceServer/> entries of the

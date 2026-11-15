@@ -15,16 +15,17 @@
 // never picks its own display name — it may send the field empty.
 //
 // Like a learning switch, the handler builds the association between a
-// connection's remote ip:port and the (user id, user session id) pair by
-// sniffing the From EPAddr field of inbound messages. It never learns —
-// and never needs — the association between a subscriber id and a
-// connection: the SS provider translates (channel, subscriber)
-// addressing into an EPAddr, so every outbound event is routed by its To
-// EPAddr alone. One EPAddr can map to several connections — two tabs
-// sharing one session, or a reconnect whose old connection has not been
-// noticed closed yet — so the event is delivered to every connection the
-// address was learned on. Events whose destination was never learned (or
-// whose connections are all gone) are dropped.
+// connection and its authenticated (user id, user session id) pair as soon
+// as the connection is registered, and retains source-address learning from
+// inbound messages. It never learns — and never needs — the association
+// between a subscriber id and a connection: the SS provider translates
+// (channel, subscriber) addressing into an EPAddr, so every outbound event
+// is routed by its To EPAddr alone. One EPAddr can map to several
+// connections — two tabs sharing one session, or a reconnect whose old
+// connection has not been noticed closed yet — so the event is delivered to
+// every connection the address was learned on. Events with a complete but
+// unknown destination are dropped unless UnknownMessageFlood is enabled;
+// incomplete destinations are always dropped.
 package websocket_ss
 
 import (
@@ -36,6 +37,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 
 	"personal-site/pkg/models/ss"
@@ -70,6 +72,14 @@ type WebSocketSSHandler struct {
 	// selects DefaultWriteTimeout. Set it before serving the first
 	// request.
 	WriteTimeout time.Duration
+
+	// UnknownMessageFlood sends events with a complete but unlearned
+	// (user id, user session id) destination to every current connection.
+	// The default is false. Enable it only for diagnostics or trusted
+	// environments: flooding can disclose signalling data across sessions
+	// and multiplies outbound traffic. Incomplete destinations are always
+	// dropped, and known destinations are never flooded.
+	UnknownMessageFlood bool
 
 	sm      pkgsession.SessionManager
 	ctx     context.Context
@@ -120,17 +130,29 @@ func (h *WebSocketSSHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return // the upgrader has already answered the request
 	}
+	endpoint := ss.EPAddr{UserId: userId, UserSessionId: sessionId}
 	c := &wsConn{
 		remote: conn.RemoteAddr().String(),
 		conn:   conn,
 		queue:  make(chan *ss.SignallingEvent, connQueueBufferSize),
+		camKey: camKeyOf(endpoint),
 	}
-	if !h.note(hubNote{kind: noteRegister, conn: c}) {
+	// The hello is connection-local and is queued before registration can
+	// make any provider event eligible for delivery, so it is always first.
+	c.queue <- &ss.SignallingEvent{
+		From:  ss.EPAddr{ServiceId: ss.WellKnownSvcIdSS},
+		To:    endpoint,
+		MsgId: ss.MsgId(uuid.NewString()),
+		S2CEv: &ss.SSToClientEv{Endpoint: &endpoint},
+	}
+	// Do not start either pump until the hub has eagerly learned c.camKey.
+	// Thus observing the hello also proves that eager CAM learning finished.
+	if !h.register(c) {
 		conn.Close()
 		return
 	}
 	go h.writePump(c)
-	go h.readPump(c, userId, sessionId, username)
+	go h.readPump(c, username)
 }
 
 // hub is the single goroutine owning the connection set and the learned
@@ -161,6 +183,8 @@ func (h *WebSocketSSHandler) hub() {
 			switch n.kind {
 			case noteRegister:
 				conns[n.conn] = struct{}{}
+				table.learn(n.conn.camKey, n.conn)
+				close(n.done)
 			case noteClosed:
 				if _, ok := conns[n.conn]; ok {
 					dropConn(table, conns, n.conn)
@@ -180,20 +204,28 @@ func (h *WebSocketSSHandler) hub() {
 	}
 }
 
-// forward routes an outbound event to every connection its To EPAddr
-// was learned on — one address may map to several connections (e.g. two
-// tabs sharing one session). Events with an empty or never-learned
-// destination are dropped.
+// forward routes an outbound event to every connection its complete To
+// EPAddr was learned on — one address may map to several connections (e.g.
+// two tabs sharing one session). A complete unknown destination is flooded
+// only when configured; an incomplete destination is always dropped.
 func (h *WebSocketSSHandler) forward(table *camTable, conns map[*wsConn]struct{}, ev *ss.SignallingEvent) {
 	key := camKeyOf(ev.To)
 	if key.empty() {
 		return
 	}
-	for c := range table.byAddr[key] {
+	targets, known := table.byAddr[key]
+	if !known {
+		if !h.UnknownMessageFlood {
+			return
+		}
+		targets = conns
+	}
+	for c := range targets {
 		select {
 		case c.queue <- ev:
 		default:
 			// Slow consumer: drop the connection rather than stall the hub.
+			// A failed known delivery never falls back to flooding.
 			dropConn(table, conns, c)
 		}
 	}
@@ -220,6 +252,23 @@ func (h *WebSocketSSHandler) note(n hubNote) bool {
 	}
 }
 
+// register waits until the hub has added c and learned its immutable CAM
+// key. It also returns when shutdown prevents that acknowledgement.
+func (h *WebSocketSSHandler) register(c *wsConn) bool {
+	done := make(chan struct{})
+	if !h.note(hubNote{kind: noteRegister, conn: c, done: done}) {
+		return false
+	}
+	select {
+	case <-done:
+		return true
+	case <-h.ctx.Done():
+		return false
+	case <-h.hubDone:
+		return false
+	}
+}
+
 // readPump parses the text frames of c as SignallingEvents and hands them
 // to the hub, overriding what the client may not choose: the From fields
 // are stamped with the connection's session identity, and a register
@@ -228,7 +277,7 @@ func (h *WebSocketSSHandler) note(n hubNote) bool {
 // Binary and unparseable frames are skipped. It
 // returns when the connection fails or the handler shuts down, and
 // reports the closure to the hub.
-func (h *WebSocketSSHandler) readPump(c *wsConn, userId ss.UserId, sessionId ss.UserSessionId, username string) {
+func (h *WebSocketSSHandler) readPump(c *wsConn, username string) {
 	defer h.note(hubNote{kind: noteClosed, conn: c})
 	for {
 		mt, data, err := c.conn.ReadMessage()
@@ -242,8 +291,8 @@ func (h *WebSocketSSHandler) readPump(c *wsConn, userId ss.UserId, sessionId ss.
 		if err := json.Unmarshal(data, &ev); err != nil {
 			continue
 		}
-		ev.From.UserId = userId
-		ev.From.UserSessionId = sessionId
+		ev.From.UserId = c.camKey.userId
+		ev.From.UserSessionId = c.camKey.sessionId
 		if ev.C2SEv != nil && ev.C2SEv.Register != nil {
 			ev.C2SEv.Register.Username = username
 		}
@@ -292,6 +341,8 @@ type wsConn struct {
 	remote string
 	conn   *websocket.Conn
 	queue  chan *ss.SignallingEvent
+	// camKey is fixed at upgrade from the authenticated session identity.
+	camKey camKey
 }
 
 type noteKind int
@@ -309,6 +360,8 @@ type hubNote struct {
 	kind noteKind
 	conn *wsConn
 	ev   *ss.SignallingEvent
+	// done is closed after a register note has been fully applied.
+	done chan struct{}
 }
 
 // camKey is the (user id, user session id) pair a connection is learned

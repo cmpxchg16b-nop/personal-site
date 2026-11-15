@@ -30,9 +30,15 @@ const (
 
 func startTestServer(t *testing.T) *httptest.Server {
 	t.Helper()
-	provider := ss.NewSimpleOnMemorySSProvider()
+	return startTestServerWithProvider(t, ss.NewSimpleOnMemorySSProvider(), false)
+}
+
+func startTestServerWithProvider(t *testing.T, provider ss.SignallingServiceProvider, unknownMessageFlood bool) *httptest.Server {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
 	sm := pkgsession.NewOnMemorySessionManager()
-	h := NewWebSocketSSHandler(context.Background(), provider, sm)
+	h := NewWebSocketSSHandler(ctx, provider, sm)
+	h.UnknownMessageFlood = unknownMessageFlood
 	// The real session middleware builds the request-scoped session object
 	// from context values, exactly as in production.
 	sessionized := pkgsession.WithSessionId(h, sm)
@@ -54,16 +60,40 @@ func startTestServer(t *testing.T) *httptest.Server {
 	srv := httptest.NewServer(adapter)
 	t.Cleanup(func() {
 		srv.Close()
-		provider.Shutdown()
+		cancel()
 	})
 	return srv
 }
 
-// dial opens a websocket connection with the test-only identity headers;
-// empty userId/sessionId omit the respective header. username is the
-// session's username — what the JWT middleware would have extracted from
-// the token's username claim.
-func dial(t *testing.T, srv *httptest.Server, userId, sessionId, username string) *websocket.Conn {
+// injectedProvider lets a test emit provider events without requiring any
+// client registration or inbound traffic. Client events are drained.
+type injectedProvider struct {
+	emit chan *ss.SignallingEvent
+}
+
+func (p *injectedProvider) Run(ctx context.Context, inMsg <-chan *ss.SignallingEvent, outMsg chan<- *ss.SignallingEvent) {
+	defer close(outMsg)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case _, ok := <-inMsg:
+			if !ok {
+				return
+			}
+		case ev := <-p.emit:
+			select {
+			case outMsg <- ev:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}
+}
+
+// dialRaw opens a websocket without consuming its initial hello.
+// Empty userId/sessionId omit the respective identity header.
+func dialRaw(t *testing.T, srv *httptest.Server, userId, sessionId, username string) *websocket.Conn {
 	t.Helper()
 	header := http.Header{}
 	if userId != "" {
@@ -82,6 +112,37 @@ func dial(t *testing.T, srv *httptest.Server, userId, sessionId, username string
 	}
 	t.Cleanup(func() { c.Close() })
 	return c
+}
+
+// dial opens a websocket and consumes its hello, keeping every business-event
+// test below independent of the connection-local control frame.
+func dial(t *testing.T, srv *httptest.Server, userId, sessionId, username string) *websocket.Conn {
+	t.Helper()
+	c := dialRaw(t, srv, userId, sessionId, username)
+	readHello(t, c, userId, sessionId)
+	return c
+}
+
+func readHello(t *testing.T, c *websocket.Conn, userId, sessionId string) *ss.SignallingEvent {
+	t.Helper()
+	hello := readEvent(t, c)
+	wantEndpoint := ss.EPAddr{UserId: ss.UserId(userId), UserSessionId: ss.UserSessionId(sessionId)}
+	if hello.From != (ss.EPAddr{ServiceId: ss.WellKnownSvcIdSS}) {
+		t.Fatalf("hello.From = %+v, want the SS service", hello.From)
+	}
+	if hello.To != wantEndpoint {
+		t.Fatalf("hello.To = %+v, want %+v", hello.To, wantEndpoint)
+	}
+	if hello.MsgId == "" {
+		t.Fatal("hello has an empty msgId")
+	}
+	if hello.InReplyTo != nil || hello.C2SEv != nil || hello.C2CEv != nil {
+		t.Fatalf("hello carries unexpected request/relay fields: %+v", hello)
+	}
+	if hello.S2CEv == nil || hello.S2CEv.Endpoint == nil || *hello.S2CEv.Endpoint != wantEndpoint {
+		t.Fatalf("hello endpoint = %+v, want %+v", hello.S2CEv, wantEndpoint)
+	}
+	return hello
 }
 
 func writeEvent(t *testing.T, c *websocket.Conn, ev *ss.SignallingEvent) {
@@ -166,6 +227,37 @@ func TestCheckOriginAllowing(t *testing.T) {
 				t.Errorf("CheckOrigin(origin %q, host %q) = %v, want %v", tc.origin, tc.host, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestHelloIsFirstFrame(t *testing.T) {
+	srv := startTestServer(t)
+	first := dialRaw(t, srv, "u-alice", "s-alice", "alice")
+	hello := readHello(t, first, "u-alice", "s-alice")
+
+	second := dialRaw(t, srv, "u-bob", "s-bob", "bob")
+	otherHello := readHello(t, second, "u-bob", "s-bob")
+	if otherHello.MsgId == hello.MsgId {
+		t.Fatalf("two hello events share msgId %q", hello.MsgId)
+	}
+}
+
+func TestHelloMeansEagerCAMLearningCompleted(t *testing.T) {
+	provider := &injectedProvider{emit: make(chan *ss.SignallingEvent)}
+	srv := startTestServerWithProvider(t, provider, false)
+	// dial returns only after the hello arrives. This socket sends no message
+	// and never registers, so delivery proves registration-time CAM learning.
+	silent := dial(t, srv, "u-silent", "s-silent", "silent")
+
+	provider.emit <- &ss.SignallingEvent{
+		From:  ss.EPAddr{ServiceId: ss.WellKnownSvcIdSS},
+		To:    ss.EPAddr{UserId: "u-silent", UserSessionId: "s-silent"},
+		MsgId: "provider-to-silent",
+		S2CEv: &ss.SSToClientEv{Pong: &ss.PingPongMsg{PingId: "eager-cam"}},
+	}
+	got := readEvent(t, silent)
+	if got.MsgId != "provider-to-silent" || got.S2CEv == nil || got.S2CEv.Pong == nil || got.S2CEv.Pong.PingId != "eager-cam" {
+		t.Fatalf("silent connection got %+v, want the injected provider event", got)
 	}
 }
 
@@ -322,6 +414,166 @@ func TestRegisterUsernameOverriddenFromSession(t *testing.T) {
 	}
 	if p := query(alice, "m-q-bob", "bob").S2CEv.Profile; p.Username != "bob-real" {
 		t.Errorf("bob's profile username = %q, want his session username %q", p.Username, "bob-real")
+	}
+}
+
+func newForwardTestConn(key camKey) *wsConn {
+	return &wsConn{queue: make(chan *ss.SignallingEvent, 1), camKey: key}
+}
+
+func requireForwardedEvent(t *testing.T, c *wsConn, want *ss.SignallingEvent) {
+	t.Helper()
+	select {
+	case got, ok := <-c.queue:
+		if !ok || got != want {
+			t.Fatalf("queued event = %+v (open %v), want %p", got, ok, want)
+		}
+	default:
+		t.Fatal("expected a queued event")
+	}
+}
+
+func requireNoForwardedEvent(t *testing.T, c *wsConn) {
+	t.Helper()
+	select {
+	case got, ok := <-c.queue:
+		t.Fatalf("unexpected queued event %+v (open %v)", got, ok)
+	default:
+	}
+}
+
+func TestForwardKnownDeliversToAllMappedConnectionsOnly(t *testing.T) {
+	key := camKey{userId: "u-alice", sessionId: "s-alice"}
+	alice1 := newForwardTestConn(key)
+	alice2 := newForwardTestConn(key)
+	bob := newForwardTestConn(camKey{userId: "u-bob", sessionId: "s-bob"})
+	table := newCamTable()
+	table.learn(key, alice1)
+	table.learn(key, alice2)
+	table.learn(bob.camKey, bob)
+	conns := map[*wsConn]struct{}{alice1: {}, alice2: {}, bob: {}}
+	h := &WebSocketSSHandler{UnknownMessageFlood: true}
+	ev := &ss.SignallingEvent{To: ss.EPAddr{UserId: key.userId, UserSessionId: key.sessionId}}
+
+	h.forward(table, conns, ev)
+	requireForwardedEvent(t, alice1, ev)
+	requireForwardedEvent(t, alice2, ev)
+	requireNoForwardedEvent(t, bob)
+}
+
+func TestForwardUnknownMessageFlood(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		flood bool
+	}{
+		{name: "default drop", flood: false},
+		{name: "enabled floods all current connections", flood: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			alice := newForwardTestConn(camKey{userId: "u-alice", sessionId: "s-alice"})
+			bob := newForwardTestConn(camKey{userId: "u-bob", sessionId: "s-bob"})
+			table := newCamTable()
+			table.learn(alice.camKey, alice)
+			conns := map[*wsConn]struct{}{alice: {}, bob: {}}
+			h := &WebSocketSSHandler{UnknownMessageFlood: tc.flood}
+			ev := &ss.SignallingEvent{To: ss.EPAddr{UserId: "u-unknown", UserSessionId: "s-unknown"}}
+
+			h.forward(table, conns, ev)
+			for _, c := range []*wsConn{alice, bob} {
+				if tc.flood {
+					requireForwardedEvent(t, c, ev)
+				} else {
+					requireNoForwardedEvent(t, c)
+				}
+			}
+		})
+	}
+}
+
+func TestForwardAlwaysDropsIncompleteDestinations(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		to   ss.EPAddr
+	}{
+		{name: "empty"},
+		{name: "user only", to: ss.EPAddr{UserId: "u"}},
+		{name: "session only", to: ss.EPAddr{UserSessionId: "s"}},
+		{name: "service only", to: ss.EPAddr{ServiceId: ss.WellKnownSvcIdSS}},
+		{name: "user and service", to: ss.EPAddr{UserId: "u", ServiceId: ss.WellKnownSvcIdSS}},
+		{name: "session and service", to: ss.EPAddr{UserSessionId: "s", ServiceId: ss.WellKnownSvcIdSS}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := newForwardTestConn(camKey{userId: "u-alice", sessionId: "s-alice"})
+			table := newCamTable()
+			table.learn(c.camKey, c)
+			conns := map[*wsConn]struct{}{c: {}}
+			h := &WebSocketSSHandler{UnknownMessageFlood: true}
+			h.forward(table, conns, &ss.SignallingEvent{To: tc.to})
+			requireNoForwardedEvent(t, c)
+		})
+	}
+}
+
+func TestForwardKnownFailureDoesNotFallbackToFlood(t *testing.T) {
+	key := camKey{userId: "u-alice", sessionId: "s-alice"}
+	alice := newForwardTestConn(key)
+	alice.queue <- &ss.SignallingEvent{MsgId: "already-full"}
+	bob := newForwardTestConn(camKey{userId: "u-bob", sessionId: "s-bob"})
+	table := newCamTable()
+	table.learn(key, alice)
+	conns := map[*wsConn]struct{}{alice: {}, bob: {}}
+	h := &WebSocketSSHandler{UnknownMessageFlood: true}
+
+	h.forward(table, conns, &ss.SignallingEvent{To: ss.EPAddr{UserId: key.userId, UserSessionId: key.sessionId}})
+	requireNoForwardedEvent(t, bob)
+	if _, ok := conns[alice]; ok {
+		t.Fatal("slow known consumer remains in the connection set")
+	}
+	if _, ok := table.byAddr[key]; ok {
+		t.Fatal("slow known consumer remains in the CAM table")
+	}
+}
+
+func TestDropConnPurgesAllLearnedAddresses(t *testing.T) {
+	key := camKey{userId: "u-alice", sessionId: "s-alice"}
+	otherKey := camKey{userId: "u-other", sessionId: "s-other"}
+	c := newForwardTestConn(key)
+	sibling := newForwardTestConn(key)
+	table := newCamTable()
+	table.learn(key, c)
+	table.learn(otherKey, c) // retain noteMessage's additional source learning
+	table.learn(key, sibling)
+	conns := map[*wsConn]struct{}{c: {}, sibling: {}}
+
+	dropConn(table, conns, c)
+	if _, ok := <-c.queue; ok {
+		t.Fatal("dropped connection queue remains open")
+	}
+	if _, ok := conns[c]; ok {
+		t.Fatal("dropped connection remains registered")
+	}
+	if _, ok := table.byConn[c]; ok {
+		t.Fatal("dropped connection retains reverse CAM entries")
+	}
+	if _, ok := table.byAddr[otherKey]; ok {
+		t.Fatal("address learned only by the dropped connection was not purged")
+	}
+	if got := table.byAddr[key]; len(got) != 1 {
+		t.Fatalf("shared address has %d connections, want only its sibling", len(got))
+	} else if _, ok := got[sibling]; !ok {
+		t.Fatal("shared address lost its surviving sibling")
+	}
+}
+
+func TestRegisterReturnsWhenHubIsDone(t *testing.T) {
+	h := &WebSocketSSHandler{
+		ctx:     context.Background(),
+		ingress: make(chan hubNote, 1),
+		hubDone: make(chan struct{}),
+	}
+	close(h.hubDone)
+	if h.register(newForwardTestConn(camKey{userId: "u", sessionId: "s"})) {
+		t.Fatal("register succeeded after the hub stopped")
 	}
 }
 

@@ -116,10 +116,20 @@ implementation must provide.
 
 ### SS → client (`s2CEv`)
 
-Carries `err`, `registerResult`, `profile`, `channelProfile`, `pong`,
-`channelMbsListResult`, or `channelListResult`. Every reply
-comes `from` the well-known SS service id, is addressed `to` the origin's
-`from`, and is correlated via `inReplyTo`. Errors pair a well-defined
+Carries `endpoint`, `err`, `registerResult`, `profile`, `channelProfile`, `pong`,
+`channelMbsListResult`, or `channelListResult`. **Every upgraded WebSocket
+starts with a connection-local endpoint hello**: its `from` is the SS service,
+`to` and `s2CEv.endpoint` are the same complete
+`{userId,userSessionId}` authenticated for this exact connection, and its
+`msgId` is fresh. The hello is queued before any provider event can reach the
+connection and never goes through the CAM/flood path. Browser and Go transports
+validate it before registration and then discard c2c/s2c events whose complete
+`to` pair does not match it. The browser also persists the pair as one
+localStorage value; that value is only a pre-dial hint, and every valid hello
+atomically replaces it. A 401 or explicit logout clears it.
+
+Every ordinary reply comes `from` the well-known SS service id, is addressed
+`to` the origin's `from`, and is correlated via `inReplyTo`. Errors pair a well-defined
 `errorCode` with a descriptive `errorMsg`:
 
 | Code | Name                       | Meaning                                                  |
@@ -556,27 +566,35 @@ target id or a kind mismatch makes the command a no-op.
 
 - The provider is the **only** component that understands subscriber
   addressing; it resolves `(channel, subscriberId)` → `EPAddr`.
-- The WebSocket handler **never learns subscriber ids**. Like a learning
-  switch, it builds the association between a connection's remote
-  `ip:port` and the `(userId, userSessionId)` pair purely by sniffing the
-  `from` field of inbound messages (after the identity override).
+- The WebSocket handler **never learns subscriber ids**. It eagerly learns the
+  authenticated `(userId,userSessionId)` pair when the upgraded connection is
+  registered with the hub, before the connection's hello is written, and also
+  retains switch-style source learning from the `from` field of inbound
+  messages (after the identity override).
 - Outbound events are routed by their `to` EPAddr to **every
   connection the address was learned on** — one address can map to
   several connections (two tabs sharing a session, or a reconnect whose
-  old connection has not been noticed closed yet); there is no flooding
-  beyond that. Events whose destination was never learned are dropped;
-  a disconnect purges the closed connection from all of its learned
-  addresses (link-down aging), and a reconnect re-learns onto the new
-  connection.
+  old connection has not been noticed closed yet). A disconnect purges the
+  closed connection from all of its learned addresses (link-down aging).
+- A complete destination missing from the CAM is **dropped by default**.
+  The root configuration attribute `unknownMessageFlood="true"` instead sends
+  each such event to every current connection. Known destinations are never
+  flooded, and empty, half-empty, and service-only destinations are always
+  dropped. This opt-in mode can disclose SDP, ICE and call metadata across
+  sessions and multiplies traffic/queue pressure; it is intended only for
+  diagnostics or trusted deployments, not as reliable delivery or tenant
+  isolation. Both client transports therefore enforce the endpoint-pair filter
+  described above. Slow consumers are still disconnected rather than blocking
+  the hub, and there is no offline queue.
 
 **Roaming.** Registrations outlive connections (the prototype has no
 unregister message), so a client that quickly disconnects and reconnects
 with the same identity **and the same subscriber id** keeps its
 registration, and its profile stays queryable even while it is offline —
-as long as it reconnects within the aging interval (below). The only
-requirement is that the reconnected client speaks first: any message
-(e.g. a registration or liveness `ping`) re-learns its address onto the
-new connection, switch-style. Ping-session state is client-side; the
+as long as it reconnects within the aging interval (below). The replacement
+connection is learned at upgrade, before its endpoint hello, so it need not
+speak first to become reachable; later inbound messages still exercise the
+source-learning path. Ping-session state is client-side; the
 browser currently starts a fresh SS ping id and sequence on each socket,
 so its previous in-flight ping does not automatically resume. A client
 that instead registers a **fresh** subscriber id (a new incarnation —
@@ -622,8 +640,10 @@ path:
 - **Handler** (`WebSocketSSHandler`): one hub goroutine owns the
   connection set and the CAM table; each connection has a read pump
   (parse JSON, populate `from`, forward to the hub's ingress channel) and
-  a write pump (drain a per-connection queue to the socket, write
-  deadline configurable via `WriteTimeout`, default 10s). A full queue makes a slow consumer get dropped rather than
+  a write pump (drain a per-connection queue, write deadline configurable
+  via `WriteTimeout`, default 10s). Connection registration is acknowledged
+  by the hub before the pumps start, which orders eager CAM learning before
+  the already-queued endpoint hello. A full queue makes a slow consumer get dropped rather than
   stall the hub. The hub exits on context cancellation or provider
   shutdown, closing every queue, which cascades to connection closure.
 

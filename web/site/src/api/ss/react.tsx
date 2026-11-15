@@ -7,16 +7,17 @@
  * SSProxy singleton in React state: it connects on mount, temporarily
  * swaps the provided value to null when the connection drops, and
  * re-provides the fresh instance getSSProxy() reconnects to; a failed
- * connection attempt is retried until one succeeds. Components
+ * connection attempt is retried until one succeeds or closeSSProxy()
+ * explicitly shuts the provider down. Components
  * therefore always see the latest proxy, or null.
  *
  * useSignalling() reads that context. At this first design stage it
  * registers the browser as a subscriber of the main channel (reusing the
- * subscriber id persisted in localStorage, or asking the SS to assign
- * one), renews the membership with a channel keepalive every few
- * seconds, renews the server's channel list every five seconds —
+ * subscriber id retained in this page for the same endpoint identity, or
+ * asking the SS to assign one), renews the membership with a channel
+ * keepalive every few seconds, renews the server's channel list every five seconds —
  * resolving each channel's profile and its members' profiles into
- * ChatChannels — and pings the SS once per second, reporting the latest
+ * ChatChannels — and pings the SS every 500ms, reporting the latest
  * round-trip time. The activities read their own streams from the proxy
  * — every getReadStream() call returns a stream duplicating the SS
  * messages.
@@ -32,7 +33,14 @@ import {
 } from "react";
 
 import { fetchProfile, ProfileApiError } from "@/api/profile";
-import { DEFAULT_SS_URL, getSSProxy, type SSProxy } from "./proxy";
+import { clearStoredIdentity, sameEndpointIdentity } from "./identity";
+import {
+  closeSSProxy,
+  DEFAULT_SS_URL,
+  getSSProxy,
+  subscribeSSProxyShutdown,
+  type SSProxy,
+} from "./proxy";
 import {
   ErrorCode,
   WELLKNOWN_CH_ID_MAIN,
@@ -42,7 +50,6 @@ import {
   type ChatUser,
   type SignallingEvent,
   type SubscriberId,
-  type UserId,
 } from "./types";
 
 // SSProxyContext carries the current SSProxy singleton, or null while no
@@ -73,12 +80,32 @@ export function SSProxyProvider({
   useEffect(() => {
     let live = true;
     let retryTimer: number | undefined;
+    const clearRetry = () => {
+      if (retryTimer !== undefined) {
+        window.clearTimeout(retryTimer);
+        retryTimer = undefined;
+      }
+    };
+    const shutdown = () => {
+      if (!live) return;
+      live = false;
+      setProxy(null);
+      clearRetry();
+    };
+    // This notification also covers an in-flight attempt that rejects before
+    // producing a proxy on which ondisconnect could report the close reason.
+    const unsubscribe = subscribeSSProxyShutdown(shutdown);
 
     const connect = () => {
+      if (!live) return;
       getSSProxy(url)
         .then((p) => {
           if (!live) return;
-          p.ondisconnect = () => {
+          p.ondisconnect = (reason) => {
+            if (reason === "shutdown") {
+              shutdown();
+              return;
+            }
             if (!live) return;
             setProxy(null);
             connect();
@@ -86,22 +113,20 @@ export function SSProxyProvider({
           setProxy(p);
         })
         .catch((err) => {
+          if (!live) return;
           // The attempt failed — the caller may be anonymous (the
           // handshake 401s until a login happens) or the server is
           // restarting: wait and retry getSSProxy() until it succeeds.
           console.error("signalling: connection failed, retrying in 2s", err);
-          if (live) {
-            retryTimer = window.setTimeout(connect, 2000);
-          }
+          retryTimer = window.setTimeout(connect, 2000);
         });
     };
     connect();
 
     return () => {
       live = false;
-      if (retryTimer !== undefined) {
-        window.clearTimeout(retryTimer);
-      }
+      unsubscribe();
+      clearRetry();
     };
   }, [url]);
 
@@ -136,9 +161,8 @@ export interface SignallingState {
    */
   lastPing: PingStat | null;
   /**
-   * The current user: `id` is the app-level user id the SS echoes in
-   * every reply's `to` (populated server-side from the caller's
-   * session), `name` the profile username, plus the signalling
+   * The current user: `id` comes from the current proxy's validated endpoint
+   * hello, `name` the profile username, plus the signalling
    * subscription (main channel, assigned subscriber id); null before the
    * first registration or after the current registration fails. Retained
    * while a replacement socket refreshes the same in-page registration.
@@ -173,7 +197,7 @@ const NO_COMPLETE_MEMBERSHIP_CHANNELS: ChannelId[] = [];
 // PING_INTERVAL_MS is how often the SS is pinged while connected —
 // deliberately well below the server's default subscriber aging (30s), so
 // the pings double as registration keepalive.
-const PING_INTERVAL_MS = 1000;
+const PING_INTERVAL_MS = 500;
 
 // PONG_TIMEOUT_MS bounds the wait for one ping's pong. A socket can look OPEN
 // after a network switch while its old path is already dead, so timeout also
@@ -310,13 +334,12 @@ async function awaitRepliesOn(
 // peers tear their stale sessions down on their very next listing. The
 // registration's display name is not the client's to choose: the server
 // stamps the session's username onto the register event. Resolves to the
-// registered subscriber id and the caller's user id — which the SS echoes
-// in the reply's `to`, populated server-side from the session. The attempt
+// registered subscriber id. The caller's user id comes independently from the
+// proxy's already-validated endpoint hello. The attempt
 // separates a transient failure from an explicit id conflict, which is the only
 // response that may make the caller abandon a retained roaming id.
 interface SubscriberRegistration {
   subscriberId: SubscriberId;
-  userId: UserId | null;
 }
 
 interface RegistrationAttempt {
@@ -354,10 +377,7 @@ async function registerSubscriber(
   if (result) {
     console.info(`signalling: registered as subscriber ${result.subscriberId}`);
     return {
-      registration: {
-        subscriberId: result.subscriberId,
-        userId: reply.to.userId ?? null,
-      },
+      registration: { subscriberId: result.subscriberId },
       idConflict: false,
     };
   }
@@ -555,9 +575,9 @@ function sameChannels(a: ChatChannel[], b: ChatChannel[]): boolean {
  * a fixed ping id, the seq chaining rule from the prototype (the next ping's
  * seq is the ack of the last reply), at most one ping in flight — reporting
  * the latest round-trip time. A successful registration also exposes the
- * current user (`me`): its id is the user id the SS echoes in the register
- * reply's `to`. Registration, the channel listing, and the ping loop each
- * read their own stream from the proxy.
+ * current user (`me`): its id comes from the proxy's endpoint hello, before
+ * registration begins. Registration, the channel listing, and the ping loop
+ * each read their own stream from the proxy.
  */
 export function useSignalling(): SignallingState {
   const proxy = useSSProxy();
@@ -591,6 +611,23 @@ export function useSignalling(): SignallingState {
     revision: number;
   } | null>(null);
 
+  // A proxy with a different session must not render even one frame of the
+  // previous session's registration or listing. Null proxy means a transport
+  // outage, so retained output remains visible until the replacement's hello
+  // tells us whether this is still the same endpoint.
+  const visibleRegistered =
+    registered !== null &&
+    (proxy === null ||
+      sameEndpointIdentity(registered.proxy.identity, proxy.identity))
+      ? registered
+      : null;
+  const visibleListed =
+    listed !== null &&
+    (proxy === null ||
+      sameEndpointIdentity(listed.proxy.identity, proxy.identity))
+      ? listed
+      : null;
+
   useEffect(() => {
     // Everything this hook does needs an authenticated session (the SS
     // endpoint is not on the JWT whitelist — an anonymous caller's WS
@@ -603,6 +640,8 @@ export function useSignalling(): SignallingState {
     fetchProfile(abort.signal).catch((err) => {
       if (err instanceof DOMException && err.name === "AbortError") return;
       if (err instanceof ProfileApiError && err.status === 401) {
+        clearStoredIdentity();
+        closeSSProxy();
         redirectToLogin();
       }
     });
@@ -615,7 +654,22 @@ export function useSignalling(): SignallingState {
     }
     let live = true;
     const abort = new AbortController();
-    const reconnectSubscriberId = registeredRef.current?.me.subscriberId ?? "";
+    const retained = registeredRef.current;
+    const sameRegistration =
+      retained === null ||
+      sameEndpointIdentity(retained.proxy.identity, proxy.identity);
+    const reconnectSubscriberId = sameRegistration
+      ? (retained?.me.subscriberId ?? "")
+      : "";
+    if (!sameRegistration) {
+      // This is a new session incarnation, not a roaming reconnect. The render
+      // gate above has already hidden stale output; now discard the state and
+      // ensure registration starts with a fresh subscriber id.
+      registeredRef.current = null;
+      setRegistered(null);
+      setListed(null);
+      setRegistrationFailed(null);
+    }
     // The ping loop's own stream; registration reads another one.
     const reader = proxy.getReadStream().getReader();
     const writer = proxy.getWriteStream().getWriter();
@@ -713,6 +767,8 @@ export function useSignalling(): SignallingState {
           if (err instanceof DOMException && err.name === "AbortError")
             return null;
           if (err instanceof ProfileApiError && err.status === 401) {
+            clearStoredIdentity();
+            closeSSProxy();
             redirectToLogin();
             return null;
           }
@@ -730,12 +786,7 @@ export function useSignalling(): SignallingState {
               requestedSubscriberId,
             );
             const reg = attempt.registration;
-            if (
-              live &&
-              !proxy.destroyed &&
-              reg !== null &&
-              reg.userId !== null
-            ) {
+            if (live && !proxy.destroyed && reg !== null) {
               const previous = registeredRef.current;
               if (
                 previous !== null &&
@@ -748,7 +799,7 @@ export function useSignalling(): SignallingState {
               setRegistered({
                 proxy,
                 me: {
-                  id: reg.userId,
+                  id: proxy.identity.userId,
                   name,
                   online: true,
                   channelId: WELLKNOWN_CH_ID_MAIN,
@@ -847,11 +898,19 @@ export function useSignalling(): SignallingState {
         // round. Reconnect renders are not new membership evidence.
         setListed((prev) => {
           if (!live || proxy.destroyed) return prev;
-          const revision = (prev?.revision ?? 0) + 1;
-          if (prev !== null && sameChannels(prev.channels, listing.channels)) {
+          const retained =
+            prev !== null &&
+            sameEndpointIdentity(prev.proxy.identity, proxy.identity)
+              ? prev
+              : null;
+          const revision = (retained?.revision ?? 0) + 1;
+          if (
+            retained !== null &&
+            sameChannels(retained.channels, listing.channels)
+          ) {
             return {
               proxy,
-              channels: prev.channels,
+              channels: retained.channels,
               completeMembershipChannelIds:
                 listing.completeMembershipChannelIds,
               revision,
@@ -896,15 +955,16 @@ export function useSignalling(): SignallingState {
   return {
     lastPing:
       proxy !== null && measured?.proxy === proxy ? measured.ping : null,
-    me: registered?.me ?? null,
-    channels: listed?.channels ?? NO_CHANNELS,
-    listingRevision: listed?.revision ?? 0,
+    me: visibleRegistered?.me ?? null,
+    channels: visibleListed?.channels ?? NO_CHANNELS,
+    listingRevision: visibleListed?.revision ?? 0,
     completeMembershipChannelIds:
-      listed?.completeMembershipChannelIds ?? NO_COMPLETE_MEMBERSHIP_CHANNELS,
+      visibleListed?.completeMembershipChannelIds ??
+      NO_COMPLETE_MEMBERSHIP_CHANNELS,
     registrationFailed:
       proxy !== null &&
-      registered?.proxy !== proxy &&
+      visibleRegistered?.proxy !== proxy &&
       registrationFailed?.proxy === proxy,
-    registrationReady: proxy !== null && registered?.proxy === proxy,
+    registrationReady: proxy !== null && visibleRegistered?.proxy === proxy,
   };
 }

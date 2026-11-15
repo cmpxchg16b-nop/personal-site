@@ -190,6 +190,10 @@ export interface RegisterResult {
 
 // Signalling server to Client event
 export interface SSToClientEv {
+  // The first frame on every WebSocket is a hello carrying the complete
+  // session endpoint, duplicated in the event's `to` address.
+  endpoint?: EPAddr;
+
   // err is present only when there IS an error occurred, null or undefined otherwise.
   err?: SSToClientErrEv;
 

@@ -182,6 +182,16 @@
              callee without memorizing numbers. See yellowPageType. -->
         <xsd:element name="sipBot" type="sipBotType" minOccurs="0" />
       </xsd:sequence>
+      <!-- Whether to flood signalling events addressed to a complete but
+           unknown (userId, userSessionId) pair to every current WebSocket
+           connection. The secure, traffic-bounded default is false. Empty
+           or incomplete destinations are always dropped. -->
+      <xsd:attribute
+        name="unknownMessageFlood"
+        type="xsd:boolean"
+        use="optional"
+        default="false"
+      />
     </xsd:complexType>
   </xsd:element>
 

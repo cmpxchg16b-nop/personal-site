@@ -16,6 +16,8 @@ import {
 import LogoutIcon from "@mui/icons-material/Logout";
 import { useProfile } from "@/hooks/useProfile";
 import { useLogout } from "@/hooks/useLogout";
+import { clearStoredIdentity } from "@/api/ss/identity";
+import { closeSSProxy } from "@/api/ss/proxy";
 import { useTranslation } from "react-i18next";
 
 // avatarHue hashes the subject id to a stable hue (0–359), so each user gets
@@ -87,6 +89,8 @@ export default function ProfileMenu() {
     closeMenu();
     logout.mutate(undefined, {
       onSuccess: () => {
+        clearStoredIdentity();
+        closeSSProxy();
         // Full-page navigation so the query cache and all other client state
         // tied to the old session are dropped with it. Home, not /login:
         // anonymous browsing is fine everywhere on the public site.

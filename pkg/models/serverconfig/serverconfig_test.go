@@ -14,6 +14,33 @@ import (
 	"testing"
 )
 
+func TestUnknownMessageFloodParsing(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		attribute string
+		want      bool
+	}{
+		{name: "default", want: false},
+		{name: "explicit false", attribute: ` unknownMessageFlood="false"`, want: false},
+		{name: "explicit true", attribute: ` unknownMessageFlood="true"`, want: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "serverConfig.xml")
+			doc := "<serverConfig" + tc.attribute + "></serverConfig>"
+			if err := os.WriteFile(path, []byte(doc), 0o644); err != nil {
+				t.Fatalf("write the config: %v", err)
+			}
+			cfg, err := LoadServerConfig(path)
+			if err != nil {
+				t.Fatalf("LoadServerConfig: %v", err)
+			}
+			if cfg.UnknownMessageFlood != tc.want {
+				t.Fatalf("UnknownMessageFlood = %v, want %v", cfg.UnknownMessageFlood, tc.want)
+			}
+		})
+	}
+}
+
 // parseMusicBot parses a configuration document consisting of the given
 // <musicBot/> body.
 func parseMusicBot(t *testing.T, body string) *MusicBotXML {

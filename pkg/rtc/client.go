@@ -697,6 +697,11 @@ type clientRun struct {
 	listing         *time.Ticker
 	round           *listingRound
 	sessions        map[ss.SubscriberId]*peerSession
+
+	// pendingC2C preserves arrival order while registerOnce owns run.in.
+	// Registration waits are ReplyTimeout-bounded and the transport has already
+	// filtered by endpoint, so this per-run slice needs no separate queue or cap.
+	pendingC2C []*ss.SignallingEvent
 }
 
 // hub is the client's single stateful goroutine. While no Run is in
@@ -783,12 +788,11 @@ func (c *HeadlessRTCClient) hub() {
 	}
 }
 
-// startRun installs the run's state and performs the initial
-// registration, answering the Run caller's ack. The registration's
-// request/reply wait happens inline — nothing can reach the client before
-// it is registered (the SS cannot resolve its address), so the only
-// events to expect are the replies themselves; the wait is bounded by
-// ReplyTimeout. A second Run while one is in flight is rejected.
+// startRun installs the run's state and performs the initial registration,
+// answering the Run caller's ack. The registration request/reply wait happens
+// inline and is bounded by ReplyTimeout. Eager CAM learning can deliver c2c
+// before the reply, so registerOnce buffers those events for an ordered replay
+// before normal tickers and listing start. A second Run is rejected.
 func (c *HeadlessRTCClient) startRun(existing *clientRun, n runNote) *clientRun {
 	if existing != nil {
 		n.ack <- ErrAlreadyRunning
@@ -806,11 +810,18 @@ func (c *HeadlessRTCClient) startRun(existing *clientRun, n runNote) *clientRun 
 	}
 	self, err := c.register(run)
 	if err != nil {
-		cancel()
-		n.ack <- err
+		c.endRun(run, err)
 		return nil
 	}
 	run.self = self
+	pendingC2C := run.pendingC2C
+	run.pendingC2C = nil
+	for _, ev := range pendingC2C {
+		if err := c.handleInbound(run, ev); err != nil {
+			c.endRun(run, err)
+			return nil
+		}
+	}
 	run.keepAlive = time.NewTicker(c.keepAliveInterval)
 	run.listing = time.NewTicker(c.memberListInterval)
 	c.logger.Info("rtc: registered", "channelId", c.channelId, "subscriberId", self)
@@ -822,8 +833,13 @@ func (c *HeadlessRTCClient) startRun(existing *clientRun, n runNote) *clientRun 
 // endRun tears the run down: tickers stopped, every session closed, the
 // Run caller's ack answered with the run's terminal error.
 func (c *HeadlessRTCClient) endRun(run *clientRun, err error) {
-	run.keepAlive.Stop()
-	run.listing.Stop()
+	if run.keepAlive != nil {
+		run.keepAlive.Stop()
+	}
+	if run.listing != nil {
+		run.listing.Stop()
+	}
+	run.pendingC2C = nil
 	run.cancel() // ends every session context
 	for _, sess := range run.sessions {
 		if err := sess.pc.Close(); err != nil {
@@ -880,7 +896,10 @@ func (c *HeadlessRTCClient) registerOnce(run *clientRun, id ss.SubscriberId) (as
 				return "", false, errors.New("rtc: signalling input ended before the registration reply")
 			}
 			if ev.S2CEv == nil || ev.InReplyTo == nil || *ev.InReplyTo != msgId {
-				continue // not the registration reply; nothing else is expected this early
+				if ev.C2CEv != nil {
+					run.pendingC2C = append(run.pendingC2C, ev)
+				}
+				continue // unrelated s2c replies remain irrelevant during registration
 			}
 			if result := ev.S2CEv.RegisterResult; result != nil {
 				return result.SubscriberId, false, nil

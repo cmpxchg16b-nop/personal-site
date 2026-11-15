@@ -27,15 +27,24 @@ retries after a fixed **2 seconds**; this loop does not use ICE's exponential
 backoff.
 
 A network switch can instead leave a stale socket that still reports `OPEN`.
-The browser therefore pings the SS every second and recycles the proxy when a
-pong does not arrive within **3 seconds** of that ping. Ping bookkeeping records
+The browser therefore pings the SS every **500 milliseconds** and recycles the
+proxy when a pong does not arrive within **3 seconds** of that ping. Ping bookkeeping records
 the pending request before the asynchronous write so a fast pong cannot be lost.
 This gives ICE recovery a working signalling path even when the browser never
 receives a socket close event.
 
 A replacement socket goes through these steps:
 
-1. **Reconnect with the same subscriber id.** `useSignalling` keeps the current
+1. **Validate the connection endpoint before registration.** The server's first
+   frame is an endpoint hello carrying the exact connection's
+   `(userId,userSessionId)`. The proxy uses it to reject any flooded c2c/s2c
+   addressed to another endpoint, and atomically replaces the browser's
+   localStorage hint. The same pair preserves the roaming behavior below; a
+   changed pair instead clears retained registration, listing, peer sessions,
+   and pre-registration offers/calls before starting a fresh subscriber
+   incarnation. Logout/401 clears the cached pair and shuts down without an
+   automatic reconnect.
+2. **Reconnect with the same subscriber id.** `useSignalling` keeps the current
    page's registration in memory and sends that id in the replacement socket's
    `register` request. For the same authenticated `(userId, userSessionId,
 channelId)` tuple, the SS accepts this as a roaming refresh. A new page load
@@ -44,18 +53,23 @@ channelId)` tuple, the SS accepts this as a roaming refresh. A new page load
    attempt times out or fails on an open socket, the retained incarnation is not
    cleared: the browser retries every **2 seconds**. Only an explicit
    `SubscriberIdIsRegistered` conflict abandons that id for a fresh incarnation.
-2. **Keep UI and WebRTC state.** The last confirmed identity and channel listing
+3. **Keep UI and WebRTC state.** The last confirmed identity and channel listing
    stay available while the socket is down and roaming registration is pending.
    Existing `RTCPeerConnection`s, their tracks and data channels, and the phone
    call model are not reset merely because the proxy changed.
-3. **Queue signalling, but do not send too early.** Each peer has an ordered
+4. **Queue signalling, but do not send too early.** Each peer has an ordered
    in-memory output queue. SDP, candidates, and restart requests produced while
    disconnected wait there. Output remains detached until registration on the
    current replacement socket succeeds, because an open WebSocket alone does not
    prove that the subscriber registration is still valid. A proxy swap also
    cancels an unsettled write on the old transport, so repeated network changes
    cannot leave later ICE messages blocked behind it.
-4. **Resume and reconcile.** Once registration succeeds, queued events flush in
+5. **Resume and reconcile.** Self-addressed c2c received after hello but before
+   the peer demux has subscribed is retained by `SSProxy` and replayed in
+   arrival order; ping and registration readers cannot consume this backlog.
+   The demux acknowledges events as its reads yield them, so a StrictMode
+   reader cancellation/re-setup replays only the still-unacknowledged suffix.
+   Once registration succeeds, queued events flush in
    order and normal negotiation continues. A peer still in `have-local-offer`
    also retransmits that offer, because a stale socket may have consumed the
    original write without delivering it. Identical unresolved offers are
@@ -84,12 +98,19 @@ The built-in echo/music bots use a different lifecycle today.
 for the configured `reconnectInterval` and starts another attempt. The default
 is **5 seconds**.
 
-The Go transport sends WebSocket protocol pings every **1 second** and uses
-pongs to extend a **3-second** read deadline. A missing pong therefore ends a
+The Go transport sends WebSocket protocol pings every **500 milliseconds** and
+uses pongs to extend a **3-second** read deadline. A missing pong therefore ends a
 half-open connection even when no close frame arrives. Any application-message
 or ping write failure also closes the socket immediately, waking the read loop;
 otherwise the write pump could exit while `Run` stayed blocked forever and the
 outer reconnect loop never ran.
+
+Each Go transport also waits for the endpoint hello before starting its writer
+or forwarding business events, then applies the same destination-pair filter as
+the browser. Eager CAM learning means a still-live old registration can produce
+c2c traffic before the new run's register reply: `HeadlessRTCClient` preserves
+those events in arrival order and replays them after the final subscriber id is
+known, rather than dropping an early offer, candidate, or INVITE.
 
 Every `HeadlessRTCClient.Run` tears down all of its peer sessions before it
 returns. Data-channel and track handler registrations survive for the next run,
@@ -123,8 +144,10 @@ While that registration remains valid:
 
 - its profile can still be queried;
 - a same-tuple, same-id registration refreshes it;
-- the first message on a replacement connection re-learns the authenticated
-  address onto that connection, allowing replies and relays to reach it;
+- a replacement connection's authenticated address is learned at upgrade,
+  before its endpoint hello, allowing replies and relays to reach it even before
+  the client sends its first message; source learning from inbound messages is
+  retained as well;
 - peers do not see a membership leave/rejoin merely because the socket changed.
 
 Registration state is not durable. A server restart loses it, and a sufficiently
@@ -230,8 +253,8 @@ Implementation: `web/site/src/api/ss/ice_restart.ts` and `negotiate.ts`, plus
 | Browser retry after an established socket drops    | Immediate                  |
 | Browser retry after a failed connection attempt    | 2s fixed                   |
 | Go bot `reconnectInterval`                         | 5s, configurable per bot   |
-| Browser SS ping / pong liveness timeout            | 1s / 3s                    |
-| Go WebSocket ping / pong read deadline             | 1s / 3s                    |
+| Browser SS ping / pong liveness timeout            | 500ms / 3s                 |
+| Go WebSocket ping / pong read deadline             | 500ms / 3s                 |
 | Browser registration reply timeout                 | 5s                         |
 | Browser retry after transient registration failure | 2s fixed                   |
 | Browser channel keepalive / member listing         | 5s / 5s                    |

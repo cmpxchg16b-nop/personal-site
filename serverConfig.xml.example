@@ -2,10 +2,19 @@
 <!-- Global server configuration, validated against serverConfig.xsd (project
      root). The <dynBlogData/> section is served live by the site's
      /api/dyn/ and /links/ endpoints; the server re-reads this document on
-     every request, so edits apply without a restart. -->
+     every request, so edits apply without a restart.
+
+     unknownMessageFlood defaults to false. Setting it to true floods
+     signalling events whose complete user/session destination is unknown to
+     every current signalling connection. This can disclose SDP, ICE, call
+     metadata, and other signalling data across sessions and can multiply
+     outbound traffic by the connection count; enable it only for diagnostics
+     in a trusted environment. Empty/incomplete destinations always remain
+     dropped, and known destinations are never flooded. -->
 <serverConfig
   xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
   xsi:noNamespaceSchemaLocation="serverConfig.xsd"
+  unknownMessageFlood="false"
 >
   <!-- The site's dynamic blog data (optional): post metadata, projects, and
        author contacts served to the frontend as JSON under /api/dyn/ (see

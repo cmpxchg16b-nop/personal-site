@@ -7,23 +7,33 @@ signalling; business payloads and their direct flow control are not.
 
 ## Transport matrix
 
-| Exchange | Path | Current use |
-| --- | --- | --- |
-| Browser ↔ signalling server | WebSocket `/api/ss/ws`, JSON `SignallingEvent` | Registration, roaming, member/channel discovery, keepalive, SS ping/pong |
-| Browser ↔ browser | The same SS WebSocket relay, `c2CEv` | SDP offer/answer, Trickle ICE, ICE-restart request, SIP-subset call dialog, call-status amendments |
-| Browser ↔ echo/music/SIP bot | Exactly the same WS c2c relay | The bot is an ordinary authenticated `HeadlessRTCClient`, not an in-process signalling shortcut |
-| Go UA / test UA ↔ bot or another Go UA | `WebSocketSignallingTransport` + the same SS c2c relay | Same wire types and negotiation rules as the browser |
-| Chat and file metadata | `dcmsg` on the pair's existing RTCPeerConnection | Plain text, file-transfer status, ordinary text/file chat-control and their business echoes |
-| File bytes and chunk ACKs | `dcbin` | `FILE` chunks and `FACK` cumulative acknowledgements; ACK is part of the file-transfer protocol, not session signalling |
-| Audio/video | RTP over the existing RTCPeerConnection | Media tracks added/removed after call acceptance; SDP for those changes is still on WS |
-| DTMF | RFC 4733 RTP `telephone-event` | Not WebSocket, not DataChannel |
-| SIP bot ↔ external SIP UA/PBX | sipgo/diago SIP sockets + RTP | Real REGISTER, INVITE, ACK, CANCEL, BYE, MESSAGE and RTP; separate from the browser-facing JSON SIP subset |
-| WHEP playback | HTTP POST/PATCH/DELETE | A separate HTTP signalling API, not part of the SS/DataChannel subsystem |
+| Exchange                               | Path                                                   | Current use                                                                                                             |
+| -------------------------------------- | ------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------- |
+| Browser ↔ signalling server            | WebSocket `/api/ss/ws`, JSON `SignallingEvent`         | Registration, roaming, member/channel discovery, keepalive, SS ping/pong                                                |
+| Browser ↔ browser                      | The same SS WebSocket relay, `c2CEv`                   | SDP offer/answer, Trickle ICE, ICE-restart request, SIP-subset call dialog, call-status amendments                      |
+| Browser ↔ echo/music/SIP bot           | Exactly the same WS c2c relay                          | The bot is an ordinary authenticated `HeadlessRTCClient`, not an in-process signalling shortcut                         |
+| Go UA / test UA ↔ bot or another Go UA | `WebSocketSignallingTransport` + the same SS c2c relay | Same wire types and negotiation rules as the browser                                                                    |
+| Chat and file metadata                 | `dcmsg` on the pair's existing RTCPeerConnection       | Plain text, file-transfer status, ordinary text/file chat-control and their business echoes                             |
+| File bytes and chunk ACKs              | `dcbin`                                                | `FILE` chunks and `FACK` cumulative acknowledgements; ACK is part of the file-transfer protocol, not session signalling |
+| Audio/video                            | RTP over the existing RTCPeerConnection                | Media tracks added/removed after call acceptance; SDP for those changes is still on WS                                  |
+| DTMF                                   | RFC 4733 RTP `telephone-event`                         | Not WebSocket, not DataChannel                                                                                          |
+| SIP bot ↔ external SIP UA/PBX          | sipgo/diago SIP sockets + RTP                          | Real REGISTER, INVITE, ACK, CANCEL, BYE, MESSAGE and RTP; separate from the browser-facing JSON SIP subset              |
+| WHEP playback                          | HTTP POST/PATCH/DELETE                                 | A separate HTTP signalling API, not part of the SS/DataChannel subsystem                                                |
 
 ## WebSocket wire protocol
 
 Every SS message is a JSON `SignallingEvent` with `from`, `to`, `msgId`,
 optional `inReplyTo`, and one of `c2SEv`, `s2CEv`, `c2CEv`.
+
+The first server frame on every connection is an endpoint hello:
+`s2CEv.endpoint` and the envelope `to` both carry the authenticated
+`{userId,userSessionId}` of that exact connection. Browser and Go transports
+validate it before registration. Thereafter they accept c2c/s2c only when the
+envelope's complete destination pair matches; this is mandatory when the
+server's opt-in `unknownMessageFlood` mode lets a CAM miss reach every
+connection. Browser identity is also cached in localStorage as a non-
+authoritative pre-dial hint, replaced by every valid hello and cleared on
+401/logout. Go transports learn afresh from every connection's hello.
 
 The WebRTC/call `c2CEv` addressing fields are `channelId`, `fromSubscriber`
 and `toSubscriber`. Its payload alternatives include:

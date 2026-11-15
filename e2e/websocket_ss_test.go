@@ -109,6 +109,7 @@ type channelListResultView struct {
 }
 
 type ssToClientEvView struct {
+	Endpoint             *epAddrView               `json:"endpoint,omitempty"`
 	Err                  *ssErrView                `json:"err,omitempty"`
 	RegisterResult       *registerResultView       `json:"registerResult,omitempty"`
 	Profile              *userProfileView          `json:"profile,omitempty"`
@@ -223,6 +224,32 @@ func (c *ssWSClient) redial() {
 		c.conn.Close()
 	}
 	c.conn = conn
+
+	// Every connection starts with a fresh, connection-local endpoint hello.
+	// Consume it here so all subsequent recv calls see business events only.
+	hello := c.recv()
+	if hello.From != (epAddrView{ServiceId: ssServiceId}) {
+		c.t.Fatalf("hello from = %+v, want the SS service", hello.From)
+	}
+	if hello.MsgId == "" || hello.InReplyTo != "" || hello.C2SEv != nil || hello.C2CEv != nil {
+		c.t.Fatalf("invalid hello envelope: %+v", hello)
+	}
+	if hello.S2CEv == nil || hello.S2CEv.Endpoint == nil {
+		c.t.Fatalf("hello carries no endpoint: %+v", hello)
+	}
+	if hello.To != *hello.S2CEv.Endpoint {
+		c.t.Fatalf("hello to = %+v, endpoint = %+v", hello.To, *hello.S2CEv.Endpoint)
+	}
+	if hello.To.UserId == "" || hello.To.UserSessionId == "" || hello.To.ServiceId != "" {
+		c.t.Fatalf("hello endpoint is not a complete user/session address: %+v", hello.To)
+	}
+	if c.userId != "" && (hello.To.UserId != c.userId || hello.To.UserSessionId != c.sessionId) {
+		c.t.Fatalf("hello identity = (%q, %q), want (%q, %q)", hello.To.UserId, hello.To.UserSessionId, c.userId, c.sessionId)
+	}
+	// Bearer-token clients learn their identity from the first hello; cookie
+	// clients also accept the server-confirmed value on every redial.
+	c.userId = hello.To.UserId
+	c.sessionId = hello.To.UserSessionId
 }
 
 func (c *ssWSClient) send(ev *signallingEventView) {

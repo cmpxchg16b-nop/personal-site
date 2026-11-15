@@ -43,6 +43,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { useICEServers } from "@/hooks/useICEServers";
+import { sameEndpointIdentity, type EndpointIdentity } from "./identity";
 import { PerfectNegotiator } from "./negotiate";
 import type { SSProxy } from "./proxy";
 import { useSSProxy } from "./react";
@@ -531,6 +532,7 @@ export function usePeerSessions(
   const sessionsRef = useRef(new Map<string, PeerSession>());
   const peerInboxesRef = useRef(new Map<string, PeerInbox>());
   const pendingCallsRef = useRef(new Map<string, PendingCalls>());
+  const previousIdentityRef = useRef<EndpointIdentity | null>(null);
   const countedListingRevisionRef = useRef<number | null>(null);
   // The async demux needs the latest address; teardown also uses the latest
   // lifecycle to distinguish initial registration from a real replacement.
@@ -625,6 +627,23 @@ export function usePeerSessions(
     return iceServersQuery.isError ? [] : null;
   }, [iceServersQuery.data, iceServersQuery.isError]);
 
+  // Pre-registration traffic belongs to the endpoint that received it, even
+  // though there is no subscriber identity for the lifecycle cleanup below to
+  // depend on. Keep the last non-null endpoint across transport outages: only
+  // a confirmed pair change clears pending input. Registered sessions, waiters,
+  // and reset notifications remain the existing lifecycle cleanup's job.
+  useEffect(() => {
+    if (proxy === null) return;
+    const previous = previousIdentityRef.current;
+    previousIdentityRef.current = proxy.identity;
+    if (previous === null || sameEndpointIdentity(previous, proxy.identity)) {
+      return;
+    }
+    for (const inbox of peerInboxesRef.current.values()) inbox.close();
+    peerInboxesRef.current.clear();
+    pendingCallsRef.current.clear();
+  }, [proxy]);
+
   // A polite peer can offer before our membership listing has created the
   // impolite session. Route every inbound c2c event through a per-peer inbox:
   // either that offer or membership creates the inbox first, and both paths
@@ -644,7 +663,7 @@ export function usePeerSessions(
   useEffect(() => {
     if (proxy === null) return;
     const inboxes = peerInboxesRef.current;
-    const reader = proxy.getReadStream().getReader();
+    const reader = proxy.getReadStream({ replayEarlyC2C: true }).getReader();
     let live = true;
     let readerActive = true;
     void (async () => {
@@ -654,6 +673,9 @@ export function usePeerSessions(
           if (done || !live) return;
           const c2c = value.c2CEv;
           if (c2c === undefined) continue;
+          // Ack only after reader.read yields: a StrictMode cleanup that wins
+          // before this point leaves the event replayable for the next setup.
+          proxy.acknowledgeEarlyC2C(value);
           const current = lifecycleRef.current.me;
           if (lifecycleRef.current.registrationFailed && current === null) {
             continue;

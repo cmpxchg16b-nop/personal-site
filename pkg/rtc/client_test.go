@@ -562,6 +562,97 @@ func TestHeadlessRTCClientRetriesRegistrationWithFreshId(t *testing.T) {
 	}
 }
 
+func TestHeadlessRTCClientReplaysOfferReceivedBeforeRegistrationReply(t *testing.T) {
+	const (
+		self = ss.SubscriberId("2-self")
+		peer = ss.SubscriberId("1-peer")
+	)
+	c, err := NewHeadlessRTCClient(PerfectNegotiatorFactory, RTCClientConfiguration{
+		SubscriberId:       self,
+		KeepAliveInterval:  time.Hour,
+		MemberListInterval: time.Hour,
+		ReplyTimeout:       time.Second,
+		Logger:             testLogger(t),
+	})
+	if err != nil {
+		t.Fatalf("NewHeadlessRTCClient: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	toSS := make(chan *ss.SignallingEvent, 16)
+	fromSS := make(chan *ss.SignallingEvent)
+	done := make(chan error, 1)
+	go func() { done <- c.Run(ctx, fromSS, toSS) }()
+
+	var registration *ss.SignallingEvent
+	select {
+	case registration = <-toSS:
+	case <-time.After(testTimeout):
+		t.Fatal("timed out waiting for registration")
+	}
+	if registration.C2SEv == nil || registration.C2SEv.Register == nil {
+		t.Fatalf("first outbound event = %+v, want registration", registration)
+	}
+
+	probe, err := webrtc.NewPeerConnection(webrtc.Configuration{})
+	if err != nil {
+		t.Fatalf("NewPeerConnection: %v", err)
+	}
+	defer probe.Close()
+	if _, err := probe.CreateDataChannel("early-offer", nil); err != nil {
+		t.Fatalf("CreateDataChannel: %v", err)
+	}
+	offer, err := probe.CreateOffer(nil)
+	if err != nil {
+		t.Fatalf("CreateOffer: %v", err)
+	}
+
+	// Eager CAM learning makes this ordering possible: the old registration
+	// still routes the peer's offer to this new connection before its ack.
+	fromSS <- &ss.SignallingEvent{
+		MsgId: "early-offer",
+		C2CEv: &ss.ClientToClientEv{
+			ChannelId:      ss.WellKnownChIdMain,
+			FromSubscriber: peer,
+			ToSubscriber:   self,
+			SessionDesc:    &offer,
+		},
+	}
+	registrationID := registration.MsgId
+	fromSS <- &ss.SignallingEvent{
+		InReplyTo: &registrationID,
+		S2CEv: &ss.SSToClientEv{RegisterResult: &ss.RegisterResult{
+			ChannelId: ss.WellKnownChIdMain, SubscriberId: self,
+		}},
+	}
+
+	if id := waitRegistered(t, c); id != self {
+		t.Fatalf("registered subscriber id = %q, want %q", id, self)
+	}
+	waitFor(t, "the pre-registration offer to create its peer session", func() bool {
+		return slices.Contains(c.Peers(), peer)
+	})
+
+	for {
+		select {
+		case ev := <-toSS:
+			if ev.C2CEv == nil || ev.C2CEv.SessionDesc == nil ||
+				ev.C2CEv.SessionDesc.Type != webrtc.SDPTypeAnswer {
+				continue
+			}
+			if ev.C2CEv.FromSubscriber != self || ev.C2CEv.ToSubscriber != peer {
+				t.Fatalf("answer addressing = %q -> %q, want %q -> %q",
+					ev.C2CEv.FromSubscriber, ev.C2CEv.ToSubscriber, self, peer)
+			}
+			return // the buffered offer was applied, not merely used to allocate a session
+		case err := <-done:
+			t.Fatalf("Run ended before answering the early offer: %v", err)
+		case <-time.After(testTimeout):
+			t.Fatal("timed out waiting for the answer to the pre-registration offer")
+		}
+	}
+}
+
 // TestHeadlessRTCClientReconcilesMemberDropout runs a client and a peer
 // on a provider with short aging, stops the peer, and expects the
 // client's session to be torn down once the peer's registration ages out
