@@ -44,10 +44,10 @@ import { createContext, useContext, useEffect, useMemo } from "react";
 import type { ReactNode } from "react";
 
 // The analyser configuration of both FFT taps: 2048-sample FFT (1024
-// frequency bins) with heavy temporal smoothing — the spectrum component
-// downsamples the bins and smooths spatially on top.
+// frequency bins) with moderate temporal smoothing — enough to avoid
+// jitter while letting the spectrum fall promptly as audio fades.
 const FFT_SIZE = 2048;
-const FFT_SMOOTHING = 0.8;
+const FFT_SMOOTHING = 0.55;
 
 // The document events the autoplay unlock listens to: any of them is a
 // user gesture a suspended AudioContext may be resumed from.
