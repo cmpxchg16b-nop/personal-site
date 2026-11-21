@@ -2,10 +2,11 @@
 
 ## Session-note workflow for substantial work
 
-Every task must be completed end to end: start with a session note and finish
-by writing the outcome back to that note. Stopping a review loop or any other
-subtask does not stop the task. Use one or more session notes as the task's
-living record:
+Every substantial task must be completed end to end: start with a session note
+and finish by writing the outcome back to that note. Simple tasks do not require
+a session note; do not create one for a trivial or tightly scoped change.
+Stopping a review loop or any other subtask does not stop the task. For
+substantial work, use one or more session notes as the task's living record:
 
 1. **Start a new note.** Create the next numbered file in
    `.ai/memory/sessions/` (for example, `40.md`), with the usual `title` and
@@ -43,3 +44,7 @@ them factual and concise enough to remain useful to the next session.
    hard maximum, not a target or an expected number of rounds.
 4. Use at most seven review rounds. If issues remain after the seventh round,
    the reviewer should fix them directly instead of requesting another rework.
+
+## Formatting and efficiency
+
+- Avoid formatting busywork; do not burn tokens on stylistic tweaks or spend time cleaning up noisy diffs left by auto-formatters.
