@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -440,6 +441,308 @@ func TestPolitePeerRollsBackOnGlare(t *testing.T) {
 	}
 	if pc.ConnectionState() == webrtc.PeerConnectionStateClosed {
 		t.Fatal("glare closed the original peer connection")
+	}
+}
+
+// fingerprintNegotiatorHarness drives a real initial offer/answer directly,
+// then lets each focused test inject its next description without an ICE or SS
+// goroutine making the PC-swap assertion timing-dependent.
+type fingerprintNegotiatorHarness struct {
+	t                    *testing.T
+	nego                 *PerfectNegotiator
+	original             *webrtc.PeerConnection
+	remote               *webrtc.PeerConnection
+	out                  chan *ss.SignallingEvent
+	replacements         int
+	offerHasApplications []bool
+}
+
+func newFingerprintNegotiatorHarness(t *testing.T) *fingerprintNegotiatorHarness {
+	t.Helper()
+	original, err := webrtc.NewPeerConnection(webrtc.Configuration{})
+	if err != nil {
+		t.Fatalf("NewPeerConnection(original): %v", err)
+	}
+	remote, err := webrtc.NewPeerConnection(webrtc.Configuration{})
+	if err != nil {
+		_ = original.Close()
+		t.Fatalf("NewPeerConnection(remote): %v", err)
+	}
+	h := &fingerprintNegotiatorHarness{
+		t: t, original: original, remote: remote,
+		out: make(chan *ss.SignallingEvent, 8),
+	}
+	h.nego, err = NewPerfectNegotiator(original, PerfectNegotiatorOptions{
+		ChannelId:      ss.WellKnownChIdMain,
+		SelfSubscriber: "alice",
+		PeerSubscriber: "bob",
+		NewPeerConnection: func(offerHasApplication bool) (*webrtc.PeerConnection, error) {
+			h.replacements++
+			h.offerHasApplications = append(h.offerHasApplications, offerHasApplication)
+			return webrtc.NewPeerConnection(webrtc.Configuration{})
+		},
+		Logger: testLogger(t),
+	})
+	if err != nil {
+		_ = original.Close()
+		_ = remote.Close()
+		t.Fatalf("NewPerfectNegotiator: %v", err)
+	}
+	t.Cleanup(func() {
+		h.nego.stopICERestartTimer()
+		h.nego.stopGlareRetryTimer()
+		_ = h.nego.pc.Close()
+		_ = remote.Close()
+	})
+
+	if _, err := remote.CreateDataChannel("initial", nil); err != nil {
+		t.Fatalf("CreateDataChannel(initial): %v", err)
+	}
+	initialOffer := setTestOffer(t, remote, nil)
+	initialAnswer := h.receiveAnswer(initialOffer)
+	if err := remote.SetRemoteDescription(*initialAnswer); err != nil {
+		t.Fatalf("remote.SetRemoteDescription(initial answer): %v", err)
+	}
+	// SetLocal/RemoteDescription starts ICE on Pion's operations goroutine.
+	// Waiting for both transports to leave new avoids restarting gathering while
+	// that asynchronous start is still installing its gatherer.
+	waitFor(t, "initial ICE transports to start", func() bool {
+		return original.ICEConnectionState() != webrtc.ICEConnectionStateNew &&
+			remote.ICEConnectionState() != webrtc.ICEConnectionStateNew
+	})
+	if h.replacements != 0 || h.nego.pc != original {
+		t.Fatal("the first remote offer replaced the peer connection")
+	}
+	if original.CurrentRemoteDescription() == nil {
+		t.Fatal("initial offer/answer did not establish a stable remote description")
+	}
+	return h
+}
+
+func setTestOffer(t *testing.T, pc *webrtc.PeerConnection, options *webrtc.OfferOptions) *webrtc.SessionDescription {
+	t.Helper()
+	offer, err := pc.CreateOffer(options)
+	if err != nil {
+		t.Fatalf("CreateOffer: %v", err)
+	}
+	if err := pc.SetLocalDescription(offer); err != nil {
+		t.Fatalf("SetLocalDescription(offer): %v", err)
+	}
+	local := pc.LocalDescription()
+	if local == nil {
+		t.Fatal("SetLocalDescription(offer) left no local description")
+	}
+	return local
+}
+
+func (h *fingerprintNegotiatorHarness) receiveAnswer(offer *webrtc.SessionDescription) *webrtc.SessionDescription {
+	h.t.Helper()
+	h.nego.handleSessionDesc(context.Background(), offer, h.out)
+	select {
+	case ev := <-h.out:
+		if ev.C2CEv == nil || ev.C2CEv.SessionDesc == nil || ev.C2CEv.SessionDesc.Type != webrtc.SDPTypeAnswer {
+			h.t.Fatalf("offer reply = %+v, want an answer", ev)
+		}
+		return ev.C2CEv.SessionDesc
+	default:
+		h.t.Fatal("offer produced no answer")
+		return nil
+	}
+}
+
+func TestPerfectNegotiatorKeepsPeerConnectionForSameFingerprintOffers(t *testing.T) {
+	t.Run("ICE restart", func(t *testing.T) {
+		h := newFingerprintNegotiatorHarness(t)
+		before := sdpICECredentials(h.remote.LocalDescription().SDP)
+		restart := setTestOffer(t, h.remote, &webrtc.OfferOptions{ICERestart: true})
+		if after := sdpICECredentials(restart.SDP); after == before || after == "" {
+			t.Fatal("test setup did not produce fresh ICE credentials")
+		}
+		answer := h.receiveAnswer(restart)
+		if h.replacements != 0 || h.nego.pc != h.original {
+			t.Fatal("same-fingerprint ICE restart replaced the peer connection")
+		}
+		if err := h.remote.SetRemoteDescription(*answer); err != nil {
+			t.Fatalf("remote.SetRemoteDescription(restart answer): %v", err)
+		}
+	})
+
+	t.Run("ordinary glare rollback", func(t *testing.T) {
+		h := newFingerprintNegotiatorHarness(t)
+		setTestOffer(t, h.original, nil)
+		collidingOffer := setTestOffer(t, h.remote, nil)
+		answer := h.receiveAnswer(collidingOffer)
+		if h.replacements != 0 || h.nego.pc != h.original {
+			t.Fatal("ordinary same-fingerprint glare replaced the peer connection")
+		}
+		if state := h.original.SignalingState(); state != webrtc.SignalingStateStable {
+			t.Fatalf("rollback left signaling state %s, want stable", state)
+		}
+		if err := h.remote.SetRemoteDescription(*answer); err != nil {
+			t.Fatalf("remote.SetRemoteDescription(glare answer): %v", err)
+		}
+	})
+}
+
+func TestPerfectNegotiatorReplacesPeerConnectionForChangedFingerprint(t *testing.T) {
+	for _, tc := range []struct {
+		name                string
+		offerHasApplication bool
+		collision           bool
+	}{
+		{name: "offerer announces data channels", offerHasApplication: true},
+		{name: "offer without application m-line"},
+		{name: "changed fingerprint wins glare", offerHasApplication: true, collision: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newFingerprintNegotiatorHarness(t)
+			freshRemote, err := webrtc.NewPeerConnection(webrtc.Configuration{})
+			if err != nil {
+				t.Fatalf("NewPeerConnection(fresh remote): %v", err)
+			}
+			t.Cleanup(func() { _ = freshRemote.Close() })
+			if tc.offerHasApplication {
+				if _, err := freshRemote.CreateDataChannel("known-label", nil); err != nil {
+					t.Fatalf("CreateDataChannel(fresh remote): %v", err)
+				}
+			} else {
+				if _, err := freshRemote.AddTransceiverFromKind(webrtc.RTPCodecTypeAudio); err != nil {
+					t.Fatalf("AddTransceiverFromKind: %v", err)
+				}
+			}
+			if tc.collision {
+				setTestOffer(t, h.original, nil)
+				h.nego.scheduleGlareRetryTimer()
+			}
+			h.nego.iceRestartPending = true
+			freshOffer := setTestOffer(t, freshRemote, nil)
+			answer := h.receiveAnswer(freshOffer)
+
+			if h.replacements != 1 || h.nego.pc == h.original {
+				t.Fatalf("changed fingerprint replacements=%d, want exactly one fresh PC", h.replacements)
+			}
+			if len(h.offerHasApplications) != 1 || h.offerHasApplications[0] != tc.offerHasApplication {
+				t.Fatalf("factory application flags=%v, want [%v]", h.offerHasApplications, tc.offerHasApplication)
+			}
+			if state := h.original.ConnectionState(); state != webrtc.PeerConnectionStateClosed {
+				t.Fatalf("replaced PC state=%s, want closed", state)
+			}
+			if h.nego.iceRestartPending || h.nego.glareRetryTimer != nil {
+				t.Fatal("replacement retained a redundant ICE restart or glare retry")
+			}
+			if state := h.nego.pc.SignalingState(); state != webrtc.SignalingStateStable {
+				t.Fatalf("fresh PC signaling state=%s, want stable", state)
+			}
+			if err := freshRemote.SetRemoteDescription(*answer); err != nil {
+				t.Fatalf("freshRemote.SetRemoteDescription(answer): %v", err)
+			}
+			h.nego.handleLocal(context.Background(), localEvent{source: h.original}, h.out)
+			if len(h.out) != 0 {
+				t.Fatal("a stale local event from the replaced PC reached the wire")
+			}
+		})
+	}
+}
+
+func TestPerfectNegotiatorDoesNotReplaceForUnusableDescriptions(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		kind webrtc.SDPType
+		sdp  func(string) string
+	}{
+		{name: "answer", kind: webrtc.SDPTypeAnswer, sdp: func(raw string) string { return raw }},
+		{name: "malformed offer", kind: webrtc.SDPTypeOffer, sdp: func(string) string { return "not SDP" }},
+		{name: "offer without fingerprint", kind: webrtc.SDPTypeOffer, sdp: withoutSDPFingerprints},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newFingerprintNegotiatorHarness(t)
+			freshRemote, err := webrtc.NewPeerConnection(webrtc.Configuration{})
+			if err != nil {
+				t.Fatalf("NewPeerConnection(fresh remote): %v", err)
+			}
+			t.Cleanup(func() { _ = freshRemote.Close() })
+			if _, err := freshRemote.CreateDataChannel("fresh", nil); err != nil {
+				t.Fatalf("CreateDataChannel: %v", err)
+			}
+			desc := *setTestOffer(t, freshRemote, nil)
+			desc.Type = tc.kind
+			desc.SDP = tc.sdp(desc.SDP)
+			h.nego.handleSessionDesc(context.Background(), &desc, h.out)
+			if h.replacements != 0 || h.nego.pc != h.original {
+				t.Fatalf("%s incorrectly replaced the peer connection", tc.name)
+			}
+		})
+	}
+}
+
+func withoutSDPFingerprints(raw string) string {
+	var b strings.Builder
+	for line := range strings.Lines(raw) {
+		if !strings.HasPrefix(line, "a=fingerprint:") {
+			b.WriteString(line)
+		}
+	}
+	return b.String()
+}
+
+func TestSessionDTLSFingerprintSemantics(t *testing.T) {
+	const base = "v=0\r\n" +
+		"o=- 1 1 IN IP4 127.0.0.1\r\n" +
+		"s=-\r\n" +
+		"t=0 0\r\n"
+	for _, tc := range []struct {
+		name string
+		raw  string
+		want string
+		ok   bool
+	}{
+		{
+			name: "session level takes precedence",
+			raw: base + "a=fingerprint:SHA-256 AA:BB\r\n" +
+				"a=group:BUNDLE 0\r\n" +
+				"m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n" +
+				"a=mid:0\r\n" +
+				"a=fingerprint:sha-256 CC:DD\r\n",
+			want: "sha-256 aa:bb", ok: true,
+		},
+		{
+			name: "first BUNDLE mid selects the media fingerprint",
+			raw: base + "a=group:BUNDLE 1 0\r\n" +
+				"m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n" +
+				"a=mid:0\r\n" +
+				"a=fingerprint:sha-256 AA:AA\r\n" +
+				"m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n" +
+				"a=mid:1\r\n" +
+				"a=fingerprint:SHA-256 BB:BB\r\n",
+			want: "sha-256 bb:bb", ok: true,
+		},
+		{
+			name: "shared non-BUNDLE media fingerprints match session-level form",
+			raw: base + "m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n" +
+				"a=mid:0\r\n" +
+				"a=fingerprint:sha-256 AA:BB\r\n" +
+				"m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n" +
+				"a=mid:1\r\n" +
+				"a=fingerprint:SHA-256 aa:bb\r\n",
+			want: "sha-256 aa:bb", ok: true,
+		},
+		{
+			name: "missing fingerprint",
+			raw: base + "m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n" +
+				"a=mid:0\r\n",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			desc := webrtc.SessionDescription{Type: webrtc.SDPTypeOffer, SDP: tc.raw}
+			parsed, err := desc.Unmarshal()
+			if err != nil {
+				t.Fatalf("Unmarshal: %v", err)
+			}
+			got, ok := sessionDTLSFingerprint(parsed)
+			if ok != tc.ok || got != tc.want {
+				t.Fatalf("sessionDTLSFingerprint()=(%q, %v), want (%q, %v)", got, ok, tc.want, tc.ok)
+			}
+		})
 	}
 }
 

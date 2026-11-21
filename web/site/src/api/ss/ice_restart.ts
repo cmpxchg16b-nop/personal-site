@@ -1,5 +1,10 @@
 "use client";
 
+export type IceRestartDiagnostic = (
+  event: string,
+  details?: Record<string, unknown>,
+) => void;
+
 export interface IceRestartControllerOptions {
   disconnectGraceMs?: number;
   retryBaseMs?: number;
@@ -8,6 +13,8 @@ export interface IceRestartControllerOptions {
   /** Starts a local ICE restart, or asks the polite peer to start one. */
   restart?: () => void;
   onRestartError?: (err: unknown) => void;
+  /** Read-only visibility into watchdog decisions; does not alter recovery. */
+  onEvent?: IceRestartDiagnostic;
 }
 
 const DEFAULT_DISCONNECT_GRACE_MS = 3_000;
@@ -29,6 +36,7 @@ export class IceRestartController {
   private readonly random: () => number;
   private readonly requestRestart: () => void;
   private readonly onRestartError: (err: unknown) => void;
+  private readonly onEvent?: IceRestartDiagnostic;
 
   private timer?: ReturnType<typeof setTimeout>;
   private usable = false;
@@ -49,6 +57,7 @@ export class IceRestartController {
     this.onRestartError =
       options.onRestartError ??
       ((err) => console.error("ICE restart failed", err));
+    this.onEvent = options.onEvent;
   }
 
   handleState(state: RTCIceConnectionState): void {
@@ -115,10 +124,14 @@ export class IceRestartController {
   }
 
   private markHealthy(): void {
+    const wasRecovering =
+      this.recovering || this.attempts > 0 || this.timer !== undefined;
+    const previousAttempts = this.attempts;
     this.usable = true;
     this.recovering = false;
     this.attempts = 0;
     this.stopTimer();
+    if (wasRecovering) this.emit("recovered", { previousAttempts });
   }
 
   private handleDisconnected(): void {
@@ -136,9 +149,11 @@ export class IceRestartController {
   }
 
   close(): void {
+    if (this.closed) return;
     this.closed = true;
     this.recovering = false;
     this.stopTimer();
+    this.emit("closed");
   }
 
   private stopTimer(): void {
@@ -154,6 +169,7 @@ export class IceRestartController {
       this.timer = undefined;
       this.restart();
     }, delayMs);
+    this.emit("watchdog:scheduled", { delayMs });
   }
 
   private restart(): void {
@@ -174,6 +190,7 @@ export class IceRestartController {
     }
 
     this.attempts += 1;
+    this.emit("restart:attempt");
     try {
       this.requestRestart();
     } catch (err) {
@@ -186,5 +203,18 @@ export class IceRestartController {
     const exponential = this.retryBaseMs * 2 ** Math.min(this.attempts - 1, 20);
     const capped = Math.min(this.retryMaxMs, exponential);
     return capped * (0.8 + this.random() * 0.4);
+  }
+
+  private emit(event: string, details: Record<string, unknown> = {}): void {
+    this.onEvent?.(event, {
+      iceConnectionState: this.pc.iceConnectionState,
+      connectionState: this.pc.connectionState,
+      signalingState: this.pc.signalingState,
+      usable: this.usable,
+      recovering: this.recovering,
+      attempts: this.attempts,
+      timerPending: this.timer !== undefined,
+      ...details,
+    });
   }
 }

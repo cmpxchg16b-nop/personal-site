@@ -43,6 +43,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { useICEServers } from "@/hooks/useICEServers";
+import {
+  createPeerDiagnostics,
+  summarizeSessionDescription,
+} from "./diagnostics";
 import { sameEndpointIdentity, type EndpointIdentity } from "./identity";
 import { PerfectNegotiator } from "./negotiate";
 import type { SSProxy } from "./proxy";
@@ -345,6 +349,12 @@ export interface PeerSessions {
     peer: SubscriberId,
     sender: RTCRtpSender,
   ): void;
+  /** Resolves a retained sender handle to the current transport's sender. */
+  resolveSender(
+    channelId: ChannelId,
+    peer: SubscriberId,
+    sender: RTCRtpSender,
+  ): RTCRtpSender | null;
   /**
    * Subscribes to remote track arrivals (pc.ontrack) of every session;
    * returns the unsubscribe function.
@@ -370,7 +380,36 @@ interface PeerSession {
   createChannel: (label: string) => void;
   sendSignalling: (event: SignallingEvent) => Promise<void>;
   setProxy: (proxy: SSProxy | null) => void;
+  addTrack: (
+    track: MediaStreamTrack,
+    ...streams: MediaStream[]
+  ) => RTCRtpSender;
+  removeTrack: (sender: RTCRtpSender) => void;
+  resolveSender: (sender: RTCRtpSender) => RTCRtpSender | null;
   close: () => void;
+}
+
+interface SessionLocalTrack {
+  track: MediaStreamTrack;
+  streams: MediaStream[];
+  sender: RTCRtpSender;
+  // Callers keep the sender returned when they joined. A transport rebuild
+  // changes the sender, but the original handle must still remove the track.
+  handles: Set<RTCRtpSender>;
+}
+
+function dtlsTransportStates(pc: RTCPeerConnection): RTCDtlsTransportState[] {
+  const transports = new Set<RTCDtlsTransport>();
+  for (const transceiver of pc.getTransceivers?.() ?? []) {
+    if (transceiver.sender.transport) {
+      transports.add(transceiver.sender.transport);
+    }
+    if (transceiver.receiver.transport) {
+      transports.add(transceiver.receiver.transport);
+    }
+  }
+  if (pc.sctp?.transport) transports.add(pc.sctp.transport);
+  return [...transports].map((transport) => transport.state);
 }
 
 // SessionHooks is how a peer session reports to the hook: a channel
@@ -411,8 +450,13 @@ function startPeerSession(
   inbox: PeerInbox,
   hooks: SessionHooks,
 ): PeerSession {
-  const pc = new RTCPeerConnection({ iceServers });
+  let pc = new RTCPeerConnection({ iceServers });
   const sessionId = crypto.randomUUID();
+  const localTracks: SessionLocalTrack[] = [];
+  const channelLabels = new Set<string>();
+  let closed = false;
+  let rebuilding = false;
+  let rebuildRetry: ReturnType<typeof setTimeout> | undefined;
   const session: PeerSession = {
     pc,
     channelId,
@@ -424,15 +468,43 @@ function startPeerSession(
     sendSignalling: () =>
       Promise.reject(new Error("peersessions: signalling output not ready")),
     setProxy: () => {},
+    addTrack: (track, ...streams) => {
+      const sender = pc.addTrack(track, ...streams);
+      localTracks.push({
+        track,
+        streams,
+        sender,
+        handles: new Set([sender]),
+      });
+      return sender;
+    },
+    removeTrack: (sender) => {
+      const index = localTracks.findIndex((local) => local.handles.has(sender));
+      if (index === -1 || pc.signalingState === "closed") return;
+      const local = localTracks[index];
+      pc.removeTrack(local.sender);
+      localTracks.splice(index, 1);
+    },
+    resolveSender: (sender) =>
+      localTracks.find((local) => local.handles.has(sender))?.sender ?? null,
     close: () => {},
   };
+  let diagnostics = createPeerDiagnostics(pc, {
+    sessionId,
+    channelId,
+    self,
+    peer,
+    polite: session.polite,
+  });
 
   // State diagnostics belong to the session rather than either consumer of
   // the PC: event listeners leave PerfectNegotiator's onice... handler and
-  // the media/data-channel handlers untouched. The actual PC is the final
-  // console argument so a developer can inspect the exact object in devtools.
+  // the media/data-channel handlers untouched. Console entries contain safe
+  // summaries; the raw PC and wire SDP are never dumped into the log.
   let previousConnectionState: RTCPeerConnectionState | null = null;
   let previousIceConnectionState: RTCIceConnectionState | null = null;
+  let hadHealthyConnection = false;
+  let statsTimer: ReturnType<typeof setInterval> | undefined;
   const trackContext = (track: MediaStreamTrack | null) =>
     track === null
       ? null
@@ -443,40 +515,46 @@ function startPeerSession(
           muted: track.muted,
           readyState: track.readyState,
         };
-  const descriptionContext = (description: RTCSessionDescription | null) =>
-    description === null
-      ? null
-      : {
-          type: description.type,
-          attributes: description.sdp
-            .split(/\r?\n/)
-            .filter(
-              (line) =>
-                line.startsWith("a=mid:") ||
-                line.startsWith("a=setup:") ||
-                line.startsWith("a=ice-ufrag:") ||
-                line.startsWith("a=fingerprint:"),
-            ),
-        };
+  const syncStatsMonitor = (event: string) => {
+    const healthy =
+      (pc.iceConnectionState === "connected" ||
+        pc.iceConnectionState === "completed") &&
+      pc.connectionState === "connected";
+    if (healthy) {
+      hadHealthyConnection = true;
+      if (statsTimer !== undefined) {
+        clearInterval(statsTimer);
+        statsTimer = undefined;
+        diagnostics.captureStats(`state:${event}:recovered`);
+      }
+      return;
+    }
+    // Do not sample the initial offer/connection ramp. Once a previously
+    // healthy call degrades, retain a compact transport timeline until it
+    // either recovers or the session closes.
+    if (!hadHealthyConnection) return;
+    diagnostics.captureStats(`state:${event}`);
+    if (statsTimer === undefined) {
+      statsTimer = setInterval(
+        () => diagnostics.captureStats("recovery:interval"),
+        5_000,
+      );
+    }
+  };
   const logState = (
-    event: "created" | "connectionstatechange" | "iceconnectionstatechange",
+    event:
+      | "created"
+      | "connectionstatechange"
+      | "iceconnectionstatechange"
+      | "icegatheringstatechange"
+      | "signalingstatechange",
   ) => {
-    const context = {
-      at: new Date().toISOString(),
-      event,
-      sessionId,
-      channelId,
-      self,
-      peer,
-      polite: session.polite,
+    diagnostics.log(event, {
       previousConnectionState,
       previousIceConnectionState,
-      connectionState: pc.connectionState,
-      iceConnectionState: pc.iceConnectionState,
-      signalingState: pc.signalingState,
-      iceGatheringState: pc.iceGatheringState,
-      localDescription: descriptionContext(pc.localDescription),
-      remoteDescription: descriptionContext(pc.remoteDescription),
+      localDescription: summarizeSessionDescription(pc.localDescription),
+      remoteDescription: summarizeSessionDescription(pc.remoteDescription),
+      dtlsTransportStates: dtlsTransportStates(pc),
       transceivers: (pc.getTransceivers?.() ?? []).map((transceiver) => ({
         mid: transceiver.mid,
         direction: transceiver.direction,
@@ -488,8 +566,8 @@ function startPeerSession(
         label: channel.label,
         readyState: channel.readyState,
       })),
-    };
-    console.info("[peersessions] RTCPeerConnection state", context, pc);
+    });
+    syncStatsMonitor(event);
     // Keep each state's previous value on its own event stream. The paired
     // ice.../connection... events then each show a real transition instead of
     // the first event erasing the second event's "previous" value.
@@ -507,40 +585,203 @@ function startPeerSession(
     if (event === "connectionstatechange" || pc.connectionState !== "new") {
       hooks.onConnectionState(channelId, peer, pc.connectionState);
     }
+    if (
+      hadHealthyConnection &&
+      pc.connectionState === "failed" &&
+      dtlsTransportStates(pc).includes("failed")
+    ) {
+      rebuildTransport(pc);
+    }
   };
   logState("created");
   const onConnectionStateChange = () => logState("connectionstatechange");
   const onIceConnectionStateChange = () => logState("iceconnectionstatechange");
-  pc.addEventListener("connectionstatechange", onConnectionStateChange);
-  pc.addEventListener("iceconnectionstatechange", onIceConnectionStateChange);
+  const onIceGatheringStateChange = () => logState("icegatheringstatechange");
+  const onSignalingStateChange = () => logState("signalingstatechange");
+  const onIceCandidateError = (event: RTCPeerConnectionIceErrorEvent) =>
+    diagnostics.log(
+      "ice:candidate:error",
+      { errorCode: event.errorCode, errorText: event.errorText },
+      "warn",
+    );
 
   // attach registers one channel of the session and reports it to the
   // label's subscribers; its opening resolves the whenOpenChannel
   // waiters.
   const attach = (label: string, dc: RTCDataChannel) => {
+    channelLabels.add(label);
+    const source = pc;
+    const sourceDiagnostics = diagnostics;
     session.channels.set(label, dc);
-    if (dc.readyState === "open") {
+    sourceDiagnostics.log("datachannel:attach", {
+      label,
+      readyState: dc.readyState,
+    });
+    const onOpen = () => {
+      if (pc !== source) return;
+      sourceDiagnostics.log("datachannel:open", { label });
       hooks.onChannelOpen(channelId, peer, label, dc);
+    };
+    if (dc.readyState === "open") {
+      onOpen();
     } else {
-      dc.addEventListener(
-        "open",
-        () => hooks.onChannelOpen(channelId, peer, label, dc),
-        { once: true },
-      );
+      dc.addEventListener("open", onOpen, { once: true });
     }
+    dc.addEventListener("close", () =>
+      sourceDiagnostics.log("datachannel:close", { label }),
+    );
+    dc.addEventListener("error", () =>
+      sourceDiagnostics.log("datachannel:error", { label }, "warn"),
+    );
     hooks.onChannel(channelId, peer, label, dc);
   };
   session.createChannel = (label) => {
+    channelLabels.add(label);
     if (!session.polite || session.channels.has(label)) return;
     attach(label, pc.createDataChannel(label));
   };
-  if (!session.polite) {
-    pc.ondatachannel = (e) => attach(e.channel.label, e.channel);
-  }
+  const onDataChannel = (event: RTCDataChannelEvent) =>
+    attach(event.channel.label, event.channel);
   // Remote tracks are multiplexed to the track subscribers; media
   // consumers (voice calls) attach and detach tracks freely — the
   // PerfectNegotiator owns the (re)negotiation they trigger.
-  pc.ontrack = (ev) => hooks.onTrack(channelId, peer, ev);
+  const onTrack = (ev: RTCTrackEvent) => {
+    diagnostics.log("track:remote", { track: trackContext(ev.track) });
+    hooks.onTrack(channelId, peer, ev);
+  };
+
+  function wirePeerConnection(target: RTCPeerConnection): void {
+    target.addEventListener("connectionstatechange", onConnectionStateChange);
+    target.addEventListener(
+      "iceconnectionstatechange",
+      onIceConnectionStateChange,
+    );
+    target.addEventListener(
+      "icegatheringstatechange",
+      onIceGatheringStateChange,
+    );
+    target.addEventListener("signalingstatechange", onSignalingStateChange);
+    target.addEventListener("icecandidateerror", onIceCandidateError);
+    if (!session.polite) {
+      target.ondatachannel = (event) => {
+        if (pc === target) onDataChannel(event);
+      };
+    }
+    target.ontrack = (event) => {
+      if (pc === target) onTrack(event);
+    };
+  }
+
+  function unwirePeerConnection(target: RTCPeerConnection): void {
+    target.removeEventListener(
+      "connectionstatechange",
+      onConnectionStateChange,
+    );
+    target.removeEventListener(
+      "iceconnectionstatechange",
+      onIceConnectionStateChange,
+    );
+    target.removeEventListener(
+      "icegatheringstatechange",
+      onIceGatheringStateChange,
+    );
+    target.removeEventListener("signalingstatechange", onSignalingStateChange);
+    target.removeEventListener("icecandidateerror", onIceCandidateError);
+    target.ondatachannel = null;
+    target.ontrack = null;
+  }
+
+  function scheduleRebuildRetry(): void {
+    if (closed || rebuildRetry !== undefined) return;
+    rebuildRetry = setTimeout(() => {
+      rebuildRetry = undefined;
+      rebuildTransport(pc);
+    }, 100);
+  }
+
+  function rebuildTransport(failedPc: RTCPeerConnection): void {
+    if (
+      closed ||
+      rebuilding ||
+      failedPc !== pc ||
+      !dtlsTransportStates(failedPc).includes("failed")
+    ) {
+      return;
+    }
+    if (!negotiator.canReplacePeerConnection()) {
+      scheduleRebuildRetry();
+      return;
+    }
+    rebuilding = true;
+    let fresh: RTCPeerConnection | undefined;
+    let adopted = false;
+    try {
+      fresh = new RTCPeerConnection({ iceServers });
+      const stockedTracks = localTracks.map((local) => ({
+        local,
+        sender: fresh!.addTrack(local.track, ...local.streams),
+      }));
+      // The fresh PC is the offerer, so it creates every known channel even if
+      // this end was impolite on the original transport. The answering Go peer
+      // detects the new DTLS identity and waits for these OnDataChannel events.
+      const stockedChannels = [...channelLabels].map((label) => ({
+        label,
+        channel: fresh!.createDataChannel(label),
+      }));
+      const nextDiagnostics = createPeerDiagnostics(fresh, {
+        sessionId,
+        channelId,
+        self,
+        peer,
+        polite: session.polite,
+      });
+      if (!negotiator.replacePeerConnection(fresh, nextDiagnostics)) {
+        fresh.close();
+        scheduleRebuildRetry();
+        return;
+      }
+      adopted = true;
+
+      const previousPc = pc;
+      const previousDiagnostics = diagnostics;
+      unwirePeerConnection(previousPc);
+      if (statsTimer !== undefined) clearInterval(statsTimer);
+      statsTimer = undefined;
+      if (rebuildRetry !== undefined) clearTimeout(rebuildRetry);
+      rebuildRetry = undefined;
+      pc = fresh;
+      session.pc = fresh;
+      diagnostics = nextDiagnostics;
+      session.channels = new Map();
+      for (const { local, sender } of stockedTracks) {
+        local.handles.add(sender);
+        local.sender = sender;
+      }
+      for (const { label, channel } of stockedChannels) attach(label, channel);
+      previousDiagnostics.log("transport:replaced", { reason: "dtls-failed" });
+      previousDiagnostics.close();
+      previousPc.close();
+      previousConnectionState = null;
+      previousIceConnectionState = null;
+      diagnostics.log("transport:rebuilt", { reason: "dtls-failed" });
+      wirePeerConnection(fresh);
+      logState("created");
+    } catch (err) {
+      diagnostics.log(
+        "transport:rebuild:error",
+        { error: String(err) },
+        "error",
+      );
+      if (!adopted) {
+        fresh?.close();
+        scheduleRebuildRetry();
+      }
+    } finally {
+      rebuilding = false;
+    }
+  }
+
+  wirePeerConnection(pc);
 
   const output = createPeerSignallingOutput(proxy);
   session.sendSignalling = output.write;
@@ -548,16 +789,19 @@ function startPeerSession(
     channelId,
     selfSubscriber: self,
     peerSubscriber: peer,
+    diagnostics,
   });
   session.setProxy = (next) => {
+    diagnostics.log("signalling:proxy", { connected: next !== null });
     output.setProxy(next);
     if (next !== null) {
       void negotiator
         .retransmitPendingOffer()
         .catch((err) =>
-          console.error(
-            `peersessions: cannot retransmit offer to ${peer} after reconnect`,
-            err,
+          diagnostics.log(
+            "signalling:retransmit:error",
+            { error: String(err) },
+            "error",
           ),
         );
     }
@@ -565,19 +809,23 @@ function startPeerSession(
   void negotiator
     .negotiate(inbox.stream, output.stream)
     .catch((err) =>
-      console.error(`peersessions: negotiation with ${peer} failed`, err),
+      diagnostics.log("negotiation:error", { error: String(err) }, "error"),
     );
 
   session.close = () => {
+    if (closed) return;
+    closed = true;
     // State listeners go first: close()'s queued "closed" event must not
     // report — a teardown is announced through onSessionClosed. Closing the
     // inbox ends negotiate(), which releases its stream locks; closing the
     // connection stops ICE and its events.
-    pc.removeEventListener("connectionstatechange", onConnectionStateChange);
-    pc.removeEventListener(
-      "iceconnectionstatechange",
-      onIceConnectionStateChange,
-    );
+    unwirePeerConnection(pc);
+    if (statsTimer !== undefined) clearInterval(statsTimer);
+    statsTimer = undefined;
+    if (rebuildRetry !== undefined) clearTimeout(rebuildRetry);
+    rebuildRetry = undefined;
+    diagnostics.log("session:closed");
+    diagnostics.close();
     output.close();
     inbox.close();
     pc.close();
@@ -1124,18 +1372,27 @@ export function usePeerSessions(
     ) => {
       const session = sessionsRef.current.get(peerKey(channelId, peer));
       if (session === undefined) return null;
-      return session.pc.addTrack(track, ...streams);
+      return session.addTrack(track, ...streams);
     },
     [],
   );
   const removeTrack = useCallback(
     (channelId: ChannelId, peer: SubscriberId, sender: RTCRtpSender) => {
       const session = sessionsRef.current.get(peerKey(channelId, peer));
-      if (session === undefined || session.pc.signalingState === "closed") {
-        return;
-      }
-      session.pc.removeTrack(sender);
+      if (session === undefined) return;
+      session.removeTrack(sender);
     },
+    [],
+  );
+  const resolveSender = useCallback(
+    (
+      channelId: ChannelId,
+      peer: SubscriberId,
+      sender: RTCRtpSender,
+    ): RTCRtpSender | null =>
+      sessionsRef.current
+        .get(peerKey(channelId, peer))
+        ?.resolveSender(sender) ?? null,
     [],
   );
   const subscribeTracks = useCallback((cb: PeerTrackHandler) => {
@@ -1155,6 +1412,7 @@ export function usePeerSessions(
       subscribeReset,
       addTrack,
       removeTrack,
+      resolveSender,
       subscribeTracks,
     }),
     [
@@ -1166,6 +1424,7 @@ export function usePeerSessions(
       subscribeReset,
       addTrack,
       removeTrack,
+      resolveSender,
       subscribeTracks,
     ],
   );

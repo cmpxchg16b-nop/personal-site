@@ -364,7 +364,11 @@ export function useCallMedia(
   const dtmfFor = useCallback(
     (channelId: ChannelId, peer: SubscriberId): DialerHandle | null => {
       const key = callKey(channelId, peer);
-      const sender = sendersRef.current.get(key);
+      const retained = sendersRef.current.get(key);
+      const sender =
+        retained === undefined
+          ? null
+          : sessions.resolveSender(channelId, peer, retained);
       if (sender?.dtmf == null) return null;
       const negotiated = sender
         .getParameters()
@@ -374,13 +378,17 @@ export function useCallMedia(
       if (!negotiated) return null;
       return {
         insert: (digit: string) => {
-          const live = sendersRef.current.get(key);
+          const retained = sendersRef.current.get(key);
+          const live =
+            retained === undefined
+              ? null
+              : sessions.resolveSender(channelId, peer, retained);
           if (live?.dtmf?.canInsertDTMF !== true) return;
           live.dtmf.insertDTMF(digit);
         },
       };
     },
-    [],
+    [sessions],
   );
 
   return {

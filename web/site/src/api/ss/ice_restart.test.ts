@@ -214,4 +214,38 @@ describe("IceRestartController", () => {
     vi.advanceTimersByTime(50);
     expect(pc.restartIce).toHaveBeenCalledTimes(2);
   });
+
+  it("emits watchdog timing, attempts and recovery diagnostics", () => {
+    const onEvent = vi.fn();
+    const { setState } = setup({ onEvent });
+    setState("connected");
+    setState("disconnected");
+    expect(onEvent).toHaveBeenCalledWith(
+      "watchdog:scheduled",
+      expect.objectContaining({
+        delayMs: 100,
+        attempts: 0,
+        recovering: true,
+        timerPending: true,
+      }),
+    );
+    vi.advanceTimersByTime(100);
+    expect(onEvent).toHaveBeenCalledWith(
+      "restart:attempt",
+      expect.objectContaining({
+        attempts: 1,
+        iceConnectionState: "disconnected",
+        connectionState: "disconnected",
+      }),
+    );
+    expect(onEvent).toHaveBeenCalledWith(
+      "watchdog:scheduled",
+      expect.objectContaining({ delayMs: 50, attempts: 1 }),
+    );
+    setState("connected");
+    expect(onEvent).toHaveBeenCalledWith(
+      "recovered",
+      expect.objectContaining({ previousAttempts: 1, attempts: 0 }),
+    );
+  });
 });

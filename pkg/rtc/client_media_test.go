@@ -575,3 +575,125 @@ func TestHeadlessRTCClientTracksSurviveGlare(t *testing.T) {
 		t.Fatalf("the RTP payload is %d bytes, want 160 (20 ms of PCMU)", len(pkt.Payload))
 	}
 }
+
+func TestHeadlessRTCClientFreshPCRebindsSessionMediaAndChannels(t *testing.T) {
+	for _, tc := range []struct {
+		name                string
+		offerHasApplication bool
+	}{
+		{name: "offerer announces channels", offerHasApplication: true},
+		{name: "polite client recreates channels without an application m-line"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			factory := defaultPeerConnectionFactory(nil)
+			original, err := factory(true)
+			if err != nil {
+				t.Fatalf("original factory: %v", err)
+			}
+			track := opusPinTestTrack(t, "music")
+			pin := []webrtc.RTPCodecParameters{
+				{RTPCodecCapability: webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus, ClockRate: 48000, Channels: 2}},
+				TelephoneEventCodec,
+			}
+			originalSender, err := original.AddTrack(track)
+			if err != nil {
+				_ = original.Close()
+				t.Fatalf("original AddTrack: %v", err)
+			}
+			if err := pinTransceiverCodecs(original, originalSender, pin); err != nil {
+				_ = original.Close()
+				t.Fatalf("original pinTransceiverCodecs: %v", err)
+			}
+			originalDC, err := original.CreateDataChannel("dcmsg", nil)
+			if err != nil {
+				_ = original.Close()
+				t.Fatalf("original CreateDataChannel: %v", err)
+			}
+
+			ctx, cancel := context.WithCancel(context.Background())
+			sess := &peerSession{
+				peer: "2-peer", polite: true, ctx: ctx, cancel: cancel,
+				in: make(chan *ss.SignallingEvent, 1), out: make(chan *ss.SignallingEvent, 1),
+				calls: make(chan callDelivery, 1), pc: original,
+				channels: map[string]*webrtc.DataChannel{"dcmsg": originalDC},
+				tracks:   []sessionTrack{{track: track, sender: originalSender, codecs: pin}},
+			}
+			run := &clientRun{sessions: map[ss.SubscriberId]*peerSession{sess.peer: sess}}
+			originalIn, originalOut, originalCalls := sess.in, sess.out, sess.calls
+			type delivery struct {
+				ctx context.Context
+				dc  *webrtc.DataChannel
+			}
+			handled := make(chan delivery, 1)
+			c := &HeadlessRTCClient{
+				newPC: factory, logger: testLogger(t), serviceChan: make(chan clientNote, 1),
+				handlers: map[string]DataChannelHandler{
+					"dcmsg": DataChannelHandlerFunc(func(handlerCtx context.Context, _ ss.ChannelId, _ ss.SubscriberId, dc *webrtc.DataChannel) {
+						handled <- delivery{ctx: handlerCtx, dc: dc}
+					}),
+				},
+			}
+			reply := make(chan rebuildReply, 1)
+			c.handleRebuildNote(run, rebuildNote{
+				sess: sess, offerHasApplication: tc.offerHasApplication, reply: reply,
+			})
+			r := <-reply
+			if r.err != nil {
+				_ = original.Close()
+				cancel()
+				t.Fatalf("handleRebuildNote: %v", r.err)
+			}
+			fresh := r.pc
+			t.Cleanup(func() {
+				cancel()
+				_ = original.Close()
+				_ = fresh.Close()
+			})
+			if fresh == nil || fresh == original || sess.pc != fresh {
+				t.Fatal("the session did not adopt a distinct fresh peer connection")
+			}
+			if sess.ctx != ctx || ctx.Err() != nil {
+				t.Fatal("rebuilding the PC canceled or replaced the session context")
+			}
+			if run.sessions[sess.peer] != sess || sess.in != originalIn ||
+				sess.out != originalOut || sess.calls != originalCalls {
+				t.Fatal("rebuilding the PC replaced the logical session or its queues")
+			}
+			if len(sess.tracks) != 1 || sess.tracks[0].track != track || sess.tracks[0].sender == originalSender {
+				t.Fatal("the fresh PC did not rebind the track and update its sender")
+			}
+			offer, err := fresh.CreateOffer(nil)
+			if err != nil {
+				t.Fatalf("fresh CreateOffer: %v", err)
+			}
+			if got, want := audioMFormats(t, offer.SDP), []string{"111", "126"}; !slices.Equal(got, want) {
+				t.Fatalf("fresh PC audio formats=%v, want restored codec pin %v", got, want)
+			}
+
+			if tc.offerHasApplication {
+				if len(sess.channels) != 0 || len(handled) != 0 || strings.Contains(offer.SDP, "m=application") {
+					t.Fatal("fresh PC created a duplicate local channel despite the offer's application m-line")
+				}
+			} else {
+				freshDC := sess.channels["dcmsg"]
+				if freshDC == nil || freshDC == originalDC || !strings.Contains(offer.SDP, "m=application") {
+					t.Fatal("polite fresh PC did not recreate the known data-channel label")
+				}
+				select {
+				case got := <-handled:
+					if got.ctx != ctx || got.dc != freshDC {
+						t.Fatal("recreated channel handler received the wrong session context or channel")
+					}
+				case <-time.After(testTimeout):
+					t.Fatal("recreated channel was not delivered exactly once to its handler")
+				}
+			}
+
+			before := sess.channels["dcmsg"]
+			c.handleAnnouncedNote(run, announcedNote{sess: sess, dc: originalDC, source: original})
+			if sess.channels["dcmsg"] != before || len(handled) != 0 {
+				t.Fatal("a queued channel callback from the replaced PC affected the fresh session")
+			}
+		})
+	}
+}

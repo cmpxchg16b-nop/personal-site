@@ -105,6 +105,7 @@ class MockSessions {
     subscribeReset: () => () => {},
     addTrack: () => null,
     removeTrack: () => {},
+    resolveSender: () => null,
     subscribeTracks: () => () => {},
   };
 

@@ -288,9 +288,19 @@ class MockProxy {
 }
 
 class MockDataChannel {
-  readonly readyState = "connecting";
+  readyState = "connecting";
+  private readonly listeners = new Map<string, Set<() => void>>();
   constructor(readonly label: string) {}
-  addEventListener(): void {}
+  addEventListener(type: string, listener: () => void): void {
+    const listeners = this.listeners.get(type) ?? new Set();
+    listeners.add(listener);
+    this.listeners.set(type, listeners);
+  }
+  emit(type: "open" | "close" | "error"): void {
+    if (type === "open") this.readyState = "open";
+    if (type === "close") this.readyState = "closed";
+    for (const listener of this.listeners.get(type) ?? []) listener();
+  }
 }
 
 class MockPeerConnection {
@@ -298,6 +308,13 @@ class MockPeerConnection {
 
   readonly candidates: RTCIceCandidateInit[] = [];
   readonly createdChannels: MockDataChannel[] = [];
+  readonly addedTracks: {
+    track: MediaStreamTrack;
+    streams: MediaStream[];
+    sender: RTCRtpSender;
+  }[] = [];
+  readonly removedSenders: RTCRtpSender[] = [];
+  dtlsState: RTCDtlsTransportState = "new";
   localDescription: RTCSessionDescriptionInit | null = null;
   remoteDescription: RTCSessionDescriptionInit | null = null;
   signalingState: RTCSignalingState = "stable";
@@ -312,6 +329,10 @@ class MockPeerConnection {
   onconnectionstatechange: (() => void) | null = null;
   private stateListeners = new Map<string, Set<() => void>>();
 
+  get sctp() {
+    return { transport: { state: this.dtlsState } };
+  }
+
   constructor() {
     MockPeerConnection.instances.push(this);
   }
@@ -323,6 +344,19 @@ class MockPeerConnection {
       this.onnegotiationneeded?.(new Event("negotiationneeded")),
     );
     return channel as unknown as RTCDataChannel;
+  }
+
+  addTrack(track: MediaStreamTrack, ...streams: MediaStream[]): RTCRtpSender {
+    const sender = { track } as RTCRtpSender;
+    this.addedTracks.push({ track, streams, sender });
+    queueMicrotask(() =>
+      this.onnegotiationneeded?.(new Event("negotiationneeded")),
+    );
+    return sender;
+  }
+
+  removeTrack(sender: RTCRtpSender): void {
+    this.removedSenders.push(sender);
   }
 
   async setLocalDescription(description?: RTCSessionDescriptionInit) {
@@ -344,6 +378,10 @@ class MockPeerConnection {
   }
 
   restartIce(): void {}
+
+  async getStats(): Promise<RTCStatsReport> {
+    return new Map() as RTCStatsReport;
+  }
 
   addEventListener(type: string, listener: () => void): void {
     const listeners = this.stateListeners.get(type) ?? new Set();
@@ -616,7 +654,7 @@ describe("usePeerSessions startup lifecycle", () => {
         ],
       ).toBe("connected");
       expect(info).toHaveBeenCalledWith(
-        "[peersessions] RTCPeerConnection state",
+        `[rtc ${me.subscriberId}→${peer.subscriberId}]`,
         expect.objectContaining({
           event: "iceconnectionstatechange",
           sessionId: expect.any(String),
@@ -626,11 +664,103 @@ describe("usePeerSessions startup lifecycle", () => {
           connectionState: "connected",
           iceConnectionState: "connected",
         }),
-        pc,
       );
     } finally {
       info.mockRestore();
     }
+  });
+
+  it("replaces only a failed DTLS transport while preserving the logical session", async () => {
+    const me = self("1000");
+    const sessions = runtime.render(me, listing([peer])).sessions;
+    await flushMicrotasks();
+    const original = MockPeerConnection.instances[0];
+    const onChannel = vi.fn();
+    const onReset = vi.fn();
+    sessions.subscribeReset(onReset);
+    const originalChannel = new MockDataChannel("dcmsg");
+    original.ondatachannel?.({
+      channel: originalChannel as unknown as RTCDataChannel,
+    });
+    // The subscription can arrive after OnDataChannel; the received label must
+    // still be part of a later transport replacement.
+    sessions.subscribeChannel("dcmsg", onChannel);
+    let openedChannel: RTCDataChannel | null | undefined;
+    const opened = sessions
+      .whenOpenChannel("dcmsg", channelId, peer.subscriberId)
+      .then((channel) => {
+        openedChannel = channel;
+      });
+    const track = { id: "mic", kind: "audio" } as MediaStreamTrack;
+    const originalSender = sessions.addTrack(
+      channelId,
+      peer.subscriberId,
+      track,
+    );
+    expect(originalSender).not.toBeNull();
+    await flushMicrotasks();
+
+    original.dtlsState = "connected";
+    original.setState("connected");
+    original.signalingState = "stable";
+    original.iceConnectionState = "failed";
+    original.connectionState = "failed";
+    original.emitStateEvent("connectionstatechange");
+    // Aggregate failure with a live DTLS association remains ICE-restartable.
+    expect(MockPeerConnection.instances).toHaveLength(1);
+
+    original.iceConnectionState = "connected";
+    original.dtlsState = "failed";
+    original.emitStateEvent("connectionstatechange");
+    expect(MockPeerConnection.instances).toHaveLength(2);
+    const fresh = MockPeerConnection.instances[1];
+    expect(original.signalingState).toBe("closed");
+    expect(onReset).not.toHaveBeenCalled();
+    expect(fresh.createdChannels.map((channel) => channel.label)).toEqual([
+      "dcmsg",
+    ]);
+    expect(fresh.addedTracks.map((added) => added.track)).toEqual([track]);
+    expect(onChannel).toHaveBeenLastCalledWith(
+      channelId,
+      peer.subscriberId,
+      fresh.createdChannels[0],
+    );
+
+    await flushMicrotasks();
+    expect(fresh.localDescription?.type).toBe("offer");
+    expect(proxy.outgoing.at(-1)?.c2CEv?.sessionDesc?.type).toBe("offer");
+    originalChannel.emit("open");
+    await flushMicrotasks();
+    expect(openedChannel).toBeUndefined();
+    fresh.createdChannels[0].emit("open");
+    await opened;
+    expect(openedChannel).toBe(fresh.createdChannels[0]);
+    expect(
+      sessions.resolveSender(
+        channelId,
+        peer.subscriberId,
+        originalSender as RTCRtpSender,
+      ),
+    ).toBe(fresh.addedTracks[0].sender);
+    sessions.removeTrack(
+      channelId,
+      peer.subscriberId,
+      originalSender as RTCRtpSender,
+    );
+    expect(fresh.removedSenders).toEqual([fresh.addedTracks[0].sender]);
+
+    // Late events from the replaced PC cannot trigger another replacement.
+    original.emitStateEvent("connectionstatechange");
+    expect(MockPeerConnection.instances).toHaveLength(2);
+    fresh.signalingState = "stable";
+    fresh.dtlsState = "connected";
+    fresh.setState("connected");
+    expect(
+      runtime.render(me, listing([peer])).connectionStates[channelId][
+        peer.subscriberId
+      ],
+    ).toBe("connected");
+    expect(onReset).not.toHaveBeenCalled();
   });
 
   it("replays an offer and candidate received before the peer appears in membership", async () => {

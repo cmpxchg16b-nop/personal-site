@@ -18,6 +18,13 @@
  * wires one negotiator per peer to it.
  */
 
+import {
+  diagnosticError,
+  sessionDescriptionDtlsFingerprints,
+  summarizeSessionDescription,
+  type PeerDiagnostics,
+  type RtcDiagnosticLevel,
+} from "./diagnostics";
 import { IceRestartController } from "./ice_restart";
 
 const GLARE_RETRY_MS = 2_000;
@@ -66,6 +73,9 @@ export interface PerfectNegotiatorOptions {
 
   /** Subscriber id of the remote peer to negotiate with. */
   peerSubscriber: SubscriberId;
+
+  /** Optional structured console diagnostics owned by the peer session. */
+  diagnostics?: PeerDiagnostics;
 }
 
 /**
@@ -101,8 +111,12 @@ export class PerfectNegotiator implements RTCNegotiator {
   public readonly polite: boolean;
 
   private writer?: WritableStreamDefaultWriter<SignallingEvent>;
-  private pendingOffer?: Promise<void>;
+  private pendingOffer?: Promise<MsgId | undefined>;
   private glareRetryTimer?: ReturnType<typeof setTimeout>;
+  private iceRestart?: IceRestartController;
+  private detachCurrent?: () => void;
+  private handlingSignalling = false;
+  private readonly retiredRemoteFingerprints = new Set<string>();
 
   /**
    * @param pc the peer connection to negotiate on. The caller keeps
@@ -113,7 +127,7 @@ export class PerfectNegotiator implements RTCNegotiator {
    *   an event listener so ICE recovery also tracks aggregate DTLS health.
    */
   constructor(
-    private readonly pc: RTCPeerConnection,
+    private pc: RTCPeerConnection,
     private readonly options: PerfectNegotiatorOptions,
   ) {
     // Subscriber ids are unique within a channel (the SS rejects
@@ -137,58 +151,7 @@ export class PerfectNegotiator implements RTCNegotiator {
     this.writer = writer;
     const reader = ssEvIn.getReader();
 
-    // Outgoing half of the pattern: local descriptions and trickled ICE
-    // candidates are pushed to the peer as WebRTC produces them.
-    this.pc.onnegotiationneeded = async () => {
-      try {
-        this.makingOffer = true;
-        await this.pc.setLocalDescription();
-        const description = this.localDescription();
-        if (description !== undefined) {
-          await this.sendOffer(description);
-        }
-        logSdp(this.tag(), "send offer", this.localDescription());
-      } catch (err) {
-        console.error(err);
-      } finally {
-        this.makingOffer = false;
-      }
-    };
-    this.pc.onicecandidate = ({ candidate }) => {
-      // A null candidate means end-of-candidates; on the wire it is an
-      // empty-candidate init, which addIceCandidate() treats the same.
-      this.sendToPeer({
-        rtcICECandidate: candidate ?? { candidate: "" },
-      }).catch(console.error);
-    };
-    const onRestartError = (err: unknown) =>
-      console.error(`${this.tag()}: ICE restart failed`, err);
-    const iceRestart = new IceRestartController(this.pc, {
-      // Only the polite peer originates automated restart offers. Letting both
-      // sides offer together would create glare on every shared outage.
-      restart: () => {
-        if (this.polite) {
-          this.pc.restartIce();
-        } else {
-          this.sendToPeer({ iceRestartRequest: true }).catch(onRestartError);
-        }
-        // restartIce() need not fire negotiationneeded while an offer is
-        // unanswered. Retry the actual signalling transaction as well, or a
-        // lost offer/answer leaves every later watchdog tick doing nothing.
-        void this.retransmitPendingOffer().catch(onRestartError);
-      },
-      onRestartError,
-    });
-    this.pc.oniceconnectionstatechange = () =>
-      iceRestart.handleState(this.pc.iceConnectionState);
-    const onConnectionStateChange = () =>
-      iceRestart.handleConnectionState(this.pc.connectionState);
-    this.pc.addEventListener(
-      "connectionstatechange",
-      onConnectionStateChange,
-    );
-    iceRestart.handleState(this.pc.iceConnectionState);
-    iceRestart.handleConnectionState(this.pc.connectionState);
+    this.attach();
 
     // Incoming half: consume signalling events until the stream closes.
     try {
@@ -200,19 +163,190 @@ export class PerfectNegotiator implements RTCNegotiator {
         await this.handle(value);
       }
     } finally {
-      this.pc.onnegotiationneeded = null;
-      this.pc.onicecandidate = null;
-      this.pc.oniceconnectionstatechange = null;
-      this.pc.removeEventListener(
-        "connectionstatechange",
-        onConnectionStateChange,
-      );
-      iceRestart.close();
+      this.detach();
       this.stopGlareRetryTimer();
       reader.releaseLock();
       writer.releaseLock();
       this.writer = undefined;
     }
+  }
+
+  /** Whether the current transport can be swapped without interrupting SDP. */
+  public canReplacePeerConnection(): boolean {
+    return (
+      this.writer !== undefined &&
+      !this.makingOffer &&
+      !this.handlingSignalling &&
+      this.pc.signalingState === "stable"
+    );
+  }
+
+  /**
+   * Adopts a stocked fresh PC for recovery from a terminal DTLS transport.
+   * The signalling streams and logical peer session stay in place. The caller
+   * closes the old PC after this synchronous, generation-safe swap.
+   */
+  public replacePeerConnection(
+    next: RTCPeerConnection,
+    diagnostics?: PeerDiagnostics,
+  ): boolean {
+    if (!this.canReplacePeerConnection() || next === this.pc) return false;
+    for (const description of [
+      this.pc.currentRemoteDescription,
+      this.pc.remoteDescription,
+    ]) {
+      for (const fingerprint of sessionDescriptionDtlsFingerprints(
+        description,
+      )) {
+        this.retiredRemoteFingerprints.add(fingerprint);
+      }
+    }
+    this.detach();
+    this.pc = next;
+    this.options.diagnostics = diagnostics;
+    this.pendingOffer = undefined;
+    this.ignoreOffer = false;
+    this.isSettingRemoteAnswerPending = false;
+    this.stopGlareRetryTimer();
+    this.attach();
+    // Adding tracks/channels before the negotiator attached need not produce a
+    // fresh negotiationneeded event. Explicitly start the replacement offer;
+    // an event already queued by the browser makes this a no-op in stable only
+    // after the first offer has begun.
+    queueMicrotask(() => {
+      if (
+        this.pc === next &&
+        next.signalingState === "stable" &&
+        !this.makingOffer
+      ) {
+        next.onnegotiationneeded?.(new Event("negotiationneeded"));
+      }
+    });
+    return true;
+  }
+
+  private attach(): void {
+    const pc = this.pc;
+    const isCurrent = () => this.pc === pc;
+    // Local descriptions and trickled ICE candidates carry the identity of
+    // their source PC: an old async continuation must not write into its
+    // replacement's negotiation.
+    pc.onnegotiationneeded = async () => {
+      if (!isCurrent()) return;
+      try {
+        this.makingOffer = true;
+        this.log("negotiationneeded");
+        await pc.setLocalDescription();
+        if (!isCurrent()) return;
+        const description = this.localDescription();
+        this.logDescription(
+          "sdp:local:created",
+          description,
+          "local description",
+        );
+        if (description !== undefined) {
+          const msgId = await this.sendOffer(description);
+          if (!isCurrent()) return;
+          this.logDescription("sdp:offer:sent", description, "send offer", {
+            msgId: msgId ?? null,
+          });
+        }
+      } catch (err) {
+        if (isCurrent()) {
+          this.log("sdp:offer:error", { error: diagnosticError(err) }, "error");
+        }
+      } finally {
+        if (isCurrent()) this.makingOffer = false;
+      }
+    };
+    pc.onicecandidate = ({ candidate }) => {
+      if (!isCurrent()) return;
+      // A null candidate means end-of-candidates; on the wire it is an
+      // empty-candidate init, which addIceCandidate() treats the same.
+      this.sendToPeer({
+        rtcICECandidate: candidate ?? { candidate: "" },
+      })
+        .then((msgId) => {
+          if (isCurrent()) {
+            this.log(
+              "ice:candidate:sent",
+              { msgId: msgId ?? null, endOfCandidates: candidate === null },
+              "debug",
+            );
+          }
+        })
+        .catch((err) => {
+          if (isCurrent()) {
+            this.log(
+              "ice:candidate:send:error",
+              { error: diagnosticError(err) },
+              "error",
+            );
+          }
+        });
+    };
+    const onRestartError = (err: unknown) => {
+      if (isCurrent()) {
+        this.log("ice:restart:error", { error: diagnosticError(err) }, "error");
+      }
+    };
+    const iceRestart = new IceRestartController(pc, {
+      // Only the polite peer originates automated restart offers. Letting both
+      // sides offer together would create glare on every shared outage.
+      restart: () => {
+        if (!isCurrent()) return;
+        this.log("ice:restart:execute", {
+          mode: this.polite ? "local-offer" : "remote-request",
+        });
+        if (this.polite) {
+          pc.restartIce();
+        } else {
+          this.sendToPeer({ iceRestartRequest: true })
+            .then((msgId) => {
+              if (isCurrent()) {
+                this.log("ice:restart:request:sent", { msgId: msgId ?? null });
+              }
+            })
+            .catch(onRestartError);
+        }
+        // restartIce() need not fire negotiationneeded while an offer is
+        // unanswered. Retry the actual signalling transaction as well, or a
+        // lost offer/answer leaves every later watchdog tick doing nothing.
+        void this.retransmitPendingOffer().catch(onRestartError);
+      },
+      onRestartError,
+      onEvent: (event, details) => {
+        if (!isCurrent()) return;
+        this.log(event, details);
+        if (event === "restart:attempt") {
+          this.options.diagnostics?.captureStats("restart:attempt");
+        }
+      },
+    });
+    this.iceRestart = iceRestart;
+    pc.oniceconnectionstatechange = () => {
+      if (isCurrent()) iceRestart.handleState(pc.iceConnectionState);
+    };
+    const onConnectionStateChange = () => {
+      if (isCurrent()) iceRestart.handleConnectionState(pc.connectionState);
+    };
+    pc.addEventListener("connectionstatechange", onConnectionStateChange);
+    this.detachCurrent = () => {
+      pc.onnegotiationneeded = null;
+      pc.onicecandidate = null;
+      pc.oniceconnectionstatechange = null;
+      pc.removeEventListener("connectionstatechange", onConnectionStateChange);
+      iceRestart.close();
+      if (this.iceRestart === iceRestart) this.iceRestart = undefined;
+    };
+    iceRestart.handleState(pc.iceConnectionState);
+    iceRestart.handleConnectionState(pc.connectionState);
+  }
+
+  private detach(): void {
+    const detach = this.detachCurrent;
+    this.detachCurrent = undefined;
+    detach?.();
   }
 
   /**
@@ -223,11 +357,25 @@ export class PerfectNegotiator implements RTCNegotiator {
    * candidates gathered since the original emission.
    */
   public async retransmitPendingOffer(): Promise<void> {
-    if (this.pc.signalingState !== "have-local-offer") return;
+    if (this.pc.signalingState !== "have-local-offer") {
+      this.log(
+        "sdp:offer:retransmit:skip",
+        {
+          reason: "no-local-offer",
+        },
+        "debug",
+      );
+      return;
+    }
     const description = this.localDescription();
     if (description === undefined) return;
-    await this.sendOffer(description);
-    logSdp(this.tag(), "retransmit offer", description);
+    const msgId = await this.sendOffer(description);
+    this.logDescription(
+      "sdp:offer:retransmitted",
+      description,
+      "retransmit offer",
+      { msgId: msgId ?? null, coalesced: msgId === undefined },
+    );
   }
 
   /** Handles one inbound signalling event; non-c2c or foreign-peer events are ignored. */
@@ -242,9 +390,28 @@ export class PerfectNegotiator implements RTCNegotiator {
       return;
     }
 
+    this.handlingSignalling = true;
     try {
       if (c2c.sessionDesc) {
         const description = c2c.sessionDesc;
+        const fingerprints = sessionDescriptionDtlsFingerprints(description);
+        if (
+          fingerprints.some((fingerprint) =>
+            this.retiredRemoteFingerprints.has(fingerprint),
+          )
+        ) {
+          // Ordered signalling can still contain an old offer retransmission or
+          // its answer after the fresh PC is adopted. Such SDP must never win a
+          // fresh-PC glare or complete the fresh offer with retired credentials.
+          this.ignoreOffer = description.type === "offer";
+          this.logDescription(
+            "sdp:stale:ignored",
+            description,
+            "ignore retired transport description",
+            { msgId: ev.msgId },
+          );
+          return;
+        }
         const readyForOffer =
           !this.makingOffer &&
           (this.pc.signalingState === "stable" ||
@@ -253,20 +420,38 @@ export class PerfectNegotiator implements RTCNegotiator {
 
         this.ignoreOffer = !this.polite && offerCollision;
         if (this.ignoreOffer) {
+          this.logDescription(
+            "sdp:offer:ignored",
+            description,
+            "ignore offer",
+            { msgId: ev.msgId, collision: true },
+          );
           // The polite peer cannot yield until it receives our pending offer.
           // Retry only a glare that stays unresolved: immediate duplicates can
           // themselves keep the polite peer rolling back an ordinary glare.
           this.scheduleGlareRetryTimer();
           return;
         }
-        logSdp(this.tag(), `apply remote ${description.type}`, description, {
-          signalingState: this.pc.signalingState,
-          collision: offerCollision,
-          polite: this.polite,
-        });
+        this.logDescription(
+          `sdp:${description.type}:apply:start`,
+          description,
+          `apply remote ${description.type}`,
+          {
+            msgId: ev.msgId,
+            collision: offerCollision,
+            makingOffer: this.makingOffer,
+            isSettingRemoteAnswerPending: this.isSettingRemoteAnswerPending,
+          },
+        );
         this.isSettingRemoteAnswerPending = description.type === "answer";
         await this.pc.setRemoteDescription(description);
         this.isSettingRemoteAnswerPending = false;
+        this.logDescription(
+          `sdp:${description.type}:apply:ok`,
+          description,
+          `applied remote ${description.type}`,
+          { msgId: ev.msgId },
+        );
         if (this.pc.signalingState === "stable") {
           this.stopGlareRetryTimer();
         }
@@ -275,20 +460,38 @@ export class PerfectNegotiator implements RTCNegotiator {
           // for the polite peer on a collision it also implicitly rolls
           // back the offer it was making.
           await this.pc.setLocalDescription();
-          await this.sendToPeer({ sessionDesc: this.localDescription() });
-          logSdp(this.tag(), "send answer", this.localDescription());
+          const answer = this.localDescription();
+          const msgId = await this.sendToPeer({ sessionDesc: answer });
+          this.logDescription("sdp:answer:sent", answer, "send answer", {
+            msgId: msgId ?? null,
+            inReplyTo: ev.msgId,
+          });
         }
       } else if (c2c.rtcICECandidate) {
         try {
           await this.pc.addIceCandidate(c2c.rtcICECandidate);
+          this.log(
+            "ice:candidate:applied",
+            {
+              msgId: ev.msgId,
+              endOfCandidates: c2c.rtcICECandidate.candidate === "",
+            },
+            "debug",
+          );
         } catch (err) {
           // Candidates belonging to an offer we chose to ignore are
           // expected to fail; everything else is a real error.
           if (!this.ignoreOffer) {
             throw err;
           }
+          this.log(
+            "ice:candidate:ignored",
+            { msgId: ev.msgId, error: diagnosticError(err) },
+            "debug",
+          );
         }
       } else if (c2c.iceRestartRequest && this.polite) {
+        this.log("ice:restart:request:received", { msgId: ev.msgId });
         // restartIce() latches through any in-flight negotiation. Also repeat
         // an unanswered offer: the requester's original answer may be the
         // message that was lost, and restartIce() alone need not emit SDP.
@@ -296,11 +499,15 @@ export class PerfectNegotiator implements RTCNegotiator {
         await this.retransmitPendingOffer();
       }
     } catch (err) {
-      logSdp(this.tag(), "FAILED", c2c.sessionDesc, {
-        signalingState: this.pc.signalingState,
-        polite: this.polite,
-      });
-      console.error(err);
+      this.logDescription(
+        "signalling:handle:error",
+        c2c.sessionDesc,
+        "FAILED",
+        { msgId: ev.msgId, error: diagnosticError(err) },
+        "error",
+      );
+    } finally {
+      this.handlingSignalling = false;
     }
   }
 
@@ -315,15 +522,23 @@ export class PerfectNegotiator implements RTCNegotiator {
     this.glareRetryTimer = setTimeout(() => {
       this.glareRetryTimer = undefined;
       void this.retransmitPendingOffer()
-        .catch(console.error)
+        .catch((err) =>
+          this.log(
+            "glare:retry:error",
+            { error: diagnosticError(err) },
+            "error",
+          ),
+        )
         .finally(() => this.scheduleGlareRetryTimer());
     }, GLARE_RETRY_MS);
+    this.log("glare:retry:scheduled", { delayMs: GLARE_RETRY_MS });
   }
 
   private stopGlareRetryTimer(): void {
     if (this.glareRetryTimer !== undefined) {
       clearTimeout(this.glareRetryTimer);
       this.glareRetryTimer = undefined;
+      this.log("glare:retry:stopped");
     }
   }
 
@@ -333,15 +548,15 @@ export class PerfectNegotiator implements RTCNegotiator {
   // stale socket), reconnect may retransmit the latest localDescription.
   private async sendOffer(
     description: RTCSessionDescriptionInit,
-  ): Promise<void> {
+  ): Promise<MsgId | undefined> {
     if (this.pendingOffer !== undefined) {
       await this.pendingOffer;
-      return;
+      return undefined;
     }
     const write = this.sendToPeer({ sessionDesc: description });
     this.pendingOffer = write;
     try {
-      await write;
+      return await write;
     } finally {
       if (this.pendingOffer === write) {
         this.pendingOffer = undefined;
@@ -351,6 +566,39 @@ export class PerfectNegotiator implements RTCNegotiator {
 
   private localDescription(): RTCSessionDescriptionInit | undefined {
     return this.pc.localDescription ?? undefined;
+  }
+
+  private log(
+    event: string,
+    details: Record<string, unknown> = {},
+    level: RtcDiagnosticLevel = "info",
+  ): void {
+    if (this.options.diagnostics) {
+      this.options.diagnostics.log(event, details, level);
+    } else {
+      console[level](this.tag(), event, details);
+    }
+  }
+
+  private logDescription(
+    event: string,
+    description: RTCSessionDescriptionInit | null | undefined,
+    fallbackWhat: string,
+    details: Record<string, unknown> = {},
+    level: RtcDiagnosticLevel = "info",
+  ): void {
+    if (this.options.diagnostics) {
+      this.options.diagnostics.log(
+        event,
+        {
+          ...details,
+          description: summarizeSessionDescription(description),
+        },
+        level,
+      );
+    } else {
+      logSdp(this.tag(), fallbackWhat, description ?? undefined, details);
+    }
   }
 
   /** The log tag identifying this negotiation pair. */
@@ -364,9 +612,9 @@ export class PerfectNegotiator implements RTCNegotiator {
       ClientToClientEv,
       "sessionDesc" | "rtcICECandidate" | "iceRestartRequest"
     >,
-  ): Promise<void> {
+  ): Promise<MsgId | undefined> {
     if (!this.writer) {
-      return;
+      return undefined;
     }
     const ev: SignallingEvent = {
       // `from` is left empty: the server-side transport populates it from
@@ -384,6 +632,7 @@ export class PerfectNegotiator implements RTCNegotiator {
       },
     };
     await this.writer.write(ev);
+    return ev.msgId;
   }
 }
 

@@ -47,11 +47,13 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
+	pionsdp "github.com/pion/sdp/v3"
 	"github.com/pion/webrtc/v4"
 
 	"personal-site/pkg/models/ss"
@@ -104,6 +106,18 @@ type PerfectNegotiatorOptions struct {
 	// PeerSubscriber is the subscriber id of the remote peer to
 	// negotiate with.
 	PeerSubscriber ss.SubscriberId
+
+	// NewPeerConnection replaces the local connection when an inbound offer's
+	// DTLS fingerprint differs from the previous stable remote description.
+	// offerHasApplication reports whether that offer already has an application
+	// m-line: the offerer will announce its data channels, so the client must not
+	// create duplicate local channels before applying the offer. Without one, a
+	// polite client may create its known labels and negotiate them normally.
+	// The factory must return a fresh connection with the session's tracks,
+	// codec preferences, and client handlers restored. The negotiator attaches
+	// its own handlers, applies the offer, answers it, and closes the old PC.
+	// Ordinary ICE restarts and glare never call this factory.
+	NewPeerConnection func(offerHasApplication bool) (*webrtc.PeerConnection, error)
 
 	// Logger receives the negotiation's error diagnostics, mirroring
 	// the frontend's console.error calls; nil selects slog's default
@@ -204,7 +218,7 @@ const (
 // localEvent is one piece of work a pion callback hands to the Negotiate
 // loop: negotiation-needed, a gathered candidate, or an ICE state change.
 // source identifies the originating connection, so any queued callback from a
-// connection replaced during glare cannot affect its replacement.
+// replaced connection cannot affect its replacement.
 type localEvent struct {
 	negotiationNeeded bool
 	candidate         *webrtc.ICECandidate
@@ -225,6 +239,10 @@ type localEvent struct {
 // making any change to pc that triggers negotiation, and start
 // Negotiate promptly — before the first run, callback deliveries
 // buffer up (up to localEventBuffer of them).
+//
+// When options.NewPeerConnection is set, ownership is shared for the one
+// fingerprint-change case documented there: the negotiator adopts the stocked
+// replacement and closes the replaced connection.
 func NewPerfectNegotiator(pc *webrtc.PeerConnection, options PerfectNegotiatorOptions) (*PerfectNegotiator, error) {
 	if pc == nil {
 		return nil, ErrNilPeerConnection
@@ -439,8 +457,12 @@ func (n *PerfectNegotiator) handleSessionDesc(ctx context.Context, desc *webrtc.
 	readyForOffer := !n.makingOffer &&
 		(n.pc.SignalingState() == webrtc.SignalingStateStable || n.isSettingRemoteAnswerPending)
 	offerCollision := desc.Type == webrtc.SDPTypeOffer && !readyForOffer
+	replacePC, offerHasApplication := n.remoteOfferNeedsReplacement(desc)
 
-	n.ignoreOffer = !n.Polite && offerCollision
+	// A changed DTLS fingerprint identifies the remote's deliberate fresh-PC
+	// recovery offer, not ordinary glare. Accept it even if a local offer is in
+	// flight; rolling back or ignoring it would preserve the failed DTLS transport.
+	n.ignoreOffer = !n.Polite && offerCollision && !replacePC
 	if n.ignoreOffer {
 		n.logger.Info("rtc: ignore colliding offer", "peer", n.options.PeerSubscriber)
 		// The polite peer cannot yield and answer until it receives our pending
@@ -449,15 +471,25 @@ func (n *PerfectNegotiator) handleSessionDesc(ctx context.Context, desc *webrtc.
 		n.scheduleGlareRetryTimer()
 		return
 	}
+	if replacePC {
+		n.logger.Info("rtc: remote DTLS fingerprint changed, replacing the peer connection",
+			"peer", n.options.PeerSubscriber, "collision", offerCollision)
+		if err := n.rebuildPeerConnection(offerHasApplication); err != nil {
+			n.logger.Error("rtc: replace peer connection for changed remote DTLS fingerprint", "err", err)
+			return
+		}
+		offerCollision = false
+	}
 	n.logger.Info("rtc: apply remote description", "peer", n.options.PeerSubscriber,
 		"type", desc.Type, "signalingState", n.pc.SignalingState(), "collision", offerCollision,
 		"polite", n.Polite, "sdp", sdpSummary(desc.SDP))
 
-	// The polite peer yields by rolling back its pending local offer, then
-	// answers on the same peer connection. Keeping the ICE/DTLS identity is
-	// essential: Firefox rejects an ordinary answer that introduces fresh ICE
-	// credentials from a replacement connection. (In the makingOffer window no
-	// local description has been applied yet, so there is nothing to roll back.)
+	// The polite peer yields an ordinary collision by rolling back its pending
+	// local offer, then answers on the same peer connection. Keeping the ICE/DTLS
+	// identity is essential: Firefox rejects an ordinary answer that introduces
+	// fresh ICE credentials from a replacement connection. (In the makingOffer
+	// window no local description has been applied yet, so there is nothing to
+	// roll back.) A fingerprint-triggered replacement above never rolls back.
 	if offerCollision && n.pc.SignalingState() == webrtc.SignalingStateHaveLocalOffer {
 		n.logger.Info("rtc: glare, rolling back the local offer", "peer", n.options.PeerSubscriber)
 		if err := n.pc.SetLocalDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeRollback}); err != nil {
@@ -507,6 +539,157 @@ func (n *PerfectNegotiator) handleSessionDesc(ctx context.Context, desc *webrtc.
 		n.makeOffer(ctx, ssEvOut, true)
 	}
 }
+
+// remoteOfferNeedsReplacement identifies the one kind of inbound description
+// that cannot be applied to the current PC: an offer carrying a different DTLS
+// fingerprint than the last stable remote description. Both descriptions must
+// parse and yield a fingerprint. Otherwise the ordinary SetRemoteDescription
+// path remains responsible for accepting or rejecting the offer.
+func (n *PerfectNegotiator) remoteOfferNeedsReplacement(desc *webrtc.SessionDescription) (replace bool, offerHasApplication bool) {
+	if desc == nil || desc.Type != webrtc.SDPTypeOffer {
+		return false, false
+	}
+	previous := n.pc.CurrentRemoteDescription()
+	if previous == nil {
+		return false, false // the first remote offer establishes the identity
+	}
+	incomingSDP, err := desc.Unmarshal()
+	if err != nil {
+		return false, false
+	}
+	previousSDP, err := previous.Unmarshal()
+	if err != nil {
+		return false, false
+	}
+	incomingFingerprint, ok := sessionDTLSFingerprint(incomingSDP)
+	if !ok {
+		return false, false
+	}
+	previousFingerprint, ok := sessionDTLSFingerprint(previousSDP)
+	if !ok || incomingFingerprint == previousFingerprint {
+		return false, false
+	}
+	return true, sessionHasApplicationMedia(incomingSDP)
+}
+
+// sessionDTLSFingerprint returns a comparable SDP fingerprint identity. A
+// session-level fingerprint takes precedence. Without one, a BUNDLE offer uses
+// the fingerprint of its first bundled m-section, whose transport represents
+// the whole bundle. Non-bundled media use a mid-keyed canonical set so a change
+// to any independent DTLS transport is detected without depending on m-line
+// order.
+func sessionDTLSFingerprint(desc *pionsdp.SessionDescription) (string, bool) {
+	if fingerprint, ok := desc.Attribute("fingerprint"); ok {
+		return normalizeDTLSFingerprint(fingerprint)
+	}
+	for _, attribute := range desc.Attributes {
+		if attribute.Key != "group" {
+			continue
+		}
+		group := strings.Fields(attribute.Value)
+		if len(group) < 2 || group[0] != "BUNDLE" {
+			continue
+		}
+		for _, media := range desc.MediaDescriptions {
+			mid, _ := media.Attribute("mid")
+			if mid != group[1] {
+				continue
+			}
+			fingerprint, ok := media.Attribute("fingerprint")
+			if !ok {
+				return "", false
+			}
+			return normalizeDTLSFingerprint(fingerprint)
+		}
+		return "", false
+	}
+
+	fingerprints := make([]string, 0, len(desc.MediaDescriptions))
+	var shared string
+	allShared := true
+	for _, media := range desc.MediaDescriptions {
+		fingerprint, ok := media.Attribute("fingerprint")
+		if !ok {
+			return "", false
+		}
+		normalized, ok := normalizeDTLSFingerprint(fingerprint)
+		if !ok {
+			return "", false
+		}
+		if shared == "" {
+			shared = normalized
+		} else if shared != normalized {
+			allShared = false
+		}
+		mid, _ := media.Attribute("mid")
+		fingerprints = append(fingerprints, mid+"="+normalized)
+	}
+	if len(fingerprints) == 0 {
+		return "", false
+	}
+	if allShared {
+		// This is semantically identical to the same session-level fingerprint.
+		return shared, true
+	}
+	slices.Sort(fingerprints)
+	return strings.Join(fingerprints, "\n"), true
+}
+
+func normalizeDTLSFingerprint(fingerprint string) (string, bool) {
+	fields := strings.Fields(fingerprint)
+	if len(fields) != 2 {
+		return "", false
+	}
+	return strings.ToLower(fields[0] + " " + fields[1]), true
+}
+
+func sessionHasApplicationMedia(desc *pionsdp.SessionDescription) bool {
+	for _, media := range desc.MediaDescriptions {
+		if media.MediaName.Media == "application" {
+			return true
+		}
+	}
+	return false
+}
+
+// rebuildPeerConnection adopts the fresh connection stocked by the client.
+// The old callbacks are detached before Close, and localEvent.source filters
+// anything they had already queued. Fresh ICE credentials satisfy a latched
+// restart; an active recovery watchdog remains armed until the fresh PC connects.
+func (n *PerfectNegotiator) rebuildPeerConnection(offerHasApplication bool) error {
+	if n.options.NewPeerConnection == nil {
+		return errNoPeerConnectionFactory
+	}
+	fresh, err := n.options.NewPeerConnection(offerHasApplication)
+	if err != nil {
+		return err
+	}
+	if fresh == nil {
+		return ErrNilPeerConnection
+	}
+	old := n.pc
+	if fresh == old {
+		return errors.New("rtc: NewPeerConnection returned the current peer connection")
+	}
+	n.pc = fresh
+	n.makingOffer = false
+	n.ignoreOffer = false
+	n.isSettingRemoteAnswerPending = false
+	n.iceLocalOfferRestart = false
+	n.stopGlareRetryTimer()
+	n.iceRestartPending = false
+	old.OnNegotiationNeeded(nil)
+	old.OnICECandidate(nil)
+	old.OnICEConnectionStateChange(nil)
+	n.attach(fresh)
+	if err := old.Close(); err != nil {
+		n.logger.Warn("rtc: close replaced peer connection", "err", err)
+	}
+	return nil
+}
+
+var errNoPeerConnectionFactory = errors.New(
+	"rtc: no NewPeerConnection factory configured for a changed remote DTLS fingerprint")
 
 // handleICECandidate applies one inbound trickle ICE candidate.
 func (n *PerfectNegotiator) handleICECandidate(candidate *webrtc.ICECandidateInit) {

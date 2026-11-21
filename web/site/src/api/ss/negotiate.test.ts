@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 
+import type { PeerDiagnostics } from "./diagnostics";
 import { PerfectNegotiator } from "./negotiate";
 import type { SignallingEvent } from "./types";
 
@@ -8,6 +9,10 @@ class MockPeerConnection {
   connectionState: RTCPeerConnectionState = "new";
   signalingState: RTCSignalingState = "stable";
   localDescription: RTCSessionDescriptionInit | null = null;
+  remoteDescription: RTCSessionDescriptionInit | null = null;
+  get currentRemoteDescription() {
+    return this.remoteDescription;
+  }
   onnegotiationneeded: ((ev: Event) => void) | null = null;
   onicecandidate: ((ev: RTCPeerConnectionIceEvent) => void) | null = null;
   oniceconnectionstatechange: (() => void) | null = null;
@@ -27,6 +32,20 @@ class MockPeerConnection {
       sdp: `offer-${this.offers}`,
     };
   });
+
+  setRemoteDescription = vi.fn(
+    async (description: RTCSessionDescriptionInit) => {
+      if (
+        description.type === "answer" &&
+        this.signalingState !== "have-local-offer"
+      ) {
+        throw new Error("invalid answer state");
+      }
+      this.remoteDescription = description;
+      this.signalingState =
+        description.type === "answer" ? "stable" : "have-remote-offer";
+    },
+  );
 
   addEventListener(type: string, listener: () => void) {
     if (type === "connectionstatechange") {
@@ -59,7 +78,10 @@ class MockPeerConnection {
   }
 }
 
-function startNegotiation(selfSubscriber: "alice" | "bob") {
+function startNegotiation(
+  selfSubscriber: "alice" | "bob",
+  diagnostics?: PeerDiagnostics,
+) {
   const pc = new MockPeerConnection();
   const events: SignallingEvent[] = [];
   let inputController!: ReadableStreamDefaultController<SignallingEvent>;
@@ -77,13 +99,14 @@ function startNegotiation(selfSubscriber: "alice" | "bob") {
     channelId: "main",
     selfSubscriber,
     peerSubscriber: selfSubscriber === "alice" ? "bob" : "alice",
+    diagnostics,
   });
   const running = negotiator.negotiate(input, output);
   const close = async () => {
     inputController.close();
     await running;
   };
-  return { pc, events, inputController, close };
+  return { pc, events, inputController, close, negotiator };
 }
 
 async function flushMicrotasks() {
@@ -268,6 +291,76 @@ describe("PerfectNegotiator ICE recovery", () => {
       expect(vi.getTimerCount()).toBe(0);
     } finally {
       vi.useRealTimers();
+    }
+  });
+
+  it("ignores delayed SDP from a retired remote DTLS identity", async () => {
+    const { pc, events, inputController, close, negotiator } =
+      startNegotiation("alice");
+    const fresh = new MockPeerConnection();
+    const oldSdp = "v=0\r\na=fingerprint:sha-256 AA:BB\r\n";
+    const freshSdp = "v=0\r\na=fingerprint:sha-256 CC:DD\r\n";
+    try {
+      pc.remoteDescription = { type: "answer", sdp: oldSdp };
+      pc.signalingState = "stable";
+      expect(
+        negotiator.replacePeerConnection(fresh as unknown as RTCPeerConnection),
+      ).toBe(true);
+      await flushMicrotasks();
+      expect(events).toHaveLength(1);
+      fresh.signalingState = "have-local-offer";
+
+      const receive = (msgId: string, sessionDesc: RTCSessionDescriptionInit) =>
+        inputController.enqueue({
+          from: {},
+          to: {},
+          msgId,
+          c2CEv: {
+            fromSubscriber: "bob",
+            toSubscriber: "alice",
+            channelId: "main",
+            sessionDesc,
+          },
+        });
+      receive("old-answer", { type: "answer", sdp: oldSdp });
+      receive("old-offer", { type: "offer", sdp: oldSdp });
+      await flushMicrotasks();
+      // Neither an old answer nor a colliding old offer may complete/roll back
+      // the fresh offer, even when the browser is the polite peer.
+      expect(fresh.setRemoteDescription).not.toHaveBeenCalled();
+      expect(fresh.signalingState).toBe("have-local-offer");
+      expect(events).toHaveLength(1);
+
+      receive("fresh-answer", { type: "answer", sdp: freshSdp });
+      await flushMicrotasks();
+      expect(fresh.remoteDescription?.sdp).toBe(freshSdp);
+      expect(fresh.signalingState).toBe("stable");
+    } finally {
+      await close();
+    }
+  });
+
+  it("correlates the outbound SDP diagnostic with its signalling msgId", async () => {
+    const diagnostics: PeerDiagnostics = {
+      log: vi.fn(),
+      captureStats: vi.fn(),
+      close: vi.fn(),
+    };
+    const { pc, events, close } = startNegotiation("alice", diagnostics);
+    try {
+      pc.onnegotiationneeded?.(new Event("negotiationneeded"));
+      await flushMicrotasks();
+      expect(events).toHaveLength(1);
+      expect(diagnostics.log).toHaveBeenCalledWith(
+        "sdp:offer:sent",
+        expect.objectContaining({
+          msgId: events[0].msgId,
+          description: { type: "offer", sections: [] },
+        }),
+        "info",
+      );
+    } finally {
+      await close();
     }
   });
 });

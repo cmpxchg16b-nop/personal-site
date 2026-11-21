@@ -160,16 +160,16 @@ is still present.
 Each perfect negotiator owns an ICE recovery watchdog. Browser and Go use the
 same policy and defaults:
 
-| Behavior                | Policy                                                                                              |
-| ----------------------- | --------------------------------------------------------------------------------------------------- |
-| When recovery arms      | Only after ICE is `connected`/`completed` **and** the aggregate `connectionState` is `connected`   |
-| `disconnected`          | Either state waits a **3-second** grace period before restarting                                   |
-| Eligible `failed` state | Either state starts recovery immediately; do not accelerate an already active retry sequence        |
-| Retry interval          | Exponential backoff from **2 seconds**, nominally capped at **30 seconds**                         |
-| Jitter                  | Multiply each retry delay by a random factor from **0.8 to 1.2**                                   |
-| `checking` / `new`      | Not recovery outcomes; an active watchdog keeps running                                            |
-| Healthy again           | ICE `connected`/`completed` **and** aggregate `connected` cancel recovery and reset backoff         |
-| Closed/torn down        | Stop recovery                                                                                       |
+| Behavior                | Policy                                                                                           |
+| ----------------------- | ------------------------------------------------------------------------------------------------ |
+| When recovery arms      | Only after ICE is `connected`/`completed` **and** the aggregate `connectionState` is `connected` |
+| `disconnected`          | Either state waits a **3-second** grace period before restarting                                 |
+| Eligible `failed` state | Either state starts recovery immediately; do not accelerate an already active retry sequence     |
+| Retry interval          | Exponential backoff from **2 seconds**, nominally capped at **30 seconds**                       |
+| Jitter                  | Multiply each retry delay by a random factor from **0.8 to 1.2**                                 |
+| `checking` / `new`      | Not recovery outcomes; an active watchdog keeps running                                          |
+| Healthy again           | ICE `connected`/`completed` **and** aggregate `connected` cancel recovery and reset backoff      |
+| Closed/torn down        | Stop recovery                                                                                    |
 
 There is no fixed maximum attempt count. A transient state must not cancel the
 watchdog, and a timer firing at the same time as a healthy state notification
@@ -232,14 +232,40 @@ described above.
 Implementation: `web/site/src/api/ss/ice_restart.ts`, `negotiate.ts`, and
 `peersessions.tsx`, plus `pkg/rtc/negotiate.go` and `ice_restart_test.go`.
 
-For field diagnosis, every browser peer session logs `[peersessions]
-RTCPeerConnection state` at creation and on both state events. The structured
-entry includes a session UUID, channel/self/peer/polite identity, previous and
-current ICE/aggregate states, signaling/gathering states, local/remote SDP
-`mid`, `setup`, ICE-ufrag and fingerprint attributes, transceiver/track state,
-and DataChannel state. The actual `RTCPeerConnection` is a separate final
-console argument, so devtools can inspect that exact object rather than a
-serialized look-alike.
+### Terminal DTLS failure requires a fresh transport
+
+An ICE restart retains the existing DTLS association. If the DTLS transport
+itself is `failed`, a new selected ICE pair can therefore produce the misleading
+combination `iceConnectionState=connected` and `connectionState=failed` while
+RTP and SCTP stay stopped. Repeating ICE restarts cannot repair that state.
+
+After a previously healthy browser session observes a failed DTLS transport,
+it stocks a fresh `RTCPeerConnection` with the session's current local tracks
+and known DataChannel labels, then offers its new ICE/DTLS identity. The logical
+peer session and WebSocket call dialog survive; sender-dependent operations
+resolve retained sender handles to the fresh sender. DataChannel and remote
+track subscribers receive the new incarnations without a session-reset event.
+
+A Go peer compares each inbound offer's DTLS fingerprint with the previous
+stable remote description. A changed fingerprint means the offer belongs to a
+fresh PC: Go stocks its own fresh PC with the same tracks and codec preferences,
+applies the offer there, answers, and closes the old PC. If the offer already has
+an application m-line, its offerer owns the replacement DataChannels and Go
+waits for `OnDataChannel` rather than creating duplicate labels. Ordinary ICE
+restarts keep the same fingerprint and PC; ordinary glare still uses same-PC
+rollback.
+
+The browser remembers retired remote DTLS fingerprints for the rest of the
+logical session. Delayed offers or answers carrying one of those identities are
+ignored, so an old queued offer cannot complete or roll back the fresh offer.
+
+For field diagnosis, every browser transport logs `[rtc self→peer]` at creation
+and on state events. Entries include the logical session UUID, peer/polite
+identity, previous and current ICE/aggregate/DTLS states, signaling/gathering
+state, safe SDP role/identity hashes, transceiver/track state, and DataChannel
+state. Recovery samples add selected-pair byte counters, transport ICE/DTLS
+states, and RTP progress. Raw SDP, ICE credentials, candidate addresses, and the
+actual `RTCPeerConnection` object are not dumped into the console.
 
 ## Combined failure scenarios
 
