@@ -109,7 +109,8 @@ export class PerfectNegotiator implements RTCNegotiator {
    *   ownership of it — tracks, `ontrack`, data channels, closing, etc.
    *   PerfectNegotiator only takes over `onnegotiationneeded`,
    *   `onicecandidate`, and `oniceconnectionstatechange` for the duration of
-   *   negotiate().
+   *   negotiate(). It separately subscribes to `connectionstatechange` with
+   *   an event listener so ICE recovery also tracks aggregate DTLS health.
    */
   constructor(
     private readonly pc: RTCPeerConnection,
@@ -180,7 +181,14 @@ export class PerfectNegotiator implements RTCNegotiator {
     });
     this.pc.oniceconnectionstatechange = () =>
       iceRestart.handleState(this.pc.iceConnectionState);
+    const onConnectionStateChange = () =>
+      iceRestart.handleConnectionState(this.pc.connectionState);
+    this.pc.addEventListener(
+      "connectionstatechange",
+      onConnectionStateChange,
+    );
     iceRestart.handleState(this.pc.iceConnectionState);
+    iceRestart.handleConnectionState(this.pc.connectionState);
 
     // Incoming half: consume signalling events until the stream closes.
     try {
@@ -195,6 +203,10 @@ export class PerfectNegotiator implements RTCNegotiator {
       this.pc.onnegotiationneeded = null;
       this.pc.onicecandidate = null;
       this.pc.oniceconnectionstatechange = null;
+      this.pc.removeEventListener(
+        "connectionstatechange",
+        onConnectionStateChange,
+      );
       iceRestart.close();
       this.stopGlareRetryTimer();
       reader.releaseLock();

@@ -1,8 +1,8 @@
 package rtc
 
 // The media tests: the client's track support (AddTrack/RemoveTrack/
-// HandleTrack), including the glare rebuild's track re-add — the piece
-// that keeps a bot's music alive across a collision.
+// HandleTrack), including track continuity when glare rollback resolves a
+// collision on the original connection.
 
 import (
 	"context"
@@ -195,8 +195,7 @@ func opusPinTestTrack(t *testing.T, id string) *webrtc.TrackLocalStaticSample {
 // exactly the pinned codec list — opus and telephone-event here, the
 // engine's opus PT 111 and tel-event's 126 — in the session's offers,
 // in its answers to the peer's media re-offers, and across a glare
-// rebuild (the pin is recorded with the track and re-applied to the
-// fresh connection). The raw peer drives the wire directly so the SDP
+// rollback on the same connection. The raw peer drives the wire directly so the SDP
 // itself is asserted; it registers the same codecs a browser would.
 func TestHeadlessRTCClientPinsTrackCodecs(t *testing.T) {
 	net := newClientTestNet(t, ss.DefaultSubscriberAging)
@@ -337,8 +336,8 @@ func TestHeadlessRTCClientPinsTrackCodecs(t *testing.T) {
 	}
 	sendC2C(&ss.ClientToClientEv{SessionDesc: peerPC.LocalDescription()})
 
-	// Step 2: the bot yields — rebuilds its peer connection through the
-	// hub — and answers the colliding offer. The answer must carry the
+	// Step 2: the bot rolls back on the original connection,
+	// and answers the colliding offer. The answer must carry the
 	// audio m-line pinned to exactly [opus, telephone-event]: the pin
 	// was re-applied to the fresh connection's re-added track, and the
 	// mic's m-line is answered with the pin.
@@ -524,8 +523,8 @@ func TestHeadlessRTCClientTracksSurviveGlare(t *testing.T) {
 	}
 	sendC2C(&ss.ClientToClientEv{SessionDesc: peerPC.LocalDescription()})
 
-	// Step 2: the bot yields — rebuilds its peer connection through the
-	// hub — and answers the colliding offer. The answer must still carry
+	// Step 2: the bot rolls back on the original connection,
+	// and answers the colliding offer. The answer must still carry
 	// the audio m-line: the track was re-added to the fresh connection.
 	answer := nextDesc()
 	if answer.Type != webrtc.SDPTypeAnswer {

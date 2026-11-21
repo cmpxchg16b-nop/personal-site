@@ -759,9 +759,9 @@ func TestHeadlessRTCClientLateHandlerRegistrationOnImpoliteSide(t *testing.T) {
 // TestHeadlessRTCClientSurvivesGlare stages the offer collision through
 // the whole client: the bot (polite) has a pending offer out when the
 // peer (impolite, a scripted raw client — not a HeadlessRTCClient) sends
-// its own offer. The bot's negotiator yields by rebuilding the peer
-// connection through the hub, the session's channels are re-created and
-// re-delivered to the handler, and the rebuilt connection carries data.
+// its own offer. The bot's negotiator rolls back on the same peer
+// connection, the session's channels survive without re-delivery, and the
+// original connection carries data.
 func TestHeadlessRTCClientSurvivesGlare(t *testing.T) {
 	net := newClientTestNet(t, ss.DefaultSubscriberAging)
 	bot, _ := startTestClient(t, net, "bot", func(c *RTCClientConfiguration) {
@@ -875,8 +875,8 @@ func TestHeadlessRTCClientSurvivesGlare(t *testing.T) {
 	}
 	sendC2C(&ss.ClientToClientEv{SessionDesc: peerPC.LocalDescription()})
 
-	// Step 2: the bot yields — rebuilds its peer connection through the
-	// hub — and answers the colliding offer.
+	// Step 2: the bot yields by rolling back and answers the colliding offer
+	// on the original connection.
 	answer := nextDesc()
 	if answer.Type != webrtc.SDPTypeAnswer {
 		t.Fatalf("the bot's reply to the collision is %s, want an answer", answer.Type)
@@ -885,7 +885,7 @@ func TestHeadlessRTCClientSurvivesGlare(t *testing.T) {
 		t.Fatalf("SetRemoteDescription(answer): %v", err)
 	}
 
-	// Step 3: the rebuilt connection re-created the session's channel.
+	// Step 3: the original connection preserves the session's channel.
 	// Whether the bot re-offers it depends on pion's negotiation-needed
 	// timing — data channels multiplex over the single SCTP m-line the
 	// answer already established, so the channel opens either way.
@@ -913,11 +913,11 @@ func TestHeadlessRTCClientSurvivesGlare(t *testing.T) {
 		}
 	}
 
-	// The handler was invoked twice for the session: once for the
-	// original channel, once for the rebuilt one.
-	botProbe.waitCalls(t, "2-peer", 2)
+	// Rollback preserves the session's original channel, so the handler is
+	// invoked only once rather than being re-delivered a replacement channel.
+	botProbe.waitCalls(t, "2-peer", 1)
 
-	// And the rebuilt connection carries data end to end.
+	// And the original connection carries data end to end.
 	var peerDC *webrtc.DataChannel
 	select {
 	case peerDC = <-announced:
@@ -925,7 +925,7 @@ func TestHeadlessRTCClientSurvivesGlare(t *testing.T) {
 			t.Fatalf("the announced channel is %q, want %q", peerDC.Label(), "dcmsg")
 		}
 	case <-time.After(testTimeout):
-		t.Fatal("timed out waiting for the bot's re-created channel")
+		t.Fatal("timed out waiting for the bot's preserved channel")
 	}
 	opened := make(chan struct{})
 	peerDC.OnOpen(func() { close(opened) })

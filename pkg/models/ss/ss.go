@@ -500,6 +500,9 @@ func (p *SimpleOnMemorySSProvider) Run(ctx context.Context, inMsg <-chan *Signal
 			if !ok {
 				return
 			}
+			if ev == nil {
+				continue
+			}
 			touch(channels, ev, time.Now())
 			if !p.handle(ctx, channels, ev, outMsg) {
 				return

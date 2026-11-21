@@ -412,6 +412,7 @@ function startPeerSession(
   hooks: SessionHooks,
 ): PeerSession {
   const pc = new RTCPeerConnection({ iceServers });
+  const sessionId = crypto.randomUUID();
   const session: PeerSession = {
     pc,
     channelId,
@@ -425,6 +426,93 @@ function startPeerSession(
     setProxy: () => {},
     close: () => {},
   };
+
+  // State diagnostics belong to the session rather than either consumer of
+  // the PC: event listeners leave PerfectNegotiator's onice... handler and
+  // the media/data-channel handlers untouched. The actual PC is the final
+  // console argument so a developer can inspect the exact object in devtools.
+  let previousConnectionState: RTCPeerConnectionState | null = null;
+  let previousIceConnectionState: RTCIceConnectionState | null = null;
+  const trackContext = (track: MediaStreamTrack | null) =>
+    track === null
+      ? null
+      : {
+          id: track.id,
+          kind: track.kind,
+          enabled: track.enabled,
+          muted: track.muted,
+          readyState: track.readyState,
+        };
+  const descriptionContext = (description: RTCSessionDescription | null) =>
+    description === null
+      ? null
+      : {
+          type: description.type,
+          attributes: description.sdp
+            .split(/\r?\n/)
+            .filter(
+              (line) =>
+                line.startsWith("a=mid:") ||
+                line.startsWith("a=setup:") ||
+                line.startsWith("a=ice-ufrag:") ||
+                line.startsWith("a=fingerprint:"),
+            ),
+        };
+  const logState = (
+    event: "created" | "connectionstatechange" | "iceconnectionstatechange",
+  ) => {
+    const context = {
+      at: new Date().toISOString(),
+      event,
+      sessionId,
+      channelId,
+      self,
+      peer,
+      polite: session.polite,
+      previousConnectionState,
+      previousIceConnectionState,
+      connectionState: pc.connectionState,
+      iceConnectionState: pc.iceConnectionState,
+      signalingState: pc.signalingState,
+      iceGatheringState: pc.iceGatheringState,
+      localDescription: descriptionContext(pc.localDescription),
+      remoteDescription: descriptionContext(pc.remoteDescription),
+      transceivers: (pc.getTransceivers?.() ?? []).map((transceiver) => ({
+        mid: transceiver.mid,
+        direction: transceiver.direction,
+        currentDirection: transceiver.currentDirection,
+        senderTrack: trackContext(transceiver.sender.track),
+        receiverTrack: trackContext(transceiver.receiver.track),
+      })),
+      dataChannels: [...session.channels.values()].map((channel) => ({
+        label: channel.label,
+        readyState: channel.readyState,
+      })),
+    };
+    console.info("[peersessions] RTCPeerConnection state", context, pc);
+    // Keep each state's previous value on its own event stream. The paired
+    // ice.../connection... events then each show a real transition instead of
+    // the first event erasing the second event's "previous" value.
+    if (event !== "iceconnectionstatechange") {
+      previousConnectionState = pc.connectionState;
+    }
+    if (event !== "connectionstatechange") {
+      previousIceConnectionState = pc.iceConnectionState;
+    }
+
+    // An ICE event is also a synchronization point for the aggregate state.
+    // This covers a browser updating connectionState without delivering its
+    // aggregate event, without ever pretending ICE-only recovery is healthy.
+    // Skip the pre-offer "new" value to avoid a spurious disconnected flash.
+    if (event === "connectionstatechange" || pc.connectionState !== "new") {
+      hooks.onConnectionState(channelId, peer, pc.connectionState);
+    }
+  };
+  logState("created");
+  const onConnectionStateChange = () => logState("connectionstatechange");
+  const onIceConnectionStateChange = () => logState("iceconnectionstatechange");
+  pc.addEventListener("connectionstatechange", onConnectionStateChange);
+  pc.addEventListener("iceconnectionstatechange", onIceConnectionStateChange);
 
   // attach registers one channel of the session and reports it to the
   // label's subscribers; its opening resolves the whenOpenChannel
@@ -453,9 +541,6 @@ function startPeerSession(
   // consumers (voice calls) attach and detach tracks freely — the
   // PerfectNegotiator owns the (re)negotiation they trigger.
   pc.ontrack = (ev) => hooks.onTrack(channelId, peer, ev);
-  // The connection state feeds the UI's presence line.
-  pc.onconnectionstatechange = () =>
-    hooks.onConnectionState(channelId, peer, pc.connectionState);
 
   const output = createPeerSignallingOutput(proxy);
   session.sendSignalling = output.write;
@@ -484,11 +569,15 @@ function startPeerSession(
     );
 
   session.close = () => {
-    // The state handler goes first: close()'s queued "closed" event must
-    // not report — a teardown is announced through onSessionClosed.
-    // Closing the inbox ends negotiate(), which releases its stream locks;
-    // closing the connection stops ICE and its events.
-    pc.onconnectionstatechange = null;
+    // State listeners go first: close()'s queued "closed" event must not
+    // report — a teardown is announced through onSessionClosed. Closing the
+    // inbox ends negotiate(), which releases its stream locks; closing the
+    // connection stops ICE and its events.
+    pc.removeEventListener("connectionstatechange", onConnectionStateChange);
+    pc.removeEventListener(
+      "iceconnectionstatechange",
+      onIceConnectionStateChange,
+    );
     output.close();
     inbox.close();
     pc.close();
@@ -571,10 +660,13 @@ export function usePeerSessions(
         for (const cb of trackHandlersRef.current) cb(channelId, peer, ev);
       },
       onConnectionState: (channelId, peer, state) => {
-        setConnectionStates((prev) => ({
-          ...prev,
-          [channelId]: { ...prev[channelId], [peer]: state },
-        }));
+        setConnectionStates((prev) => {
+          if (prev[channelId]?.[peer] === state) return prev;
+          return {
+            ...prev,
+            [channelId]: { ...prev[channelId], [peer]: state },
+          };
+        });
       },
       onSessionClosed: (channelId, peer) => {
         // The session's connection-state entry goes with it: the last

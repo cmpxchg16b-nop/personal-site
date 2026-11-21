@@ -160,20 +160,29 @@ is still present.
 Each perfect negotiator owns an ICE recovery watchdog. Browser and Go use the
 same policy and defaults:
 
-| Behavior                | Policy                                                                         |
-| ----------------------- | ------------------------------------------------------------------------------ |
-| When recovery arms      | Only after ICE has reached `connected` or `completed` at least once            |
-| `disconnected`          | Wait a **3-second** grace period before restarting                             |
-| Eligible `failed` state | Start recovery immediately; do not accelerate an already active retry sequence |
-| Retry interval          | Exponential backoff from **2 seconds**, nominally capped at **30 seconds**     |
-| Jitter                  | Multiply each retry delay by a random factor from **0.8 to 1.2**               |
-| `checking` / `new`      | Not recovery outcomes; an active watchdog keeps running                        |
-| Healthy again           | `connected` or `completed` cancels recovery and resets backoff                 |
-| Closed/torn down        | Stop recovery                                                                  |
+| Behavior                | Policy                                                                                              |
+| ----------------------- | --------------------------------------------------------------------------------------------------- |
+| When recovery arms      | Only after ICE is `connected`/`completed` **and** the aggregate `connectionState` is `connected`   |
+| `disconnected`          | Either state waits a **3-second** grace period before restarting                                   |
+| Eligible `failed` state | Either state starts recovery immediately; do not accelerate an already active retry sequence        |
+| Retry interval          | Exponential backoff from **2 seconds**, nominally capped at **30 seconds**                         |
+| Jitter                  | Multiply each retry delay by a random factor from **0.8 to 1.2**                                   |
+| `checking` / `new`      | Not recovery outcomes; an active watchdog keeps running                                            |
+| Healthy again           | ICE `connected`/`completed` **and** aggregate `connected` cancel recovery and reset backoff         |
+| Closed/torn down        | Stop recovery                                                                                       |
 
 There is no fixed maximum attempt count. A transient state must not cancel the
 watchdog, and a timer firing at the same time as a healthy state notification
 must not restart an already recovered transport.
+
+The browser listens to both `iceconnectionstatechange` and
+`connectionstatechange`. A nominated/selected candidate pair and even an
+aggregate ICE `connected` state are not sufficient by themselves: DTLS or
+another transport can still leave `connectionState` disconnected, with RTP
+stalled. In that case the watchdog keeps retrying until the whole peer
+connection is healthy. Each ICE event also re-reads the current aggregate state
+for the UI, covering a missing aggregate event without reporting ICE-only
+recovery as connected.
 
 ### One side owns restart offers
 
@@ -200,10 +209,10 @@ duplicate offer makes the remote send another answer. An impolite peer also
 retransmits its own pending ordinary offer. After an impolite peer ignores a
 colliding offer, either implementation starts a spaced **2-second** retry only
 if that glare remains unresolved; normal glare converges without an immediate
-duplicate that could cause repeated rollback/rebuild. The delayed retry is still
-required when the impolite peer's ICE is healthy: the polite peer cannot roll
-back or rebuild and answer until it receives that offer, after which the active
-watchdog can finish ICE recovery. Retransmission reads the current
+duplicate that could cause repeated rollback. The delayed retry is still
+required when the impolite peer's ICE is healthy: the polite peer cannot yield
+and answer until it receives that offer, after which the active watchdog can
+finish ICE recovery. Retransmission reads the current
 `LocalDescription`, so it may include
 newly gathered candidates while retaining the same ICE credentials.
 
@@ -220,8 +229,17 @@ and candidates need a working signalling path. In the browser, restart-related
 messages produced during a socket outage therefore join the same ordered queue
 described above.
 
-Implementation: `web/site/src/api/ss/ice_restart.ts` and `negotiate.ts`, plus
-`pkg/rtc/negotiate.go` and `ice_restart_test.go`.
+Implementation: `web/site/src/api/ss/ice_restart.ts`, `negotiate.ts`, and
+`peersessions.tsx`, plus `pkg/rtc/negotiate.go` and `ice_restart_test.go`.
+
+For field diagnosis, every browser peer session logs `[peersessions]
+RTCPeerConnection state` at creation and on both state events. The structured
+entry includes a session UUID, channel/self/peer/polite identity, previous and
+current ICE/aggregate states, signaling/gathering states, local/remote SDP
+`mid`, `setup`, ICE-ufrag and fingerprint attributes, transceiver/track state,
+and DataChannel state. The actual `RTCPeerConnection` is a separate final
+console argument, so devtools can inspect that exact object rather than a
+serialized look-alike.
 
 ## Combined failure scenarios
 
@@ -259,7 +277,7 @@ Implementation: `web/site/src/api/ss/ice_restart.ts` and `negotiate.ts`, plus
 | Browser retry after transient registration failure | 2s fixed                   |
 | Browser channel keepalive / member listing         | 5s / 5s                    |
 | SS subscriber aging                                | 30s (`--ss-aging`)         |
-| ICE disconnected grace                             | 3s                         |
+| ICE / aggregate disconnected grace                 | 3s                         |
 | ICE retry base / nominal cap                       | 2s / 30s, with ±20% jitter |
 | Unresolved-glare offer retry                       | 2s, until stable or closed |
 

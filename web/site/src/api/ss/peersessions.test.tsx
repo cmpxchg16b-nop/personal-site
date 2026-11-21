@@ -310,6 +310,7 @@ class MockPeerConnection {
   ondatachannel: ((event: { channel: RTCDataChannel }) => void) | null = null;
   ontrack: ((event: RTCTrackEvent) => void) | null = null;
   onconnectionstatechange: (() => void) | null = null;
+  private stateListeners = new Map<string, Set<() => void>>();
 
   constructor() {
     MockPeerConnection.instances.push(this);
@@ -343,6 +344,40 @@ class MockPeerConnection {
   }
 
   restartIce(): void {}
+
+  addEventListener(type: string, listener: () => void): void {
+    const listeners = this.stateListeners.get(type) ?? new Set();
+    listeners.add(listener);
+    this.stateListeners.set(type, listeners);
+  }
+
+  removeEventListener(type: string, listener: () => void): void {
+    this.stateListeners.get(type)?.delete(listener);
+  }
+
+  emitStateEvent(type: "connectionstatechange" | "iceconnectionstatechange") {
+    for (const listener of this.stateListeners.get(type) ?? []) listener();
+  }
+
+  setState(state: RTCIceConnectionState): void {
+    this.iceConnectionState = state;
+    this.connectionState =
+      state === "connected" || state === "completed"
+        ? "connected"
+        : state === "disconnected"
+          ? "disconnected"
+          : state === "failed"
+            ? "failed"
+            : state === "closed"
+              ? "closed"
+              : state === "checking"
+                ? "connecting"
+                : "new";
+    this.oniceconnectionstatechange?.();
+    this.emitStateEvent("iceconnectionstatechange");
+    this.onconnectionstatechange?.();
+    this.emitStateEvent("connectionstatechange");
+  }
 
   close(): void {
     this.connectionState = "closed";
@@ -548,6 +583,56 @@ afterEach(async () => {
 });
 
 describe("usePeerSessions startup lifecycle", () => {
+  it("synchronizes and logs the current PC state on an ICE-only event", async () => {
+    const info = vi.spyOn(console, "info").mockImplementation(() => {});
+    try {
+      const me = self("1000");
+      runtime.render(me, listing([peer]));
+      await flushMicrotasks();
+      const pc = MockPeerConnection.instances[0];
+      expect(pc).toBeDefined();
+
+      pc.iceConnectionState = "disconnected";
+      pc.connectionState = "disconnected";
+      pc.oniceconnectionstatechange?.();
+      pc.emitStateEvent("iceconnectionstatechange");
+      pc.emitStateEvent("connectionstatechange");
+      expect(
+        runtime.render(me, listing([peer])).connectionStates[channelId][
+          peer.subscriberId
+        ],
+      ).toBe("disconnected");
+
+      // The browser updated both properties but delivered only the ICE event.
+      // The session must re-read the aggregate instead of waiting forever for
+      // a missing connectionstatechange notification.
+      pc.iceConnectionState = "connected";
+      pc.connectionState = "connected";
+      pc.oniceconnectionstatechange?.();
+      pc.emitStateEvent("iceconnectionstatechange");
+      expect(
+        runtime.render(me, listing([peer])).connectionStates[channelId][
+          peer.subscriberId
+        ],
+      ).toBe("connected");
+      expect(info).toHaveBeenCalledWith(
+        "[peersessions] RTCPeerConnection state",
+        expect.objectContaining({
+          event: "iceconnectionstatechange",
+          sessionId: expect.any(String),
+          peer: peer.subscriberId,
+          previousConnectionState: "disconnected",
+          previousIceConnectionState: "disconnected",
+          connectionState: "connected",
+          iceConnectionState: "connected",
+        }),
+        pc,
+      );
+    } finally {
+      info.mockRestore();
+    }
+  });
+
   it("replays an offer and candidate received before the peer appears in membership", async () => {
     const me = self("1000");
     const sessions = runtime.render(me, []).sessions;
@@ -1306,10 +1391,8 @@ describe("useSignalling membership and registration outcomes", () => {
       if (request.c2SEv?.ping) return;
       respondWithPings?.(request);
     };
-    pc.iceConnectionState = "connected";
-    pc.oniceconnectionstatechange?.();
-    pc.iceConnectionState = "disconnected";
-    pc.oniceconnectionstatechange?.();
+    pc.setState("connected");
+    pc.setState("disconnected");
 
     await vi.advanceTimersByTimeAsync(3000);
     await flushMicrotasks();
@@ -1358,10 +1441,8 @@ describe("useSignalling membership and registration outcomes", () => {
     });
     mocks.proxy.current = null;
     runtime.render(me, listing([peer]));
-    pc.iceConnectionState = "connected";
-    pc.oniceconnectionstatechange?.();
-    pc.iceConnectionState = "disconnected";
-    pc.oniceconnectionstatechange?.();
+    pc.setState("connected");
+    pc.setState("disconnected");
     await vi.advanceTimersByTimeAsync(3000);
     await flushMicrotasks();
     expect(pc.signalingState).toBe("have-local-offer");
@@ -1401,10 +1482,8 @@ describe("useSignalling membership and registration outcomes", () => {
       if (request.c2SEv?.ping) return; // A stale OPEN socket never answers.
       respond?.(request);
     };
-    pc.iceConnectionState = "connected";
-    pc.oniceconnectionstatechange?.();
-    pc.iceConnectionState = "disconnected";
-    pc.oniceconnectionstatechange?.();
+    pc.setState("connected");
+    pc.setState("disconnected");
 
     await vi.advanceTimersByTimeAsync(4000);
     await flushMicrotasks();

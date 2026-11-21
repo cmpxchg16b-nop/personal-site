@@ -1,0 +1,4 @@
+[submodule "third_party/webrtc"]
+	path = third_party/webrtc
+	url = https://github.com/pion/webrtc.git
+	branch = main

@@ -28,10 +28,8 @@ const testTimeout = 30 * time.Second
 
 // testClient is one in-process SS client: a peer connection with a
 // negotiator attached, plus the transport channels the test pumps
-// between it and the SS. The peer connection is mutable: a glare can
-// make the negotiator rebuild it through the factory, so every access
-// goes through the mutex, and the data channel bookkeeping follows the
-// latest incarnation.
+// between it and the SS. The mutex also protects data-channel bookkeeping
+// from pion's callback goroutines.
 type testClient struct {
 	sub    ss.SubscriberId
 	nego   *PerfectNegotiator
@@ -200,27 +198,6 @@ func newSSTestNet(t *testing.T, subA, subB ss.SubscriberId) *ssTestNet {
 			SelfSubscriber: self,
 			PeerSubscriber: peer,
 			Logger:         testLogger(t),
-			// The glare factory: a fresh peer connection with the same
-			// data channels re-created — exactly what a real caller
-			// must provide.
-			NewPeerConnection: func() (*webrtc.PeerConnection, error) {
-				fresh, err := webrtc.NewPeerConnection(webrtc.Configuration{})
-				if err != nil {
-					return nil, err
-				}
-				c.mu.Lock()
-				defer c.mu.Unlock()
-				c.pc = fresh
-				c.attach(fresh)
-				for label := range c.local {
-					dc, err := fresh.CreateDataChannel(label, nil)
-					if err != nil {
-						return nil, err
-					}
-					c.local[label] = dc
-				}
-				return fresh, nil
-			},
 		})
 		if err != nil {
 			t.Fatalf("NewPerfectNegotiator(%s): %v", self, err)
@@ -338,9 +315,8 @@ func TestPerfectNegotiatorConnectsTwoPeersThroughSS(t *testing.T) {
 // at the same time — each creates a data channel before either offer
 // has been answered — the simultaneous-offer collision the perfect
 // negotiation pattern exists for. alice ("alice" < "bob") is the polite
-// peer and yields (rebuilding her peer connection, since pion cannot
-// roll an offer back); bob is impolite and ignores hers. Both data
-// channels must still come up.
+// peer and yields by rolling her offer back; bob is impolite and ignores
+// hers. Both data channels must still come up on the original connections.
 func TestPerfectNegotiatorSurvivesGlare(t *testing.T) {
 	net := newSSTestNet(t, "alice", "bob")
 	if !net.a.nego.Polite || net.b.nego.Polite {
@@ -363,31 +339,21 @@ func TestPerfectNegotiatorSurvivesGlare(t *testing.T) {
 	assertDCMessage(t, bSide, aSideB, "b keeps its own channel")
 }
 
-// TestPolitePeerRebuildsOnGlare drives the collision deterministically,
-// without ICE: the polite negotiator's peer connection is parked in
-// have-local-offer (as a sent offer leaves it), a colliding offer
-// arrives, and the negotiator must rebuild the peer connection through
-// the factory, answer on the fresh one, and close the replaced one.
-func TestPolitePeerRebuildsOnGlare(t *testing.T) {
+// TestPolitePeerRollsBackOnGlare drives the collision deterministically:
+// the polite negotiator abandons its pending offer, answers on the same peer
+// connection, and never replaces the session's ICE/DTLS identity.
+func TestPolitePeerRollsBackOnGlare(t *testing.T) {
 	pc, err := webrtc.NewPeerConnection(webrtc.Configuration{})
 	if err != nil {
 		t.Fatalf("NewPeerConnection: %v", err)
 	}
+	t.Cleanup(func() { _ = pc.Close() })
 
-	rebuilt := make(chan *webrtc.PeerConnection, 1)
 	nego, err := NewPerfectNegotiator(pc, PerfectNegotiatorOptions{
 		ChannelId:      ss.WellKnownChIdMain,
 		SelfSubscriber: "alice",
 		PeerSubscriber: "bob",
 		Logger:         testLogger(t),
-		NewPeerConnection: func() (*webrtc.PeerConnection, error) {
-			fresh, err := webrtc.NewPeerConnection(webrtc.Configuration{})
-			if err != nil {
-				return nil, err
-			}
-			rebuilt <- fresh
-			return fresh, nil
-		},
 	})
 	if err != nil {
 		t.Fatalf("NewPerfectNegotiator: %v", err)
@@ -396,8 +362,6 @@ func TestPolitePeerRebuildsOnGlare(t *testing.T) {
 		t.Fatal(`"alice" must be the polite peer of "bob"`)
 	}
 
-	// Park the local side in have-local-offer, as a sent offer leaves
-	// it, with a pending local channel the factory must recreate.
 	if _, err := pc.CreateDataChannel("mine", nil); err != nil {
 		t.Fatalf("CreateDataChannel: %v", err)
 	}
@@ -413,9 +377,6 @@ func TestPolitePeerRebuildsOnGlare(t *testing.T) {
 	t.Cleanup(cancel)
 	in := make(chan *ss.SignallingEvent, 1)
 	out := make(chan *ss.SignallingEvent, 8)
-	// Drain the outbound channel: trickled ICE candidates for the
-	// parked offer keep flowing, and Negotiate — like the frontend's
-	// WritableStream writer — backpressures on a full channel.
 	outEvents := make(chan *ss.SignallingEvent, 32)
 	go func() {
 		for {
@@ -433,7 +394,6 @@ func TestPolitePeerRebuildsOnGlare(t *testing.T) {
 		}
 	}()
 
-	// The colliding offer: a genuine offer from the peer.
 	peerPC, err := webrtc.NewPeerConnection(webrtc.Configuration{})
 	if err != nil {
 		t.Fatalf("NewPeerConnection: %v", err)
@@ -456,23 +416,6 @@ func TestPolitePeerRebuildsOnGlare(t *testing.T) {
 		},
 	}
 
-	// The factory ran and the replaced connection was closed.
-	var fresh *webrtc.PeerConnection
-	select {
-	case fresh = <-rebuilt:
-	case <-time.After(testTimeout):
-		t.Fatal("timed out waiting for the peer connection rebuild")
-	}
-	deadline := time.Now().Add(testTimeout)
-	for pc.ConnectionState() != webrtc.PeerConnectionStateClosed {
-		if time.Now().After(deadline) {
-			t.Fatalf("replaced peer connection state is %s, want closed", pc.ConnectionState())
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	t.Cleanup(func() { _ = fresh.Close() })
-
-	// The colliding offer was applied and answered on the fresh one.
 	answer := func() *ss.SignallingEvent {
 		deadline := time.After(testTimeout)
 		for {
@@ -489,11 +432,14 @@ func TestPolitePeerRebuildsOnGlare(t *testing.T) {
 	if answer == nil || answer.C2CEv.SessionDesc.Type != webrtc.SDPTypeAnswer {
 		t.Fatalf("glare reply: %+v", answer)
 	}
-	if state := fresh.SignalingState(); state != webrtc.SignalingStateStable {
-		t.Fatalf("fresh peer connection signaling state is %s, want stable", state)
+	if state := pc.SignalingState(); state != webrtc.SignalingStateStable {
+		t.Fatalf("peer connection signaling state is %s, want stable", state)
 	}
-	if remote := fresh.RemoteDescription(); remote == nil || remote.Type != webrtc.SDPTypeOffer {
-		t.Fatalf("fresh peer connection remote description: %+v", remote)
+	if remote := pc.RemoteDescription(); remote == nil || remote.Type != webrtc.SDPTypeOffer {
+		t.Fatalf("peer connection remote description: %+v", remote)
+	}
+	if pc.ConnectionState() == webrtc.PeerConnectionStateClosed {
+		t.Fatal("glare closed the original peer connection")
 	}
 }
 

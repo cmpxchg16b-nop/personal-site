@@ -196,16 +196,12 @@ retry timing, and interaction with socket reconnects.
 
 Two Go-side points the pattern leaves to the implementation:
 
-- **Yielding to a colliding offer**: pion cannot roll a pending local
-  offer back (the browser's implicit rollback has no pion counterpart),
-  so the polite Go peer yields by **rebuilding its peer connection**
-  through the caller-provided `NewPeerConnection` factory and answering
-  on the fresh one. A rebuilt connection presents a fresh ICE/DTLS
-  identity in an answer to an offer that was not an ICE restart —
-  something a browser cannot fold into the running transport (the pair
-  ends `disconnected`, and under load can negotiation-storm), so real
-  flows must avoid colliding in the first place: see the hangup
-  sequencing in `docs/music-bot.md` and the limitation below.
+- **Yielding to a colliding offer**: the local Pion submodule implements
+  standard local and remote rollback. The polite Go peer rolls its pending
+  offer back and answers on the **same peer connection**, restoring the
+  previous stable ICE credentials if the abandoned offer restarted ICE. This
+  preserves the ICE/DTLS identity required by Firefox and other browsers; an
+  ordinary answer never introduces credentials from a replacement connection.
 - **The answering DTLS role**: pion's defaults answer an `actpass`
   offer with `setup:active` — wrong for the initial offerer, which is
   already the DTLS server. A browser rejects that role flip outright
@@ -685,16 +681,6 @@ ordinary authenticated sessions.
 - **Username format** (lowercase, no-space, valid DNS label) is declared
   by the prototype but not validated server-side.
 - Channel member pages are fixed at 64 members.
-- **A mid-call glare against a browser is fatal to the pair.** The
-  polite Go peer's glare yield rebuilds its peer connection, and a
-  browser cannot fold the rebuilt connection's fresh ICE/DTLS identity
-  into the running transport (see _Client ↔ client relay_): the
-  connection goes `disconnected` → `failed`, and the sessions rebuild
-  only on a membership change, so the pair stays dead until one side
-  re-registers. The hangup flow avoids the glare by sequencing the
-  teardown (the music bot defers its track withdrawal until the peer's
-  own offer has passed); glares at other moments — e.g. a browser-side
-  track change colliding with a bot-side one — still hit the rebuild.
 
 ## Testing
 

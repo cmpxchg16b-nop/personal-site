@@ -24,18 +24,11 @@
 //     owns all perfect-negotiation state — the Go rendition of the
 //     browser's single-threaded event loop (CSP, like
 //     SimpleOnMemorySSProvider).
-//   - pion cannot roll a pending local offer back: unlike the browser,
-//     where setRemoteDescription(offer) implicitly rolls the polite
-//     peer's own offer back on a glare, pion rejects every route back
-//     to the stable state (SetLocalDescription(SDPTypeRollback) is
-//     unreachable — the empty-SDP pre-check rejects the type, and the
-//     signaling state machine has no have-local-offer → rollback →
-//     stable transition), and a peer stuck in have-local-offer can
-//     apply nothing but the answer to its own offer. Yielding to a
-//     colliding offer therefore means REBUILDING the peer connection
-//     via PerfectNegotiatorOptions.NewPeerConnection and answering on
-//     the fresh one; without a factory the polite peer cannot yield
-//     and the pair deadlocks on glare.
+//   - the local Pion submodule adds standards-compatible rollback support.
+//     A polite peer yields to a colliding offer by rolling its pending local
+//     offer back to the previous stable descriptions and answering on the same
+//     peer connection. This preserves the ICE/DTLS identity, which browsers
+//     require when the colliding offer did not request an ICE restart.
 //
 // HeadlessRTCClient (client.go) composes the pieces into a complete
 // headless peer — a bot: given a pair of signalling channels (the
@@ -112,23 +105,6 @@ type PerfectNegotiatorOptions struct {
 	// negotiate with.
 	PeerSubscriber ss.SubscriberId
 
-	// NewPeerConnection, when set, lets the polite peer yield to a
-	// colliding offer by rebuilding the local peer connection: the
-	// browser rolls its pending offer back implicitly, pion cannot (see
-	// the package comment), so the factory must return a fresh peer
-	// connection with every track, data channel, and handler the
-	// current one has, re-registered. The negotiator closes the old
-	// connection, adopts the fresh one, and answers the colliding offer
-	// on it. The cost versus the browser is a connection reset whenever
-	// this peer yields during an established connection (glare while
-	// renegotiating); a glare during session establishment is
-	// unnoticeable, as the connection was not up yet anyway.
-	//
-	// When nil, the polite peer cannot yield: it logs and ignores the
-	// colliding offer exactly like the impolite peer would, and the
-	// negotiation deadlocks until one side restarts.
-	NewPeerConnection func() (*webrtc.PeerConnection, error)
-
 	// Logger receives the negotiation's error diagnostics, mirroring
 	// the frontend's console.error calls; nil selects slog's default
 	// logger.
@@ -198,7 +174,7 @@ type PerfectNegotiator struct {
 	iceRestartTimerC     <-chan time.Time
 
 	// A glare retry is deliberately slower than the perfect-negotiation
-	// exchange. Immediate duplicates can make the polite peer rebuild forever.
+	// exchange. Immediate duplicates can keep the polite peer rolling back.
 	glareRetryDelay  time.Duration
 	glareRetryTimer  *time.Timer
 	glareRetryTimerC <-chan time.Time
@@ -209,7 +185,7 @@ type PerfectNegotiator struct {
 	iceRetryBase       time.Duration
 	iceRetryMax        time.Duration
 	iceRandom          func() float64
-	// iceStateReader follows n.pc across rebuilds. Tests replace it to model a
+	// iceStateReader reads the current PC. Tests replace it to model a
 	// transport failure while driving the real negotiation and offer path.
 	iceStateReader func() webrtc.ICEConnectionState
 }
@@ -249,11 +225,6 @@ type localEvent struct {
 // making any change to pc that triggers negotiation, and start
 // Negotiate promptly — before the first run, callback deliveries
 // buffer up (up to localEventBuffer of them).
-//
-// The one ownership exception: when options.NewPeerConnection is set,
-// ownership is shared — on a glare the negotiator may replace pc via
-// the factory and close the replaced connection (see
-// PerfectNegotiatorOptions.NewPeerConnection).
 func NewPerfectNegotiator(pc *webrtc.PeerConnection, options PerfectNegotiatorOptions) (*PerfectNegotiator, error) {
 	if pc == nil {
 		return nil, ErrNilPeerConnection
@@ -474,7 +445,7 @@ func (n *PerfectNegotiator) handleSessionDesc(ctx context.Context, desc *webrtc.
 		n.logger.Info("rtc: ignore colliding offer", "peer", n.options.PeerSubscriber)
 		// The polite peer cannot yield and answer until it receives our pending
 		// offer. Retry only if the glare stays unresolved: an immediate duplicate
-		// can itself keep the polite peer rebuilding on an ordinary glare.
+		// can itself keep the polite peer rolling back on an ordinary glare.
 		n.scheduleGlareRetryTimer()
 		return
 	}
@@ -482,20 +453,20 @@ func (n *PerfectNegotiator) handleSessionDesc(ctx context.Context, desc *webrtc.
 		"type", desc.Type, "signalingState", n.pc.SignalingState(), "collision", offerCollision,
 		"polite", n.Polite, "sdp", sdpSummary(desc.SDP))
 
-	// The polite peer yields to the colliding offer. In the browser this
-	// is where setRemoteDescription(offer) implicitly rolls the pending
-	// local offer back; pion cannot roll back (see the package comment),
-	// so a pending local offer is abandoned by rebuilding the peer
-	// connection instead. (When the local offer is still being created
-	// — the makingOffer window — nothing has been set locally yet and no
-	// rebuild is needed; its later SetLocalDescription simply fails.)
+	// The polite peer yields by rolling back its pending local offer, then
+	// answers on the same peer connection. Keeping the ICE/DTLS identity is
+	// essential: Firefox rejects an ordinary answer that introduces fresh ICE
+	// credentials from a replacement connection. (In the makingOffer window no
+	// local description has been applied yet, so there is nothing to roll back.)
 	if offerCollision && n.pc.SignalingState() == webrtc.SignalingStateHaveLocalOffer {
-		n.logger.Info("rtc: glare, rebuilding the peer connection", "peer", n.options.PeerSubscriber)
-		if err := n.rebuildPeerConnection(); err != nil {
+		n.logger.Info("rtc: glare, rolling back the local offer", "peer", n.options.PeerSubscriber)
+		if err := n.pc.SetLocalDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeRollback}); err != nil {
 			n.logger.Error("rtc: yield to colliding offer", "err", err)
 			n.ignoreOffer = true
 			return
 		}
+		n.iceLocalOfferRestart = false
+		n.stopGlareRetryTimer()
 	}
 
 	n.isSettingRemoteAnswerPending = desc.Type == webrtc.SDPTypeAnswer
@@ -711,46 +682,6 @@ func (n *PerfectNegotiator) nextICERestartDelay() time.Duration {
 	}
 	return time.Duration(float64(delay) * (0.8 + 0.4*random()))
 }
-
-// rebuildPeerConnection swaps the local peer connection for a fresh
-// one from options.NewPeerConnection — pion's stand-in for the
-// browser's implicit rollback on a glare. The old connection's
-// negotiator handlers are detached, the fresh one's are attached, and
-// the old connection is closed; the factory must have re-registered
-// every track, data channel, and handler on the fresh connection.
-// ICE candidates of the colliding offer are not lost: they can only
-// arrive after it, by which time the swap has happened.
-func (n *PerfectNegotiator) rebuildPeerConnection() error {
-	if n.options.NewPeerConnection == nil {
-		return errNoPeerConnectionFactory
-	}
-	fresh, err := n.options.NewPeerConnection()
-	if err != nil {
-		return err
-	}
-	old := n.pc
-	n.pc = fresh
-	n.makingOffer = false
-	n.ignoreOffer = false
-	n.isSettingRemoteAnswerPending = false
-	n.iceLocalOfferRestart = false
-	n.stopGlareRetryTimer()
-	// The replacement has fresh ICE credentials already; an additional restart
-	// offer would be redundant. Keep the recovery watchdog until it connects.
-	n.iceRestartPending = false
-	old.OnNegotiationNeeded(nil)
-	old.OnICECandidate(nil)
-	old.OnICEConnectionStateChange(nil)
-	n.attach(fresh)
-	if err := old.Close(); err != nil {
-		n.logger.Warn("rtc: close replaced peer connection", "err", err)
-	}
-	return nil
-}
-
-// errNoPeerConnectionFactory explains a polite peer that cannot yield.
-var errNoPeerConnectionFactory = errors.New(
-	"rtc: no NewPeerConnection factory configured; the polite peer cannot yield to a colliding offer")
 
 // sdpSummary condenses a session description to what a failed
 // SetRemoteDescription is about: per m-section, the mid and the a=setup

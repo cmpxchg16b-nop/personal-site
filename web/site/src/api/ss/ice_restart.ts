@@ -17,8 +17,10 @@ const DEFAULT_RETRY_MAX_MS = 30_000;
 /**
  * Restarts ICE after an established connection stops working. A disconnected
  * state gets a grace period; failed restarts immediately. The retry timer is a
- * watchdog, so checking does not cancel recovery — only connected/completed,
- * closed, or close() does.
+ * watchdog, so checking does not cancel recovery. Success requires both a
+ * connected/completed ICE state and an aggregate connected state: a selected
+ * ICE pair alone can leave DTLS or another transport unhealthy. Closed or
+ * close() stops recovery.
  */
 export class IceRestartController {
   private readonly disconnectGraceMs: number;
@@ -52,25 +54,23 @@ export class IceRestartController {
   handleState(state: RTCIceConnectionState): void {
     if (this.closed) return;
 
+    if (this.isHealthy(state, this.pc.connectionState)) {
+      this.markHealthy();
+      return;
+    }
     switch (state) {
       case "connected":
       case "completed":
-        this.usable = true;
-        this.recovering = false;
-        this.attempts = 0;
-        this.stopTimer();
+        // ICE can find a working candidate pair before DTLS (or another
+        // transport) is healthy. Let the aggregate state decide whether the
+        // recovery watchdog may stop.
+        this.handleConnectionState(this.pc.connectionState);
         return;
       case "disconnected":
-        if (this.usable && !this.recovering) {
-          this.recovering = true;
-          this.schedule(this.disconnectGraceMs);
-        }
+        this.handleDisconnected();
         return;
       case "failed":
-        if (!this.usable || (this.recovering && this.attempts > 0)) return;
-        this.recovering = true;
-        this.stopTimer();
-        this.schedule(0);
+        this.handleFailed();
         return;
       case "closed":
         this.close();
@@ -79,6 +79,60 @@ export class IceRestartController {
         // new/checking are not outcomes: a restart watchdog must keep running.
         return;
     }
+  }
+
+  /** Reconciles recovery with the aggregate ICE + DTLS connection state. */
+  handleConnectionState(state: RTCPeerConnectionState): void {
+    if (this.closed) return;
+    if (this.isHealthy(this.pc.iceConnectionState, state)) {
+      this.markHealthy();
+      return;
+    }
+    switch (state) {
+      case "disconnected":
+        this.handleDisconnected();
+        return;
+      case "failed":
+        this.handleFailed();
+        return;
+      case "closed":
+        this.close();
+        return;
+      default:
+        // new/connecting are not outcomes; an active watchdog keeps running.
+        return;
+    }
+  }
+
+  private isHealthy(
+    ice: RTCIceConnectionState,
+    connection: RTCPeerConnectionState,
+  ): boolean {
+    return (
+      (ice === "connected" || ice === "completed") &&
+      connection === "connected"
+    );
+  }
+
+  private markHealthy(): void {
+    this.usable = true;
+    this.recovering = false;
+    this.attempts = 0;
+    this.stopTimer();
+  }
+
+  private handleDisconnected(): void {
+    if (this.usable && !this.recovering) {
+      this.recovering = true;
+      this.schedule(this.disconnectGraceMs);
+    }
+  }
+
+  private handleFailed(): void {
+    if (!this.usable || (this.recovering && this.attempts > 0)) return;
+    this.recovering = true;
+    this.stopTimer();
+    this.schedule(0);
   }
 
   close(): void {
@@ -105,14 +159,14 @@ export class IceRestartController {
   private restart(): void {
     if (this.closed || !this.recovering) return;
     if (
-      this.pc.iceConnectionState === "connected" ||
-      this.pc.iceConnectionState === "completed"
+      this.isHealthy(this.pc.iceConnectionState, this.pc.connectionState)
     ) {
-      this.handleState(this.pc.iceConnectionState);
+      this.markHealthy();
       return;
     }
     if (
       this.pc.iceConnectionState === "closed" ||
+      this.pc.connectionState === "closed" ||
       this.pc.signalingState === "closed"
     ) {
       this.close();

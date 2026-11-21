@@ -5,9 +5,30 @@ import {
   type IceRestartControllerOptions,
 } from "./ice_restart";
 
+function connectionStateFor(
+  state: RTCIceConnectionState,
+): RTCPeerConnectionState {
+  switch (state) {
+    case "connected":
+    case "completed":
+      return "connected";
+    case "disconnected":
+      return "disconnected";
+    case "failed":
+      return "failed";
+    case "checking":
+      return "connecting";
+    case "closed":
+      return "closed";
+    default:
+      return "new";
+  }
+}
+
 function mockPeerConnection() {
   return {
     iceConnectionState: "new" as RTCIceConnectionState,
+    connectionState: "new" as RTCPeerConnectionState,
     signalingState: "stable" as RTCSignalingState,
     restartIce: vi.fn(),
   };
@@ -25,11 +46,19 @@ function setup(options: IceRestartControllerOptions = {}) {
       ...options,
     },
   );
-  const setState = (state: RTCIceConnectionState) => {
+  const setState = (
+    state: RTCIceConnectionState,
+    connectionState = connectionStateFor(state),
+  ) => {
     pc.iceConnectionState = state;
+    pc.connectionState = connectionState;
     controller.handleState(state);
   };
-  return { pc, controller, setState };
+  const setConnectionState = (state: RTCPeerConnectionState) => {
+    pc.connectionState = state;
+    controller.handleConnectionState(state);
+  };
+  return { pc, controller, setState, setConnectionState };
 }
 
 describe("IceRestartController", () => {
@@ -128,6 +157,37 @@ describe("IceRestartController", () => {
     expect(pc.restartIce).toHaveBeenCalledTimes(1);
     vi.advanceTimersByTime(1);
     expect(pc.restartIce).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps retrying when ICE recovers but the aggregate stays disconnected", () => {
+    const { pc, setState, setConnectionState } = setup();
+    setState("connected");
+    setState("disconnected");
+    vi.advanceTimersByTime(100);
+    expect(pc.restartIce).toHaveBeenCalledTimes(1);
+
+    // A selected candidate pair is not full recovery: DTLS or another
+    // transport can still leave the aggregate disconnected.
+    setState("connected", "disconnected");
+    vi.advanceTimersByTime(49);
+    expect(pc.restartIce).toHaveBeenCalledTimes(1);
+    vi.advanceTimersByTime(1);
+    expect(pc.restartIce).toHaveBeenCalledTimes(2);
+
+    setConnectionState("connected");
+    expect(vi.getTimerCount()).toBe(0);
+    vi.advanceTimersByTime(10_000);
+    expect(pc.restartIce).toHaveBeenCalledTimes(2);
+  });
+
+  it("arms recovery from the aggregate even while ICE remains connected", () => {
+    const { pc, setState, setConnectionState } = setup();
+    setState("connected");
+    setConnectionState("disconnected");
+    vi.advanceTimersByTime(99);
+    expect(pc.restartIce).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(1);
+    expect(pc.restartIce).toHaveBeenCalledTimes(1);
   });
 
   it("cancels on close and ignores late state events", () => {

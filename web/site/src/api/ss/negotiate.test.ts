@@ -5,12 +5,14 @@ import type { SignallingEvent } from "./types";
 
 class MockPeerConnection {
   iceConnectionState: RTCIceConnectionState = "new";
+  connectionState: RTCPeerConnectionState = "new";
   signalingState: RTCSignalingState = "stable";
   localDescription: RTCSessionDescriptionInit | null = null;
   onnegotiationneeded: ((ev: Event) => void) | null = null;
   onicecandidate: ((ev: RTCPeerConnectionIceEvent) => void) | null = null;
   oniceconnectionstatechange: (() => void) | null = null;
   offers = 0;
+  private connectionStateListeners = new Set<() => void>();
 
   restartIce = vi.fn(() => {
     queueMicrotask(() =>
@@ -26,9 +28,34 @@ class MockPeerConnection {
     };
   });
 
+  addEventListener(type: string, listener: () => void) {
+    if (type === "connectionstatechange") {
+      this.connectionStateListeners.add(listener);
+    }
+  }
+
+  removeEventListener(type: string, listener: () => void) {
+    if (type === "connectionstatechange") {
+      this.connectionStateListeners.delete(listener);
+    }
+  }
+
   setState(state: RTCIceConnectionState) {
     this.iceConnectionState = state;
+    this.connectionState =
+      state === "connected" || state === "completed"
+        ? "connected"
+        : state === "disconnected"
+          ? "disconnected"
+          : state === "failed"
+            ? "failed"
+            : state === "closed"
+              ? "closed"
+              : state === "checking"
+                ? "connecting"
+                : "new";
     this.oniceconnectionstatechange?.();
+    for (const listener of this.connectionStateListeners) listener();
   }
 }
 

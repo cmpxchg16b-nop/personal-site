@@ -51,10 +51,8 @@ import (
 // session's freshly created peer connection (the client's data-channel
 // wiring already attached), and options carries the c2c addressing the
 // client resolved — the channel, the client's own (already registered)
-// subscriber id, and the peer's — plus the peer-connection rebuild factory
-// the polite peer needs to yield to a colliding offer (see
-// PerfectNegotiatorOptions.NewPeerConnection). A factory may adjust the
-// options (e.g. a different Logger) before constructing the negotiator.
+// subscriber id, and the peer's. A factory may adjust the options (e.g. a
+// different Logger) before constructing the negotiator.
 //
 // The client needs a factory rather than a Negotiator instance because
 // there is one negotiator per peer, and because the client's own
@@ -75,9 +73,8 @@ func PerfectNegotiatorFactory(pc *webrtc.PeerConnection, options PerfectNegotiat
 // ServeDataChannel is invoked once per (session, label) incarnation: when
 // a session's channel of the label appears — created locally by the polite
 // peer, or announced by the remote peer (pion's OnDataChannel, whose event
-// carries the data channel this label matches on) — and again with the
-// fresh channel when a glare rebuild replaces the session's peer
-// connection. The channel may still be connecting; attach OnOpen/OnMessage
+// carries the data channel this label matches on). Glare rollback preserves
+// that channel. The channel may still be connecting; attach OnOpen/OnMessage
 // callbacks instead of assuming it is open.
 //
 // ctx is the peer session's context: it is canceled when the session ends
@@ -128,9 +125,8 @@ var _ CallSignallingHandler = CallSignallingHandlerFunc(nil)
 // channels are long up) arrives here.
 //
 // ServeTrack is invoked once per (session, track): when a remote track
-// arrives on the session's peer connection — and again for the re-arrived
-// track after a glare rebuild replaced the session's peer connection (the
-// renegotiation re-announces it). ctx is the peer session's context (see
+// arrives on the session's peer connection. Glare rollback preserves the
+// session and its media. ctx is the peer session's context (see
 // DataChannelHandler). Every invocation runs on its own goroutine; a
 // panicking handler is logged and swallowed.
 type TrackHandler interface {
@@ -173,10 +169,6 @@ var (
 	ErrNilCallSignalling = errors.New("rtc: nil call signalling")
 )
 
-// errPeerSessionGone answers a rebuild request that arrived after its
-// session was torn down.
-var errPeerSessionGone = errors.New("rtc: peer session is gone")
-
 // Defaults of the client's periodic activities, mirroring the browser
 // client: the keepalive and the listing run well below the SS's default
 // subscriber aging (30s), so a live client never ages out and membership
@@ -212,8 +204,8 @@ type RTCClientConfiguration struct {
 	// network still connect.
 	ICEServers []string
 
-	// NewPeerConnection creates one peer connection per peer session (and
-	// per glare rebuild). polite says whether this client is the session's
+	// NewPeerConnection creates one peer connection per peer session.
+	// polite says whether this client is the session's
 	// polite peer — the one creating the data channels, hence the initial
 	// offerer, hence the DTLS server: its answers must keep that role
 	// (setup:passive), or the peer's transport breaks at the first
@@ -481,11 +473,9 @@ func (c *HeadlessRTCClient) HandleTrackFunc(handler func(ctx context.Context, ch
 // when there is no session with the peer; re-adding an already attached
 // track is a no-op returning its current sender.
 //
-// The track survives a glare rebuild: the client re-adds the session's
-// tracks to the rebuilt connection. The returned sender does NOT — it
-// belongs to the replaced connection — so RemoveTrack keys by track, never
-// The track must be a comparable implementation (pion's track
-// types are pointers).
+// Glare rollback preserves the track and sender on the same connection.
+// RemoveTrack nevertheless keys by the stable track identity. The track must
+// be a comparable implementation (pion's track types are pointers).
 func (c *HeadlessRTCClient) AddTrack(peer ss.SubscriberId, track webrtc.TrackLocal) (*webrtc.RTPSender, error) {
 	return c.AddTrackWithCodecPreferences(peer, track, nil)
 }
@@ -495,8 +485,8 @@ func (c *HeadlessRTCClient) AddTrack(peer ss.SubscriberId, track webrtc.TrackLoc
 // carry exactly codecs for the track's m-line (pion generates both from
 // the transceiver's preferences). The pin is in place before the
 // renegotiation the attach triggers, and it is recorded with the track
-// and re-applied when a glare rebuild re-adds the track to the fresh
-// connection. A nil codecs is AddTrack exactly.
+// so later negotiations keep the same preferences. A nil codecs is AddTrack
+// exactly.
 func (c *HeadlessRTCClient) AddTrackWithCodecPreferences(peer ss.SubscriberId, track webrtc.TrackLocal, codecs []webrtc.RTPCodecParameters) (*webrtc.RTPSender, error) {
 	if track == nil {
 		panic("rtc: nil track")
@@ -509,9 +499,8 @@ func (c *HeadlessRTCClient) AddTrackWithCodecPreferences(peer ss.SubscriberId, t
 
 // RemoveTrack removes track (previously added with AddTrack) from the peer
 // session — the mirror of the browser's PeerSessions.removeTrack, keyed by
-// track rather than sender so a glare rebuild (which swaps the sender)
-// cannot stale the caller's handle. Removing renegotiates like adding
-// does. It is a no-op when the session or the track is already gone.
+// the stable track identity. Removing renegotiates like adding does. It is
+// a no-op when the session or the track is already gone.
 func (c *HeadlessRTCClient) RemoveTrack(peer ss.SubscriberId, track webrtc.TrackLocal) error {
 	if track == nil {
 		panic("rtc: nil track")
@@ -652,18 +641,6 @@ type trackNote struct {
 	receiver *webrtc.RTPReceiver
 }
 
-// rebuildNote is a session's glare yield: the negotiator needs a fresh
-// peer connection, re-wired and re-stocked with the session's channels.
-type rebuildNote struct {
-	sess  *peerSession
-	reply chan<- rebuildReply
-}
-
-type rebuildReply struct {
-	pc  *webrtc.PeerConnection
-	err error
-}
-
 // selfNote / peersNote answer the accessors.
 type selfNote struct{ reply chan<- ss.SubscriberId }
 type peersNote struct{ reply chan<- []ss.SubscriberId }
@@ -677,7 +654,6 @@ func (trackHandlerNote) isClientNote() {}
 func (addTrackNote) isClientNote()     {}
 func (removeTrackNote) isClientNote()  {}
 func (trackNote) isClientNote()        {}
-func (rebuildNote) isClientNote()      {}
 func (selfNote) isClientNote()         {}
 func (peersNote) isClientNote()        {}
 
@@ -746,8 +722,6 @@ func (c *HeadlessRTCClient) hub() {
 				c.handleRemoveTrackNote(run, n)
 			case trackNote:
 				c.handleTrackNote(run, n)
-			case rebuildNote:
-				c.handleRebuildNote(run, n)
 			case selfNote:
 				if run == nil {
 					n.reply <- ""
@@ -1079,20 +1053,7 @@ func (c *HeadlessRTCClient) startSession(run *clientRun, peer ss.SubscriberId) *
 		ChannelId:      c.channelId,
 		SelfSubscriber: run.self,
 		PeerSubscriber: peer,
-		// On a glare the negotiator rebuilds the peer connection through
-		// this factory: the swap is hub state, so it is posted as a note;
-		// the negotiator's goroutine waits for the reply.
-		NewPeerConnection: func() (*webrtc.PeerConnection, error) {
-			reply := make(chan rebuildReply, 1)
-			select {
-			case c.serviceChan <- rebuildNote{sess: sess, reply: reply}:
-			case <-sess.ctx.Done():
-				return nil, sess.ctx.Err()
-			}
-			r := <-reply
-			return r.pc, r.err
-		},
-		Logger: c.logger,
+		Logger:         c.logger,
 	})
 	if err != nil {
 		_ = pc.Close()
@@ -1229,9 +1190,9 @@ func (c *HeadlessRTCClient) handleTrackHandlerNote(n trackHandlerNote) {
 }
 
 // handleAddTrackNote attaches a local media track to the session's peer
-// connection and records it, so a glare rebuild can re-add it to the
-// rebuilt connection. Adding fires the peer connection's
-// OnNegotiationNeeded — the session's negotiator renegotiates on its own.
+// connection and records its stable identity for idempotent removal. Adding
+// fires the peer connection's OnNegotiationNeeded — the session's negotiator
+// renegotiates on its own.
 func (c *HeadlessRTCClient) handleAddTrackNote(run *clientRun, n addTrackNote) {
 	if run == nil {
 		n.reply <- addTrackReply{err: ErrNoPeerSession}
@@ -1270,8 +1231,7 @@ func (c *HeadlessRTCClient) handleAddTrackNote(run *clientRun, n addTrackNote) {
 
 // pinTransceiverCodecs pins the codec preferences of the transceiver
 // sender belongs to — pion's RTPTransceiver.SetCodecPreferences, found
-// by the sender (AddTrackWithCodecPreferences' hub-side half, and the
-// glare rebuild's re-apply).
+// by the sender (AddTrackWithCodecPreferences' hub-side half).
 func pinTransceiverCodecs(pc *webrtc.PeerConnection, sender *webrtc.RTPSender, codecs []webrtc.RTPCodecParameters) error {
 	for _, t := range pc.GetTransceivers() {
 		if t.Sender() == sender {
@@ -1323,76 +1283,6 @@ func (c *HeadlessRTCClient) handleTrackNote(run *clientRun, n trackNote) {
 		return
 	}
 	c.dispatchTrack(n.sess, n.track, n.receiver, handler)
-}
-
-// handleRebuildNote is the hub side of a session's glare yield: a fresh
-// peer connection, re-wired and re-stocked with the session's channels —
-// every known label is re-created locally (the peer's own channels died
-// with the replaced connection either way), the label handlers are
-// re-invoked with the fresh channels, and the session's local media tracks
-// are re-added (pion cannot roll back; the browser's implicit rollback
-// preserves its transceivers, so the rebuild must). The session's state is
-// swapped only once the fresh connection is fully stocked, so a failure
-// leaves the session untouched. See PerfectNegotiatorOptions.NewPeerConnection.
-func (c *HeadlessRTCClient) handleRebuildNote(run *clientRun, n rebuildNote) {
-	if run == nil || run.sessions[n.sess.peer] != n.sess {
-		n.reply <- rebuildReply{err: errPeerSessionGone}
-		return
-	}
-	fresh, err := c.newPC(n.sess.polite)
-	if err != nil {
-		n.reply <- rebuildReply{err: err}
-		return
-	}
-	c.attachPeerConnection(n.sess, fresh)
-	type pending struct {
-		dc      *webrtc.DataChannel
-		handler DataChannelHandler
-	}
-	var toDispatch []pending
-	channels := make(map[string]*webrtc.DataChannel, len(n.sess.channels))
-	for label := range n.sess.channels {
-		dc, err := fresh.CreateDataChannel(label, nil)
-		if err != nil {
-			_ = fresh.Close()
-			n.reply <- rebuildReply{err: fmt.Errorf("rtc: re-create data channel %q: %w", label, err)}
-			return
-		}
-		channels[label] = dc
-		if handler := c.handlers[label]; handler != nil {
-			toDispatch = append(toDispatch, pending{dc, handler})
-		}
-	}
-	// The tracks, re-added before the swap completes: the negotiator
-	// answers the colliding offer on the fresh connection, and the answer
-	// must carry them.
-	tracks := make([]sessionTrack, 0, len(n.sess.tracks))
-	for _, st := range n.sess.tracks {
-		sender, err := fresh.AddTrack(st.track)
-		if err != nil {
-			_ = fresh.Close()
-			n.reply <- rebuildReply{err: fmt.Errorf("rtc: re-add track %q: %w", st.track.ID(), err)}
-			return
-		}
-		if st.codecs != nil {
-			// The codec pin the track was attached with re-applies on the
-			// fresh connection — the answer to the colliding offer must
-			// carry the pin too.
-			if err := pinTransceiverCodecs(fresh, sender, st.codecs); err != nil {
-				_ = fresh.Close()
-				n.reply <- rebuildReply{err: fmt.Errorf("rtc: re-pin track %q: %w", st.track.ID(), err)}
-				return
-			}
-		}
-		tracks = append(tracks, sessionTrack{track: st.track, sender: sender, codecs: st.codecs})
-	}
-	n.sess.pc = fresh
-	n.sess.channels = channels
-	n.sess.tracks = tracks
-	n.reply <- rebuildReply{pc: fresh}
-	for _, p := range toDispatch {
-		c.dispatchDataChannel(n.sess, p.dc, p.handler)
-	}
 }
 
 // attachPeerConnection wires the client's own pion handlers on pc —
@@ -1496,8 +1386,7 @@ type peerSession struct {
 	out   chan *ss.SignallingEvent // SDP/ICE/call → session → transport
 	calls chan callDelivery        // hub → ordered per-peer call handler
 
-	// Owned by the hub goroutine (pc is swapped by the glare rebuild);
-	// never touched elsewhere.
+	// Owned by the hub goroutine; never touched elsewhere.
 	pc       *webrtc.PeerConnection
 	channels map[string]*webrtc.DataChannel
 	tracks   []sessionTrack
@@ -1510,10 +1399,8 @@ type callDelivery struct {
 }
 
 // sessionTrack is one local media track attached to the session's peer
-// connection, with its current sender — refreshed when a glare rebuild
-// re-adds the track to the rebuilt connection, so the session's record
-// stays removal-ready — and its codec pin when the track was attached
-// with one (AddTrackWithCodecPreferences), re-applied on the rebuild.
+// connection, with its sender and the codec pin supplied when the track was
+// attached (AddTrackWithCodecPreferences).
 type sessionTrack struct {
 	track  webrtc.TrackLocal
 	sender *webrtc.RTPSender
@@ -1589,9 +1476,8 @@ func (sess *peerSession) pumpCalls(handlerIn chan<- callDelivery) {
 // pumpIn moves events from the session's hub-facing channel to the
 // negotiator through an unbounded queue (the nil-channel idiom: the
 // output case is disabled while the queue is empty). The hub — and
-// therefore every other session — is never blocked by a negotiator that
-// is busy, e.g. rebuilding the peer connection through the hub on a
-// glare: such a cycle would deadlock.
+// therefore every other session — is never blocked by a slow negotiator:
+// such a cycle would deadlock.
 func (sess *peerSession) pumpIn(negoIn chan<- *ss.SignallingEvent) {
 	var queue []*ss.SignallingEvent
 	for {
