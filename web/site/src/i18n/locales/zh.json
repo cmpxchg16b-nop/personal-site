@@ -122,6 +122,43 @@
     "back": "返回频道列表",
     "today": "今天",
     "yesterday": "昨天",
+    "navigation": "聊天导航",
+    "tabs": {
+      "chat": "聊天",
+      "phone": "电话",
+      "settings": "设置"
+    },
+    "phone": {
+      "search": "搜索姓名或号码",
+      "empty": "暂无通话记录。",
+      "noMatch": "没有匹配的通话记录。",
+      "newSipCall": "新建 SIP 呼叫",
+      "numberPrompt": "请输入被叫号码",
+      "number": "被叫号码",
+      "cancel": "取消",
+      "call": "呼叫",
+      "unavailable": "暂未实现，敬请期待",
+      "viewContact": "查看 {{name}} 的通话操作",
+      "backToHistory": "返回通话记录",
+      "videoCall": "视频呼叫",
+      "voiceCall": "语音呼叫",
+      "sms": "发送短信"
+    },
+
+    "sip": {
+      "title": "SIP 注册",
+      "back": "返回设置",
+      "placeholder": "SIP 注册服务端尚未实现。添加的配置仅保留在当前页面，不会发起实际注册。",
+      "currentStatus": "当前 SIP 注册状态",
+      "unregistered": "未注册",
+      "configurations": "注册配置",
+      "add": "添加 SIP 注册",
+      "server": "SIP 服务器",
+      "username": "用户名",
+      "password": "密码",
+      "transport": "连接方式",
+      "submit": "添加注册"
+    },
     "fileTransfer": {
       "pending": "等待中…",
       "running": "传输中",

@@ -10,8 +10,10 @@ import type {
   SubscriberId,
 } from "@/api/ss/types";
 import type { PeerConnectionStates } from "@/api/ss/peersessions";
-import ChatSidebar from "./ChatSidebar";
+import ChatSidebar, { type ChatSidebarTab } from "./ChatSidebar";
 import ConversationView from "./ConversationView";
+import PhoneContactView from "./PhoneContactView";
+import SipRegistrationSettings from "./SipRegistrationSettings";
 import { IncomingCallWindow } from "./IncomingCallWindow";
 import { VideoWindow } from "./VideoWindow";
 import { DialPad } from "./DialPad";
@@ -132,6 +134,12 @@ export default function ChatApp({
 }: ChatAppProps) {
   const { t } = useTranslation();
   const [mobileListOpen, setMobileListOpen] = useState(false);
+  const [activeTab, setActiveTab] = useState<ChatSidebarTab>("chat");
+  const [phoneContact, setPhoneContact] = useState<{
+    ref: ConversationRef;
+    messageId: string;
+  } | null>(null);
+  const [sipSettingsOpen, setSipSettingsOpen] = useState(false);
   // The dial pad's visibility — viewport chrome like mobileListOpen:
   // the pad EXISTS while the open conversation's call negotiated DTMF
   // (activeDialer below), and SHOWS on the user's toggle.
@@ -145,6 +153,9 @@ export default function ChatApp({
           channelId: selected.channelId,
           user: users[selected.userId] ?? users[currentUserId],
         };
+
+  const phoneContactUser =
+    phoneContact === null ? undefined : users[phoneContact.ref.userId];
 
   const activeKey = selected === null ? null : conversationKey(selected);
   const activeMessages = activeKey === null ? [] : (messages[activeKey] ?? []);
@@ -181,6 +192,20 @@ export default function ChatApp({
 
   const handleSelect = (ref: ConversationRef) => {
     onSelect(ref);
+    setPhoneContact(null);
+    setSipSettingsOpen(false);
+    setMobileListOpen(false);
+  };
+
+  const handleTabChange = (tab: ChatSidebarTab) => {
+    setActiveTab(tab);
+    setPhoneContact(null);
+    setSipSettingsOpen(false);
+  };
+
+  const handleSelectContact = (ref: ConversationRef, messageId: string) => {
+    setPhoneContact({ ref, messageId });
+    setSipSettingsOpen(false);
     setMobileListOpen(false);
   };
 
@@ -207,43 +232,74 @@ export default function ChatApp({
           selected={selected}
           onSelect={handleSelect}
           calls={calls}
+          tab={activeTab}
+          onTabChange={handleTabChange}
+          messages={messages}
+          users={users}
+          currentUserId={currentUserId}
+          selectedCallId={phoneContact?.messageId ?? null}
+          onSelectContact={handleSelectContact}
+          sipSelected={activeTab === "settings" && sipSettingsOpen}
+          onOpenSip={() => {
+            setSipSettingsOpen(true);
+            setMobileListOpen(false);
+          }}
           sx={{ display: { xs: mobileListOpen ? "flex" : "none", sm: "flex" } }}
         />
-        <ConversationView
-          conversation={conversation}
-          messages={activeMessages}
-          usersById={users}
-          currentUserId={currentUserId}
-          onSend={onSend}
-          onAttachFile={onAttachFile}
-          onRequestFile={onRequestFile}
-          getFileByFileId={getFileByFileId}
-          call={activeCall}
-          connectionState={peerConnectionState}
-          onStartCall={() =>
-            selected !== null && onStartCall(selected, "voice")
-          }
-          onStartVideoCall={() =>
-            selected !== null && onStartCall(selected, "video")
-          }
-          onEndCall={() => activeCall !== null && onEndCall(activeCall)}
-          localAnalyser={localAnalyser}
-          remoteAnalyser={
-            selected === null
-              ? null
-              : remoteAnalyserFor(selected.channelId, selected.userId)
-          }
-          dialPad={
-            activeDialer === null
-              ? undefined
-              : {
-                  open: dialPadOpen,
-                  onToggle: () => setDialPadOpen((open) => !open),
-                }
-          }
-          onBack={() => setMobileListOpen(true)}
-          sx={{ display: { xs: mobileListOpen ? "none" : "flex", sm: "flex" } }}
-        />
+        {activeTab === "settings" && sipSettingsOpen ? (
+          <SipRegistrationSettings
+            onBack={() => setMobileListOpen(true)}
+            sx={{
+              display: { xs: mobileListOpen ? "none" : "flex", sm: "flex" },
+            }}
+          />
+        ) : activeTab === "phone" && phoneContactUser !== undefined ? (
+          <PhoneContactView
+            user={phoneContactUser}
+            onBack={() => setMobileListOpen(true)}
+            sx={{
+              display: { xs: mobileListOpen ? "none" : "flex", sm: "flex" },
+            }}
+          />
+        ) : (
+          <ConversationView
+            conversation={conversation}
+            messages={activeMessages}
+            usersById={users}
+            currentUserId={currentUserId}
+            onSend={onSend}
+            onAttachFile={onAttachFile}
+            onRequestFile={onRequestFile}
+            getFileByFileId={getFileByFileId}
+            call={activeCall}
+            connectionState={peerConnectionState}
+            onStartCall={() =>
+              selected !== null && onStartCall(selected, "voice")
+            }
+            onStartVideoCall={() =>
+              selected !== null && onStartCall(selected, "video")
+            }
+            onEndCall={() => activeCall !== null && onEndCall(activeCall)}
+            localAnalyser={localAnalyser}
+            remoteAnalyser={
+              selected === null
+                ? null
+                : remoteAnalyserFor(selected.channelId, selected.userId)
+            }
+            dialPad={
+              activeDialer === null
+                ? undefined
+                : {
+                    open: dialPadOpen,
+                    onToggle: () => setDialPadOpen((open) => !open),
+                  }
+            }
+            onBack={() => setMobileListOpen(true)}
+            sx={{
+              display: { xs: mobileListOpen ? "none" : "flex", sm: "flex" },
+            }}
+          />
+        )}
       </Paper>
       {/* The global incoming-call popup — the one place calls are
           answered. */}

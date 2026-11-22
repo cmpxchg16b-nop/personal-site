@@ -122,6 +122,43 @@
     "back": "Back to the channel list",
     "today": "Today",
     "yesterday": "Yesterday",
+    "navigation": "Chat navigation",
+    "tabs": {
+      "chat": "Chat",
+      "phone": "Phone",
+      "settings": "Settings"
+    },
+    "phone": {
+      "search": "Search names or numbers",
+      "empty": "No calls yet.",
+      "noMatch": "No matching calls.",
+      "newSipCall": "New SIP call",
+      "numberPrompt": "Enter the number to call",
+      "number": "Phone number",
+      "cancel": "Cancel",
+      "call": "Call",
+      "unavailable": "Not implemented yet — stay tuned.",
+      "viewContact": "View call actions for {{name}}",
+      "backToHistory": "Back to call history",
+      "videoCall": "Video call",
+      "voiceCall": "Voice call",
+      "sms": "Send SMS"
+    },
+
+    "sip": {
+      "title": "SIP Registration",
+      "back": "Back to settings",
+      "placeholder": "The SIP registration service is not implemented yet. Configurations added here only remain on this page; no registration is attempted.",
+      "currentStatus": "Current SIP registration status",
+      "unregistered": "Not registered",
+      "configurations": "Registration configurations",
+      "add": "Add SIP registration",
+      "server": "SIP server",
+      "username": "Username",
+      "password": "Password",
+      "transport": "Transport",
+      "submit": "Add registration"
+    },
     "fileTransfer": {
       "pending": "Waiting…",
       "running": "Transferring",
