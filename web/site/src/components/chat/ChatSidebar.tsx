@@ -132,14 +132,16 @@ export default function ChatSidebar({
         sx={{
           order: 2,
           width: "100%",
-          minHeight: 44,
+          // Keep the complete bar (48px + top border) level with the
+          // conversation composer's 49px single-line height.
+          minHeight: 48,
           flexShrink: 0,
           borderTop: 1,
           borderColor: "divider",
           "& .MuiTabs-indicator": { display: "none" },
           "& .MuiTab-root": {
             minWidth: 0,
-            minHeight: 44,
+            minHeight: 48,
             px: 0.25,
             py: 0.5,
             gap: 0.25,

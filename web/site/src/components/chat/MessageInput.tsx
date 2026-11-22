@@ -89,10 +89,14 @@ export default function MessageInput({
     <Box
       sx={{
         display: "flex",
-        alignItems: "flex-end",
+        alignItems: "center",
         gap: 1,
         px: 1,
-        py: 1,
+        // Single-line composer: 49px including the border, level with the
+        // sidebar's bottom tab bar. Multiline content can still grow upward.
+        minHeight: 49,
+        boxSizing: "border-box",
+        py: 0.5,
         borderTop: 1,
         borderColor: "divider",
       }}
