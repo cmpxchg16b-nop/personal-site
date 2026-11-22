@@ -164,11 +164,10 @@
       "echoCancellation": "Echo cancellation"
     },
     "visibility": {
-      "title": "Public visibility",
-      "control": "Public visibility: {{state}}",
+      "title": "Visibility",
+      "control": "Visibility: {{state}}",
       "online": "Online",
-      "invisible": "Invisible",
-      "description": "When invisible, you disappear from public channel member lists; members who know your subscription address can still reach you through signalling."
+      "invisible": "Invisible"
     }
   },
   "footer": {

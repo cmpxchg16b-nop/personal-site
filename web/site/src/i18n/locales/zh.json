@@ -164,11 +164,10 @@
       "echoCancellation": "回声消除"
     },
     "visibility": {
-      "title": "公开可见性",
-      "control": "公开可见性：{{state}}",
+      "title": "可见性",
+      "control": "可见性：{{state}}",
       "online": "在线",
-      "invisible": "隐身",
-      "description": "隐身时不会出现在公共频道成员列表中，但已知你订阅地址的成员仍可通过信令联系你。"
+      "invisible": "隐身"
     }
   },
   "footer": {

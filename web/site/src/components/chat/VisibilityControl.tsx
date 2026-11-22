@@ -31,13 +31,17 @@ export function VisibilityControl({
 }: VisibilityControlProps) {
   const { t } = useTranslation();
   const [anchor, setAnchor] = useState<HTMLButtonElement | null>(null);
-  const state = t(visible ? "chat.visibility.online" : "chat.visibility.invisible");
+  const state = t(
+    visible ? "chat.visibility.online" : "chat.visibility.invisible",
+  );
 
   return (
     <>
       <Tooltip title={t("chat.visibility.control", { state })}>
         <IconButton
-          onClick={(e) => setAnchor((a) => (a === null ? e.currentTarget : null))}
+          onClick={(e) =>
+            setAnchor((a) => (a === null ? e.currentTarget : null))
+          }
           aria-label={t("chat.visibility.control", { state })}
           size="small"
         >
@@ -61,7 +65,12 @@ export function VisibilityControl({
             {t("chat.visibility.title")}
           </Typography>
           <FormControlLabel
-            sx={{ mt: 1, mx: 0, display: "flex", justifyContent: "space-between" }}
+            sx={{
+              mt: 1,
+              mx: 0,
+              display: "flex",
+              justifyContent: "space-between",
+            }}
             label={state}
             labelPlacement="start"
             control={
@@ -76,9 +85,6 @@ export function VisibilityControl({
               />
             }
           />
-          <Typography variant="caption" color="text.secondary">
-            {t("chat.visibility.description")}
-          </Typography>
         </Box>
       </Popover>
     </>
