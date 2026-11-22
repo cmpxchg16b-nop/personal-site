@@ -627,6 +627,10 @@ func startBotClient(ctx context.Context, name string, cfg *pkgmodelsserverconfig
 	if err != nil {
 		return fmt.Errorf("reconnectInterval: %w", err)
 	}
+	visible, err := cfg.VisibleOrDefault()
+	if err != nil {
+		return err
+	}
 
 	// The token doubles as the bot's whole identity: the endpoint stamps
 	// its subject/session onto the bot's events and its username claim
@@ -640,6 +644,7 @@ func startBotClient(ctx context.Context, name string, cfg *pkgmodelsserverconfig
 	client, err := rtc.NewHeadlessRTCClient(rtc.PerfectNegotiatorFactory, rtc.RTCClientConfiguration{
 		ChannelId:          pkgmodelsss.ChannelId(cfg.ChannelId),
 		SubscriberId:       pkgmodelsss.SubscriberId(cfg.SubscriberId),
+		Visible:            &visible,
 		ICEServers:         iceServers,
 		KeepAliveInterval:  keepAliveInterval,
 		MemberListInterval: memberListInterval,

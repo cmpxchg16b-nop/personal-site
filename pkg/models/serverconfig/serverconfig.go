@@ -136,6 +136,9 @@ type BotClientXML struct {
 	// SubscriberId is the bot's subscriber id; empty asks the SS to
 	// assign one from the automatic assignment range.
 	SubscriberId string `xml:"subscriberId,attr"`
+	// Visible is the raw visible attribute; empty selects the default (true)
+	// in VisibleOrDefault.
+	Visible string `xml:"visible,attr"`
 	// IceServers is the raw comma-separated iceServers attribute; split
 	// it with iceservers.ParseURLs. Empty means no ICE servers: the
 	// bot's peer connections run on host candidates alone.
@@ -146,6 +149,20 @@ type BotClientXML struct {
 	MemberListInterval string `xml:"memberListInterval,attr"`
 	ReplyTimeout       string `xml:"replyTimeout,attr"`
 	ReconnectInterval  string `xml:"reconnectInterval,attr"`
+}
+
+// VisibleOrDefault reports whether the bot appears in public channel member
+// listings. It defaults to true. Invisible bots remain reachable by direct
+// signalling.
+func (x *BotClientXML) VisibleOrDefault() (bool, error) {
+	if x.Visible == "" {
+		return true, nil
+	}
+	visible, err := strconv.ParseBool(x.Visible)
+	if err != nil {
+		return false, fmt.Errorf("visible %q is not a boolean", x.Visible)
+	}
+	return visible, nil
 }
 
 // MusicBotXML mirrors the <musicBot/> section of serverConfig.xml: a

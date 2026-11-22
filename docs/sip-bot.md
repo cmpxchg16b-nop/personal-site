@@ -978,10 +978,12 @@ nil preferences are today's behavior.
 ## 10. Hosting and configuration
 
 - `serverConfig.xsd` / `serverconfig.go`: a `<sipBot/>` element of the
-  existing `botClientType` (url, jwt, channelId, subscriberId,
+  existing `botClientType` (url, jwt, channelId, subscriberId, visible,
   iceServers, the timing knobs) — identical identity mechanics to the
   echo/music bots (a static session JWT from the `sign` subcommand,
-  `--sub bot:sip --username "SIP Bot"`).
+  `--sub bot:sip --username "SIP Bot"`). `visible` defaults to true;
+  false hides the bot from public channel member listings without blocking
+  direct signalling.
 - `cmd/server/main.go`: `startSipBot` on the shared `startBotClient`,
   wiring `sipbot.New(client, sipbot.NewOnMemoryUserSessionStorage(),
 pool, cfg)` and reusing `stereoOpusPCFactory` — its MediaEngine (opus

@@ -44,8 +44,8 @@ export interface EPAddr {
 // Message for a client register itself to the server, send from client to SS.
 // A subscriber id is bound to zero or one (user id, user session id, channel id)
 // tuple: re-registration of a live id by the same tuple is allowed and acts as a
-// refresh (it may update the username); registration of an id bound to another
-// tuple is rejected with ErrorCode.SubscriberIdIsRegistered.
+// refresh (it may update the username and public visibility); registration of an
+// id bound to another tuple is rejected with ErrorCode.SubscriberIdIsRegistered.
 export interface ClientToSSRegEv {
   /** if empty, the SS assigns a subscriber id sequentially from the
    * automatic assignment range 1000-1999 and echoes it in the
@@ -55,6 +55,10 @@ export interface ClientToSSRegEv {
    * registration. */
   subscriberId: SubscriberId;
   channelId: ChannelId;
+  /** Whether the member appears in public channel-member listings. Omission
+   * selects the backwards-compatible default, true. Invisible members remain
+   * directly addressable for profile queries and c2c signalling. */
+  visible?: boolean;
   // The subscriber's display name — descriptive, lowercase, no-space, valid
   // dns label. The server never trusts the wire value: the WS endpoint
   // stamps the session's username (the JWT's username claim) onto every
@@ -149,12 +153,14 @@ export interface UserProfile {
   subscriberId: SubscriberId;
   channelId: ChannelId;
   username: string;
+  visible: boolean;
 }
 
 // The profile data the SS holds about a channel.
 export interface ChannelProfile {
   channelId: ChannelId;
   channelName: string;
+  visible: boolean;
 }
 
 // One page of a channel members list result. Multiple result messages can be
@@ -181,11 +187,14 @@ export interface SSToClientChannelListResult {
 }
 
 // The result of a successful registration, echoed back by the SS: the
-// channel and the subscriber id the registration is bound to. The
-// subscriber id is assigned by the SS when the request left it empty.
+// channel, subscriber id, and effective public visibility. The subscriber id
+// is assigned by the SS when the request left it empty.
 export interface RegisterResult {
   channelId: ChannelId;
   subscriberId: SubscriberId;
+  /** Effective visibility confirmed by the SS. Omission identifies a legacy
+   * server, whose only behavior is equivalent to visible=true. */
+  visible?: boolean;
 }
 
 // Signalling server to Client event
@@ -346,6 +355,8 @@ export type ChatUser = {
   id: string;
   name: string;
   online: boolean;
+  // Public-listing visibility is independent of transport/session presence.
+  visible: boolean;
   // The signalling channel the user's subscription lives in — the scope
   // of subscriberId — when known.
   channelId?: ChannelId;
@@ -360,5 +371,6 @@ export type ChatUser = {
 export type ChatChannel = {
   id: string;
   name: string;
+  visible: boolean;
   members: ChatUser[];
 };

@@ -41,6 +41,67 @@ func TestUnknownMessageFloodParsing(t *testing.T) {
 	}
 }
 
+func TestBotClientVisible(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		attribute string
+		raw       string
+		want      bool
+		wantErr   bool
+	}{
+		{name: "default", want: true},
+		{name: "explicit true", attribute: ` visible="true"`, raw: "true", want: true},
+		{name: "explicit false", attribute: ` visible="false"`, raw: "false", want: false},
+		{name: "invalid", attribute: ` visible="sometimes"`, raw: "sometimes", wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			doc := `<serverConfig>` +
+				`<echoBot url="ws://localhost:3000/api/ss/ws" jwt="t"` + tc.attribute + `/>` +
+				`<musicBot url="ws://localhost:3000/api/ss/ws" jwt="t"` + tc.attribute + `/>` +
+				`<sipBot url="ws://localhost:3000/api/ss/ws" jwt="t"` + tc.attribute + `/>` +
+				`</serverConfig>`
+			path := filepath.Join(t.TempDir(), "serverConfig.xml")
+			if err := os.WriteFile(path, []byte(doc), 0o644); err != nil {
+				t.Fatalf("write the config: %v", err)
+			}
+			cfg, err := LoadServerConfig(path)
+			if err != nil {
+				t.Fatalf("LoadServerConfig: %v", err)
+			}
+			if cfg.EchoBot == nil || cfg.MusicBot == nil || cfg.SipBot == nil {
+				t.Fatal("the document does not carry all three bots")
+			}
+
+			for _, bot := range []struct {
+				name string
+				cfg  *BotClientXML
+			}{
+				{name: "echo", cfg: cfg.EchoBot},
+				{name: "music", cfg: &cfg.MusicBot.BotClientXML},
+				{name: "sip", cfg: &cfg.SipBot.BotClientXML},
+			} {
+				if bot.cfg.Visible != tc.raw {
+					t.Errorf("%s bot raw visible = %q, want %q", bot.name, bot.cfg.Visible, tc.raw)
+				}
+				got, err := bot.cfg.VisibleOrDefault()
+				if tc.wantErr {
+					if err == nil || !strings.Contains(err.Error(), `visible "sometimes"`) {
+						t.Errorf("%s bot VisibleOrDefault error = %v, want an invalid visible error", bot.name, err)
+					}
+					continue
+				}
+				if err != nil {
+					t.Errorf("%s bot VisibleOrDefault: %v", bot.name, err)
+					continue
+				}
+				if got != tc.want {
+					t.Errorf("%s bot visible = %v, want %v", bot.name, got, tc.want)
+				}
+			}
+		})
+	}
+}
+
 // parseMusicBot parses a configuration document consisting of the given
 // <musicBot/> body.
 func parseMusicBot(t *testing.T, body string) *MusicBotXML {

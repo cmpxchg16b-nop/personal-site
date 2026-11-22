@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { ErrorCode, WELLKNOWN_CH_ID_MAIN } from "./types";
 import type { EndpointIdentity } from "./identity";
+import { SS_VISIBILITY_STORAGE_KEY } from "./visibility";
 import type { SignallingState } from "./react";
 import type {
   ChannelId,
@@ -17,6 +18,7 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock("react", () => ({
   createContext: () => ({}),
+  startTransition: (fn: () => void) => fn(),
   useContext: () => mocks.proxy.current,
   useCallback: (fn: unknown, deps: readonly unknown[]) =>
     (mocks.runtime.current as HookRuntime).memo(() => fn, deps),
@@ -429,6 +431,7 @@ const peer: ChatUser & { subscriberId: string } = {
   id: "0-bot",
   name: "bot",
   online: true,
+  visible: true,
   channelId,
   subscriberId: "0-bot",
 };
@@ -438,13 +441,14 @@ function self(subscriberId: string): ChatUser & { subscriberId: string } {
     id: `user-${subscriberId}`,
     name: subscriberId,
     online: true,
+    visible: true,
     channelId,
     subscriberId,
   };
 }
 
 function listing(members: ChatUser[]): ChatChannel[] {
-  return [{ id: channelId, name: "main", members }];
+  return [{ id: channelId, name: "main", visible: true, members }];
 }
 
 function c2c(
@@ -494,9 +498,18 @@ type ListingMode = "incomplete-members" | "profile-failure" | "complete";
 function prepareProducer(
   mode: { current: ListingMode },
   registrationFails = false,
+  storedVisibility?: "true" | "false",
 ) {
   vi.useFakeTimers();
+  const stored = new Map<string, string>();
+  if (storedVisibility !== undefined)
+    stored.set(SS_VISIBILITY_STORAGE_KEY, storedVisibility);
   vi.stubGlobal("window", {
+    localStorage: {
+      getItem: (key: string) => stored.get(key) ?? null,
+      setItem: (key: string, value: string) => stored.set(key, value),
+      removeItem: (key: string) => stored.delete(key),
+    },
     setTimeout: globalThis.setTimeout.bind(globalThis),
     clearTimeout: globalThis.clearTimeout.bind(globalThis),
     setInterval: globalThis.setInterval.bind(globalThis),
@@ -519,6 +532,7 @@ function prepareProducer(
               registerResult: {
                 channelId,
                 subscriberId: "1000",
+                visible: event.register.visible ?? true,
               },
             },
       );
@@ -532,7 +546,7 @@ function prepareProducer(
     }
     if (event?.channelProfileQuery) {
       proxy.respond(request, {
-        channelProfile: { channelId, channelName: "main" },
+        channelProfile: { channelId, channelName: "main", visible: true },
       });
       return;
     }
@@ -566,6 +580,7 @@ function prepareProducer(
                 subscriberId: peer.subscriberId,
                 channelId,
                 username: peer.name,
+                visible: true,
               },
             },
       );
@@ -1342,6 +1357,10 @@ describe("useSignalling membership and registration outcomes", () => {
     prepareProducer({ current: "complete" });
     runtime.renderWithSignalling(actualUseSignalling);
     await flushMicrotasks();
+    // The preference-loading effect gates registration; this deterministic
+    // hook runtime needs the state-driven second render explicitly.
+    runtime.renderWithSignalling(actualUseSignalling);
+    await flushMicrotasks();
     const pings = () =>
       proxy.outgoing.filter((event) => event.c2SEv?.ping !== undefined);
     expect(pings()).toHaveLength(1);
@@ -1353,6 +1372,126 @@ describe("useSignalling membership and registration outcomes", () => {
     const result = runtime.renderWithSignalling(actualUseSignalling);
     expect(result.signalling.lastPing).not.toBeNull();
     expect(proxy.destroyed).toBe(false);
+  });
+
+  it("persists online/invisible switches and re-registers the same incarnation", async () => {
+    prepareProducer({ current: "complete" });
+    const initial = await producerAtRevision(1);
+    const pc = MockPeerConnection.instances[0];
+    const registrations = () =>
+      proxy.outgoing.filter((event) => event.c2SEv?.register !== undefined);
+    expect(registrations()).toHaveLength(1);
+    expect(registrations()[0].c2SEv?.register).toMatchObject({
+      subscriberId: "",
+      visible: true,
+    });
+
+    initial.signalling.setVisible(false);
+    expect(window.localStorage.getItem(SS_VISIBILITY_STORAGE_KEY)).toBe(
+      "false",
+    );
+    const pending = runtime.renderWithSignalling(actualUseSignalling);
+    expect(pending.signalling.visible).toBe(false);
+    expect(pending.signalling.visibilityPending).toBe(true);
+    expect(pending.signalling.registrationReady).toBe(true);
+    expect(pending.signalling.me).toBe(initial.signalling.me);
+    expect(pending.signalling.channels).toBe(initial.signalling.channels);
+
+    const invisible = await producerAtRevision(2);
+    expect(invisible.signalling.visible).toBe(false);
+    expect(invisible.signalling.visibilityPending).toBe(false);
+    expect(invisible.signalling.me?.visible).toBe(false);
+    expect(registrations()).toHaveLength(2);
+    expect(registrations()[1].c2SEv?.register).toMatchObject({
+      subscriberId: "1000",
+      visible: false,
+    });
+    expect(MockPeerConnection.instances).toHaveLength(1);
+    expect(pc.signalingState).not.toBe("closed");
+
+    invisible.signalling.setVisible(true);
+    const online = await producerAtRevision(3);
+    expect(window.localStorage.getItem(SS_VISIBILITY_STORAGE_KEY)).toBe("true");
+    expect(online.signalling.visible).toBe(true);
+    expect(online.signalling.visibilityPending).toBe(false);
+    expect(online.signalling.me?.visible).toBe(true);
+    expect(registrations()).toHaveLength(3);
+    expect(registrations()[2].c2SEv?.register).toMatchObject({
+      subscriberId: "1000",
+      visible: true,
+    });
+    expect(MockPeerConnection.instances).toHaveLength(1);
+    expect(pc.signalingState).not.toBe("closed");
+  });
+
+  it("loads an invisible preference before registration and preserves it while roaming", async () => {
+    prepareProducer({ current: "complete" }, false, "false");
+    const initial = await producerAtRevision(1);
+    expect(initial.signalling.visible).toBe(false);
+    expect(initial.signalling.me?.visible).toBe(false);
+    const firstProxy = proxy;
+    const firstRegistrations = firstProxy.outgoing.filter(
+      (event) => event.c2SEv?.register !== undefined,
+    );
+    expect(firstRegistrations).toHaveLength(1);
+    expect(firstRegistrations[0].c2SEv?.register).toMatchObject({
+      subscriberId: "",
+      visible: false,
+    });
+
+    firstProxy.close();
+    await flushMicrotasks();
+    mocks.proxy.current = null;
+    runtime.renderWithSignalling(actualUseSignalling);
+    await flushMicrotasks();
+    const secondProxy = new MockProxy();
+    secondProxy.onSend = firstProxy.onSend;
+    mocks.proxy.current = secondProxy;
+    proxy = secondProxy;
+    runtime.renderWithSignalling(actualUseSignalling);
+    await flushMicrotasks();
+    const reconnected = runtime.renderWithSignalling(actualUseSignalling);
+    await flushMicrotasks();
+    const secondRegistrations = secondProxy.outgoing.filter(
+      (event) => event.c2SEv?.register !== undefined,
+    );
+    expect(secondRegistrations).toHaveLength(1);
+    expect(secondRegistrations[0].c2SEv?.register).toMatchObject({
+      subscriberId: "1000",
+      visible: false,
+    });
+    expect(reconnected.signalling.visible).toBe(false);
+    expect(reconnected.signalling.registrationReady).toBe(true);
+  });
+
+  it("does not claim invisibility when a legacy SS omits confirmation", async () => {
+    prepareProducer({ current: "complete" }, false, "false");
+    const respond = proxy.onSend;
+    proxy.onSend = (request) => {
+      if (request.c2SEv?.register) {
+        proxy.respond(request, {
+          registerResult: { channelId, subscriberId: "1000" },
+        });
+        return;
+      }
+      respond?.(request);
+    };
+    await producerAtRevision(1);
+    // The legacy reply restores visible=true, which schedules one confirming
+    // refresh on the next render in this deterministic hook runtime.
+    runtime.renderWithSignalling(actualUseSignalling);
+    await flushMicrotasks();
+    const result = runtime.renderWithSignalling(actualUseSignalling);
+    const registrations = proxy.outgoing.filter(
+      (event) => event.c2SEv?.register !== undefined,
+    );
+    expect(registrations).toHaveLength(2);
+    expect(registrations[0].c2SEv?.register?.visible).toBe(false);
+    expect(registrations[1].c2SEv?.register?.visible).toBe(true);
+    expect(result.signalling.visible).toBe(true);
+    expect(result.signalling.me?.visible).toBe(true);
+    expect(result.signalling.visibilityPending).toBe(false);
+    expect(window.localStorage.getItem(SS_VISIBILITY_STORAGE_KEY)).toBe("true");
   });
 
   it("retains the incarnation and queues output until roaming registration succeeds", async () => {

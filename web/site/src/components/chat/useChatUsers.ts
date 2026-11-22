@@ -38,6 +38,9 @@ export function useChatUsers(
             id: senderId,
             name: senderId,
             online: false,
+            // The sender is absent from the current public listing; its actual
+            // registration preference is unknown without a direct profile query.
+            visible: false,
             channelId: msgs[0].channelId,
             subscriberId: senderId,
           };

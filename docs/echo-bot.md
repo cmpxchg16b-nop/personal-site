@@ -102,7 +102,7 @@ That's the entire call policy. Notably it predates the media API: when the inter
 
 Both bots are hosted by the server binary as **ordinary authenticated clients** (`cmd/server/main.go`):
 
-- Configuration: `<echoBot/>` / `<musicBot/>` elements in `serverConfig.xml` (`BotClientXML`: url, jwt, channelId, subscriberId, iceServers, timing knobs). Present + url + jwt → wired.
+- Configuration: `<echoBot/>` / `<musicBot/>` elements in `serverConfig.xml` (`BotClientXML`: url, jwt, channelId, subscriberId, visible, iceServers, timing knobs). Present + url + jwt → wired. `visible` defaults to true; false hides the bot from public channel member listings but leaves direct signalling available.
 - Identity: a **static session JWT** issued offline with the `sign` subcommand (e.g. `--sub bot:echo --username "Echo Bot"`). The bot never inspects the token — the SS endpoint validates it and stamps the token's subject/session onto its events and the username claim as display name. A bad token simply surfaces as logged 401s in the reconnect loop. (Known open item from sessions 18–20: the config-file JWT is never refreshed.)
 - `startBotClient` (shared by both bots since session 24) builds the `HeadlessRTCClient`, calls `wire(client)` — `echobot.New` self-registers the `dcmsg`/`dcbin` handlers at construction and "needs no further driving" — then runs the **reconnect loop**: a fresh channel pair per attempt, `transport.Run` (WebSocket, `Authorization: Bearer`) against `client.Run`; when either ends, log and retry after `reconnectInterval` (default 5 s). The loop also absorbs the startup race where the bot's first dial can beat `ListenAndServe`.
 - An empty `iceServers` attribute means host candidates only.

@@ -43,6 +43,7 @@ type epAddrView struct {
 type registerEvView struct {
 	SubscriberId string `json:"subscriberId"`
 	ChannelId    string `json:"channelId"`
+	Visible      *bool  `json:"visible,omitempty"`
 	Username     string `json:"username"`
 }
 
@@ -85,11 +86,13 @@ type userProfileView struct {
 	SubscriberId string `json:"subscriberId"`
 	ChannelId    string `json:"channelId"`
 	Username     string `json:"username"`
+	Visible      bool   `json:"visible"`
 }
 
 type registerResultView struct {
 	ChannelId    string `json:"channelId"`
 	SubscriberId string `json:"subscriberId"`
+	Visible      *bool  `json:"visible,omitempty"`
 }
 
 type channelMbsListResultView struct {
@@ -101,6 +104,7 @@ type channelMbsListResultView struct {
 type channelProfileView struct {
 	ChannelId   string `json:"channelId"`
 	ChannelName string `json:"channelName"`
+	Visible     bool   `json:"visible"`
 }
 
 type channelListResultView struct {
@@ -313,11 +317,19 @@ func (c *ssWSClient) expectSilent() {
 // stamps the session's username onto the registration.
 func (c *ssWSClient) register(msgId, sub, username string) *signallingEventView {
 	c.t.Helper()
+	return c.registerVisible(msgId, sub, username, nil)
+}
+
+// registerVisible is register with an explicit public-listing preference; nil
+// exercises the backwards-compatible default (visible=true).
+func (c *ssWSClient) registerVisible(msgId, sub, username string, visible *bool) *signallingEventView {
+	c.t.Helper()
 	c.send(&signallingEventView{
 		MsgId: msgId,
 		C2SEv: &clientToSSEvView{Register: &registerEvView{
 			SubscriberId: sub,
 			ChannelId:    ssMainChannelId,
+			Visible:      visible,
 			Username:     username,
 		}},
 	})
@@ -336,6 +348,10 @@ func (c *ssWSClient) register(msgId, sub, username string) *signallingEventView 
 	}
 	if sub != "" && ack.S2CEv.RegisterResult.SubscriberId != sub {
 		c.t.Fatalf("registerResult subscriberId = %q, want %q", ack.S2CEv.RegisterResult.SubscriberId, sub)
+	}
+	wantVisible := visible == nil || *visible
+	if ack.S2CEv.RegisterResult.Visible == nil || *ack.S2CEv.RegisterResult.Visible != wantVisible {
+		c.t.Fatalf("registerResult visible = %v, want %v", ack.S2CEv.RegisterResult.Visible, wantVisible)
 	}
 	return ack
 }
@@ -397,8 +413,8 @@ func TestSSRegisterAndProfile(t *testing.T) {
 		t.Fatalf("profile reply = %+v, want a profile and no error", reply)
 	}
 	profile := reply.S2CEv.Profile
-	if profile.SubscriberId != "alice" || profile.ChannelId != ssMainChannelId || profile.Username != alice.username {
-		t.Errorf("profile = %+v, want alice in the main channel with her session username %q", profile, alice.username)
+	if profile.SubscriberId != "alice" || profile.ChannelId != ssMainChannelId || profile.Username != alice.username || !profile.Visible {
+		t.Errorf("profile = %+v, want visible alice in the main channel with her session username %q", profile, alice.username)
 	}
 
 	// Querying an unknown subscriber answers SubscriberNotFound.
@@ -636,6 +652,62 @@ func TestSSRelayRTCData(t *testing.T) {
 	alice.expectSilent()
 }
 
+// TestSSVisibility covers the public-listing preference end to end: omitted
+// visible defaults true, explicit false hides only discovery, same-id
+// re-registration updates it, and direct c2c routing remains available.
+func TestSSVisibility(t *testing.T) {
+	baseURL := startServer(t)
+	alice := dialSS(t, baseURL)
+	bob := dialSS(t, baseURL)
+	alice.register("e2e-visible-alice", "alice", "alice")
+	invisible := false
+	bob.registerVisible("e2e-invisible-bob", "bob", "bob", &invisible)
+
+	listMembers := func(msgId string) []string {
+		t.Helper()
+		alice.send(&signallingEventView{
+			To:    epAddrView{ServiceId: ssServiceId},
+			MsgId: msgId,
+			C2SEv: &clientToSSEvView{ListChannelMembers: &listChannelMembersView{ChannelId: ssMainChannelId}},
+		})
+		reply := alice.recvReply(msgId)
+		if reply.S2CEv == nil || reply.S2CEv.ChannelMbsListResult == nil || reply.S2CEv.ChannelMbsListResult.HasMore {
+			t.Fatalf("member list reply = %+v, want one final page", reply)
+		}
+		return reply.S2CEv.ChannelMbsListResult.Members
+	}
+	if got, want := listMembers("e2e-visible-list-initial"), []string{"alice"}; !slices.Equal(got, want) {
+		t.Fatalf("initial public members = %v, want %v", got, want)
+	}
+
+	alice.send(&signallingEventView{
+		MsgId: "e2e-visible-profile-bob",
+		C2SEv: &clientToSSEvView{UserProfileQuery: &userProfileQueryView{SubscriberId: "bob", ChannelId: ssMainChannelId}},
+	})
+	profile := alice.recvReply("e2e-visible-profile-bob")
+	if profile.S2CEv == nil || profile.S2CEv.Profile == nil || profile.S2CEv.Profile.Visible {
+		t.Fatalf("invisible bob profile = %+v, want visible=false", profile)
+	}
+
+	alice.send(&signallingEventView{
+		MsgId: "e2e-visible-relay",
+		C2CEv: &clientToClientEvView{
+			ChannelId: ssMainChannelId, FromSubscriber: "alice", ToSubscriber: "bob",
+			Ping: &pingPongView{PingId: "e2e-invisible-ping", SequenceNumber: 1},
+		},
+	})
+	relayed := bob.recv()
+	if relayed.C2CEv == nil || relayed.C2CEv.Ping == nil || relayed.C2CEv.Ping.PingId != "e2e-invisible-ping" {
+		t.Fatalf("bob received %+v, want the directly addressed ping", relayed)
+	}
+
+	visible := true
+	bob.registerVisible("e2e-visible-bob", "bob", "bob", &visible)
+	if got, want := listMembers("e2e-visible-list-updated"), []string{"alice", "bob"}; !slices.Equal(got, want) {
+		t.Fatalf("public members after re-registration = %v, want %v", got, want)
+	}
+}
+
 // TestSSListChannelMembers covers the paginated channel members list:
 // the SS answers one request with one or more channelMbsListResult
 // messages, all correlated via inReplyTo, ending with hasMore=false.
@@ -740,8 +812,8 @@ func TestSSListChannelsAndProfile(t *testing.T) {
 	if profile.S2CEv == nil || profile.S2CEv.ChannelProfile == nil {
 		t.Fatalf("profile reply = %+v, want a channelProfile", profile)
 	}
-	if got := profile.S2CEv.ChannelProfile; got.ChannelId != ssMainChannelId || got.ChannelName != "main" {
-		t.Errorf("channel profile = %+v, want the main channel named %q", got, "main")
+	if got := profile.S2CEv.ChannelProfile; got.ChannelId != ssMainChannelId || got.ChannelName != "main" || !got.Visible {
+		t.Errorf("channel profile = %+v, want the visible main channel named %q", got, "main")
 	}
 
 	alice.send(&signallingEventView{

@@ -127,6 +127,10 @@
                                ing whitespace is ignored. Empty means no
                                ICE servers: the bot connects with host
                                candidates alone.
+               * visible       whether the bot appears in public channel
+                               member listings; default true. False hides
+                               the listing entry but direct signalling
+                               remains available.
                * keepAliveInterval, memberListInterval, replyTimeout
                                the client's periodic knobs, Go
                                time.Duration strings (e.g. "5s"); keep
@@ -212,13 +216,19 @@
     <xsd:attribute name="url" type="xsd:string" use="required" />
   </xsd:complexType>
 
-  <!-- A single bot client configuration (echo bot, music bot); see the
-       echoBot and musicBot elements above. -->
+  <!-- A single bot client configuration (echo, music and sip bots); see
+       the echoBot, musicBot and sipBot elements above. -->
   <xsd:complexType name="botClientType">
     <xsd:attribute name="url" type="xsd:string" use="required" />
     <xsd:attribute name="jwt" type="xsd:string" use="required" />
     <xsd:attribute name="channelId" type="xsd:string" use="optional" />
     <xsd:attribute name="subscriberId" type="xsd:string" use="optional" />
+    <xsd:attribute
+      name="visible"
+      type="xsd:boolean"
+      use="optional"
+      default="true"
+    />
     <xsd:attribute
       name="iceServers"
       type="xsd:string"

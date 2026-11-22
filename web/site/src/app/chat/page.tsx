@@ -14,6 +14,7 @@ import ChatApp from "@/components/chat/ChatApp";
 import { buildMagicControl, parseMagicCommand } from "@/components/chat/magic";
 import { conversationKey, type TransferKind } from "@/components/chat/types";
 import { VolumeControl } from "@/components/chat/VolumeControl";
+import { VisibilityControl } from "@/components/chat/VisibilityControl";
 import { TopBarActions } from "@/components/TopBarActions";
 import { useCallMedia } from "@/components/chat/useCallMedia";
 import { useCallVolumes } from "@/components/chat/useCallVolumes";
@@ -41,6 +42,9 @@ export default function ChatPage() {
   const {
     channels,
     me,
+    visible,
+    visibilityPending,
+    setVisible,
     listingRevision,
     completeMembershipChannelIds,
     registrationFailed,
@@ -209,8 +213,13 @@ export default function ChatPage() {
 
   return (
     <>
-      {hasLiveCall && (
-        <TopBarActions>
+      <TopBarActions>
+        <VisibilityControl
+          visible={visible}
+          disabled={!registrationReady || visibilityPending}
+          onVisibleChange={setVisible}
+        />
+        {hasLiveCall && (
           <VolumeControl
             localVolume={localVolume}
             remoteVolume={remoteVolume}
@@ -219,8 +228,8 @@ export default function ChatPage() {
             echoCancellation={echoCancellation}
             onEchoCancellationChange={setEchoCancellation}
           />
-        </TopBarActions>
-      )}
+        )}
+      </TopBarActions>
       <ChatApp
         channels={channels}
         users={users}

@@ -695,6 +695,143 @@ func TestListChannelMembers(t *testing.T) {
 	}
 }
 
+func TestSubscriberVisibility(t *testing.T) {
+	h := startProvider(t)
+	register := func(msgId MsgId, sub SubscriberId, visible *bool) {
+		t.Helper()
+		ev := registerEvent(sub, WellKnownChIdMain, string(sub))
+		ev.MsgId = msgId
+		ev.C2SEv.Register.Visible = visible
+		h.in <- ev
+		ack := h.recvOut(t)
+		if ack.S2CEv == nil || ack.S2CEv.Err != nil || ack.S2CEv.RegisterResult == nil {
+			t.Fatalf("register %q ack = %+v, want success", sub, ack)
+		}
+		wantVisible := visible == nil || *visible
+		if got := ack.S2CEv.RegisterResult.Visible; got == nil || *got != wantVisible {
+			t.Fatalf("register %q confirmed visible = %v, want %v", sub, got, wantVisible)
+		}
+	}
+	listMembers := func(msgId MsgId) []SubscriberId {
+		t.Helper()
+		h.in <- &SignallingEvent{
+			From:  EPAddr{UserId: "u-query", UserSessionId: "s-query"},
+			MsgId: msgId,
+			C2SEv: &ClientToSSEv{ListChannelMembers: &ClientToSSListChannelMembers{ChannelId: WellKnownChIdMain}},
+		}
+		res := h.recvOut(t)
+		if res.S2CEv == nil || res.S2CEv.ChannelMbsListResult == nil || res.S2CEv.ChannelMbsListResult.HasMore {
+			t.Fatalf("member list reply = %+v, want one final page", res)
+		}
+		return res.S2CEv.ChannelMbsListResult.Members
+	}
+
+	// Omitting visible preserves the legacy default: public/online.
+	register("m-reg-visible", "alice", nil)
+	invisible := false
+	register("m-reg-invisible", "bob", &invisible)
+	if got, want := listMembers("m-list-initial"), []SubscriberId{"alice"}; !slices.Equal(got, want) {
+		t.Fatalf("initial members = %v, want %v", got, want)
+	}
+
+	// An invisible subscriber still has a directly queryable profile.
+	h.in <- &SignallingEvent{
+		From:  EPAddr{UserId: "u-query", UserSessionId: "s-query"},
+		MsgId: "m-profile-invisible",
+		C2SEv: &ClientToSSEv{UserProfileQuery: &ClientToSSUserProfileQuery{SubscriberId: "bob", ChannelId: WellKnownChIdMain}},
+	}
+	profile := h.recvOut(t)
+	if profile.S2CEv == nil || profile.S2CEv.Profile == nil || profile.S2CEv.Profile.Visible {
+		t.Fatalf("invisible profile = %+v, want bob with visible=false", profile)
+	}
+
+	// Visibility does not remove the registration from direct c2c routing.
+	h.in <- &SignallingEvent{
+		From:  EPAddr{UserId: "u-alice", UserSessionId: "s-alice"},
+		MsgId: "m-relay-invisible",
+		C2CEv: &ClientToClientEv{
+			ChannelId: WellKnownChIdMain, FromSubscriber: "alice", ToSubscriber: "bob",
+			Ping: &PingPongMsg{PingId: "p-invisible", SequenceNumber: 1},
+		},
+	}
+	relayed := h.recvOut(t)
+	if relayed.C2CEv == nil || relayed.C2CEv.Ping == nil || relayed.To.UserId != "u-bob" || relayed.To.UserSessionId != "s-bob" {
+		t.Fatalf("relay to invisible bob = %+v, want direct delivery", relayed)
+	}
+
+	// Same-id re-registration updates visibility in both directions. Keepalive
+	// in between renews activity without changing the selected visibility.
+	visible := true
+	register("m-reg-visible-again", "bob", &visible)
+	if got, want := listMembers("m-list-visible"), []SubscriberId{"alice", "bob"}; !slices.Equal(got, want) {
+		t.Fatalf("members after bob becomes visible = %v, want %v", got, want)
+	}
+	register("m-reg-invisible-again", "bob", &invisible)
+	h.in <- keepAliveEventFrom(EPAddr{UserId: "u-bob", UserSessionId: "s-bob"}, "bob", WellKnownChIdMain, "m-keepalive-invisible")
+	h.expectNoOut(t)
+	if got, want := listMembers("m-list-invisible"), []SubscriberId{"alice"}; !slices.Equal(got, want) {
+		t.Fatalf("members after bob becomes invisible = %v, want %v", got, want)
+	}
+	register("m-reg-default-again", "bob", nil)
+	if got, want := listMembers("m-list-default"), []SubscriberId{"alice", "bob"}; !slices.Equal(got, want) {
+		t.Fatalf("members after omitted visible = %v, want default visible %v", got, want)
+	}
+}
+
+func TestChannelVisibilityFiltersPublicListings(t *testing.T) {
+	p := NewSimpleOnMemorySSProvider()
+	now := time.Now()
+	main := newChannelState(mainChannelName, true)
+	main.subscribers["alice"] = &subscriberState{id: "alice", username: "alice", visible: true, lastActive: now}
+	main.subscribers["bob"] = &subscriberState{id: "bob", username: "bob", visible: false, lastActive: now}
+	hidden := newChannelState("hidden", false)
+	hidden.subscribers["carol"] = &subscriberState{id: "carol", username: "carol", visible: true, lastActive: now}
+	channels := map[ChannelId]*channelState{WellKnownChIdMain: main, "hidden": hidden}
+	from := EPAddr{UserId: "u-query", UserSessionId: "s-query"}
+	out := make(chan *SignallingEvent, 4)
+
+	listEv := &SignallingEvent{From: from, MsgId: "m-list-channels-visibility", C2SEv: &ClientToSSEv{ListChannels: &ClientToSSListChannels{}}}
+	if !p.handleListChannels(context.Background(), channels, listEv, out) {
+		t.Fatal("handleListChannels stopped the provider")
+	}
+	list := <-out
+	if got := list.S2CEv.ChannelListResult; got == nil || got.HasMore || !slices.Equal(got.Channels, []ChannelId{WellKnownChIdMain}) {
+		t.Fatalf("public channel list = %+v, want only main", list)
+	}
+
+	for _, tc := range []struct {
+		name      string
+		channelId ChannelId
+		want      []SubscriberId
+	}{
+		{name: "invisible members omitted", channelId: WellKnownChIdMain, want: []SubscriberId{"alice"}},
+		{name: "invisible channel has no public members", channelId: "hidden", want: []SubscriberId{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ev := &SignallingEvent{From: from, MsgId: MsgId("m-list-" + tc.channelId), C2SEv: &ClientToSSEv{ListChannelMembers: &ClientToSSListChannelMembers{ChannelId: tc.channelId}}}
+			if !p.handleListChannelMembers(context.Background(), channels, ev, out) {
+				t.Fatal("handleListChannelMembers stopped the provider")
+			}
+			res := <-out
+			page := res.S2CEv.ChannelMbsListResult
+			if page == nil || page.HasMore || !slices.Equal(page.Members, tc.want) {
+				t.Fatalf("public member page = %+v, want %v", page, tc.want)
+			}
+		})
+	}
+
+	// A known invisible channel remains directly resolvable and reports its
+	// visibility; only public discovery hides it.
+	profileEv := &SignallingEvent{From: from, MsgId: "m-profile-hidden-channel", C2SEv: &ClientToSSEv{ChannelProfileQuery: &ClientToSSChannelProfileQuery{ChannelId: "hidden"}}}
+	if !p.handleQueryChannelProfile(context.Background(), channels, profileEv, out) {
+		t.Fatal("handleQueryChannelProfile stopped the provider")
+	}
+	profile := <-out
+	if got := profile.S2CEv.ChannelProfile; got == nil || got.ChannelName != "hidden" || got.Visible {
+		t.Fatalf("hidden channel profile = %+v, want hidden with visible=false", profile)
+	}
+}
+
 func keepAliveEventFrom(from EPAddr, sub SubscriberId, ch ChannelId, msgId string) *SignallingEvent {
 	return &SignallingEvent{
 		From:  from,

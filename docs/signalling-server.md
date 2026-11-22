@@ -56,9 +56,9 @@ implementation must provide.
 
 ### Client → SS (`c2SEv`)
 
-- **`register {subscriberId, channelId, username}`** — registers the client
+- **`register {subscriberId, channelId, visible, username}`** — registers the client
   as a subscriber of a channel. Answered by a
-  `registerResult {channelId, subscriberId}` on success or an `err`
+  `registerResult {channelId, subscriberId, visible}` on success or an `err`
   otherwise. An **empty `subscriberId`** asks the SS to assign one,
   sequentially, from the automatic assignment range **1000-1999** (the
   assigned id comes back in `registerResult`; empty always creates a fresh
@@ -66,8 +66,12 @@ implementation must provide.
   their own subscriber ids are recommended to **preserve the 1000-1999
   range** for automatic registration. A subscriber id is bound to zero or
   one (user id, user session id, channel id) tuple: re-registration of a
-  live id by the same tuple is a refresh (renewing `lastActive`), while
-  another tuple is rejected with `SubscriberIdIsRegistered`.
+  live id by the same tuple is a refresh (renewing `lastActive` and replacing
+  `visible` and `username`), while another tuple is rejected with
+  `SubscriberIdIsRegistered`. **`visible`** controls public member discovery;
+  omission defaults to `true` for backwards compatibility. The result echoes
+  the effective `visible`; an old SS that omits it only supports `true`. See
+  _Public visibility_ below.
   **A fresh registration starts a new incarnation**: a browser page load
   mints a fresh, empty `subscriberId`, while a replacement WebSocket in the
   same page re-registers its current id as a roaming refresh. Any _other_
@@ -91,20 +95,22 @@ implementation must provide.
   another (user id, user session id) tuple — meaning the membership is
   gone and the client should re-register.
 - **`userProfileQuery {subscriberId, channelId}`** — answered with a
-  `profile {subscriberId, channelId, username}` reply.
+  `profile {subscriberId, channelId, username, visible}` reply. Visibility does
+  not restrict this direct query.
 - **`listChannelMembers {channelId}`** — answered with **one or more**
   `channelMbsListResult {channelId, members, hasMore}` messages, all
   `inReplyTo` the request. `members` is a page of subscriber ids (resolve
   them via `userProfileQuery`). The client may time out on its own, or
   keep reading until `hasMore` is `false`; even an empty channel yields
-  one final empty page.
+  one final empty page. Invisible members are omitted; an invisible channel
+  returns an empty public member page.
 - **`listChannels {}`** — dynamic channel discovery; carries no fields.
   Answered with **one or more** `channelListResult {channels, hasMore}`
   messages, all `inReplyTo` the request, with the same paging semantics
   as `listChannelMembers`. Resolve a channel's profile via
-  `channelProfileQuery`.
+  `channelProfileQuery`. Invisible channels are omitted.
 - **`channelProfileQuery {channelId}`** — answered with a
-  `channelProfile {channelId, channelName}` reply; an unknown channel
+  `channelProfile {channelId, channelName, visible}` reply; an unknown channel
   yields `ChannelNotFound`.
 - **`ping {pingId, sequenceNumber, ackSequenceNumber}`** — out-of-band
   liveness ping to the SS itself (browsers cannot send protocol-level
@@ -178,7 +184,9 @@ The sender addresses the event **to the SS**; the SS translates
 subscriber's `from` at registration — and **rewrites the envelope's `to`**
 to the resolved destination. `from` and the payload pass through
 unchanged. An unknown channel yields a `ChannelNotFound` error; an
-unknown subscriber in it yields `SubscriberNotFound`.
+unknown subscriber in it yields `SubscriberNotFound`. Public visibility is not
+a routing rule: an invisible subscriber remains reachable by its known
+`(channelId, subscriberId)` address.
 
 `sessionDesc`/`rtcICECandidate` traffic is produced and consumed by the
 perfect negotiators on each end (`negotiate.ts` in the browser,
@@ -558,6 +566,37 @@ Amendments copy the target's immutable fields (a file transfer's
 `fileId`, name and MIME type) from the local history, so an unknown
 target id or a kind mismatch makes the command a no-op.
 
+## Public visibility
+
+Channels and subscribers each carry a concrete `visible` flag in their profile;
+the main channel is currently fixed at `visible=true`. Registration accepts an
+optional member `visible`, defaulting to `true` when omitted so older clients
+remain publicly discoverable. Re-registering the same live subscriber id from
+the same authenticated tuple replaces the flag in either direction without
+creating a new subscriber incarnation. `registerResult.visible` confirms the
+effective value. When a legacy SS omits that confirmation, the browser falls
+back to Online rather than falsely claiming Invisible; a Go bot configured with
+`visible=false` reports an unconfirmed-visibility error instead of silently
+appearing in the public list.
+
+`listChannels` and `listChannelMembers` are the public-square views: they omit
+invisible channels and members, respectively. Asking for the member list of a
+known invisible channel produces an empty final page. This is deliberately not
+an access-control or unsubscribe mechanism: direct channel/user profile queries
+and the c2c relay still resolve known invisible entities. Clients that reconcile
+peer sessions from the public member list will nevertheless tear down a session
+after the peer disappears from that list; visibility does not provide a hidden,
+persistent-peer mode.
+
+The browser exposes the flag as an **Online / Invisible** switch in the chat
+TopBar. It stores the choice under the `personal-site-ss-visibility`
+localStorage key and reads it before the first registration after a page load,
+so an invisible preference is never briefly registered as visible. Switching
+re-registers the same subscriber id; socket roaming also retains the choice.
+Unavailable or corrupt storage falls back to visible. Go bots use the shared
+`visible` XML attribute (default `true`), applied on every registration and
+reconnect; changing the XML requires a process restart.
+
 ## Addressing and routing
 
 - The provider is the **only** component that understands subscriber
@@ -699,8 +738,9 @@ ordinary authenticated sessions.
   `pkg/rtc/ice_restart_test.go` cover the matching ICE recovery state machines,
   restart ownership, pending offers, backoff, and cancellation.
 - `e2e/websocket_ss_test.go` exercises the real built server binary:
-  register + profile, a 3-round c2c ping/pong session (seq/ack chaining),
-  RTC payload pass-through, the members list, c2s ping before
+  register + profile, visibility defaults/updates/filtering with direct relay,
+  a 3-round c2c ping/pong session (seq/ack chaining), RTC payload pass-through,
+  the members list, c2s ping before
   registration, and handshake rejection without a session — all dialled
   with real issued session tokens. Its wire views are deliberately
   independent copies, so accidental drift in the covered wire fields fails

@@ -25,6 +25,8 @@
 
 import {
   createContext,
+  startTransition,
+  useCallback,
   useContext,
   useEffect,
   useRef,
@@ -34,6 +36,7 @@ import {
 
 import { fetchProfile, ProfileApiError } from "@/api/profile";
 import { clearStoredIdentity, sameEndpointIdentity } from "./identity";
+import { readStoredVisibility, writeStoredVisibility } from "./visibility";
 import {
   closeSSProxy,
   DEFAULT_SS_URL,
@@ -168,6 +171,13 @@ export interface SignallingState {
    * while a replacement socket refreshes the same in-page registration.
    */
   me: ChatUser | null;
+  /** Requested public-listing visibility, restored from local storage before
+   * registration. Defaults to true. */
+  visible: boolean;
+  /** True until the requested visibility has been confirmed by registration. */
+  visibilityPending: boolean;
+  /** Persist a new preference and refresh the same subscriber's registration. */
+  setVisible: (visible: boolean) => void;
   /**
    * The channels of the signalling server — id, name, and members with
    * resolved profiles (excluding the current user) — renewed every
@@ -318,7 +328,9 @@ async function awaitRepliesOn(
 // 1000-1999 range): a page load is a new incarnation, and a dead
 // incarnation's subscriber id must NOT be reused. A replacement WebSocket in
 // the same page instead passes its current id, which the SS accepts as a
-// roaming refresh from the same authenticated session. Peer sessions are keyed
+// roaming refresh from the same authenticated session. An online/invisible
+// switch likewise refreshes that id without creating a new peer incarnation.
+// Peer sessions are keyed
 // by subscriber id and rebuilt only when the member listing observes a
 // peer leaving and returning. Reusing an id after a page reload would be a
 // same-tuple refresh, so peers would never see the leave, would keep their
@@ -340,6 +352,7 @@ async function awaitRepliesOn(
 // response that may make the caller abandon a retained roaming id.
 interface SubscriberRegistration {
   subscriberId: SubscriberId;
+  visible: boolean;
 }
 
 interface RegistrationAttempt {
@@ -350,6 +363,7 @@ interface RegistrationAttempt {
 async function registerSubscriber(
   read: () => ReadableStream<SignallingEvent>,
   send: (ev: SignallingEvent) => Promise<void>,
+  visible: boolean,
   reconnectSubscriberId: SubscriberId = "",
 ): Promise<RegistrationAttempt> {
   const msgId = crypto.randomUUID();
@@ -364,6 +378,7 @@ async function registerSubscriber(
       register: {
         subscriberId: reconnectSubscriberId,
         channelId: WELLKNOWN_CH_ID_MAIN,
+        visible,
         username: "",
       },
     },
@@ -377,7 +392,11 @@ async function registerSubscriber(
   if (result) {
     console.info(`signalling: registered as subscriber ${result.subscriberId}`);
     return {
-      registration: { subscriberId: result.subscriberId },
+      registration: {
+        subscriberId: result.subscriberId,
+        // A legacy SS omits the acknowledgement and always behaves as visible.
+        visible: result.visible ?? true,
+      },
       idConflict: false,
     };
   }
@@ -521,6 +540,7 @@ async function listChannel(
         // subscriber id — all the SS knows — doubles as the chat user id.
         id: userProfile.subscriberId,
         name: userProfile.username,
+        visible: userProfile.visible,
         // A listed member is online: the SS sweeps expired registrations
         // before answering listChannelMembers.
         online: true,
@@ -534,6 +554,7 @@ async function listChannel(
     channel: {
       id: profile.channelId,
       name: profile.channelName,
+      visible: profile.visible,
       members: members.filter((m): m is ChatUser => m !== null),
     },
     // A partial member page or a dropped profile is fine for best-effort UI,
@@ -556,9 +577,13 @@ function sameChannels(a: ChatChannel[], b: ChatChannel[]): boolean {
         o !== undefined &&
         c.id === o.id &&
         c.name === o.name &&
+        c.visible === o.visible &&
         c.members.length === o.members.length &&
         c.members.every(
-          (m, j) => m.id === o.members[j]?.id && m.name === o.members[j]?.name,
+          (m, j) =>
+            m.id === o.members[j]?.id &&
+            m.name === o.members[j]?.name &&
+            m.visible === o.members[j]?.visible,
         )
       );
     })
@@ -581,6 +606,21 @@ function sameChannels(a: ChatChannel[], b: ChatChannel[]): boolean {
  */
 export function useSignalling(): SignallingState {
   const proxy = useSSProxy();
+  // Do not register until the persisted preference has been read: doing so
+  // would briefly expose a previously invisible user under the default true.
+  const [visible, setVisibleState] = useState(true);
+  const [visibilityLoaded, setVisibilityLoaded] = useState(false);
+  const setVisible = useCallback((next: boolean) => {
+    writeStoredVisibility(next);
+    setVisibleState(next);
+  }, []);
+  useEffect(() => {
+    const stored = readStoredVisibility();
+    startTransition(() => {
+      setVisibleState(stored);
+      setVisibilityLoaded(true);
+    });
+  }, []);
   // The last answered ping is recorded together with the proxy it was
   // measured on, so a stale value never outlives its connection: after a
   // disconnect or reconnect the pair no longer matches and lastPing
@@ -595,6 +635,7 @@ export function useSignalling(): SignallingState {
   const [registered, setRegistered] = useState<{
     proxy: SSProxy;
     me: ChatUser;
+    visible: boolean;
   } | null>(null);
   const registeredRef = useRef(registered);
   registeredRef.current = registered;
@@ -649,7 +690,7 @@ export function useSignalling(): SignallingState {
   }, []);
 
   useEffect(() => {
-    if (!proxy) {
+    if (!proxy || !visibilityLoaded) {
       return;
     }
     let live = true;
@@ -783,10 +824,19 @@ export function useSignalling(): SignallingState {
             const attempt = await registerSubscriber(
               () => proxy.getReadStream(),
               (ev) => writer.write(ev),
+              visible,
               requestedSubscriberId,
             );
             const reg = attempt.registration;
             if (live && !proxy.destroyed && reg !== null) {
+              if (reg.visible !== visible) {
+                // A pre-visibility SS accepts but ignores visible=false. Reflect
+                // its actual behavior instead of claiming invisible is confirmed.
+                console.warn(
+                  "signalling: server did not confirm requested visibility; using its effective value",
+                );
+                setVisible(reg.visible);
+              }
               const previous = registeredRef.current;
               if (
                 previous !== null &&
@@ -798,10 +848,12 @@ export function useSignalling(): SignallingState {
               }
               setRegistered({
                 proxy,
+                visible: reg.visible,
                 me: {
                   id: proxy.identity.userId,
                   name,
                   online: true,
+                  visible: reg.visible,
                   channelId: WELLKNOWN_CH_ID_MAIN,
                   subscriberId: reg.subscriberId,
                 },
@@ -950,12 +1002,16 @@ export function useSignalling(): SignallingState {
       void reader.cancel();
       writer.releaseLock();
     };
-  }, [proxy]);
+  }, [proxy, setVisible, visible, visibilityLoaded]);
 
   return {
     lastPing:
       proxy !== null && measured?.proxy === proxy ? measured.ping : null,
     me: visibleRegistered?.me ?? null,
+    visible,
+    visibilityPending:
+      !visibilityLoaded || visibleRegistered?.visible !== visible,
+    setVisible,
     channels: visibleListed?.channels ?? NO_CHANNELS,
     listingRevision: visibleListed?.revision ?? 0,
     completeMembershipChannelIds:

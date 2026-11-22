@@ -540,6 +540,193 @@ func TestHeadlessRTCClientRegistersSubscriberId(t *testing.T) {
 	})
 }
 
+func readClientRegistration(t *testing.T, toSS <-chan *ss.SignallingEvent) *ss.SignallingEvent {
+	t.Helper()
+	select {
+	case ev := <-toSS:
+		if ev.C2SEv == nil || ev.C2SEv.Register == nil {
+			t.Fatalf("outbound event = %+v, want registration", ev)
+		}
+		return ev
+	case <-time.After(testTimeout):
+		t.Fatal("timed out waiting for registration")
+		return nil
+	}
+}
+
+func assertRegistrationVisible(t *testing.T, ev *ss.SignallingEvent, want bool) {
+	t.Helper()
+	visible := ev.C2SEv.Register.Visible
+	if visible == nil || *visible != want {
+		t.Fatalf("registration visible = %v, want %v", visible, want)
+	}
+}
+
+// TestHeadlessRTCClientSendsVisibilityOnEveryRun covers the effective
+// registration value: nil configuration defaults to true, explicit values
+// survive, and every reconnecting Run sends a non-nil value.
+func TestHeadlessRTCClientSendsVisibilityOnEveryRun(t *testing.T) {
+	explicitTrue, explicitFalse := true, false
+	for _, tc := range []struct {
+		name    string
+		visible *bool
+		want    bool
+	}{
+		{name: "default", want: true},
+		{name: "explicit true", visible: &explicitTrue, want: true},
+		{name: "explicit false", visible: &explicitFalse, want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, err := NewHeadlessRTCClient(PerfectNegotiatorFactory, RTCClientConfiguration{
+				SubscriberId:       "bot",
+				Visible:            tc.visible,
+				KeepAliveInterval:  time.Hour,
+				MemberListInterval: time.Hour,
+				ReplyTimeout:       time.Second,
+				Logger:             testLogger(t),
+			})
+			if err != nil {
+				t.Fatalf("NewHeadlessRTCClient: %v", err)
+			}
+
+			for runNumber := 1; runNumber <= 2; runNumber++ {
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				toSS := make(chan *ss.SignallingEvent, 16)
+				fromSS := make(chan *ss.SignallingEvent)
+				done := make(chan error, 1)
+				go func() { done <- c.Run(ctx, fromSS, toSS) }()
+
+				registration := readClientRegistration(t, toSS)
+				assertRegistrationVisible(t, registration, tc.want)
+				registrationID := registration.MsgId
+				fromSS <- &ss.SignallingEvent{
+					InReplyTo: &registrationID,
+					S2CEv: &ss.SSToClientEv{RegisterResult: &ss.RegisterResult{
+						ChannelId: ss.WellKnownChIdMain, SubscriberId: "bot", Visible: &tc.want,
+					}},
+				}
+				if id := waitRegistered(t, c); id != "bot" {
+					t.Fatalf("run %d subscriber id = %q, want bot", runNumber, id)
+				}
+
+				cancel()
+				select {
+				case err := <-done:
+					if !errors.Is(err, context.Canceled) {
+						t.Fatalf("run %d ended with %v, want context.Canceled", runNumber, err)
+					}
+				case <-time.After(testTimeout):
+					t.Fatalf("run %d did not end after cancellation", runNumber)
+				}
+			}
+		})
+	}
+}
+
+func TestHeadlessRTCClientRejectsUnconfirmedInvisibility(t *testing.T) {
+	requested := false
+	c, err := NewHeadlessRTCClient(PerfectNegotiatorFactory, RTCClientConfiguration{
+		SubscriberId:       "bot",
+		Visible:            &requested,
+		KeepAliveInterval:  time.Hour,
+		MemberListInterval: time.Hour,
+		ReplyTimeout:       time.Second,
+		Logger:             testLogger(t),
+	})
+	if err != nil {
+		t.Fatalf("NewHeadlessRTCClient: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	toSS := make(chan *ss.SignallingEvent, 16)
+	fromSS := make(chan *ss.SignallingEvent)
+	done := make(chan error, 1)
+	go func() { done <- c.Run(ctx, fromSS, toSS) }()
+
+	registration := readClientRegistration(t, toSS)
+	assertRegistrationVisible(t, registration, false)
+	registrationID := registration.MsgId
+	// A legacy server accepts the unknown field but omits effective visibility.
+	fromSS <- &ss.SignallingEvent{
+		InReplyTo: &registrationID,
+		S2CEv: &ss.SSToClientEv{RegisterResult: &ss.RegisterResult{
+			ChannelId: ss.WellKnownChIdMain, SubscriberId: "bot",
+		}},
+	}
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "requested visibility") {
+			t.Fatalf("Run error = %v, want unconfirmed visibility", err)
+		}
+	case <-time.After(testTimeout):
+		t.Fatal("Run did not reject an unconfirmed invisible registration")
+	}
+}
+
+// TestHeadlessRTCClientRegistrationRetryPreservesVisibility covers the
+// second registration attempt after a configured-id conflict: it uses a fresh
+// id but the same effective visibility as the rejected attempt.
+func TestHeadlessRTCClientRegistrationRetryPreservesVisibility(t *testing.T) {
+	visible := false
+	c, err := NewHeadlessRTCClient(PerfectNegotiatorFactory, RTCClientConfiguration{
+		SubscriberId:       "duplicate",
+		Visible:            &visible,
+		KeepAliveInterval:  time.Hour,
+		MemberListInterval: time.Hour,
+		ReplyTimeout:       time.Second,
+		Logger:             testLogger(t),
+	})
+	if err != nil {
+		t.Fatalf("NewHeadlessRTCClient: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	toSS := make(chan *ss.SignallingEvent, 16)
+	fromSS := make(chan *ss.SignallingEvent)
+	done := make(chan error, 1)
+	go func() { done <- c.Run(ctx, fromSS, toSS) }()
+
+	first := readClientRegistration(t, toSS)
+	if got := first.C2SEv.Register.SubscriberId; got != "duplicate" {
+		t.Fatalf("first subscriber id = %q, want duplicate", got)
+	}
+	assertRegistrationVisible(t, first, false)
+	firstID := first.MsgId
+	fromSS <- &ss.SignallingEvent{
+		InReplyTo: &firstID,
+		S2CEv: &ss.SSToClientEv{Err: &ss.SSToClientErrEv{
+			ErrorCode: ss.ErrorCodeSubscriberIdIsRegistered, ErrorMsg: "duplicate id",
+		}},
+	}
+
+	second := readClientRegistration(t, toSS)
+	if got := second.C2SEv.Register.SubscriberId; got != "" {
+		t.Fatalf("retry subscriber id = %q, want empty", got)
+	}
+	assertRegistrationVisible(t, second, false)
+	secondID := second.MsgId
+	fromSS <- &ss.SignallingEvent{
+		InReplyTo: &secondID,
+		S2CEv: &ss.SSToClientEv{RegisterResult: &ss.RegisterResult{
+			ChannelId: ss.WellKnownChIdMain, SubscriberId: "1000", Visible: &visible,
+		}},
+	}
+	if id := waitRegistered(t, c); id != "1000" {
+		t.Fatalf("registered subscriber id = %q, want 1000", id)
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Run ended with %v, want context.Canceled", err)
+		}
+	case <-time.After(testTimeout):
+		t.Fatal("Run did not end after cancellation")
+	}
+}
+
 // TestHeadlessRTCClientRetriesRegistrationWithFreshId covers the
 // registration retry: a configured subscriber id that is already
 // registered to another tuple is retried once with an empty id, which the

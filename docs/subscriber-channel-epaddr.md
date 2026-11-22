@@ -56,11 +56,12 @@ Detailed:
 register: {
   subscriberId: "",
   channelId: WELLKNOWN_CH_ID_MAIN,
+  visible: true,
   username: "",
 }
 ```
 
-如果 `subscriberId` 为空，服务器会从 `1000–1999` 中分配一个；注册结果返回最终的 `(channelId, subscriberId)`。相关定义在 `web/site/src/api/ss/types.ts:44`，注册逻辑在 `pkg/models/ss/ss.go:536`。
+如果 `subscriberId` 为空，服务器会从 `1000–1999` 中分配一个；注册结果返回最终的 `(channelId, subscriberId)`。`visible` 缺省为 `true`；同一 subscriber 的后续注册可以切换它。Web 端会把“在线/隐身”的选择保存在 localStorage，刷新后沿用。相关定义在 `web/site/src/api/ss/types.ts:44`，注册逻辑在 `pkg/models/ss/ss.go:536`。
 
 服务器为每个 subscriber 保存的信息大致是：
 
@@ -68,6 +69,7 @@ register: {
 type subscriberState struct {
     id         SubscriberId
     username   string
+    visible    bool
     addr       EPAddr
     lastActive time.Time
 }
@@ -121,6 +123,7 @@ Channel 是信令服务器维护的一个**成员集合和寻址命名空间**�
 ```go
 type channelState struct {
     name          string
+    visible       bool
     subscribers   map[SubscriberId]*subscriberState
     idsByUsername map[string]SubscriberId
     nextAutoId    int
@@ -139,6 +142,8 @@ type channelState struct {
 - channel 的资料：`channelProfileQuery`
 - channel 里有哪些 subscriber：`listChannelMembers`
 - 某个 subscriber 的资料：`userProfileQuery`
+
+公共列举会排除 `visible=false` 的 channel 和 subscriber；但已知 `(channelId, subscriberId)` 后，直接资料查询和信令 relay 仍然可用。main channel 当前固定为可见。
 
 前端发现同 channel 的其他成员后，会自动为每个成员建立 peer session，见 `web/site/src/api/ss/peersessions.tsx:776`。
 
@@ -312,6 +317,7 @@ interface EPAddr {
     register: {
       subscriberId: "",
       channelId: WELLKNOWN_CH_ID_MAIN,
+      visible: true,
       username: "",
     },
   },
@@ -341,6 +347,7 @@ interface EPAddr {
 type subscriberState struct {
     id         SubscriberId
     username   string
+    visible    bool
     addr       EPAddr
     lastActive time.Time
 }

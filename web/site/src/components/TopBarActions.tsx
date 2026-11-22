@@ -1,8 +1,8 @@
 "use client";
 
 // TopBarActions is the bridge through which the active page contributes
-// contextual controls to the TopBar (the chat page's call volume control
-// while a call is live, so far): TopBar renders the always-present
+// contextual controls to the TopBar (the chat page's visibility switch and
+// call volume control): TopBar renders the always-present
 // TopBarActionsHost, and a page wraps its controls in <TopBarActions> to
 // portal them into it. The host element is held at module level (the
 // SSProxy-style singleton pattern) and subscribed via

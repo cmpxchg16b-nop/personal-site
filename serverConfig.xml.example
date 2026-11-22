@@ -239,7 +239,9 @@
        assignment range 1000-1999 — set a fixed id outside that range for a
        stable, recognizable address; iceServers is a comma-separated list
        of ICE server URLs for the bot's peer connections — empty means
-       none (host candidates only); keepAliveInterval, memberListInterval,
+       none (host candidates only); visible defaults to true, and false
+       hides the bot from public channel member listings without blocking
+       direct signalling; keepAliveInterval, memberListInterval,
        replyTimeout and reconnectInterval are Go duration strings (e.g.
        "5s") with code-side defaults — keep the keepalive well below the
        server's subscriber aging (the ss-aging flag, default 30s).
@@ -247,6 +249,7 @@
     url="wss://example.com/api/ss/ws"
     jwt=""
     subscriberId="echobot"
+    visible="true"
     keepAliveInterval="5s"
   />
   -->

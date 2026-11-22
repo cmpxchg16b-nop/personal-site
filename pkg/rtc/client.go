@@ -203,6 +203,11 @@ type RTCClientConfiguration struct {
 	// retries once with an empty id, mirroring the browser.
 	SubscriberId ss.SubscriberId
 
+	// Visible controls whether the registration appears in public channel
+	// member listings. Nil selects true. Invisible members remain reachable
+	// by direct signalling.
+	Visible *bool
+
 	// ICEServers holds the STUN/TURN URLs of the peer connections (e.g.
 	// "stun:stun.l.google.com:19302") — what the browser loads from
 	// GET /api/iceServers. Empty means no ICE servers: peers on the local
@@ -260,6 +265,7 @@ type HeadlessRTCClient struct {
 	// The configuration, normalized at construction.
 	channelId          ss.ChannelId
 	subscriberId       ss.SubscriberId
+	visible            bool
 	newPC              func(polite bool) (*webrtc.PeerConnection, error)
 	keepAliveInterval  time.Duration
 	memberListInterval time.Duration
@@ -306,10 +312,15 @@ func NewHeadlessRTCClient(newNegotiator NegotiatorFactory, config RTCClientConfi
 	if logger == nil {
 		logger = slog.Default()
 	}
+	visible := true
+	if config.Visible != nil {
+		visible = *config.Visible
+	}
 	c := &HeadlessRTCClient{
 		newNegotiator:      newNegotiator,
 		channelId:          channelId,
 		subscriberId:       config.SubscriberId,
+		visible:            visible,
 		newPC:              newPC,
 		keepAliveInterval:  orDuration(config.KeepAliveInterval, defaultKeepAliveInterval),
 		memberListInterval: orDuration(config.MemberListInterval, defaultMemberListInterval),
@@ -875,9 +886,11 @@ func (c *HeadlessRTCClient) registerOnce(run *clientRun, id ss.SubscriberId) (as
 	// The display name is not the client's to choose: the WS endpoint
 	// stamps the session's username (the JWT's claim) onto the register
 	// event, so the wire field goes empty.
+	visible := c.visible
 	msgId, ok := c.sendToSS(run, &ss.ClientToSSEv{Register: &ss.ClientToSSRegEv{
 		SubscriberId: id,
 		ChannelId:    c.channelId,
+		Visible:      &visible,
 	}})
 	if !ok {
 		return "", false, run.ctx.Err()
@@ -901,6 +914,13 @@ func (c *HeadlessRTCClient) registerOnce(run *clientRun, id ss.SubscriberId) (as
 				continue // unrelated s2c replies remain irrelevant during registration
 			}
 			if result := ev.S2CEv.RegisterResult; result != nil {
+				confirmedVisible := true // a legacy SS omits visible and always lists members
+				if result.Visible != nil {
+					confirmedVisible = *result.Visible
+				}
+				if confirmedVisible != c.visible {
+					return "", false, fmt.Errorf("rtc: requested visibility %v was not confirmed (server effective visibility %v)", c.visible, confirmedVisible)
+				}
 				return result.SubscriberId, false, nil
 			}
 			if e := ev.S2CEv.Err; e != nil {

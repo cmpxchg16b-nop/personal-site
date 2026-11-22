@@ -34,6 +34,7 @@ const me: ChatUser = {
   id: "1000",
   name: "browser",
   online: true,
+  visible: true,
   channelId,
   subscriberId: "1000",
 };

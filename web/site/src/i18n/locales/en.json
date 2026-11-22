@@ -162,6 +162,13 @@
       "microphone": "Microphone",
       "speaker": "Speaker",
       "echoCancellation": "Echo cancellation"
+    },
+    "visibility": {
+      "title": "Public visibility",
+      "control": "Public visibility: {{state}}",
+      "online": "Online",
+      "invisible": "Invisible",
+      "description": "When invisible, you disappear from public channel member lists; members who know your subscription address can still reach you through signalling."
     }
   },
   "footer": {

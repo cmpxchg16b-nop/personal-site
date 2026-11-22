@@ -80,7 +80,7 @@ type EPAddr struct {
 // A subscriber id is bound to zero or one (user id, user session id,
 // channel id) tuple: re-registration of a live id by the same tuple is
 // allowed and acts as a refresh — it renews lastActive and may update
-// the username; registration of an id bound to another tuple is
+// the username and public visibility; registration of an id bound to another tuple is
 // rejected with ErrorCodeSubscriberIdIsRegistered.
 type ClientToSSRegEv struct {
 	// SubscriberId may be empty: the SS then assigns one sequentially
@@ -91,6 +91,11 @@ type ClientToSSRegEv struct {
 	// automatic registration.
 	SubscriberId SubscriberId `json:"subscriberId"`
 	ChannelId    ChannelId    `json:"channelId"`
+
+	// Visible controls whether the subscriber appears in public channel-member
+	// listings. Nil selects the backwards-compatible default, true. An invisible
+	// subscriber remains directly addressable for profile queries and c2c relay.
+	Visible *bool `json:"visible,omitempty"`
 
 	// Username is descriptive: lowercase, no-space, valid DNS label, for
 	// displaying the subscriber in the UI. The WebSocket endpoint
@@ -266,20 +271,26 @@ type UserProfile struct {
 	SubscriberId SubscriberId `json:"subscriberId"`
 	ChannelId    ChannelId    `json:"channelId"`
 	Username     string       `json:"username"`
+	Visible      bool         `json:"visible"`
 }
 
 // ChannelProfile is the profile data the SS holds about a channel.
 type ChannelProfile struct {
 	ChannelId   ChannelId `json:"channelId"`
 	ChannelName string    `json:"channelName"`
+	// Visible controls public discovery; the main channel is fixed to true.
+	Visible bool `json:"visible"`
 }
 
 // RegisterResult is the SS's answer to a successful registration: the
-// channel and the subscriber id the registration is bound to. The
-// subscriber id is assigned by the SS when the request left it empty.
+// channel, subscriber id, and effective public visibility. The subscriber id
+// is assigned by the SS when the request left it empty.
 type RegisterResult struct {
 	ChannelId    ChannelId    `json:"channelId"`
 	SubscriberId SubscriberId `json:"subscriberId"`
+	// Visible is the effective value confirmed by the SS. Nil identifies a
+	// legacy SS that predates visibility; clients treat that as visible=true.
+	Visible *bool `json:"visible,omitempty"`
 }
 
 // PingPongMsg is a ping or ping-reply message: between two clients
@@ -478,7 +489,7 @@ func (p *SimpleOnMemorySSProvider) Run(ctx context.Context, inMsg <-chan *Signal
 	// All provider state lives on this goroutine's stack and every event
 	// is handled sequentially, so no mutex is needed anywhere.
 	channels := map[ChannelId]*channelState{
-		WellKnownChIdMain: newChannelState(mainChannelName),
+		WellKnownChIdMain: newChannelState(mainChannelName, true),
 	}
 
 	for {
@@ -542,6 +553,7 @@ func (p *SimpleOnMemorySSProvider) handle(ctx context.Context, channels map[Chan
 
 func (p *SimpleOnMemorySSProvider) handleRegister(ctx context.Context, channels map[ChannelId]*channelState, ev *SignallingEvent, outMsg chan<- *SignallingEvent) bool {
 	reg := ev.C2SEv.Register
+	visible := reg.Visible == nil || *reg.Visible
 	ch, ok := channels[reg.ChannelId]
 	if !ok {
 		return p.send(ctx, outMsg, replyErr(ev, ErrorCodeChannelNotFound,
@@ -559,10 +571,10 @@ func (p *SimpleOnMemorySSProvider) handleRegister(ctx context.Context, channels 
 				"no subscriber id is available in the automatic assignment range 1000-1999"))
 		}
 	}
-	// A client registers exactly once per incarnation — a browser page
-	// load mints a fresh subscriber id (a reload is a new incarnation; see
-	// the browser's registerSubscriber). Any OTHER live registration of
-	// the registrar's own (user id, user session id) tuple is therefore a
+	// A browser page load mints a fresh subscriber id (a reload is a new
+	// incarnation); same-id refreshes cover roaming and visibility updates.
+	// Any OTHER live registration of the
+	// registrar's own (user id, user session id) tuple is therefore a
 	// previous, now-dead incarnation of the same client, and is evicted
 	// here: the incarnation change becomes immediately visible to member
 	// listings (peers rebuild their stale peer sessions for the old id at
@@ -583,7 +595,7 @@ func (p *SimpleOnMemorySSProvider) handleRegister(ctx context.Context, channels 
 				"subscriber id has already been registered by another (user id, user session id, channel id) tuple"))
 		}
 		// Re-registration by the same tuple is a refresh: renew
-		// lastActive, and update the username if it changed.
+		// lastActive, update public visibility, and update the username if changed.
 		if reg.Username != existing.username {
 			if owner, taken := ch.idsByUsername[reg.Username]; taken &&
 				ch.live(owner, now, p.aging) != nil {
@@ -594,10 +606,12 @@ func (p *SimpleOnMemorySSProvider) handleRegister(ctx context.Context, channels 
 			ch.idsByUsername[reg.Username] = existing.id
 			existing.username = reg.Username
 		}
+		existing.visible = visible
 		existing.lastActive = now
 		return p.send(ctx, outMsg, reply(ev, &SSToClientEv{RegisterResult: &RegisterResult{
 			ChannelId:    reg.ChannelId,
 			SubscriberId: reg.SubscriberId,
+			Visible:      &visible,
 		}}))
 	}
 	if owner, taken := ch.idsByUsername[reg.Username]; taken &&
@@ -608,6 +622,7 @@ func (p *SimpleOnMemorySSProvider) handleRegister(ctx context.Context, channels 
 	ch.subscribers[reg.SubscriberId] = &subscriberState{
 		id:         reg.SubscriberId,
 		username:   reg.Username,
+		visible:    visible,
 		addr:       ev.From,
 		lastActive: now,
 	}
@@ -615,6 +630,7 @@ func (p *SimpleOnMemorySSProvider) handleRegister(ctx context.Context, channels 
 	return p.send(ctx, outMsg, reply(ev, &SSToClientEv{RegisterResult: &RegisterResult{
 		ChannelId:    reg.ChannelId,
 		SubscriberId: reg.SubscriberId,
+		Visible:      &visible,
 	}}))
 }
 
@@ -668,6 +684,7 @@ func (p *SimpleOnMemorySSProvider) handleQueryProfile(ctx context.Context, chann
 		SubscriberId: sub.id,
 		ChannelId:    query.ChannelId,
 		Username:     sub.username,
+		Visible:      sub.visible,
 	}}))
 }
 
@@ -683,6 +700,7 @@ func (p *SimpleOnMemorySSProvider) handleQueryChannelProfile(ctx context.Context
 	return p.send(ctx, outMsg, reply(ev, &SSToClientEv{ChannelProfile: &ChannelProfile{
 		ChannelId:   query.ChannelId,
 		ChannelName: ch.name,
+		Visible:     ch.visible,
 	}}))
 }
 
@@ -708,8 +726,9 @@ const channelMembersPageSize = 64
 // or more channelMbsListResult messages, paged by channelMembersPageSize
 // and each carrying a fresh MsgId with InReplyTo pointing at the
 // request. Even an empty channel yields one (empty, final) page, so the
-// client always observes hasMore=false. Members are listed sorted by
-// subscriber id, so pages are stable.
+// client always observes hasMore=false. Invisible members are omitted, and an
+// invisible channel has an empty public member list. Members are listed sorted
+// by subscriber id, so pages are stable.
 func (p *SimpleOnMemorySSProvider) handleListChannelMembers(ctx context.Context, channels map[ChannelId]*channelState, ev *SignallingEvent, outMsg chan<- *SignallingEvent) bool {
 	req := ev.C2SEv.ListChannelMembers
 	ch, ok := channels[req.ChannelId]
@@ -718,8 +737,12 @@ func (p *SimpleOnMemorySSProvider) handleListChannelMembers(ctx context.Context,
 	}
 	ch.sweep(time.Now(), p.aging)
 	members := make([]SubscriberId, 0, len(ch.subscribers))
-	for id := range ch.subscribers {
-		members = append(members, id)
+	if ch.visible {
+		for id, sub := range ch.subscribers {
+			if sub.visible {
+				members = append(members, id)
+			}
+		}
 	}
 	sort.Slice(members, func(i, j int) bool { return members[i] < members[j] })
 	for start := 0; ; start += channelMembersPageSize {
@@ -747,12 +770,15 @@ const channelListPageSize = 64
 // channelListResult messages, paged by channelListPageSize and each
 // carrying a fresh MsgId with InReplyTo pointing at the request. Even an
 // empty channel list yields one (empty, final) page, so the client
-// always observes hasMore=false. Channels are listed sorted by channel
-// id, so pages are stable. No registration is needed first.
+// client always observes hasMore=false. Invisible channels are omitted.
+// Channels are listed sorted by channel id, so pages are stable. No
+// registration is needed first.
 func (p *SimpleOnMemorySSProvider) handleListChannels(ctx context.Context, channels map[ChannelId]*channelState, ev *SignallingEvent, outMsg chan<- *SignallingEvent) bool {
 	ids := make([]ChannelId, 0, len(channels))
-	for id := range channels {
-		ids = append(ids, id)
+	for id, ch := range channels {
+		if ch.visible {
+			ids = append(ids, id)
+		}
 	}
 	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
 	for start := 0; ; start += channelListPageSize {
@@ -839,6 +865,7 @@ func newMsgId() MsgId {
 type subscriberState struct {
 	id       SubscriberId
 	username string
+	visible  bool
 
 	// addr is the EPAddr the subscriber registered with, learned from
 	// the From field of the registration event.
@@ -859,6 +886,7 @@ func (s *subscriberState) expired(now time.Time, aging time.Duration) bool {
 // username.
 type channelState struct {
 	name          string
+	visible       bool
 	subscribers   map[SubscriberId]*subscriberState
 	idsByUsername map[string]SubscriberId
 
@@ -867,9 +895,10 @@ type channelState struct {
 	nextAutoId int
 }
 
-func newChannelState(name string) *channelState {
+func newChannelState(name string, visible bool) *channelState {
 	return &channelState{
 		name:          name,
+		visible:       visible,
 		subscribers:   make(map[SubscriberId]*subscriberState),
 		idsByUsername: make(map[string]SubscriberId),
 		nextAutoId:    autoSubscriberIdRangeStart,

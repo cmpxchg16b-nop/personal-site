@@ -92,7 +92,7 @@ Implementation: `web/site/src/api/ss/proxy.ts`, `react.tsx`, and
 
 ### Go bots: reconnect and rebuild the run
 
-The built-in echo/music bots use a different lifecycle today.
+The built-in bots use a different lifecycle today.
 `startBotClient` runs one `WebSocketSignallingTransport` plus one
 `HeadlessRTCClient.Run` per connection attempt. When either side ends, it waits
 for the configured `reconnectInterval` and starts another attempt. The default
@@ -127,7 +127,10 @@ destination subscriber leaving, does not tear down the sender's own run.
 
 A configured bot `subscriberId` is registered again on the next run. If the
 configuration left it empty, each run asks for a fresh automatically assigned
-id. A configured-id conflict is retried once with an empty id.
+id. A configured-id conflict is retried once with an empty id. Every
+registration, including that retry, carries the bot's effective `visible`
+value (default true, configurable in XML). Reconnecting reuses the configuration
+loaded at process startup; it does not re-read the XML document.
 
 Implementation: `cmd/server/main.go` (`startBotClient`), `pkg/rtc/client.go`,
 and `pkg/rtc/transport.go`.
