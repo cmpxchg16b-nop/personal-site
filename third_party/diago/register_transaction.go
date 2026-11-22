@@ -109,6 +109,9 @@ func (t *RegisterTransaction) register(ctx context.Context) error {
 	username, password := t.opts.Username, t.opts.Password
 	client := t.client
 	req := t.Origin
+	// Each REGISTER attempt is a new transaction. In particular, do not reuse
+	// the Via left by a timed-out attempt while its old transaction is winding down.
+	req.RemoveHeader("Via")
 	contact := req.Contact().Clone()
 
 	res, err := func() (*sip.Response, error) {
@@ -122,6 +125,7 @@ func (t *RegisterTransaction) register(ctx context.Context) error {
 			if err != nil {
 				return nil, err
 			}
+			defer tx.Terminate()
 
 			host, port, err := sip.ParseAddr(tx.Connection().LocalAddr().String())
 			if err != nil {
@@ -132,7 +136,6 @@ func (t *RegisterTransaction) register(ctx context.Context) error {
 
 			err = tx.Init()
 			if err != nil {
-				tx.Terminate()
 				return nil, err
 			}
 
@@ -158,6 +161,10 @@ func (t *RegisterTransaction) register(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("fail to create transaction req=%q: %w", req.StartLine(), err)
 	}
+	// Capture the actual wire Contact after an ephemeral port was filled in,
+	// but before rport/received NAT rewriting below. Multi-binding responses
+	// are matched against this identity.
+	contact = req.Contact().Clone()
 
 	via := res.Via()
 	if via == nil {
@@ -197,17 +204,103 @@ func (t *RegisterTransaction) register(ctx context.Context) error {
 		}
 	}
 
-	// Now update server expiry
-	t.expiry = t.opts.Expiry
-	if h := res.GetHeader("Expires"); h != nil {
-		val, err := strconv.Atoi(h.Value())
-		if err != nil {
-			return fmt.Errorf("failed to parse server Expires value: %w", err)
-		}
-		t.expiry = time.Duration(val) * time.Second
+	expiry, expiryErr := registerResponseExpiry(res, t.opts.Expiry, contact)
+	if expiryErr != nil {
+		// The 200 may already have created the remote binding. Preserve the
+		// requested lease and report success so the caller can refresh and later
+		// unregister that binding instead of leaking it until remote expiry.
+		t.log.Warn("Failed to parse REGISTER expiry; using requested lease", "error", expiryErr)
+		expiry = t.opts.Expiry
 	}
-
+	t.expiry = expiry
 	return nil
+}
+
+// Expiry returns the lease granted by the latest successful REGISTER response.
+// Like the transaction itself, it is not synchronized; callers must serialize
+// it with Register, Qualify, and Unregister.
+func (t *RegisterTransaction) Expiry() time.Duration {
+	return t.expiry
+}
+
+// registerResponseExpiry prefers our Contact binding's expires parameter (RFC
+// 3261 §10.2.1.1) and falls back to the response-wide Expires header. A 200 can
+// contain bindings for several devices, so blindly reading the first Contact
+// can schedule this UA's refresh from another device's lease.
+func registerResponseExpiry(res *sip.Response, fallback time.Duration, ownContact *sip.ContactHeader) (time.Duration, error) {
+	contacts, err := registerResponseContacts(res)
+	if err != nil {
+		return 0, err
+	}
+	var selected *sip.ContactHeader
+	if len(contacts) == 1 {
+		// A single binding may reflect NAT rewriting rather than the exact
+		// Contact sent by this UA; it is still the only binding to consider.
+		selected = contacts[0]
+	} else if ownContact != nil {
+		for _, candidate := range contacts {
+			if sameContactAddress(candidate, ownContact) {
+				selected = candidate
+				break
+			}
+		}
+	}
+	if selected != nil {
+		if raw, ok := contactParam(selected.Params, "expires"); ok {
+			seconds, err := strconv.Atoi(raw)
+			if err != nil || seconds < 0 {
+				return 0, fmt.Errorf("failed to parse server Contact expires value %q", raw)
+			}
+			return time.Duration(seconds) * time.Second, nil
+		}
+	}
+	if header := res.GetHeader("Expires"); header != nil {
+		seconds, err := strconv.Atoi(header.Value())
+		if err != nil || seconds < 0 {
+			return 0, fmt.Errorf("failed to parse server Expires value %q", header.Value())
+		}
+		return time.Duration(seconds) * time.Second, nil
+	}
+	return fallback, nil
+}
+
+func registerResponseContacts(res *sip.Response) ([]*sip.ContactHeader, error) {
+	var contacts []*sip.ContactHeader
+	for _, raw := range res.GetHeaders("Contact") {
+		parsed, err := sip.HeadersParser(sip.DefaultHeadersParser()).ParseHeader(nil, []byte(raw.Name()+": "+raw.Value()))
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse server Contact header: %w", err)
+		}
+		for _, header := range parsed {
+			contact, ok := header.(*sip.ContactHeader)
+			if !ok {
+				return nil, fmt.Errorf("server Contact parser returned %T", header)
+			}
+			contacts = append(contacts, contact)
+		}
+	}
+	return contacts, nil
+}
+
+func sameContactAddress(a, b *sip.ContactHeader) bool {
+	if a.Address.User != b.Address.User ||
+		!strings.EqualFold(a.Address.Host, b.Address.Host) ||
+		a.Address.Port != b.Address.Port ||
+		!strings.EqualFold(a.Address.Scheme, b.Address.Scheme) {
+		return false
+	}
+	aTransport, aHasTransport := contactParam(a.Address.UriParams, "transport")
+	bTransport, bHasTransport := contactParam(b.Address.UriParams, "transport")
+	return !aHasTransport || !bHasTransport || strings.EqualFold(aTransport, bTransport)
+}
+
+func contactParam(params sip.HeaderParams, name string) (string, bool) {
+	for _, parameter := range params {
+		if strings.EqualFold(parameter.K, name) {
+			return parameter.V, true
+		}
+	}
+	return "", false
 }
 
 func (t *RegisterTransaction) QualifyLoop(ctx context.Context) error {
@@ -263,14 +356,34 @@ func (t *RegisterTransaction) calcRetry(expiry time.Duration) time.Duration {
 }
 
 func (t *RegisterTransaction) Unregister(ctx context.Context) error {
-	req := t.Origin
+	if err := buildUnregisterRequest(t.Origin); err != nil {
+		return err
+	}
+	return t.doRequest(ctx, t.Origin)
+}
 
+func buildUnregisterRequest(req *sip.Request) error {
+	contact := req.Contact().Clone()
+	if contact == nil {
+		return fmt.Errorf("cannot unregister without a Contact")
+	}
+
+	// Contact: * removes every device registered for the AOR. Expiring only
+	// this transaction's Contact leaves the user's ordinary SIP phones and
+	// other UAs registered, as RFC 3261 contact-specific removal intends.
+	params := make(sip.HeaderParams, 0, len(contact.Params)+1)
+	for _, parameter := range contact.Params {
+		if !strings.EqualFold(parameter.K, "expires") {
+			params = append(params, parameter)
+		}
+	}
+	contact.Params = append(params, sip.HeaderKV{K: "expires", V: "0"})
 	req.RemoveHeader("Expires")
 	req.RemoveHeader("Contact")
-	req.AppendHeader(sip.NewHeader("Contact", "*"))
+	req.AppendHeader(contact)
 	expires := sip.ExpiresHeader(0)
 	req.AppendHeader(&expires)
-	return t.doRequest(ctx, req)
+	return nil
 }
 
 func (t *RegisterTransaction) Qualify(ctx context.Context) error {
@@ -307,15 +420,18 @@ func (t *RegisterTransaction) doRequest(ctx context.Context, req *sip.Request) e
 		}
 	}
 
-	// Check is expirese changed
-	if h := res.GetHeader("Expires"); h != nil {
-		val, err := strconv.Atoi(h.Value())
-		if err != nil {
-			return fmt.Errorf("Failed to parse server Expires value: %w", err)
-		}
-		t.expiry = time.Duration(val) * time.Second
+	fallback := t.expiry
+	if fallback <= 0 {
+		fallback = t.opts.Expiry
 	}
-
+	expiry, expiryErr := registerResponseExpiry(res, fallback, req.Contact().Clone())
+	if expiryErr != nil {
+		// Keep the last known good lease. A malformed refresh response must not
+		// poison all later responses that omit expiry information.
+		t.log.Warn("Failed to parse REGISTER refresh expiry; retaining lease", "error", expiryErr)
+		expiry = fallback
+	}
+	t.expiry = expiry
 	return nil
 }
 

@@ -90,3 +90,21 @@ guard now counts only m-lines OF THE REQUESTED TYPE:
   byte-identically.
 
 No other behavior changes; SDP generation is untouched.
+
+## Patch 5: serial REGISTER lease and transaction lifecycle
+
+The user-level registration service drives one transaction serially and needs
+more lifecycle information and cleanup than upstream v0.32.2 provides:
+
+- `RegisterTransaction.Expiry` exposes the latest granted lease. Successful
+  responses prefer this UA's `Contact;expires=` over top-level `Expires`, parse
+  comma-separated and repeated Contact headers, compare URI transport when both
+  sides carry it, and retain a valid fallback when a value is malformed.
+- Initial REGISTER attempts always build a fresh Via. The hand-written UDP
+  client transaction is terminated on success, error, and context cancellation
+  so its retransmission timers cannot outlive the attempt.
+- Unregister expires only the transaction's own Contact with `expires=0`; it
+  does not send `Contact: *` and remove other devices' bindings.
+
+The service intentionally serializes calls on each transaction; this patch does
+not make a single `RegisterTransaction` safe for concurrent use.

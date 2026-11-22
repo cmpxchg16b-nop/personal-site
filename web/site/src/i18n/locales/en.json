@@ -148,16 +148,42 @@
     "sip": {
       "title": "SIP Registration",
       "back": "Back to settings",
-      "placeholder": "The SIP registration service is not implemented yet. Configurations added here only remain on this page; no registration is attempted.",
-      "currentStatus": "Current SIP registration status",
-      "unregistered": "Not registered",
-      "configurations": "Registration configurations",
-      "add": "Add SIP registration",
+
+      "loading": "Loading SIP credentials…",
+      "loadFailed": "Failed to load SIP credentials.",
+      "mutationFailed": "The request failed. Please try again.",
+
+      "empty": "No SIP credentials yet.",
+
+      "add": "Add",
+      "addTitle": "Add SIP credential",
+      "edit": "Edit SIP credential",
+      "editCredential": "Edit {{uri}}",
+      "deleteCredential": "Delete {{uri}}",
+      "enableCredential": "Enable {{uri}}",
       "server": "SIP server",
       "username": "Username",
       "password": "Password",
+      "passwordHint": "Leave blank to keep the current password.",
       "transport": "Transport",
-      "submit": "Add registration"
+      "enabled": "Enabled",
+      "confirm": "Confirm",
+      "save": "Save",
+      "adding": "Adding…",
+      "saving": "Saving…",
+      "cancel": "Cancel",
+      "retry": "Retry",
+      "retryAt": "Next retry: {{time}}",
+      "deleteTitle": "Delete SIP credential?",
+      "deleteMessage": "This permanently removes {{uri}}. This action cannot be undone.",
+      "delete": "Delete",
+      "deleting": "Deleting…",
+      "states": {
+        "disabled": "Disabled",
+        "registering": "Registering",
+        "registered": "Registered",
+        "failed": "Failed"
+      }
     },
     "fileTransfer": {
       "pending": "Waiting…",

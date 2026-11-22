@@ -2,12 +2,15 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"syscall"
 	"time"
 
 	personalsite "personal-site"
@@ -22,6 +25,7 @@ import (
 	pkgapiloginoptions "personal-site/pkg/api/loginoptions"
 	pkgapilogout "personal-site/pkg/api/logout"
 	pkgapiprofile "personal-site/pkg/api/profile"
+	pkgapisipcredentials "personal-site/pkg/api/sipcredentials"
 	pkgapiwebsocketss "personal-site/pkg/api/websocket_ss"
 	pkgauth "personal-site/pkg/auth"
 	pkgcookie "personal-site/pkg/cookie"
@@ -37,6 +41,7 @@ import (
 	"personal-site/pkg/rtc/musicbot"
 	"personal-site/pkg/rtc/sipbot"
 	pkgsession "personal-site/pkg/session"
+	"personal-site/pkg/sipregistration"
 
 	"github.com/alecthomas/kong"
 	"github.com/joho/godotenv"
@@ -78,6 +83,7 @@ type ServeCmd struct {
 	VisitorSessionValidity      time.Duration `name:"validity-of-visitor-session" help:"Validity of visitor session" default:"168h"`
 	VisitorSessionTicketGenIntv time.Duration `name:"visitor-jwt-ticket-gen-intv" help:"We issue visitor token based on some ticket generator, this is the interval of how fast it generate tickets" default:"1s"`
 	NonceLifespan               time.Duration `name:"nonce-lifespan" help:"Lifespan of the OAuth nonce." default:"10m"`
+	SIPAllowPrivateRegistrars   bool          `name:"sip-allow-private-registrars" help:"Allow visitor SIP credentials to register against private or loopback targets (development/trusted networks only)." default:"false"`
 }
 
 // Run serves. cli carries the root flags shared with the other subcommands.
@@ -86,7 +92,8 @@ func (cmd *ServeCmd) Run(cli *CLI) error {
 		return runHealthzProbe(cmd.Addr)
 	}
 
-	ctx := context.Background()
+	ctx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stopSignals()
 
 	// The global server configuration document is loaded once here; its
 	// sections are consumed by the wiring below (login options, generic OIDC
@@ -136,6 +143,12 @@ func (cmd *ServeCmd) Run(cli *CLI) error {
 	// values the JWT auth middleware injects into the request context.
 	sm := pkgsession.NewOnMemorySessionManager()
 
+	// User SIP credentials and REGISTER state live above any browser or bot
+	// session. The browser manages desired state through the site's API; this
+	// manager alone originates and terminates SIP toward external registrars.
+	sipRegistrations := sipregistration.NewManager(logger, sipregistration.WithPrivateRegistrars(cmd.SIPAllowPrivateRegistrars))
+	defer sipRegistrations.Close()
+
 	// API routes. The site is a purely client-rendered static export today;
 	// these endpoints are the seed of the dynamic features served by this Go
 	// backend (profile, dynamic blog data, …).
@@ -165,6 +178,13 @@ func (cmd *ServeCmd) Run(cli *CLI) error {
 	// caller's session identity, never from the request body — and comments
 	// live in process memory only, so they are lost on restart.
 	muxHandlerDyn.Handle("/api/comments/", pkgapicomments.NewCommentsHandler(pkgmodelscomment.NewOnMemoryCommentProvider(), sm))
+
+	// Per-user SIP credentials are deliberately absent from the JWT whitelist:
+	// every read and mutation is scoped to the authenticated JWT subject. Both
+	// mount forms reach the same handler without a collection-path redirect.
+	sipCredentialsHandler := pkgapisipcredentials.NewHandler(sipRegistrations, sm, allowedOrigins...)
+	muxHandlerDyn.Handle("/api/sip/credentials", sipCredentialsHandler)
+	muxHandlerDyn.Handle("/api/sip/credentials/", sipCredentialsHandler)
 
 	// The signalling endpoint upgrades client connections to WebSocket and
 	// bridges them to the signalling service: visitors discover each other
@@ -409,8 +429,30 @@ func (cmd *ServeCmd) Run(cli *CLI) error {
 	// additionally get the detailed HTTP log above.
 	handler := pkglog.WithLogTraceId(pkglog.WithOverallLog(logger, muxHandlerGeneral))
 
+	server := &http.Server{Addr: cmd.Addr, Handler: handler}
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- server.ListenAndServe() }()
 	logger.Info("listening", "addr", cmd.Addr)
-	return http.ListenAndServe(cmd.Addr, handler)
+
+	select {
+	case err := <-serveErr:
+		if errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return err
+	case <-ctx.Done():
+		logger.Info("shutting down")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			_ = server.Close()
+			return fmt.Errorf("HTTP server shutdown: %w", err)
+		}
+		if err := <-serveErr; err != nil && !errors.Is(err, http.ErrServerClosed) {
+			return err
+		}
+		return nil
+	}
 }
 
 func (cli *CLI) getJWTSecret() ([]byte, error) {
