@@ -1,8 +1,9 @@
 // Package websocket_ss terminates the WebSocket connections of the
 // site's signalling clients and bridges them to a pkg/models/ss
-// SignallingServiceProvider: every parsed text frame is forwarded to the
-// provider, and every event the provider emits is written to the
-// connection its To EPAddr resolves to.
+// SignallingServiceProvider: ordinary parsed text frames are forwarded to the
+// provider, and every event the provider emits is written to the connection
+// its To EPAddr resolves to. Client SIP events are intercepted for the
+// configured SIPHandler instead of reaching that ordinary provider.
 //
 // Client identity comes from the caller's session (see
 // pkgsession.SessionManager): the session's subject id is the user id and
@@ -31,6 +32,7 @@ package websocket_ss
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/url"
 	"slices"
@@ -54,6 +56,20 @@ const (
 // DefaultWriteTimeout is the default bound on a single websocket write;
 // see WebSocketSSHandler.WriteTimeout.
 const DefaultWriteTimeout = 10 * time.Second
+
+var (
+	errSIPPayload = errors.New("websocket_ss: exactly one of SIP call and SIP message must be non-nil")
+	errHubStopped = errors.New("websocket_ss: hub is stopped")
+)
+
+// SIPHandler receives client SIP events and connection-close notifications.
+// The hub invokes these methods synchronously: implementations must only
+// enqueue work for their own service goroutines and return promptly. In
+// particular, they must not perform SIP/network I/O or wait for a hub request.
+type SIPHandler interface {
+	HandleSIP(userID ss.UserId, deliveryID string, call *ss.SIPCallEvent, message *ss.SIPMessageEvent)
+	SIPDisconnected(deliveryID string)
+}
 
 // WebSocketSSHandler is an http.Handler that upgrades signalling client
 // connections to WebSocket and bridges them to a
@@ -81,12 +97,13 @@ type WebSocketSSHandler struct {
 	// dropped, and known destinations are never flooded.
 	UnknownMessageFlood bool
 
-	sm      pkgsession.SessionManager
-	ctx     context.Context
-	inMsg   chan *ss.SignallingEvent // events from all connections, to the provider
-	outMsg  chan *ss.SignallingEvent // events emitted by the provider
-	ingress chan hubNote             // notes from connection goroutines to the hub
-	hubDone chan struct{}            // closed when the hub returns
+	sm         pkgsession.SessionManager
+	sipHandler SIPHandler
+	ctx        context.Context
+	inMsg      chan *ss.SignallingEvent // events from all connections, to the provider
+	outMsg     chan *ss.SignallingEvent // events emitted by the provider
+	ingress    chan hubNote             // notes from connection goroutines to the hub
+	hubDone    chan struct{}            // closed when the hub returns
 }
 
 // NewWebSocketSSHandler constructs a WebSocketSSHandler bridging to
@@ -108,6 +125,74 @@ func NewWebSocketSSHandler(ctx context.Context, provider ss.SignallingServicePro
 	go provider.Run(ctx, h.inMsg, h.outMsg)
 	go h.hub()
 	return h
+}
+
+// SetSIPHandler sets the external user-SIP event handler. It must be called
+// before serving the first connection, like the handler's other configuration
+// setters. A nil handler drops intercepted SIP events without forwarding them
+// to the ordinary provider.
+func (h *WebSocketSSHandler) SetSIPHandler(handler SIPHandler) {
+	h.sipHandler = handler
+}
+
+// FanoutSIP queues an independent copy of call or message on every current
+// socket belonging to userID, across sessions and duplicate connections. It
+// returns the delivery IDs whose queues accepted the event. No matching
+// sockets is a successful empty result. Exactly one payload must be non-nil.
+func (h *WebSocketSSHandler) FanoutSIP(ctx context.Context, userID ss.UserId, call *ss.SIPCallEvent, message *ss.SIPMessageEvent) ([]string, error) {
+	if (call == nil) == (message == nil) {
+		return nil, errSIPPayload
+	}
+	result, err := h.requestSIP(ctx, hubNote{kind: noteFanoutSIP, userID: userID, call: call, message: message})
+	if err != nil {
+		return nil, err
+	}
+	return result.deliveryIDs, nil
+}
+
+// SendSIP queues call or message only on the current socket identified by
+// deliveryID. It returns false when that delivery is stale or missing, or its
+// bounded queue is full. Exactly one payload must be non-nil.
+func (h *WebSocketSSHandler) SendSIP(ctx context.Context, deliveryID string, call *ss.SIPCallEvent, message *ss.SIPMessageEvent) (bool, error) {
+	if (call == nil) == (message == nil) {
+		return false, errSIPPayload
+	}
+	result, err := h.requestSIP(ctx, hubNote{kind: noteSendSIP, deliveryID: deliveryID, call: call, message: message})
+	if err != nil {
+		return false, err
+	}
+	return result.delivered, nil
+}
+
+// requestSIP posts a bounded hub request and waits for its acknowledgement.
+// The capacity-one ack lets the hub finish even when the caller abandons the
+// request through ctx cancellation.
+func (h *WebSocketSSHandler) requestSIP(ctx context.Context, n hubNote) (sipResult, error) {
+	n.ack = make(chan sipResult, 1)
+	select {
+	case <-ctx.Done():
+		return sipResult{}, ctx.Err()
+	default:
+	}
+	select {
+	case h.ingress <- n:
+	case <-ctx.Done():
+		return sipResult{}, ctx.Err()
+	case <-h.ctx.Done():
+		return sipResult{}, h.ctx.Err()
+	case <-h.hubDone:
+		return sipResult{}, errHubStopped
+	}
+	select {
+	case result := <-n.ack:
+		return result, nil
+	case <-ctx.Done():
+		return sipResult{}, ctx.Err()
+	case <-h.ctx.Done():
+		return sipResult{}, h.ctx.Err()
+	case <-h.hubDone:
+		return sipResult{}, errHubStopped
+	}
 }
 
 // ServeHTTP implements http.Handler. Requests whose session carries no
@@ -132,10 +217,11 @@ func (h *WebSocketSSHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	endpoint := ss.EPAddr{UserId: userId, UserSessionId: sessionId}
 	c := &wsConn{
-		remote: conn.RemoteAddr().String(),
-		conn:   conn,
-		queue:  make(chan *ss.SignallingEvent, connQueueBufferSize),
-		camKey: camKeyOf(endpoint),
+		remote:     conn.RemoteAddr().String(),
+		conn:       conn,
+		queue:      make(chan *ss.SignallingEvent, connQueueBufferSize),
+		camKey:     camKeyOf(endpoint),
+		deliveryID: uuid.NewString(),
 	}
 	// The hello is connection-local and is queued before registration can
 	// make any provider event eligible for delivery, so it is always first.
@@ -156,8 +242,9 @@ func (h *WebSocketSSHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // hub is the single goroutine owning the connection set and the learned
-// address table. It forwards inbound events to the provider and routes
-// outbound events to their destination connection. It returns when ctx
+// address table. It forwards ordinary inbound events to the provider, handles
+// SIP interception and delivery requests, and routes outbound events to their
+// destination connection. It returns when ctx
 // is done or the provider closes outMsg, closing every connection's
 // queue (which makes the write pumps close the connections).
 func (h *WebSocketSSHandler) hub() {
@@ -166,7 +253,7 @@ func (h *WebSocketSSHandler) hub() {
 	conns := make(map[*wsConn]struct{})
 	defer func() {
 		for c := range conns {
-			close(c.queue)
+			h.dropConn(table, conns, c)
 		}
 	}()
 
@@ -187,9 +274,22 @@ func (h *WebSocketSSHandler) hub() {
 				close(n.done)
 			case noteClosed:
 				if _, ok := conns[n.conn]; ok {
-					dropConn(table, conns, n.conn)
+					h.dropConn(table, conns, n.conn)
 				}
 			case noteMessage:
+				if _, ok := conns[n.conn]; !ok {
+					continue
+				}
+				if n.ev.C2SEv != nil && (n.ev.C2SEv.SIPCall != nil || n.ev.C2SEv.SIPMessage != nil) {
+					// Intercept SIP before the ordinary provider and replace the
+					// complete source address, including any spoofed ServiceId.
+					n.ev.From = ss.EPAddr{UserId: n.conn.camKey.userId, UserSessionId: n.conn.camKey.sessionId}
+					table.learn(camKeyOf(n.ev.From), n.conn)
+					if h.sipHandler != nil {
+						h.sipHandler.HandleSIP(n.conn.camKey.userId, n.conn.deliveryID, n.ev.C2SEv.SIPCall, n.ev.C2SEv.SIPMessage)
+					}
+					continue
+				}
 				// Source address learning, switch-style: remember
 				// this connection serves the From address (one address
 				// may be served by several connections).
@@ -199,6 +299,10 @@ func (h *WebSocketSSHandler) hub() {
 				case <-h.ctx.Done():
 					return
 				}
+			case noteFanoutSIP:
+				n.ack <- sipResult{deliveryIDs: h.fanoutSIP(table, conns, n.userID, n.call, n.message)}
+			case noteSendSIP:
+				n.ack <- sipResult{delivered: h.sendSIP(table, conns, n.deliveryID, n.call, n.message)}
 			}
 		}
 	}
@@ -226,8 +330,71 @@ func (h *WebSocketSSHandler) forward(table *camTable, conns map[*wsConn]struct{}
 		default:
 			// Slow consumer: drop the connection rather than stall the hub.
 			// A failed known delivery never falls back to flooding.
-			dropConn(table, conns, c)
+			h.dropConn(table, conns, c)
 		}
+	}
+}
+
+// fanoutSIP delivers to every active socket of userID. The hub owns conns, so
+// scanning it cannot race connection registration or removal.
+func (h *WebSocketSSHandler) fanoutSIP(table *camTable, conns map[*wsConn]struct{}, userID ss.UserId, call *ss.SIPCallEvent, message *ss.SIPMessageEvent) []string {
+	deliveryIDs := make([]string, 0)
+	for c := range conns {
+		if c.camKey.userId == userID && h.enqueueSIP(table, conns, c, call, message) {
+			deliveryIDs = append(deliveryIDs, c.deliveryID)
+		}
+	}
+	return deliveryIDs
+}
+
+// sendSIP delivers only to the exact current delivery ID, never to a newer
+// socket that happens to have the same authenticated endpoint.
+func (h *WebSocketSSHandler) sendSIP(table *camTable, conns map[*wsConn]struct{}, deliveryID string, call *ss.SIPCallEvent, message *ss.SIPMessageEvent) bool {
+	if deliveryID == "" {
+		return false
+	}
+	for c := range conns {
+		if c.deliveryID == deliveryID {
+			return h.enqueueSIP(table, conns, c, call, message)
+		}
+	}
+	return false
+}
+
+func (h *WebSocketSSHandler) enqueueSIP(table *camTable, conns map[*wsConn]struct{}, c *wsConn, call *ss.SIPCallEvent, message *ss.SIPMessageEvent) bool {
+	select {
+	case c.queue <- newSIPEvent(c.camKey, call, message):
+		return true
+	default:
+		h.dropConn(table, conns, c)
+		return false
+	}
+}
+
+func newSIPEvent(key camKey, call *ss.SIPCallEvent, message *ss.SIPMessageEvent) *ss.SignallingEvent {
+	body := &ss.SSToClientEv{}
+	if call != nil {
+		callCopy := *call
+		body.SIPCall = &callCopy
+	}
+	if message != nil {
+		messageCopy := *message
+		body.SIPMessage = &messageCopy
+	}
+	return &ss.SignallingEvent{
+		From:  ss.EPAddr{ServiceId: ss.WellKnownSvcIdSIP},
+		To:    ss.EPAddr{UserId: key.userId, UserSessionId: key.sessionId},
+		MsgId: ss.MsgId(uuid.NewString()),
+		S2CEv: body,
+	}
+}
+
+// dropConn removes c before notifying the SIP service, so a disconnect
+// callback can never observe that delivery as still active.
+func (h *WebSocketSSHandler) dropConn(table *camTable, conns map[*wsConn]struct{}, c *wsConn) {
+	dropConn(table, conns, c)
+	if h.sipHandler != nil {
+		h.sipHandler.SIPDisconnected(c.deliveryID)
 	}
 }
 
@@ -270,13 +437,12 @@ func (h *WebSocketSSHandler) register(c *wsConn) bool {
 }
 
 // readPump parses the text frames of c as SignallingEvents and hands them
-// to the hub, overriding what the client may not choose: the From fields
-// are stamped with the connection's session identity, and a register
-// event's username is stamped with the session's username (a client-
-// supplied From or display name is untrusted input and is discarded).
-// Binary and unparseable frames are skipped. It
-// returns when the connection fails or the handler shuts down, and
-// reports the closure to the hub.
+// to the hub, enforcing the client protocol boundary: From is stamped with
+// the connection's session identity (clearing any claimed service), every
+// client-supplied S2CEv is discarded, and a register event's username is
+// stamped with the session's username. Binary and unparseable frames are
+// skipped. It returns when the connection fails or the handler shuts down,
+// and reports the closure to the hub.
 func (h *WebSocketSSHandler) readPump(c *wsConn, username string) {
 	defer h.note(hubNote{kind: noteClosed, conn: c})
 	for {
@@ -291,8 +457,8 @@ func (h *WebSocketSSHandler) readPump(c *wsConn, username string) {
 		if err := json.Unmarshal(data, &ev); err != nil {
 			continue
 		}
-		ev.From.UserId = c.camKey.userId
-		ev.From.UserSessionId = c.camKey.sessionId
+		ev.From = ss.EPAddr{UserId: c.camKey.userId, UserSessionId: c.camKey.sessionId}
+		ev.S2CEv = nil
 		if ev.C2SEv != nil && ev.C2SEv.Register != nil {
 			ev.C2SEv.Register.Username = username
 		}
@@ -343,6 +509,8 @@ type wsConn struct {
 	queue  chan *ss.SignallingEvent
 	// camKey is fixed at upgrade from the authenticated session identity.
 	camKey camKey
+	// deliveryID uniquely identifies this socket for external SIP delivery.
+	deliveryID string
 }
 
 type noteKind int
@@ -351,6 +519,8 @@ const (
 	noteRegister noteKind = iota + 1
 	noteMessage
 	noteClosed
+	noteFanoutSIP
+	noteSendSIP
 )
 
 // hubNote is a note from a connection's goroutines to the hub: the
@@ -362,6 +532,18 @@ type hubNote struct {
 	ev   *ss.SignallingEvent
 	// done is closed after a register note has been fully applied.
 	done chan struct{}
+
+	userID     ss.UserId
+	deliveryID string
+	call       *ss.SIPCallEvent
+	message    *ss.SIPMessageEvent
+	ack        chan sipResult
+}
+
+// sipResult is the buffered acknowledgement of a SIP delivery request.
+type sipResult struct {
+	deliveryIDs []string
+	delivered   bool
 }
 
 // camKey is the (user id, user session id) pair a connection is learned

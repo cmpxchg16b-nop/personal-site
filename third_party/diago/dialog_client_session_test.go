@@ -512,23 +512,29 @@ func TestIntegrationDialogClientBadMediaNegotiation(t *testing.T) {
 	defer cancel()
 
 	lock := sync.Mutex{}
-	requests := []sip.Message{}
-	responses := []sip.Message{}
+	requests := []*sip.Request{}
+	responses := []*sip.Response{}
+	byeResponse := make(chan struct{}, 1)
+	serverPort := 0
 
 	{
 		ua, _ := sipgo.NewUA(sipgo.WithUserAgent("server"))
 		defer ua.Close()
 		ua.TransportLayer().OnMessage(func(msg sip.Message) {
+			request, ok := msg.(*sip.Request)
+			if !ok {
+				return
+			}
 			lock.Lock()
-			defer lock.Unlock()
-			requests = append(requests, msg)
+			requests = append(requests, request)
+			lock.Unlock()
 		})
 
 		dg := NewDiago(ua, WithTransport(
 			Transport{
 				Transport: "udp",
 				BindHost:  "127.0.0.1",
-				BindPort:  15060,
+				BindPort:  0,
 			},
 		),
 		)
@@ -542,15 +548,31 @@ func TestIntegrationDialogClientBadMediaNegotiation(t *testing.T) {
 			<-d.Context().Done()
 		})
 		require.NoError(t, err)
+		var ports []int
+		require.Eventually(t, func() bool {
+			ports = dg.server.TransportLayer().ListenPorts("udp")
+			return len(ports) == 1
+		}, time.Second, time.Millisecond)
+		serverPort = ports[0]
 	}
 
 	ua, _ := sipgo.NewUA()
 	defer ua.Close()
 
 	ua.TransportLayer().OnMessage(func(msg sip.Message) {
+		response, ok := msg.(*sip.Response)
+		if !ok {
+			return
+		}
 		lock.Lock()
-		defer lock.Unlock()
-		responses = append(responses, msg)
+		responses = append(responses, response)
+		lock.Unlock()
+		if response.StatusCode == sip.StatusOK && response.CSeq() != nil && response.CSeq().MethodName == sip.BYE {
+			select {
+			case byeResponse <- struct{}{}:
+			default:
+			}
+		}
 	})
 
 	dg := newDialer(ua)
@@ -558,7 +580,7 @@ func TestIntegrationDialogClientBadMediaNegotiation(t *testing.T) {
 	require.NoError(t, err)
 
 	// Media negotiaton should fail and call should be terminated
-	_, err = dg.Invite(ctx, sip.Uri{User: "dialer", Host: "127.0.0.1", Port: 15060}, InviteOptions{
+	_, err = dg.Invite(ctx, sip.Uri{User: "dialer", Host: "127.0.0.1", Port: serverPort}, InviteOptions{
 		OnResponse: func(res *sip.Response) error {
 			// Fake Bad SDP
 			res.SetBody([]byte("Bad SDP"))
@@ -567,18 +589,105 @@ func TestIntegrationDialogClientBadMediaNegotiation(t *testing.T) {
 	})
 	t.Log(err)
 	require.Error(t, err)
+	select {
+	case <-byeResponse:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for BYE 200 response")
+	}
 
 	lock.Lock()
 	defer lock.Unlock()
 	require.Len(t, requests, 3)
-	require.Len(t, responses, 2)
+	require.GreaterOrEqual(t, len(responses), 2)
 
-	// Termination of dialog should be this correct
-	assert.EqualValues(t, "INVITE", requests[0].(*sip.Request).Method)
-	assert.EqualValues(t, 200, responses[0].(*sip.Response).StatusCode)
-	assert.EqualValues(t, "ACK", requests[1].(*sip.Request).Method)
-	assert.EqualValues(t, "BYE", requests[2].(*sip.Request).Method)
-	assert.EqualValues(t, 200, responses[1].(*sip.Response).StatusCode)
+	// Termination of dialog should be this correct. INVITE 200 responses may
+	// be retransmitted until ACK; the BYE must also receive a 200.
+	assert.EqualValues(t, "INVITE", requests[0].Method)
+	assert.EqualValues(t, "ACK", requests[1].Method)
+	assert.EqualValues(t, "BYE", requests[2].Method)
+	require.NotNil(t, requests[0].CallID())
+	callID := requests[0].CallID().Value()
+	inviteResponses := 0
+	byeResponses := 0
+	for _, response := range responses {
+		require.Equal(t, sip.StatusOK, response.StatusCode)
+		require.NotNil(t, response.CSeq())
+		require.NotNil(t, response.CallID())
+		require.Equal(t, callID, response.CallID().Value())
+		switch response.CSeq().MethodName {
+		case sip.INVITE:
+			inviteResponses++
+		case sip.BYE:
+			byeResponses++
+		default:
+			t.Fatalf("unexpected response CSeq method: %s", response.CSeq().MethodName)
+		}
+	}
+	require.GreaterOrEqual(t, inviteResponses, 1)
+	require.Equal(t, 1, byeResponses)
+}
+
+func TestIntegrationDialogClientBadMediaNegotiationAfterCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	requests := make(chan string, 8)
+	serverUA, err := sipgo.NewUA(sipgo.WithUserAgent("server"))
+	require.NoError(t, err)
+	defer serverUA.Close()
+	serverUA.TransportLayer().OnMessage(func(msg sip.Message) {
+		if request, ok := msg.(*sip.Request); ok {
+			requests <- string(request.Method)
+		}
+	})
+	server := NewDiago(serverUA, WithTransport(Transport{
+		Transport: "udp",
+		BindHost:  "127.0.0.1",
+		BindPort:  0,
+	}))
+	require.NoError(t, server.ServeBackground(ctx, func(d *DialogServerSession) {
+		if err := d.Answer(); err != nil {
+			t.Log("Error on answer", err)
+			return
+		}
+		<-d.Context().Done()
+	}))
+	var ports []int
+	require.Eventually(t, func() bool {
+		ports = server.server.TransportLayer().ListenPorts("udp")
+		return len(ports) == 1
+	}, time.Second, time.Millisecond)
+
+	clientUA, err := sipgo.NewUA()
+	require.NoError(t, err)
+	defer clientUA.Close()
+	client := newDialer(clientUA)
+	require.NoError(t, client.ServeBackground(context.Background(), func(d *DialogServerSession) {}))
+
+	inviteCtx, cancelInvite := context.WithCancel(context.Background())
+	defer cancelInvite()
+	dialog, err := client.Invite(inviteCtx, sip.Uri{User: "dialer", Host: "127.0.0.1", Port: ports[0]}, InviteOptions{
+		OnResponse: func(res *sip.Response) error {
+			if res.StatusCode == sip.StatusOK {
+				res.SetBody([]byte("Bad SDP"))
+				cancelInvite()
+			}
+			return nil
+		},
+	})
+	require.Error(t, err)
+	require.ErrorContains(t, err, "Connection information does not exists")
+	require.Nil(t, dialog)
+	require.ErrorIs(t, inviteCtx.Err(), context.Canceled)
+
+	for _, method := range []string{"INVITE", "ACK", "BYE"} {
+		select {
+		case got := <-requests:
+			require.Equal(t, method, got)
+		case <-time.After(5 * time.Second):
+			t.Fatalf("timed out waiting for %s after canceled INVITE; error: %v", method, err)
+		}
+	}
 }
 
 func TestIntegrationDialogClientRefer(t *testing.T) {

@@ -17,10 +17,15 @@ import (
 )
 
 type registrarObservation struct {
-	kind    string
-	from    string
-	contact string
-	source  string
+	kind          string
+	from          string
+	fromHost      string
+	contact       string
+	source        string
+	requestURI    string
+	authorization string
+	contentType   string
+	body          string
 }
 
 type loopbackRegistrar struct {
@@ -75,6 +80,30 @@ func newLoopbackRegistrar(t *testing.T) *loopbackRegistrar {
 			return
 		}
 		// No Expires in the response: the runtime must use its requested lease.
+		_ = transaction.Respond(sip.NewResponseFromRequest(request, 200, "OK", nil))
+	})
+	server.OnMessage(func(request *sip.Request, transaction sip.ServerTransaction) {
+		observation := registrarObservation{
+			kind:       "message",
+			from:       request.From().Address.User,
+			fromHost:   request.From().Address.Host,
+			source:     request.Source(),
+			requestURI: request.Recipient.String(),
+			body:       string(request.Body()),
+		}
+		if authorization := request.GetHeader("Authorization"); authorization != nil {
+			observation.authorization = authorization.Value()
+		}
+		if contentType := request.ContentType(); contentType != nil {
+			observation.contentType = contentType.Value()
+		}
+		registrar.observations <- observation
+		if observation.authorization == "" || !strings.Contains(observation.authorization, `username="1001"`) {
+			response := sip.NewResponseFromRequest(request, sip.StatusUnauthorized, "Unauthorized", nil)
+			response.AppendHeader(sip.NewHeader("WWW-Authenticate", `Digest realm="loopback", nonce="0123456789abcdef", algorithm=MD5`))
+			_ = transaction.Respond(response)
+			return
+		}
 		_ = transaction.Respond(sip.NewResponseFromRequest(request, 200, "OK", nil))
 	})
 
@@ -219,6 +248,76 @@ func TestDiagoRuntimeRegisterRefreshRouteAndUnregister(t *testing.T) {
 	if strings.Contains(logText, "secret") {
 		t.Errorf("logs leaked the password:\n%s", logText)
 	}
+}
+
+func TestDiagoRuntimeOutboundMessageUsesPinnedProxyAndOwnedDigest(t *testing.T) {
+	registrar := newLoopbackRegistrar(t)
+	manager := NewManager(slog.New(slog.DiscardHandler))
+	manager.registrationExpiry = time.Minute
+	manager.attemptTimeout = time.Second
+	manager.unregisterTimeout = time.Second
+	t.Cleanup(func() { _ = manager.Close() })
+
+	created, err := manager.Create("user-alice", Input{
+		Server: registrar.address, Username: "1001", Password: "secret", Transport: TransportUDP, Enabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	registration := registrar.waitObservation(t, "register", 0)
+	waitFor(t, "registered status for outbound MESSAGE", func() bool {
+		got, _ := manager.Get("user-alice", created.ID)
+		return got.Registration.State == RegistrationRegistered
+	})
+	credential, operations, revision, err := manager.acquireOperation("user-alice", created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if revision != 1 {
+		t.Fatalf("operation revision = %d, want 1", revision)
+	}
+	target, display, err := parseSIPTarget(credential, "2002@target.invalid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if display != "sip:2002@target.invalid" {
+		t.Fatalf("target display = %q", display)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := operations.SendMessage(ctx, credential, target, "hello world"); err != nil {
+		t.Fatal(err)
+	}
+
+	unauthenticated := registrar.waitObservation(t, "message", 0)
+	if unauthenticated.authorization != "" {
+		t.Fatalf("first MESSAGE unexpectedly carried authorization: %q", unauthenticated.authorization)
+	}
+	authenticated := registrar.waitObservation(t, "message", 0)
+	if !strings.Contains(authenticated.authorization, "Digest") || !strings.Contains(authenticated.authorization, `username="1001"`) {
+		t.Fatalf("authenticated MESSAGE authorization = %q", authenticated.authorization)
+	}
+	for _, observation := range []registrarObservation{unauthenticated, authenticated} {
+		if observation.from != "1001" || observation.fromHost != "127.0.0.1" {
+			t.Errorf("MESSAGE From = %s@%s", observation.from, observation.fromHost)
+		}
+		if observation.requestURI != "sip:2002@target.invalid" {
+			t.Errorf("MESSAGE Request-URI = %q", observation.requestURI)
+		}
+		if observation.source != registration.source {
+			t.Errorf("MESSAGE source = %q, REGISTER source = %q", observation.source, registration.source)
+		}
+		if observation.contentType != outboundContentType || observation.body != "hello world" {
+			t.Errorf("MESSAGE content type/body = %q / %q", observation.contentType, observation.body)
+		}
+	}
+
+	// Delete cancels operations before de-REGISTER; the shared UDP client must
+	// remain usable until that final REGISTER transaction has finished.
+	if err := manager.Delete("user-alice", created.ID); err != nil {
+		t.Fatal(err)
+	}
+	registrar.waitObservation(t, "unregister", 0)
 }
 
 func TestDiagoRuntimeUnregistersWhenSuccessResponseIsLost(t *testing.T) {

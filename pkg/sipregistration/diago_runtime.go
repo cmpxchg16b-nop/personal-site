@@ -25,11 +25,17 @@ import (
 // listener uses an ephemeral port: credentials are independent UAs and no
 // account monopolizes a host-wide SIP port.
 type diagoRuntime struct {
-	transaction *diago.RegisterTransaction
-	ua          *sipgo.UserAgent
-	stopServing context.CancelFunc
-	closeOnce   sync.Once
-	closeErr    error
+	transaction    *diago.RegisterTransaction
+	ua             *sipgo.UserAgent
+	dg             *diago.Diago
+	proxyHost      string
+	proxyPort      int
+	mediaBindIP    net.IP
+	operationCtx   context.Context
+	stopOperations context.CancelFunc
+	stopServing    context.CancelFunc
+	closeOnce      sync.Once
+	closeErr       error
 }
 
 func newDiagoRuntime(credential Credential, manager *Manager) (runtime, error) {
@@ -63,11 +69,34 @@ func newDiagoRuntime(credential Credential, manager *Manager) (runtime, error) {
 		return nil, err
 	}
 	stackCtx, stopServing := context.WithCancel(context.Background())
+	operationCtx, stopOperations := context.WithCancel(stackCtx)
 	closeStack := func() {
+		stopOperations()
 		stopServing()
 		_ = ua.Close()
 	}
 	bindHost := sourceAddressFor(dialHost, port)
+	mediaBindIP := net.ParseIP(bindHost)
+	if mediaBindIP == nil || mediaBindIP.IsUnspecified() {
+		network := "ip4"
+		if mediaBindIP != nil && mediaBindIP.To4() == nil {
+			network = "ip6"
+		}
+		if resolved, _, resolveErr := sip.ResolveInterfacesIP(network, nil); resolveErr == nil {
+			mediaBindIP = resolved
+		}
+	}
+	// Bind each callback to this exact runtime. A stale listener must never
+	// acquire a replacement generation's lease for the same AOR.
+	runtime := &diagoRuntime{
+		ua:             ua,
+		proxyHost:      dialHost,
+		proxyPort:      port,
+		mediaBindIP:    mediaBindIP,
+		operationCtx:   operationCtx,
+		stopOperations: stopOperations,
+		stopServing:    stopServing,
+	}
 	dg := diago.NewDiago(ua,
 		diago.WithLogger(manager.logger),
 		diago.WithTransport(diago.Transport{
@@ -77,9 +106,25 @@ func newDiagoRuntime(credential Credential, manager *Manager) (runtime, error) {
 			BindPort:  0,
 			TLSConf:   serverTLS,
 		}),
-		diago.WithMessageHandler(manager.handleInboundMessage),
+		diago.WithMessageHandler(func(request *sip.Request, transaction sip.ServerTransaction) error {
+			return manager.handleRuntimeInboundMessage(runtime, request, transaction)
+		}),
+		diago.WithServerRequestMiddleware(func(next sipgo.RequestHandler) sipgo.RequestHandler {
+			return func(request *sip.Request, transaction sip.ServerTransaction) {
+				// The user service has one fixed SDP negotiation per call. Diago's
+				// default would otherwise silently accept re-INVITE/hold SDP updates.
+				if request.Method == sip.INVITE && request.To() != nil && request.To().Params != nil && request.To().Params.Has("tag") {
+					_ = transaction.Respond(sip.NewResponseFromRequest(request, 488, "Not Acceptable Here", nil))
+					return
+				}
+				next(request, transaction)
+			}
+		}),
 	)
-	if err := dg.ServeBackground(stackCtx, manager.handleInboundInvite); err != nil {
+	runtime.dg = dg
+	if err := dg.ServeBackground(stackCtx, func(dialog *diago.DialogServerSession) {
+		manager.handleRuntimeInboundInvite(runtime, dialog)
+	}); err != nil {
 		closeStack()
 		return nil, fmt.Errorf("start SIP listener: %w", err)
 	}
@@ -115,7 +160,8 @@ func newDiagoRuntime(credential Credential, manager *Manager) (runtime, error) {
 	transaction.Origin.AppendHeader(from)
 	// Keep the Contact user equal to the AOR user even if the UA default changes.
 	transaction.Origin.Contact().Address.User = credential.Username
-	return &diagoRuntime{transaction: transaction, ua: ua, stopServing: stopServing}, nil
+	runtime.transaction = transaction
+	return runtime, nil
 }
 
 func (r *diagoRuntime) Register(ctx context.Context) error {
@@ -136,6 +182,7 @@ func (r *diagoRuntime) Expiry() time.Duration {
 
 func (r *diagoRuntime) Close() error {
 	r.closeOnce.Do(func() {
+		r.StopOperations()
 		r.stopServing()
 		r.closeErr = r.ua.Close()
 	})

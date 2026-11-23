@@ -59,6 +59,9 @@ const (
 	// server.
 	WellKnownSvcIdSS ServiceId = "253dc952-a55b-4d01-a885-c5e240e95fdb"
 
+	// WellKnownSvcIdSIP is the well-known service id of the user SIP service.
+	WellKnownSvcIdSIP ServiceId = "6ad2a70f-61e6-4b0b-85a0-e028f8f0a65b"
+
 	// WellKnownChIdMain is the well-known channel id of the main channel;
 	// a SS implementation should at least implement the main channel.
 	WellKnownChIdMain ChannelId = "f887f5b0-7b78-4ceb-a051-f42879f9d98e"
@@ -143,6 +146,39 @@ type ClientToSSListChannelMembers struct {
 // messages, all inReplyTo the request.
 type ClientToSSListChannels struct{}
 
+// SIPCallEvent carries a user-SIP call action or state, including WebRTC
+// negotiation when the action or state requires it.
+type SIPCallEvent struct {
+	CallId          string                     `json:"callId"`
+	CredentialId    string                     `json:"credentialId,omitempty"`
+	Target          string                     `json:"target,omitempty"`
+	Kind            string                     `json:"kind,omitempty"`
+	Action          string                     `json:"action,omitempty"`
+	Direction       string                     `json:"direction,omitempty"`
+	State           string                     `json:"state,omitempty"`
+	LocalUri        string                     `json:"localUri,omitempty"`
+	RemoteUri       string                     `json:"remoteUri,omitempty"`
+	Reason          string                     `json:"reason,omitempty"`
+	SessionDesc     *webrtc.SessionDescription `json:"sessionDesc,omitempty"`
+	RTCICECandidate *webrtc.ICECandidateInit   `json:"rtcICECandidate,omitempty"`
+}
+
+// SIPMessageEvent carries a user-SIP MESSAGE action or delivery state.
+// CreatedAt is Unix time in seconds, with a fractional part when available.
+type SIPMessageEvent struct {
+	MessageId    string  `json:"messageId"`
+	CredentialId string  `json:"credentialId,omitempty"`
+	Target       string  `json:"target,omitempty"`
+	Text         string  `json:"text,omitempty"`
+	Action       string  `json:"action,omitempty"`
+	Direction    string  `json:"direction,omitempty"`
+	State        string  `json:"state,omitempty"`
+	LocalUri     string  `json:"localUri,omitempty"`
+	RemoteUri    string  `json:"remoteUri,omitempty"`
+	Reason       string  `json:"reason,omitempty"`
+	CreatedAt    float64 `json:"createdAt,omitempty"`
+}
+
 // ClientToSSEv is a client-to-signalling-server event.
 type ClientToSSEv struct {
 	Register         *ClientToSSRegEv            `json:"register,omitempty"`
@@ -167,6 +203,12 @@ type ClientToSSEv struct {
 
 	// ListChannels asks for the channels of the server.
 	ListChannels *ClientToSSListChannels `json:"listChannels,omitempty"`
+
+	// SIPCall carries a user-SIP call action for the external SIP service.
+	SIPCall *SIPCallEvent `json:"sipCall,omitempty"`
+
+	// SIPMessage carries a user-SIP MESSAGE action for the external SIP service.
+	SIPMessage *SIPMessageEvent `json:"sipMessage,omitempty"`
 }
 
 // ErrorCode is the well-defined code of an SSToClientErrEv.
@@ -263,6 +305,12 @@ type SSToClientEv struct {
 	// ChannelListResult is one page of the answer to a listChannels
 	// request.
 	ChannelListResult *SSToClientChannelListResult `json:"channelListResult,omitempty"`
+
+	// SIPCall carries a user-SIP call state from the external SIP service.
+	SIPCall *SIPCallEvent `json:"sipCall,omitempty"`
+
+	// SIPMessage carries a user-SIP MESSAGE state from the external SIP service.
+	SIPMessage *SIPMessageEvent `json:"sipMessage,omitempty"`
 }
 
 // UserProfile is the profile data the SS holds about a registered

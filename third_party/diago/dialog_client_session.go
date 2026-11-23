@@ -23,6 +23,8 @@ var (
 	ErrClientEarlyMedia = errors.New("Early media detected")
 )
 
+const answerCleanupTimeout = 5 * time.Second
+
 // DialogClientSession represents outbound channel
 type DialogClientSession struct {
 	*sipgo.DialogClientSession
@@ -344,11 +346,17 @@ func (d *DialogClientSession) waitAnswer(ctx context.Context, med *DialogMedia, 
 	}
 
 	if err := d.applyRemoteSDP(med, remoteSDP); err != nil {
-		// Terminate call. Call must be ACK before doing BYE
-		if err := d.Ack(ctx); err != nil {
-			return errors.Join(err, d.Ack(ctx))
-		}
-		return errors.Join(err, d.Bye(ctx))
+		// A final response has established the dialog even if the caller has
+		// since canceled ctx. ACK and BYE are mandatory and each gets its own
+		// bounded cleanup budget.
+		ackCtx, cancelAck := context.WithTimeout(context.Background(), answerCleanupTimeout)
+		ackErr := d.Ack(ackCtx)
+		cancelAck()
+
+		byeCtx, cancelBye := context.WithTimeout(context.Background(), answerCleanupTimeout)
+		byeErr := d.Bye(byeCtx)
+		cancelBye()
+		return errors.Join(err, ackErr, byeErr)
 	}
 
 	return nil

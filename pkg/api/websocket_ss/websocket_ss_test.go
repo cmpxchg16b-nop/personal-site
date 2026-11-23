@@ -35,10 +35,17 @@ func startTestServer(t *testing.T) *httptest.Server {
 
 func startTestServerWithProvider(t *testing.T, provider ss.SignallingServiceProvider, unknownMessageFlood bool) *httptest.Server {
 	t.Helper()
+	srv, _ := startTestServerWithSIPHandler(t, provider, unknownMessageFlood, nil)
+	return srv
+}
+
+func startTestServerWithSIPHandler(t *testing.T, provider ss.SignallingServiceProvider, unknownMessageFlood bool, sipHandler SIPHandler) (*httptest.Server, *WebSocketSSHandler) {
+	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	sm := pkgsession.NewOnMemorySessionManager()
 	h := NewWebSocketSSHandler(ctx, provider, sm)
 	h.UnknownMessageFlood = unknownMessageFlood
+	h.SetSIPHandler(sipHandler)
 	// The real session middleware builds the request-scoped session object
 	// from context values, exactly as in production.
 	sessionized := pkgsession.WithSessionId(h, sm)
@@ -62,13 +69,14 @@ func startTestServerWithProvider(t *testing.T, provider ss.SignallingServiceProv
 		srv.Close()
 		cancel()
 	})
-	return srv
+	return srv, h
 }
 
 // injectedProvider lets a test emit provider events without requiring any
 // client registration or inbound traffic. Client events are drained.
 type injectedProvider struct {
-	emit chan *ss.SignallingEvent
+	emit     chan *ss.SignallingEvent
+	received chan *ss.SignallingEvent
 }
 
 func (p *injectedProvider) Run(ctx context.Context, inMsg <-chan *ss.SignallingEvent, outMsg chan<- *ss.SignallingEvent) {
@@ -77,9 +85,12 @@ func (p *injectedProvider) Run(ctx context.Context, inMsg <-chan *ss.SignallingE
 		select {
 		case <-ctx.Done():
 			return
-		case _, ok := <-inMsg:
+		case ev, ok := <-inMsg:
 			if !ok {
 				return
+			}
+			if p.received != nil {
+				p.received <- ev
 			}
 		case ev := <-p.emit:
 			select {

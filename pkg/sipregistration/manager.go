@@ -49,6 +49,7 @@ type entry struct {
 	key        credentialKey
 	credential Credential // guarded by Manager.mu
 	revision   uint64     // guarded by Manager.mu
+	runtime    runtime    // guarded by Manager.mu
 	cancel     context.CancelFunc
 	done       chan struct{}
 }
@@ -81,6 +82,7 @@ type Manager struct {
 	maxPerUser             int
 	maxCredentials         int
 	allowPrivateRegistrars bool
+	service                *Service // guarded by mu; installed by NewService
 }
 
 // Option configures process-wide registration policy before the manager serves
@@ -387,7 +389,14 @@ func (m *Manager) Close() error {
 			delete(m.entries, key)
 		}
 		clear(m.aors)
+		service := m.service
 		m.mu.Unlock()
+
+		// Stop accepting browser work and terminate calls before any registrar
+		// teardown can remove the runtimes those calls depend on.
+		if service != nil {
+			_ = service.Close()
+		}
 
 		// Cancel every generation before waiting for any unregister. Otherwise N
 		// unresponsive registrars make shutdown take N times the unregister timeout.
@@ -423,7 +432,17 @@ func (m *Manager) startWorkerLocked(current *entry) {
 func (m *Manager) cancelWorker(current *entry) {
 	m.mu.RLock()
 	cancel := current.cancel
+	rt := current.runtime
+	service := m.service
 	m.mu.RUnlock()
+	if operations, ok := rt.(operationRuntime); ok && service != nil {
+		// Match the exact runtime pointer, not a newly installed generation with
+		// the same credential ID. Delete/Close may already have bumped revision.
+		service.cancelCallsForRuntime(operations)
+	}
+	if operations, ok := rt.(interface{ StopOperations() }); ok {
+		operations.StopOperations()
+	}
 	if cancel != nil {
 		cancel()
 	}
@@ -451,6 +470,11 @@ func (m *Manager) runWorker(ctx context.Context, current *entry, revision uint64
 	failures := 0
 	var registeredAt, expiresAt *time.Time
 	defer func() {
+		m.mu.Lock()
+		if current.runtime == rt {
+			current.runtime = nil
+		}
+		m.mu.Unlock()
 		if rt == nil {
 			return
 		}
@@ -481,6 +505,15 @@ func (m *Manager) runWorker(ctx context.Context, current *entry, revision uint64
 				}
 				rt = nil
 				continue
+			}
+			m.mu.Lock()
+			currentGeneration := !m.closed && ctx.Err() == nil && m.entries[current.key] == current && current.revision == revision
+			if currentGeneration {
+				current.runtime = rt
+			}
+			m.mu.Unlock()
+			if !currentGeneration {
+				return
 			}
 		}
 

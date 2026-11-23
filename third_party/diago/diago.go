@@ -332,8 +332,9 @@ func NewDiago(ua *sipgo.UserAgent, opts ...DiagoOption) *Diago {
 	}))
 
 	server.OnCancel(errHandler(func(req *sip.Request, tx sip.ServerTransaction) error {
-		// INVITE transaction should be terminated by transaction layer and 200 response will be sent
-		// In case of stateless proxy this we would need to forward
+		// A CANCEL matching a pending INVITE is consumed by sipgo's transaction
+		// layer: it responds 200 to CANCEL and terminates the INVITE with 487.
+		// Only an unmatched CANCEL reaches this handler, so RFC 3261 §9.2 requires 481.
 		return tx.Respond(sip.NewResponseFromRequest(req, sip.StatusCallTransactionDoesNotExists, "Call/Transaction Does Not Exist", nil))
 	}))
 

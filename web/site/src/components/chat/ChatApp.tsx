@@ -10,6 +10,7 @@ import type {
   SubscriberId,
 } from "@/api/ss/types";
 import type { PeerConnectionStates } from "@/api/ss/peersessions";
+import type { UseExternalSIPResult } from "@/api/ss/sip";
 import ChatSidebar, { type ChatSidebarTab } from "./ChatSidebar";
 import ConversationView from "./ConversationView";
 import PhoneContactView from "./PhoneContactView";
@@ -17,6 +18,7 @@ import SipRegistrationSettings from "./SipRegistrationSettings";
 import { IncomingCallWindow } from "./IncomingCallWindow";
 import { VideoWindow } from "./VideoWindow";
 import { DialPad } from "./DialPad";
+import { ExternalSIPCallOverlay } from "./ExternalSIPCallOverlay";
 import type { DialerHandle } from "./useCallMedia";
 import {
   conversationKey,
@@ -106,6 +108,8 @@ type ChatAppProps = {
   // One pair's DTMF dialer while its call negotiated telephone-event
   // (see useCallMedia): the dial pad's existence test.
   dtmfFor: (channelId: ChannelId, peer: SubscriberId) => DialerHandle | null;
+  // External SIP is intentionally separate from channel conversations/calls.
+  externalSIP: UseExternalSIPResult;
 };
 
 export default function ChatApp({
@@ -131,6 +135,7 @@ export default function ChatApp({
   localCamera,
   remoteVideoFor,
   dtmfFor,
+  externalSIP,
 }: ChatAppProps) {
   const { t } = useTranslation();
   const [mobileListOpen, setMobileListOpen] = useState(false);
@@ -244,6 +249,7 @@ export default function ChatApp({
             setSipSettingsOpen(true);
             setMobileListOpen(false);
           }}
+          sip={externalSIP}
           sx={{ display: { xs: mobileListOpen ? "flex" : "none", sm: "flex" } }}
         />
         {activeTab === "settings" && sipSettingsOpen ? (
@@ -311,6 +317,7 @@ export default function ChatApp({
         onAccept={onAcceptCall}
         onReject={onRejectCall}
       />
+      <ExternalSIPCallOverlay sip={externalSIP} />
       {/* The video calls' floating views: our own camera while it
           sends, then the peers' cameras — rendered later at the same
           z-index, a peer view always covers the "me" view, never the

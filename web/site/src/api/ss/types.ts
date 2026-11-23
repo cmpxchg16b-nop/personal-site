@@ -25,6 +25,11 @@ export type MsgId = string;
 export const WELLKNOWN_SVC_ID_SS: ServiceId =
   "253dc952-a55b-4d01-a885-c5e240e95fdb";
 
+// Wellknown service id for the external SIP gateway. Browser clients exchange
+// WebRTC signalling with this service; they never emit raw SIP themselves.
+export const WELLKNOWN_SVC_ID_SIP: ServiceId =
+  "6ad2a70f-61e6-4b0b-85a0-e028f8f0a65b";
+
 // Wellknown channel id for main channel (a SS implementation should at least implement main channel)
 export const WELLKNOWN_CH_ID_MAIN: ChannelId =
   "f887f5b0-7b78-4ceb-a051-f42879f9d98e";
@@ -104,6 +109,12 @@ export type ClientToSSListChannels = Record<string, never>;
 // Client to signalling server event
 export interface ClientToSSEv {
   register?: ClientToSSRegEv;
+
+  /** External SIP call control and browser WebRTC signalling. */
+  sipCall?: SIPCallEvent;
+
+  /** External SIP MESSAGE. */
+  sipMessage?: SIPMessageEvent;
 
   /** renew the caller's membership of a channel (see ClientToSSChannelKeepAlive); the SS answers nothing on success, an err otherwise */
   channelKeepAlive?: ClientToSSChannelKeepAlive;
@@ -199,6 +210,12 @@ export interface RegisterResult {
 
 // Signalling server to Client event
 export interface SSToClientEv {
+  /** External SIP call progress and browser WebRTC signalling. */
+  sipCall?: SIPCallEvent;
+
+  /** External SIP MESSAGE delivery or send result. */
+  sipMessage?: SIPMessageEvent;
+
   // The first frame on every WebSocket is a hello carrying the complete
   // session endpoint, duplicated in the event's `to` address.
   endpoint?: EPAddr;
@@ -326,6 +343,55 @@ export interface ClientToClientEv {
 
   /** out of band ping reply message */
   pong?: PingPongMsg;
+}
+
+export type SIPCallKind = "voice" | "video";
+export type SIPCallAction =
+  "dial" | "accept" | "decline" | "cancel" | "hangup" | "ice";
+export type SIPCallDirection = "incoming" | "outgoing";
+export type SIPCallState =
+  | "dialing"
+  | "ringing"
+  | "answering"
+  | "accepted"
+  | "ended"
+  | "cancelled"
+  | "rejected"
+  | "failed";
+
+/** One external-SIP call event. SDP and ICE are browser WebRTC wire values. */
+export interface SIPCallEvent {
+  callId: string;
+  credentialId?: string;
+  target?: string;
+  kind?: SIPCallKind;
+  action?: SIPCallAction;
+  direction?: SIPCallDirection;
+  state?: SIPCallState;
+  localUri?: string;
+  remoteUri?: string;
+  reason?: string;
+  sessionDesc?: RTCSessionDescriptionInit;
+  rtcICECandidate?: RTCIceCandidateInit;
+}
+
+export type SIPMessageAction = "send";
+export type SIPMessageState = "sent" | "failed" | "received";
+
+/** One external-SIP MESSAGE or its delivery result. */
+export interface SIPMessageEvent {
+  messageId: string;
+  credentialId?: string;
+  target?: string;
+  text?: string;
+  action?: SIPMessageAction;
+  direction?: SIPCallDirection;
+  state?: SIPMessageState;
+  localUri?: string;
+  remoteUri?: string;
+  reason?: string;
+  /** Unix seconds. */
+  createdAt?: number;
 }
 
 export interface SignallingEvent {

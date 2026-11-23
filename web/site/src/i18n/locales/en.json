@@ -145,6 +145,49 @@
       "sms": "Send SMS"
     },
 
+    "externalSip": {
+      "historyNavigation": "SIP history",
+      "calls": "Calls",
+      "messages": "Messages",
+      "noMessages": "No SIP messages yet.",
+      "reply": "Reply",
+      "newMessage": "New SIP message",
+      "dialTitle": "New external SIP call",
+      "messageTitle": "New SIP message",
+      "noEligibleIdentity": "No enabled, registered SIP caller identity is available.",
+      "callerIdentity": "Caller identity",
+      "target": "Target number or SIP URI",
+      "callKind": "Media",
+      "voice": "Voice",
+      "audioVideo": "Audio + video",
+      "messageText": "Message",
+      "sendMessage": "Send message",
+      "incomingTitle": "Incoming external SIP call",
+      "incomingVoice": "Incoming external SIP voice call",
+      "incomingVideo": "Incoming external SIP video call",
+      "accept": "Accept",
+      "direction": {
+        "incoming": "Incoming",
+        "outgoing": "Outgoing"
+      },
+      "states": {
+        "dialing": "Dialing…",
+        "ringing": "Ringing…",
+        "answering": "Answering…",
+        "accepted": "In call",
+        "ended": "Ended",
+        "cancelled": "Cancelled",
+        "rejected": "Declined",
+        "failed": "Failed"
+      },
+      "messageStates": {
+        "sending": "Sending…",
+        "sent": "Sent",
+        "failed": "Failed",
+        "received": "Received"
+      }
+    },
+
     "sip": {
       "title": "SIP Registration",
       "back": "Back to settings",

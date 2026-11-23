@@ -10,6 +10,7 @@ import {
 import { useBinaryDataChannel } from "@/api/ss/binarydatachannel";
 import { usePeerSessions } from "@/api/ss/peersessions";
 import { useSignalling } from "@/api/ss/react";
+import { isExternalSIPCallActive, useExternalSIP } from "@/api/ss/sip";
 import ChatApp from "@/components/chat/ChatApp";
 import { buildMagicControl, parseMagicCommand } from "@/components/chat/magic";
 import { conversationKey, type TransferKind } from "@/components/chat/types";
@@ -84,6 +85,7 @@ export default function ChatPage() {
   // audio graph (useCallMedia); the two volumes are the graph's gain
   // nodes (useCallVolumes).
   const audio = useAudioGraph();
+  const externalSIP = useExternalSIP(audio);
   const { calls, startCall, acceptCall, rejectCall, hangupCall } =
     usePhoneCalls(me, dcMsgs, sessions, sendTo, audio);
   const {
@@ -101,7 +103,9 @@ export default function ChatPage() {
   // conversation list — and only while a call session is live (calls
   // holds just the inviting/accepted ones): with no ongoing call there
   // is nothing to adjust.
-  const hasLiveCall = Object.keys(calls).length > 0;
+  const hasLiveCall =
+    Object.keys(calls).length > 0 ||
+    Object.values(externalSIP.calls).some(isExternalSIPCallActive);
 
   const handleSend = (content: string) => {
     // The composer only exists while a conversation is open, so a null
@@ -253,6 +257,7 @@ export default function ChatPage() {
         localCamera={localCamera}
         remoteVideoFor={remoteVideoFor}
         dtmfFor={dtmfFor}
+        externalSIP={externalSIP}
       />
     </>
   );

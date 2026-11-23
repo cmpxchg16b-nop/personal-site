@@ -145,6 +145,49 @@
       "sms": "发送短信"
     },
 
+    "externalSip": {
+      "historyNavigation": "SIP 历史记录",
+      "calls": "通话",
+      "messages": "消息",
+      "noMessages": "暂无 SIP 消息。",
+      "reply": "回复",
+      "newMessage": "新建 SIP 消息",
+      "dialTitle": "新建外部 SIP 呼叫",
+      "messageTitle": "新建 SIP 消息",
+      "noEligibleIdentity": "没有已启用且已注册的 SIP 主叫身份。",
+      "callerIdentity": "主叫身份",
+      "target": "目标号码或 SIP URI",
+      "callKind": "媒体类型",
+      "voice": "语音",
+      "audioVideo": "音频 + 视频",
+      "messageText": "消息内容",
+      "sendMessage": "发送消息",
+      "incomingTitle": "外部 SIP 来电",
+      "incomingVoice": "外部 SIP 语音来电",
+      "incomingVideo": "外部 SIP 视频来电",
+      "accept": "接听",
+      "direction": {
+        "incoming": "来电",
+        "outgoing": "去电"
+      },
+      "states": {
+        "dialing": "拨号中…",
+        "ringing": "振铃中…",
+        "answering": "接听中…",
+        "accepted": "通话中",
+        "ended": "已结束",
+        "cancelled": "已取消",
+        "rejected": "已拒绝",
+        "failed": "失败"
+      },
+      "messageStates": {
+        "sending": "发送中…",
+        "sent": "已发送",
+        "failed": "发送失败",
+        "received": "已接收"
+      }
+    },
+
     "sip": {
       "title": "SIP 注册",
       "back": "返回设置",

@@ -782,14 +782,16 @@ func (s *MediaSession) updateRemoteCodecs(codecs []Codec, answerer bool) int {
 }
 
 // codecsMatch reports whether two codecs are the same for SDP negotiation.
-// Fmtp annotates the local offer/answer and is never parsed from remote
-// SDP, so it must not take part in matching — with it, a local codec
-// carrying an Fmtp string would never equal its remote counterpart and no
-// codec would ever negotiate. (Local patch — see PATCHES.md.)
+// Encoding names are case-insensitive. Fmtp annotates the local offer/answer
+// and is never parsed from remote SDP, so it must not take part in matching —
+// with it, a local codec carrying an Fmtp string would never equal its remote
+// counterpart and no codec would ever negotiate. (Local patch — see PATCHES.md.)
 func codecsMatch(a, b Codec) bool {
-	a.Fmtp = ""
-	b.Fmtp = ""
-	return a == b
+	return strings.EqualFold(a.Name, b.Name) &&
+		a.PayloadType == b.PayloadType &&
+		a.SampleRate == b.SampleRate &&
+		a.SampleDur == b.SampleDur &&
+		a.NumChannels == b.NumChannels
 }
 
 // codecFmtpLine renders the codec's a=fmtp line: the codec's own Fmtp when

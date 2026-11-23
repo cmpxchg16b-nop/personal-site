@@ -157,6 +157,52 @@ func TestMediaSessionUpdateCodec(t *testing.T) {
 	assert.Equal(t, []Codec{}, m.filterCodecs)
 }
 
+func TestCodecsMatch(t *testing.T) {
+	upperOpus := CodecAudioOpus
+	upperOpus.Name = "OPUS"
+	upperOpus.Fmtp = "useinbandfec=1;stereo=1"
+	differentName := upperOpus
+	differentName.Name = "opus2"
+	differentPayload := upperOpus
+	differentPayload.PayloadType++
+	differentRate := upperOpus
+	differentRate.SampleRate++
+	differentDuration := upperOpus
+	differentDuration.SampleDur++
+	differentChannels := upperOpus
+	differentChannels.NumChannels++
+
+	tests := []struct {
+		name string
+		a    Codec
+		b    Codec
+		want bool
+	}{
+		{name: "name case and fmtp ignored", a: CodecAudioOpus, b: upperOpus, want: true},
+		{name: "different name", a: CodecAudioOpus, b: differentName, want: false},
+		{name: "different payload type", a: CodecAudioOpus, b: differentPayload, want: false},
+		{name: "different sample rate", a: CodecAudioOpus, b: differentRate, want: false},
+		{name: "different sample duration", a: CodecAudioOpus, b: differentDuration, want: false},
+		{name: "different channels", a: CodecAudioOpus, b: differentChannels, want: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			assert.Equal(t, test.want, codecsMatch(test.a, test.b))
+		})
+	}
+}
+
+func TestMediaSessionUpdateCodecCaseInsensitiveName(t *testing.T) {
+	local := CodecAudioOpus
+	local.Fmtp = "useinbandfec=1;stereo=1"
+	remote := CodecAudioOpus
+	remote.Name = "OPUS"
+
+	m := MediaSession{Codecs: []Codec{local}}
+	require.Equal(t, 1, m.updateRemoteCodecs([]Codec{remote}, false))
+	assert.Equal(t, []Codec{local}, m.filterCodecs)
+}
+
 func TestMediaSessionUpdateSDP(t *testing.T) {
 	sd := `v=0
 o=- 3948988145 3948988145 IN IP4 192.168.178.54

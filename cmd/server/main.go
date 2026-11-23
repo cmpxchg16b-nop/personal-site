@@ -210,15 +210,25 @@ func (cmd *ServeCmd) Run(cli *CLI) error {
 	// unconditionally — an empty list when unconfigured — and reachable
 	// without a session (it is on the JWT whitelist below).
 	var iceServerEntries []pkgapiiceservers.IceServerEntry
+	var sipICEServerURLs []string
 	if serverCfg != nil {
 		for _, e := range serverCfg.IceServers {
+			urls := pkgapiiceservers.ParseURLs(e.URLs)
 			iceServerEntries = append(iceServerEntries, pkgapiiceservers.IceServerEntry{
-				URLs:          pkgapiiceservers.ParseURLs(e.URLs),
+				URLs:          urls,
 				AllowedOrigin: e.AllowedOrigin,
 			})
+			sipICEServerURLs = append(sipICEServerURLs, urls...)
 		}
 	}
 	muxHandlerDyn.Handle("GET /api/iceServers", pkgapiiceservers.NewIceServersHandler(iceServerEntries))
+
+	// Both halves are constructed before the HTTP server accepts requests. The
+	// service owns user SIP calls/messages; the hub only provides bounded event
+	// delivery and never waits for SIP network operations on its own goroutine.
+	sipService := sipregistration.NewService(sipRegistrations, logger, sipregistration.WithICEServers(sipICEServerURLs))
+	sipService.SetBridge(ssHandler)
+	ssHandler.SetSIPHandler(sipService)
 
 	// The home page's live stream endpoint serves the <homeLiveWHEPURL/>
 	// element of the configuration document: the Live section reads its

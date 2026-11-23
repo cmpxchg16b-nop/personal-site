@@ -21,12 +21,14 @@ one. The sip bot must announce stereo opus toward the SIP network
   adds an `a=fmtp` line for any other payload type that sets one
   (`codecFmtpLine` helper).
 - `media/media_session.go` `updateRemoteCodecs`: codec matching compares
-  with `codecsMatch`, which excludes `Fmtp` — the field annotates the
-  local offer/answer and is never parsed from remote SDP, so with the
-  upstream struct equality (`c == rc`) a local codec carrying `Fmtp`
-  would never match its remote counterpart and nothing would negotiate.
-  The `SDPCodecPreferLocalOrder` branch additionally re-attaches the
-  local codec's `Fmtp` to the kept (remote) codec.
+  with `codecsMatch`, which excludes `Fmtp` and compares encoding names
+  case-insensitively (for example, `OPUS` matches `opus`). Payload type,
+  sample rate, sample duration, and channel count still use exact equality.
+  `Fmtp` annotates the local offer/answer and is never parsed from remote
+  SDP, so with the upstream struct equality (`c == rc`) a local codec
+  carrying `Fmtp` would never match its remote counterpart and nothing
+  would negotiate. The `SDPCodecPreferLocalOrder` branch additionally
+  re-attaches the local codec's `Fmtp` to the kept (remote) codec.
 
 No other behavior changes. When `Fmtp` is empty everywhere (the upstream
 constants), the generated SDP is byte-identical to upstream.
@@ -108,3 +110,36 @@ more lifecycle information and cleanup than upstream v0.32.2 provides:
 
 The service intentionally serializes calls on each transaction; this patch does
 not make a single `RegisterTransaction` safe for concurrent use.
+
+## Patch 6: cancellation-safe cleanup after a final INVITE answer
+
+A final 2xx establishes the dialog even when the caller cancels its INVITE
+context while the answer is being processed. If applying the answer's SDP then
+fails, upstream's cleanup reused that canceled context and accidentally called
+`Ack` a second time on ACK failure instead of sending BYE.
+
+- `dialog_client_session.go` `waitAnswer`: after `applyRemoteSDP` fails, diago
+  now attempts ACK and then BYE with separate five-second contexts derived from
+  `context.Background`, so cancellation cannot suppress either mandatory
+  request. The original negotiation error is preserved and joined with any ACK
+  and BYE errors. Successful negotiation and pre-answer cancellation behavior
+  are unchanged. Dialog/media closing remains the caller's responsibility, as
+  before.
+
+## Addendum: CANCEL transaction handling (review issue 7)
+
+The `diago.go` `OnCancel` comment now records the transaction-layer contract
+explicitly. This is a comment-only vendored change; there is no response-path
+behavior change and no dialog-cache-based second response:
+
+- In sipgo v1.4.3 (the nested diago module) and v1.6.0 (the root module), a
+  CANCEL matching a pending INVITE is intercepted before diago's `OnCancel`
+  handler. Sipgo sends 200 to CANCEL, terminates the INVITE with 487, and the
+  dialog callbacks end a pre-established dialog's context.
+- Only a CANCEL without a matching INVITE transaction reaches diago's handler,
+  so its 481 response is intentional and remains unchanged. Responding 200 in
+  this handler would both violate RFC 3261 §9.2 for unknown CANCELs and risk
+  duplicate responses if transaction routing changes.
+- `pkg/sipregistration/inbound_wire_test.go` in the root module pins the full
+  real-UDP runtime behavior: INVITE/180, matched CANCEL/200, INVITE/487, dialog
+  cancellation, and unknown CANCEL/481.

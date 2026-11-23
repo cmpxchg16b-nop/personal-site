@@ -17,6 +17,7 @@ import SearchIcon from "@mui/icons-material/Search";
 import SettingsOutlinedIcon from "@mui/icons-material/SettingsOutlined";
 import { useTranslation } from "react-i18next";
 import type { ChatChannel, ChatUser } from "@/api/ss/types";
+import type { UseExternalSIPResult } from "@/api/ss/sip";
 import ConversationTree from "./ConversationTree";
 import PhonePanel from "./PhonePanel";
 import SettingsPanel from "./SettingsPanel";
@@ -47,6 +48,7 @@ type ChatSidebarProps = {
   onSelectContact: (ref: ConversationRef, messageId: string) => void;
   sipSelected: boolean;
   onOpenSip: () => void;
+  sip: UseExternalSIPResult;
   // Responsive visibility is controlled by the parent (ChatApp) through sx.
   sx?: SxProps<Theme>;
 };
@@ -69,6 +71,7 @@ export default function ChatSidebar({
   onSelectContact,
   sipSelected,
   onOpenSip,
+  sip,
   sx,
 }: ChatSidebarProps) {
   const { t } = useTranslation();
@@ -263,6 +266,7 @@ export default function ChatSidebar({
               currentUserId={currentUserId}
               selectedMessageId={selectedCallId}
               onSelectContact={onSelectContact}
+              sip={sip}
             />
           </Box>
         )}
