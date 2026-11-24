@@ -6,6 +6,7 @@ package sipregistration
 import (
 	"errors"
 	"fmt"
+	"net/netip"
 	"strings"
 	"time"
 	"unicode"
@@ -145,6 +146,9 @@ func parseServer(server string) (host string, port int, normalized string, err e
 	if strings.IndexFunc(server, unicode.IsSpace) >= 0 {
 		return "", 0, "", fmt.Errorf("%w: SIP server contains whitespace", ErrInvalidInput)
 	}
+	if strings.ContainsAny(server, `/\\#`) {
+		return "", 0, "", fmt.Errorf("%w: SIP server must be host[:port], without a path", ErrInvalidInput)
+	}
 	if strings.HasPrefix(strings.ToLower(server), "sips:") {
 		return "", 0, "", fmt.Errorf("%w: use the TLS transport instead of a sips: server", ErrInvalidInput)
 	}
@@ -165,6 +169,15 @@ func parseServer(server string) (host string, port int, normalized string, err e
 		return "", 0, "", fmt.Errorf("%w: SIP server must not contain URI parameters or headers", ErrInvalidInput)
 	}
 	host = strings.ToLower(uri.Host)
+	bareHost := strings.Trim(host, "[]")
+	numericHost := strings.IndexFunc(bareHost, func(r rune) bool {
+		return r != '.' && (r < '0' || r > '9')
+	}) == -1
+	if numericHost {
+		if _, parseErr := netip.ParseAddr(bareHost); parseErr != nil {
+			return "", 0, "", fmt.Errorf("%w: invalid numeric IP address %q", ErrInvalidInput, bareHost)
+		}
+	}
 	port = uri.Port
 	normalized = host
 	if port > 0 {

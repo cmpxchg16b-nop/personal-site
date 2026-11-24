@@ -1090,10 +1090,7 @@ func (s *Service) validateSelectionEgress(credential Credential, selection negot
 	return nil
 }
 
-func (s *Service) validateMediaIP(credential Credential, ip net.IP) error {
-	if s.manager != nil && !s.manager.allowPrivateRegistrars && strings.HasPrefix(credential.OwnerID, "visitor:") && !publicRegistrarIP(ip) {
-		return errors.New("visitor SIP media address is not public")
-	}
+func (s *Service) validateMediaIP(_ Credential, ip net.IP) error {
 	if ip == nil {
 		return errors.New("SIP media address is missing")
 	}

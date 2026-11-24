@@ -83,7 +83,6 @@ type ServeCmd struct {
 	VisitorSessionValidity      time.Duration `name:"validity-of-visitor-session" help:"Validity of visitor session" default:"168h"`
 	VisitorSessionTicketGenIntv time.Duration `name:"visitor-jwt-ticket-gen-intv" help:"We issue visitor token based on some ticket generator, this is the interval of how fast it generate tickets" default:"1s"`
 	NonceLifespan               time.Duration `name:"nonce-lifespan" help:"Lifespan of the OAuth nonce." default:"10m"`
-	SIPAllowPrivateRegistrars   bool          `name:"sip-allow-private-registrars" help:"Allow visitor SIP credentials to register against private or loopback targets (development/trusted networks only)." default:"false"`
 }
 
 // Run serves. cli carries the root flags shared with the other subcommands.
@@ -146,7 +145,7 @@ func (cmd *ServeCmd) Run(cli *CLI) error {
 	// User SIP credentials and REGISTER state live above any browser or bot
 	// session. The browser manages desired state through the site's API; this
 	// manager alone originates and terminates SIP toward external registrars.
-	sipRegistrations := sipregistration.NewManager(logger, sipregistration.WithPrivateRegistrars(cmd.SIPAllowPrivateRegistrars))
+	sipRegistrations := sipregistration.NewManager(logger)
 	defer sipRegistrations.Close()
 
 	// API routes. The site is a purely client-rendered static export today;

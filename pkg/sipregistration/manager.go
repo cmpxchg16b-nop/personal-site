@@ -79,27 +79,14 @@ type Manager struct {
 	retryMax           time.Duration
 	jitter             func() float64
 
-	maxPerUser             int
-	maxCredentials         int
-	allowPrivateRegistrars bool
-	service                *Service // guarded by mu; installed by NewService
-}
-
-// Option configures process-wide registration policy before the manager serves
-// requests.
-type Option func(*Manager)
-
-// WithPrivateRegistrars controls whether anonymous visitors may target private,
-// loopback, and other special-use registrar addresses. Enable only for local
-// development or a trusted deployment; ordinary authenticated users are not
-// restricted by this option.
-func WithPrivateRegistrars(allow bool) Option {
-	return func(manager *Manager) { manager.allowPrivateRegistrars = allow }
+	maxPerUser     int
+	maxCredentials int
+	service        *Service // guarded by mu; installed by NewService
 }
 
 // NewManager constructs an empty in-memory manager. Credentials begin their
 // REGISTER lifecycle when created enabled; no process-wide SIP account exists.
-func NewManager(logger *slog.Logger, options ...Option) *Manager {
+func NewManager(logger *slog.Logger) *Manager {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -117,9 +104,7 @@ func NewManager(logger *slog.Logger, options ...Option) *Manager {
 		maxPerUser:         defaultMaxPerUser,
 		maxCredentials:     defaultMaxCredentials,
 	}
-	for _, option := range options {
-		option(m)
-	}
+
 	m.newRuntime = func(credential Credential, manager *Manager) (runtime, error) {
 		return newDiagoRuntime(credential, manager)
 	}
@@ -202,11 +187,6 @@ func (m *Manager) Create(ownerID string, input Input) (Credential, error) {
 		return Credential{}, err
 	}
 	normalized.OwnerID = ownerID
-	if normalized.Enabled {
-		if err := m.validateRegistrarTarget(normalized); err != nil {
-			return Credential{}, err
-		}
-	}
 	key := credentialKey{ownerID: ownerID, id: uuid.NewString()}
 	normalized.ID = key.id
 	normalized.OwnerID = ownerID
@@ -286,11 +266,6 @@ func (m *Manager) Update(ownerID, id string, input Input) (Credential, error) {
 	}
 	oldAOR := current.credential.SIPURI
 	m.mu.RUnlock()
-	if normalized.Enabled {
-		if err := m.validateRegistrarTarget(normalized); err != nil {
-			return Credential{}, err
-		}
-	}
 
 	// Reserve both identities across the de-REGISTER wait. A concurrent create
 	// or update of either AOR cannot slip into that window; unrelated AORs only

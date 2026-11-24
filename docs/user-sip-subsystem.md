@@ -368,16 +368,9 @@ tests alone.
   are excluded from API responses and application log fields. MESSAGE bodies,
   Authorization headers, and SDP credentials/fingerprints are not logged.
 - Creation is capped at eight credentials per user and 64 process-wide,
-  including disabled entries. Visitor registrar targets default to public IP
-  space only; loopback, private, link-local, CGNAT, and mixed public/private DNS
-  answers are rejected. The destination is pinned to the validated IP while the
-  AOR and TLS ServerName retain the configured domain.
-  `--sip-allow-private-registrars` deliberately relaxes this for local
-  development/trusted networks; ordinary authenticated users may use private
-  PBXs without that flag.
-- The same visitor egress policy applies to every negotiated SIP audio/video
-  address before RTP can flow. A public PBX cannot use an SDP answer to redirect
-  an unrestricted visitor's media to loopback/private/special-use space.
+  including disabled entries. Registrar and negotiated media targets may use
+  public, private, loopback, or other locally reachable addresses for every
+  subject; no visitor-only public-network egress policy is applied.
 - Visitor subjects are random per visitor login. A visitor who logs out and
   receives a new subject cannot recover the old subject's in-memory accounts;
   those accounts currently remain until process restart (bounded by the global

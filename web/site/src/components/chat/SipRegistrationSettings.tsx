@@ -481,7 +481,7 @@ export default function SipRegistrationSettings({
                     required
                     autoFocus
                     label={t("chat.sip.server")}
-                    placeholder="sip.example.com"
+                    placeholder="192.168.1.10:5060"
                     value={form.server}
                     onChange={(event) =>
                       setForm((current) => ({

@@ -355,6 +355,39 @@ func TestManagerCloseCancelsAllWorkersBeforeWaiting(t *testing.T) {
 	}
 }
 
+func TestNormalizeInputAcceptsRegistrarHostIPAndPortForms(t *testing.T) {
+	tests := []struct {
+		server     string
+		wantServer string
+		wantHost   string
+		wantPort   int
+	}{
+		{server: "PBX.Example", wantServer: "pbx.example", wantHost: "pbx.example"},
+		{server: "192.168.1.20", wantServer: "192.168.1.20", wantHost: "192.168.1.20"},
+		{server: "127.0.0.1:5060", wantServer: "127.0.0.1:5060", wantHost: "127.0.0.1", wantPort: 5060},
+		{server: "100.64.0.20:5061", wantServer: "100.64.0.20:5061", wantHost: "100.64.0.20", wantPort: 5061},
+		{server: "169.254.1.20", wantServer: "169.254.1.20", wantHost: "169.254.1.20"},
+		{server: "localhost:5060", wantServer: "localhost:5060", wantHost: "localhost", wantPort: 5060},
+		{server: "sip:192.168.1.20:5060", wantServer: "192.168.1.20:5060", wantHost: "192.168.1.20", wantPort: 5060},
+		{server: "[::1]", wantServer: "[::1]", wantHost: "[::1]"},
+		{server: "[fe80::20]:5060", wantServer: "[fe80::20]:5060", wantHost: "[fe80::20]", wantPort: 5060},
+	}
+	for _, test := range tests {
+		t.Run(test.server, func(t *testing.T) {
+			credential, err := normalizeInput(testInput(test.server, "1001", false))
+			if err != nil {
+				t.Fatalf("normalizeInput(%q): %v", test.server, err)
+			}
+			if credential.Server != test.wantServer || credential.registrarHost != test.wantHost || credential.registrarPort != test.wantPort {
+				t.Fatalf("normalizeInput(%q) = server %q, host %q, port %d", test.server, credential.Server, credential.registrarHost, credential.registrarPort)
+			}
+			if credential.SIPURI != "sip:1001@"+test.wantHost {
+				t.Fatalf("normalizeInput(%q) SIP URI = %q", test.server, credential.SIPURI)
+			}
+		})
+	}
+}
+
 func TestNormalizeInputRejectsAmbiguousAddresses(t *testing.T) {
 	tests := []Input{
 		testInput("", "1001", false),
@@ -362,6 +395,14 @@ func TestNormalizeInputRejectsAmbiguousAddresses(t *testing.T) {
 		testInput("pbx.example", "1001@elsewhere", false),
 		testInput("sip:1001@pbx.example", "1001", false),
 		testInput("pbx.example", "white space", false),
+		testInput("pbx.example:70000", "1001", false),
+		testInput("pbx.example:not-a-port", "1001", false),
+		testInput("192.168.1.1:5060:5061", "1001", false),
+		testInput("http://pbx.example", "1001", false),
+		testInput("pbx.example/path", "1001", false),
+		testInput(`pbx.example\path`, "1001", false),
+		testInput("999.1.1.1", "1001", false),
+		testInput("[::1", "1001", false),
 		{Server: "pbx.example", Username: "1001", Transport: "carrier-pigeon"},
 	}
 	for _, input := range tests {
@@ -474,7 +515,7 @@ func TestUpdatePreserveEnabledIsAtomic(t *testing.T) {
 	}
 }
 
-func TestCredentialQuotaAndVisitorTargetPolicy(t *testing.T) {
+func TestCredentialQuotaAndPrivateRegistrarAcceptance(t *testing.T) {
 	m, _ := newFakeManager(t)
 	m.maxPerUser = 2
 	m.maxCredentials = 3
@@ -495,8 +536,8 @@ func TestCredentialQuotaAndVisitorTargetPolicy(t *testing.T) {
 	}
 	m.maxPerUser = 10
 	m.maxCredentials = 10
-	if _, err := m.Create("visitor:abc", testInput("127.0.0.1", "1001", true)); !errors.Is(err, ErrInvalidInput) {
-		t.Fatalf("visitor loopback target error = %v", err)
+	if _, err := m.Create("visitor:abc", testInput("127.0.0.1", "1001", true)); err != nil {
+		t.Fatalf("visitor loopback target rejected: %v", err)
 	}
 	if _, err := m.Create("user-alice", testInput("127.0.0.1", "1002", true)); err != nil {
 		t.Fatalf("authenticated private target rejected: %v", err)

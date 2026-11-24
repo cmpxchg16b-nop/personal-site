@@ -39,12 +39,7 @@ type diagoRuntime struct {
 }
 
 func newDiagoRuntime(credential Credential, manager *Manager) (runtime, error) {
-	// Revalidate on every attempt and pin the actual destination to the
-	// validated address. The SIP URI still carries the configured domain.
-	dialHost, err := manager.registrarDialHost(credential)
-	if err != nil {
-		return nil, err
-	}
+	dialHost := strings.Trim(credential.registrarHost, "[]")
 	port := credential.registrarPort
 	if port == 0 {
 		port = defaultRegistrarPort(credential.Transport)
