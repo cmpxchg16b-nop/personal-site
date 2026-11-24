@@ -239,6 +239,65 @@ func TestNewInboundSIPMediaPinsSelectedAnswerAndCleansDialog(t *testing.T) {
 	}
 }
 
+func TestNewInboundSIPMediaAudioVideoPayloadTypeCollision(t *testing.T) {
+	browserOffer := testSDP(
+		"m=audio 9 UDP/TLS/RTP/SAVPF 111",
+		"a=rtpmap:111 opus/48000/2",
+		"a=fmtp:111 minptime=10;useinbandfec=1;stereo=1",
+		"m=video 9 UDP/TLS/RTP/SAVPF 96",
+		"a=rtpmap:96 VP8/90000",
+	)
+	// This is the codec layout from the crashing FreeSWITCH offer. Payload
+	// types 96/97/98/99 have independent audio and video mappings.
+	sipOffer := testSDP(
+		"m=audio 55234 RTP/AVP 96 97 98 0 8 9 18 101 99 100",
+		"c=IN IP4 127.0.0.1",
+		"a=rtpmap:96 opus/48000/2",
+		"a=fmtp:96 useinbandfec=1;stereo=1",
+		"a=rtpmap:97 speex/16000",
+		"a=rtpmap:98 speex/8000",
+		"a=fmtp:18 annexb=yes",
+		"a=rtpmap:101 telephone-event/48000",
+		"a=rtpmap:99 telephone-event/16000",
+		"a=rtpmap:100 telephone-event/8000",
+		"m=video 58426 RTP/AVP 96 97 98 99",
+		"a=rtpmap:96 AV1/90000",
+		"a=rtpmap:97 H265/90000",
+		"a=rtpmap:98 H264/90000",
+		"a=rtpmap:99 VP8/90000",
+	)
+	selection, err := negotiateInboundSelection(browserOffer, sipOffer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(selection.Audio) != 1 || selection.Audio[0].SIP.PayloadType != 96 ||
+		len(selection.Video) != 1 || selection.Video[0].SIP.PayloadType != 99 {
+		t.Fatalf("unexpected collision-offer selection: %+v", selection)
+	}
+
+	request := sip.NewRequest(sip.INVITE, sip.Uri{User: "user", Host: "127.0.0.1"})
+	request.SetBody(sipOffer)
+	server := &sipgo.DialogServerSession{}
+	server.InviteRequest = request
+	dialog := &diago.DialogServerSession{DialogServerSession: server}
+	session, _, err := newInboundSIPMedia(dialog, net.ParseIP("127.0.0.1"), selection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = dialog.DialogMedia.Close() })
+
+	answer, err := parseSDP(session.LocalSDP())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(answer.Audio.Codecs) != 1 || answer.Audio.Codecs[0].PayloadType != 96 || answer.Audio.Codecs[0].Name != "opus" {
+		t.Fatalf("answer audio = %+v", answer.Audio)
+	}
+	if answer.Video == nil || len(answer.Video.Codecs) != 1 || answer.Video.Codecs[0].PayloadType != 99 || answer.Video.Codecs[0].Name != "VP8" {
+		t.Fatalf("answer video = %+v", answer.Video)
+	}
+}
+
 func TestNewInboundSIPMediaAnswerDirections(t *testing.T) {
 	for _, test := range []struct {
 		offerDirection string

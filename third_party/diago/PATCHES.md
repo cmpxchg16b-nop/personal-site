@@ -143,3 +143,21 @@ behavior change and no dialog-cache-based second response:
 - `pkg/sipregistration/inbound_wire_test.go` in the root module pins the full
   real-UDP runtime behavior: INVITE/180, matched CANCEL/200, INVITE/487, dialog
   cancellation, and unknown CANCEL/481.
+
+## Patch 7: one codec per SDP payload format
+
+Upstream v0.32.2's `CodecsFromSDPRead` appends a codec for every matching
+`rtpmap` attribute even though `MediaSession` allocates the output with one
+slot per `m=` format. Audio and video media sections may legally reuse a
+dynamic payload type for different codecs; scanning all attributes then writes
+past the audio slice and panics. A FreeSWITCH offer with audio/video collisions
+on PT 96/97/98/99 reproduced `index out of range [10] with length 10`.
+
+- `media/codec.go`: stop scanning after the first valid `rtpmap` for each
+  format, matching current upstream's one-codec-per-format control flow. This
+  preserves the audio mapping when its media section precedes video and keeps
+  the existing caller/output-size contract unchanged.
+- `media/media_session_test.go`: the real 10-format/40-attribute offer now
+  negotiates audio codecs without a panic.
+- `pkg/sipregistration/media_test.go`: the complete inbound selection, remote
+  offer, and pinned-answer path covers Opus/96 audio plus VP8/99 video.

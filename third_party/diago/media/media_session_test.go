@@ -270,6 +270,67 @@ a=sendrecv`
 	}
 }
 
+func TestRemoteSDPAudioVideoPayloadTypeCollision(t *testing.T) {
+	// FreeSWITCH offer: dynamic payload types are scoped to each media section.
+	// Audio 96/97/98/99 and video 96/97/98/99 deliberately have different codecs.
+	sd := `v=0
+o=1002 2205 1425 IN IP4 192.168.10.201
+s=Talk
+c=IN IP4 192.168.10.201
+t=0 0
+a=rtcp-xr:rcvr-rtt=all:10000 stat-summary=loss,dup,jitt,TTL voip-metrics
+a=group:BUNDLE as vs
+a=record:off
+m=audio 55234 RTP/AVP 96 97 98 0 8 9 18 101 99 100
+a=rtpmap:96 opus/48000/2
+a=fmtp:96 useinbandfec=1;stereo=1
+a=rtpmap:97 speex/16000
+a=fmtp:97 vbr=on
+a=rtpmap:98 speex/8000
+a=fmtp:98 vbr=on
+a=fmtp:18 annexb=yes
+a=rtpmap:101 telephone-event/48000
+a=rtpmap:99 telephone-event/16000
+a=rtpmap:100 telephone-event/8000
+a=rtcp-mux
+a=mid:as
+a=extmap:1 urn:ietf:params:rtp-hdrext:sdes:mid
+a=rtcp:55819
+a=rtcp-fb:* trr-int 1000
+a=rtcp-fb:* ccm tmmbr
+m=video 58426 RTP/AVP 96 97 98 99
+a=rtpmap:96 AV1/90000
+a=rtpmap:97 H265/90000
+a=rtpmap:98 H264/90000
+a=fmtp:98 profile-level-id=42801F
+a=rtpmap:99 VP8/90000
+a=rtcp-mux
+a=mid:vs
+a=extmap:1 urn:ietf:params:rtp-hdrext:sdes:mid
+a=rtcp:51160
+a=rtcp-fb:* trr-int 1000
+a=rtcp-fb:* ccm tmmbr
+a=rtcp-fb:96 nack pli
+a=rtcp-fb:96 ccm fir
+a=rtcp-fb:97 nack pli
+a=rtcp-fb:97 ccm fir
+a=rtcp-fb:98 nack pli
+a=rtcp-fb:98 ccm fir
+a=rtcp-fb:99 nack pli
+a=rtcp-fb:99 nack sli
+a=rtcp-fb:99 ack rpsi
+a=rtcp-fb:99 ccm fir
+`
+
+	m := MediaSession{
+		Codecs: []Codec{CodecAudioOpus, CodecAudioUlaw, CodecAudioAlaw, CodecAudioG722},
+		Laddr:  net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1234},
+		Mode:   sdp.ModeSendrecv,
+	}
+	require.NoError(t, m.RemoteSDP([]byte(sd)))
+	assert.Equal(t, []Codec{CodecAudioOpus, CodecAudioUlaw, CodecAudioAlaw, CodecAudioG722}, m.CommonCodecs())
+}
+
 func TestMediaNegotiaton(t *testing.T) {
 	t.Run("UnsupportedRTPProfile", func(t *testing.T) {
 		sd := `v=0

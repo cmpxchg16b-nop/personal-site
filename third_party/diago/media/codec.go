@@ -232,6 +232,9 @@ func CodecsFromSDPRead(formats []string, attrs []string, codecsAudio []Codec) (i
 				}
 				codecsAudio[n] = codec
 				n++
+				// Each format produces at most one codec. Other media sections may
+				// reuse the payload type with a different rtpmap. (Local patch.)
+				break
 			}
 		}
 	}
