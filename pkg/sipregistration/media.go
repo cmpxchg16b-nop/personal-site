@@ -73,10 +73,20 @@ func initializeSIPMediaSession(bindIP net.IP, audio, video []rtpCodec) (*media.M
 	// statistics layer does not discard video packets on the shared socket.
 	codecs := diagoCodecList("audio", audio)
 	codecs = append(codecs, diagoCodecList("video", video)...)
+	allowedNATSources := make(map[uint8]bool, len(audio))
+	for _, codec := range audio {
+		allowedNATSources[codec.PayloadType] = true
+	}
 	session := &media.MediaSession{
 		Codecs: codecs,
 		Mode:   diagosdp.ModeSendrecv,
 		Laddr:  net.UDPAddr{IP: cloneIP(bindIP)},
+		// The SDP address may be a PBX's private address (for example a Docker
+		// container), not the source address reachable from this runtime. Use
+		// diago's symmetric RTP learning so audio and DTMF return to the actual
+		// mapped source instead of disappearing into that private route.
+		RTPNAT:             media.RTPNATSymetric,
+		RTPNATPayloadTypes: allowedNATSources,
 	}
 	if err := session.Init(); err != nil {
 		return nil, fmt.Errorf("initialize SIP media: %w", err)
@@ -86,7 +96,7 @@ func initializeSIPMediaSession(bindIP net.IP, audio, video []rtpCodec) (*media.M
 
 // newOutboundSIPMedia creates the plaintext offer for the SIP leg from the
 // browser's actual capabilities. The primary codecs stay bounded for UDP MTU;
-// one offered telephone-event capability is retained for RFC 4733 DTMF.
+// one offered 8 kHz telephone-event capability is retained for RFC 4733 DTMF.
 func newOutboundSIPMedia(bindIP net.IP, browser sdpModel, wantVideo bool) (*media.MediaSession, error) {
 	if !activeMedia(browser.Audio) {
 		return nil, errNoCommonAudio
@@ -100,8 +110,10 @@ func newOutboundSIPMedia(bindIP net.IP, browser sdpModel, wantVideo bool) (*medi
 	if wantVideo && activeMedia(browser.Video) {
 		video = sipOfferPrimaryCodecs(browser.Video.Codecs, maxSIPOfferVideoCodecs)
 	}
-	if len(browser.Audio.TelephoneEvents) > 0 {
-		dtmf := browser.Audio.TelephoneEvents[0]
+	for _, dtmf := range browser.Audio.TelephoneEvents {
+		if dtmf.ClockRate != dtmfClockRate {
+			continue
+		}
 		conflicts := false
 		for _, videoCodec := range video {
 			if dtmf.PayloadType == videoCodec.PayloadType {
@@ -113,6 +125,7 @@ func newOutboundSIPMedia(bindIP net.IP, browser sdpModel, wantVideo bool) (*medi
 		}
 		if !conflicts {
 			offerAudio = append(offerAudio, dtmf)
+			break
 		}
 	}
 
@@ -454,10 +467,13 @@ func (w *udpRTPWriter) WriteRTP(packet *rtp.Packet) error {
 // relayRTPWriter gives each browser track its own RTP sequence/SSRC writer.
 // The shared mutex serializes diago's underlying MediaSession write buffer.
 type relayRTPWriter struct {
-	mu       *sync.Mutex
-	writer   *media.RTPPacketWriter
-	started  bool
-	previous uint32
+	mu               *sync.Mutex
+	writer           *media.RTPPacketWriter
+	clockRate        uint32
+	started          bool
+	previous         uint32
+	dtmfAdvance      uint32
+	lastDTMFDuration uint16
 }
 
 func newRelayRTPWriter(target media.RTPWriter, codec rtpCodec, kind string, mu *sync.Mutex) *relayRTPWriter {
@@ -476,7 +492,19 @@ func newRelayRTPWriter(target media.RTPWriter, codec rtpCodec, kind string, mu *
 			rtpSession.PrimeWriteStats(converted, writer.SSRC)
 		}
 	}
-	return &relayRTPWriter{mu: mu, writer: writer}
+	return &relayRTPWriter{mu: mu, writer: writer, clockRate: converted.SampleRate}
+}
+
+// advanceDTMF separates consecutive generated event start timestamps. The
+// caller holds the shared audio write mutex. Write subtracts this compensation
+// when primary audio resumes, preserving that stream's original delta clock.
+func (w *relayRTPWriter) advanceDTMF(duration uint16, eventClockRate uint32) {
+	if duration == 0 || eventClockRate == 0 || w.clockRate == 0 {
+		return
+	}
+	advance := uint32((uint64(duration)*uint64(w.clockRate) + uint64(eventClockRate) - 1) / uint64(eventClockRate))
+	w.writer.DelayTimestamp(advance)
+	w.dtmfAdvance += advance
 }
 
 func (w *relayRTPWriter) Write(packet *rtp.Packet, sipPayloadType uint8) error {
@@ -490,12 +518,14 @@ func (w *relayRTPWriter) Write(packet *rtp.Packet, sipPayloadType uint8) error {
 	// DelayTimestamp advances the timestamp used by the next packet. Passing a
 	// zero increment to WriteSamples avoids diago applying the delta one packet
 	// late; subtraction deliberately retains uint32 wraparound semantics.
-	w.writer.DelayTimestamp(delta)
+	w.writer.DelayTimestamp(delta - w.dtmfAdvance)
+	w.dtmfAdvance = 0
 	w.started = true
 	if _, err := w.writer.WriteSamples(packet.Payload, 0, packet.Marker, sipPayloadType); err != nil {
 		return err
 	}
 	w.previous = packet.Timestamp
+	w.lastDTMFDuration = 0
 	return nil
 }
 
@@ -509,6 +539,8 @@ type mediaRelay struct {
 	session   *media.MediaSession
 
 	audioWriter *relayRTPWriter
+	dtmfWriter  *media.RTPDtmfWriter
+	dtmfCh      chan rune
 	videoWriter *relayRTPWriter
 	videoConn   *net.UDPConn
 	writeMu     *sync.Mutex
@@ -633,6 +665,15 @@ func newMediaRelay(dialog sipDialog, browser *browserMedia, selection negotiated
 			audioTarget = rtpSession
 		}
 		relay.audioWriter = newRelayRTPWriter(audioTarget, selection.Audio[0].SIP, "audio", relay.writeMu)
+		if selection.DTMF != nil {
+			// Match sip-bot: parse/dedupe browser events, then re-originate a
+			// fresh RFC 4733 series on the SIP audio RTP timeline. Diago's
+			// writer uses the negotiated 8 kHz payload type and shares the
+			// primary audio packet writer/SSRC.
+			codec := selection.DTMF.SIP.diagoCodec("audio")
+			relay.dtmfWriter = media.NewRTPDTMFWriter(codec, relay.audioWriter.writer, nil)
+			relay.dtmfCh = make(chan rune, 16)
+		}
 	}
 
 	if len(selection.Video) == 1 && sipRelaySendAllowed(selection.SIPVideo) {
@@ -656,6 +697,11 @@ func newMediaRelay(dialog sipDialog, browser *browserMedia, selection negotiated
 		relay.videoWriter = newRelayRTPWriter(videoTarget, selection.Video[0].SIP, "video", relay.writeMu)
 	}
 
+	// Start background workers only after every fallible setup step succeeds.
+	if relay.dtmfCh != nil {
+		relay.wg.Add(1)
+		go relay.sendDigits()
+	}
 	if sipRelayReceiveAllowed(selection.SIPAudio) || (len(selection.Video) == 1 && sipRelayReceiveAllowed(selection.SIPVideo)) {
 		relay.wg.Add(1)
 		go relay.sipToBrowser()
@@ -757,6 +803,7 @@ func (r *mediaRelay) AddTrack(track *webrtc.TrackRemote) {
 
 func (r *mediaRelay) browserToSIP(track *webrtc.TrackRemote, writer *relayRTPWriter, pair codecPair, dtmf *codecPair) {
 	defer r.wg.Done()
+	var dedup dtmfDeduper
 	for {
 		select {
 		case <-r.done:
@@ -768,12 +815,20 @@ func (r *mediaRelay) browserToSIP(track *webrtc.TrackRemote, writer *relayRTPWri
 			return
 		}
 		if dtmf != nil && packet.PayloadType == dtmf.Browser.PayloadType {
-			// Preserve the browser's complete RFC 4733 series, including its
-			// redundant END packets. Re-encoding fresh digits here (as sip-bot
-			// does) would be redundant in this packet-payload gateway; only the
-			// negotiated payload type changes between the two RTP legs.
-			if err := writer.Write(packet, dtmf.SIP.PayloadType); err != nil {
-				return
+			event, ok := parseDTMFEvent(packet.Payload)
+			if !ok {
+				continue
+			}
+			if !event.end {
+				continue
+			}
+			digit, ok := event.digit()
+			if !ok || !dedup.freshEnd(event.code, packet.Timestamp) {
+				continue
+			}
+			select {
+			case r.dtmfCh <- digit:
+			default: // a flooded pad drops digits, never the audio pump
 			}
 			continue
 		}
@@ -781,6 +836,32 @@ func (r *mediaRelay) browserToSIP(track *webrtc.TrackRemote, writer *relayRTPWri
 			continue
 		}
 		if err := writer.Write(packet, pair.SIP.PayloadType); err != nil {
+			return
+		}
+	}
+}
+
+// sendDigits serializes fresh DTMF events with primary audio on the SIP RTP
+// writer. WriteDTMF takes real time, so it runs outside the browser read pump.
+func (r *mediaRelay) sendDigits() {
+	defer r.wg.Done()
+	for {
+		select {
+		case digit := <-r.dtmfCh:
+			r.writeMu.Lock()
+			if r.audioWriter.lastDTMFDuration > 0 {
+				r.audioWriter.advanceDTMF(r.audioWriter.lastDTMFDuration, r.selection.DTMF.SIP.ClockRate)
+			}
+			err := r.dtmfWriter.WriteDTMF(digit)
+			if err == nil {
+				// diago's standard series ends at 800 units (100 ms at 8 kHz).
+				r.audioWriter.lastDTMFDuration = 800
+			}
+			r.writeMu.Unlock()
+			if err != nil {
+				return
+			}
+		case <-r.done:
 			return
 		}
 	}

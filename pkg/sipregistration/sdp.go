@@ -443,6 +443,9 @@ func intersectCodecsForKind(kind string, browser, sip []rtpCodec) []codecPair {
 // telephone-event rides the audio RTP stream but is never decoded as audio.
 func intersectTelephoneEvents(browser, sip []rtpCodec) *codecPair {
 	for _, browserCodec := range browser {
+		if browserCodec.ClockRate != dtmfClockRate {
+			continue
+		}
 		for _, sipCodec := range sip {
 			if rtpCodecsCompatible("audio", browserCodec, sipCodec) {
 				return &codecPair{Browser: browserCodec, SIP: sipCodec}

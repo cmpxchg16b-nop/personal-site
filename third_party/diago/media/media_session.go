@@ -168,9 +168,13 @@ type MediaSession struct {
 	srtpRemoteTag int
 
 	// RTP NAT enables handling RTP behind NAT. Checkout also RTPSourceLock
-	RTPNAT          int // 0 - disabled, 1 - Learn source change (RTP Symetric)
-	learnedRTPFrom  atomic.Pointer[net.UDPAddr]
-	learnedRTCPFrom atomic.Pointer[net.UDPAddr]
+	RTPNAT int // 0 - disabled, 1 - Learn source change (RTP Symetric)
+	// RTPNATPayloadTypes optionally restricts which RTP payload types may teach
+	// the symmetric remote address. An empty/nil map retains upstream behavior.
+	// Configure it on shared sockets so demuxed video cannot redirect audio.
+	RTPNATPayloadTypes map[uint8]bool
+	learnedRTPFrom     atomic.Pointer[net.UDPAddr]
+	learnedRTCPFrom    atomic.Pointer[net.UDPAddr]
 
 	// ReadRTPFromAddr is set after Read operation. NOT THREAD SAFE and should be only used together with Read
 	// It can be used to validate source of RTP packet
@@ -296,17 +300,18 @@ func (s *MediaSession) StartRTP(rw int8) error {
 // It preserves pointer to same conneciton but rest is removed
 func (s *MediaSession) Fork() *MediaSession {
 	cp := MediaSession{
-		Laddr:          s.Laddr, // TODO clone it although it is read only
-		ExternalIP:     slices.Clone(s.ExternalIP),
-		rtpConn:        s.rtpConn,
-		rtcpConn:       s.rtcpConn,
-		Codecs:         slices.Clone(s.Codecs),
-		Mode:           s.Mode,
-		RTPNAT:         s.RTPNAT,
-		sdp:            slices.Clone(s.sdp),
-		sessionID:      s.sessionID,
-		sessionVersion: s.sessionVersion,
-		DTLSConf:       s.DTLSConf,
+		Laddr:              s.Laddr, // TODO clone it although it is read only
+		ExternalIP:         slices.Clone(s.ExternalIP),
+		rtpConn:            s.rtpConn,
+		rtcpConn:           s.rtcpConn,
+		Codecs:             slices.Clone(s.Codecs),
+		Mode:               s.Mode,
+		RTPNAT:             s.RTPNAT,
+		RTPNATPayloadTypes: s.RTPNATPayloadTypes, // read-only after setup
+		sdp:                slices.Clone(s.sdp),
+		sessionID:          s.sessionID,
+		sessionVersion:     s.sessionVersion,
+		DTLSConf:           s.DTLSConf,
 	}
 	return &cp
 }
@@ -909,7 +914,7 @@ func (m *MediaSession) ReadRTP(buf []byte, pkt *rtp.Packet) (int, error) {
 	m.ReadRTPFromAddr = from
 
 	// Handle NAT
-	if m.RTPNAT == 1 && from.String() != m.Raddr.String() {
+	if m.RTPNAT == 1 && from.String() != m.Raddr.String() && m.rtpNATSourceAllowed(buf[:n]) {
 		// Moving this to RTP session could have simplify validation (sequence tracking), but for now here is more easier to maintain
 		func() {
 			// Make sure it is valid pkt
@@ -966,7 +971,7 @@ func (m *MediaSession) readRTPParsed() (rtp.Packet, error) {
 func (m *MediaSession) ReadRTPRaw(buf []byte) (int, error) {
 	n, from, err := m.rtpConn.ReadFrom(buf)
 
-	if m.RTPNAT == 1 {
+	if m.RTPNAT == 1 && m.rtpNATSourceAllowed(buf[:n]) {
 		addr, _ := from.(*net.UDPAddr)
 		m.learnedRTPFrom.Store(addr)
 	}
@@ -1084,6 +1089,13 @@ func (m *MediaSession) getWriteBuf() []byte {
 		m.writeRTPBuf = make([]byte, RTPBufSize)
 	}
 	return m.writeRTPBuf
+}
+
+func (m *MediaSession) rtpNATSourceAllowed(data []byte) bool {
+	if len(m.RTPNATPayloadTypes) == 0 {
+		return true
+	}
+	return len(data) >= 2 && m.RTPNATPayloadTypes[data[1]&0x7f]
 }
 
 func (m *MediaSession) WriteRTPRaw(data []byte) (n int, err error) {

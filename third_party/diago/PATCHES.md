@@ -180,3 +180,21 @@ wrong rate.
   the selected primary SIP audio codec when writing through an `RTPSession`.
 - `media/rtp_session_test.go`: a DTMF-first/Opus-second sequence verifies that
   the sender report advances at 48 kHz and retains the shared writer SSRC.
+
+## Patch 9: media-aware symmetric RTP source learning
+
+Upstream symmetric RTP learns the remote source from any valid RTP packet. A
+shared audio/video socket with different remote addresses can therefore learn
+the video peer and subsequently send audio and DTMF to the wrong destination.
+An unrelated RTP packet can also claim the first learned source before diago's
+source-lock check runs.
+
+- `media/media_session.go`: optional `RTPNATPayloadTypes` restricts which RTP
+  payload types may update `learnedRTPFrom`. Both the raw read path and the
+  parsed first-source `CompareAndSwap` honor the filter. Nil/empty maps retain
+  upstream behavior, and `Fork` retains the read-only configuration.
+- `pkg/sipregistration/media.go`: shared SIP sessions enable symmetric RTP but
+  allow only their offered audio/telephone-event PTs to teach the return source.
+- `media/media_session_test.go`: a video PT is ignored before an allowed audio
+  PT teaches the mapped source. The user-subsystem demux test additionally sends
+  browser audio after inbound video and proves it still reaches the audio peer.

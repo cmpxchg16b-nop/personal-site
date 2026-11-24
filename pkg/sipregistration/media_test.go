@@ -39,6 +39,7 @@ func TestNewOutboundSIPMediaUsesActualBrowserCodecs(t *testing.T) {
 			{PayloadType: 111, Name: "opus", ClockRate: 48000, Channels: 2, Fmtp: "minptime=10;useinbandfec=1"},
 			{PayloadType: 0, Name: "PCMU", ClockRate: 8000, Channels: 1},
 		}, TelephoneEvents: []rtpCodec{
+			{PayloadType: 110, Name: "telephone-event", ClockRate: 48000, Channels: 1},
 			{PayloadType: 101, Name: "telephone-event", ClockRate: 8000, Channels: 1},
 		}},
 		Video: &mediaSection{Kind: "video", Port: 9, Codecs: []rtpCodec{
@@ -58,13 +59,16 @@ func TestNewOutboundSIPMediaUsesActualBrowserCodecs(t *testing.T) {
 	if model.Audio.Protocol != "RTP/AVP" || model.Video.Protocol != "RTP/AVP" {
 		t.Fatalf("outbound profiles = %q, %q", model.Audio.Protocol, model.Video.Protocol)
 	}
+	if session.RTPNAT != media.RTPNATSymetric {
+		t.Fatalf("SIP media RTPNAT = %d, want symmetric source learning", session.RTPNAT)
+	}
 	if model.Audio.Direction != "sendrecv" || model.Video.Direction != "sendrecv" {
 		t.Fatalf("outbound offer directions = %q, %q", model.Audio.Direction, model.Video.Direction)
 	}
 	if !reflect.DeepEqual(model.Audio.Codecs, browser.Audio.Codecs) || !reflect.DeepEqual(model.Video.Codecs, browser.Video.Codecs[:1]) {
 		t.Fatalf("outbound codecs = %#v, %#v", model.Audio.Codecs, model.Video.Codecs)
 	}
-	if !reflect.DeepEqual(model.Audio.TelephoneEvents, browser.Audio.TelephoneEvents) || strings.Contains(strings.ToLower(string(session.LocalSDP())), "rtx") {
+	if !reflect.DeepEqual(model.Audio.TelephoneEvents, browser.Audio.TelephoneEvents[1:]) || strings.Contains(strings.ToLower(string(session.LocalSDP())), "rtx") {
 		t.Fatalf("outbound DTMF/helper codecs are wrong:\n%s", session.LocalSDP())
 	}
 	if len(session.Codecs) != 4 || session.Codecs[0].Fmtp != browser.Audio.Codecs[0].Fmtp {
@@ -883,6 +887,15 @@ func TestMediaRelayBidirectionalPayloadPTTimestampAndDemuxCleanup(t *testing.T) 
 		t.Fatalf("SIP-to-browser video = %+v payload %x", got.Header, got.Payload)
 	}
 
+	// Demuxed video must not teach the shared symmetric-RTP session to send
+	// subsequent audio/DTMF to videoPeer instead of audioPeer.
+	audioPayload3 := []byte{0x55, 0x66, 0x77}
+	writeTestPacket(t, fixture.audio, 111, 2000, false, audioPayload3)
+	got = readTestUDPRTP(t, audioPeer)
+	if got.PayloadType != 96 || got.Timestamp != 2000 || !bytes.Equal(got.Payload, audioPayload3) {
+		t.Fatalf("audio after demuxed video = %+v payload %x", got.Header, got.Payload)
+	}
+
 	if err := relay.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -894,7 +907,7 @@ func TestMediaRelayBidirectionalPayloadPTTimestampAndDemuxCleanup(t *testing.T) 
 	}
 }
 
-func TestMediaRelayForwardsBrowserDTMFWithNegotiatedPT(t *testing.T) {
+func TestMediaRelayReoriginatesBrowserDTMFOnSIPClock(t *testing.T) {
 	selection := testRelaySelection()
 	selection.Video = nil
 	selection.DTMF = &codecPair{
@@ -957,7 +970,7 @@ func TestMediaRelayForwardsBrowserDTMFWithNegotiatedPT(t *testing.T) {
 		t.Fatalf("audio before DTMF = %+v payload %x", got.Header, got.Payload)
 	}
 
-	const eventTimestamp = uint32(4000)
+	eventTimestamp := uint32(4000)
 	events := []struct {
 		sequence uint16
 		marker   bool
@@ -968,20 +981,53 @@ func TestMediaRelayForwardsBrowserDTMFWithNegotiatedPT(t *testing.T) {
 		{sequence: 1003, payload: []byte{5, 0x8a, 3, 32}},
 		{sequence: 1004, payload: []byte{5, 0x8a, 3, 32}},
 		{sequence: 1005, payload: []byte{5, 0x8a, 3, 32}},
+		{sequence: 1006, marker: true, payload: []byte{5, 10, 0, 160}},
+		{sequence: 1007, payload: []byte{5, 10, 1, 64}},
+		{sequence: 1008, payload: []byte{5, 0x8a, 3, 32}},
+		{sequence: 1009, payload: []byte{5, 0x8a, 3, 32}},
+		{sequence: 1010, payload: []byte{5, 0x8a, 3, 32}},
 	}
-	for _, event := range events {
+	for index, event := range events {
+		if index == 5 {
+			eventTimestamp = 4800 // a new press of the same digit, not an END retransmission
+		}
 		crafted := append([]byte{0xee}, event.payload...)
 		writeTestPacketWithSequence(t, fixture.audio, 111, event.sequence, eventTimestamp, event.marker, crafted)
-		got = readTestUDPRTP(t, audioPeer)
-		if got.PayloadType != 120 || got.Timestamp != eventTimestamp || got.Marker != event.marker || !bytes.Equal(got.Payload, event.payload) {
-			t.Fatalf("SIP DTMF sequence %d = %+v payload %x, want PT 120 timestamp %d marker %v payload %x", event.sequence, got.Header, got.Payload, eventTimestamp, event.marker, event.payload)
+	}
+
+	// The three browser END packets are one key press. As in sip-bot, diago
+	// emits a fresh seven-packet series on the SIP audio timeline instead of
+	// forwarding the browser's event timestamp through the audio delta clock.
+	wantEvents := []struct {
+		end      bool
+		duration uint16
+	}{
+		{duration: 160}, {duration: 320}, {duration: 480}, {duration: 640},
+		{end: true, duration: 800}, {end: true, duration: 800}, {end: true, duration: 800},
+	}
+	for press := 0; press < 2; press++ {
+		wantTimestamp := uint32(1000)
+		if press == 1 {
+			// Opus uses 48 kHz: advance 100 ms (800 units at 8 kHz)
+			// between the two event starts, not zero between every packet.
+			wantTimestamp = 5800
+		}
+		for index, want := range wantEvents {
+			got = readTestUDPRTP(t, audioPeer)
+			wantPayload := []byte{5, 10, byte(want.duration >> 8), byte(want.duration)}
+			if want.end {
+				wantPayload[1] |= 0x80
+			}
+			if got.PayloadType != 120 || got.Timestamp != wantTimestamp || got.Marker != (index == 0) || !bytes.Equal(got.Payload, wantPayload) {
+				t.Fatalf("SIP DTMF press %d packet %d = %+v payload %x, want PT 120 timestamp %d marker %t payload %x", press, index, got.Header, got.Payload, wantTimestamp, index == 0, wantPayload)
+			}
 		}
 	}
 
 	audioAfter := []byte{0xde, 0xad, 0xbe, 0xef}
-	writeTestPacket(t, fixture.audio, 111, 5000, false, audioAfter)
+	writeTestPacket(t, fixture.audio, 111, 12000, false, audioAfter)
 	got = readTestUDPRTP(t, audioPeer)
-	if got.PayloadType != 96 || got.Timestamp != 5000 || !bytes.Equal(got.Payload, audioAfter) {
+	if got.PayloadType != 96 || got.Timestamp != 12000 || !bytes.Equal(got.Payload, audioAfter) {
 		t.Fatalf("audio after DTMF = %+v payload %x", got.Header, got.Payload)
 	}
 }

@@ -564,11 +564,17 @@ func TestNegotiateTelephoneEventUsesSeparateDynamicPTAndAllowsAbsence(t *testing
 	sipAudio := rtpCodec{PayloadType: 96, Name: "opus", ClockRate: 48000, Channels: 2}
 	browser := sdpModel{Audio: &mediaSection{
 		Kind: "audio", Port: 9, Codecs: []rtpCodec{browserAudio},
-		TelephoneEvents: []rtpCodec{{PayloadType: 126, Name: "telephone-event", ClockRate: 8000, Channels: 1, Fmtp: "0-16"}},
+		TelephoneEvents: []rtpCodec{
+			{PayloadType: 110, Name: "telephone-event", ClockRate: 48000, Channels: 1},
+			{PayloadType: 126, Name: "telephone-event", ClockRate: 8000, Channels: 1, Fmtp: "0-16"},
+		},
 	}}
 	sip := sdpModel{Audio: &mediaSection{
 		Kind: "audio", Port: 4000, Codecs: []rtpCodec{sipAudio},
-		TelephoneEvents: []rtpCodec{{PayloadType: 120, Name: "telephone-event", ClockRate: 8000, Channels: 1, Fmtp: "0-15"}},
+		TelephoneEvents: []rtpCodec{
+			{PayloadType: 110, Name: "telephone-event", ClockRate: 48000, Channels: 1},
+			{PayloadType: 120, Name: "telephone-event", ClockRate: 8000, Channels: 1, Fmtp: "0-15"},
+		},
 	}}
 	selection, err := negotiateSDPModels(browser, sip)
 	if err != nil {
@@ -585,6 +591,16 @@ func TestNegotiateTelephoneEventUsesSeparateDynamicPTAndAllowsAbsence(t *testing
 	}
 	if selection.DTMF != nil {
 		t.Fatalf("DTMF negotiated without a SIP capability: %+v", selection.DTMF)
+	}
+
+	browser.Audio.TelephoneEvents = browser.Audio.TelephoneEvents[:1]
+	sip.Audio.TelephoneEvents = []rtpCodec{{PayloadType: 110, Name: "telephone-event", ClockRate: 48000, Channels: 1}}
+	selection, err = negotiateSDPModels(browser, sip)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if selection.DTMF != nil {
+		t.Fatalf("non-8kHz DTMF negotiated without sip-bot-compatible generation: %+v", selection.DTMF)
 	}
 }
 

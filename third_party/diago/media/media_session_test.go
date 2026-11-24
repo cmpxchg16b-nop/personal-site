@@ -593,3 +593,33 @@ func TestMediaSessionRTPSymetric(t *testing.T) {
 	rtpLen := session.rtpConn.(*fakes.UDPConn).Writers["127.2.2.2:4321"].(*bytes.Buffer).Len()
 	assert.Greater(t, rtpLen, 0)
 }
+
+func TestMediaSessionRTPSymetricPayloadTypeFilter(t *testing.T) {
+	mappedSource := net.UDPAddr{IP: net.IPv4(127, 2, 2, 2), Port: 4321}
+	reader, writer := io.Pipe()
+	go func() {
+		for _, payloadType := range []uint8{97, 96} {
+			raw, err := (&rtp.Packet{Header: rtp.Header{Version: 2, PayloadType: payloadType}}).Marshal()
+			if err != nil {
+				return
+			}
+			if _, err := writer.Write(raw); err != nil {
+				return
+			}
+		}
+	}()
+	session := &MediaSession{
+		Raddr:              net.UDPAddr{IP: net.IPv4(127, 1, 1, 1), Port: 1234},
+		RTPNAT:             RTPNATSymetric,
+		RTPNATPayloadTypes: map[uint8]bool{96: true},
+	}
+	session.rtpConn = &fakes.UDPConn{RAddr: mappedSource, Reader: reader}
+
+	packet := rtp.Packet{}
+	_, err := session.ReadRTP(make([]byte, 1500), &packet)
+	require.NoError(t, err)
+	assert.Nil(t, session.learnedRTPFrom.Load(), "demuxed video must not become the audio return source")
+	_, err = session.ReadRTP(make([]byte, 1500), &packet)
+	require.NoError(t, err)
+	assert.Equal(t, &mappedSource, session.learnedRTPFrom.Load())
+}
