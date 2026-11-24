@@ -209,7 +209,6 @@ func (cmd *ServeCmd) Run(cli *CLI) error {
 	// unconditionally — an empty list when unconfigured — and reachable
 	// without a session (it is on the JWT whitelist below).
 	var iceServerEntries []pkgapiiceservers.IceServerEntry
-	var sipICEServerURLs []string
 	if serverCfg != nil {
 		for _, e := range serverCfg.IceServers {
 			urls := pkgapiiceservers.ParseURLs(e.URLs)
@@ -217,7 +216,6 @@ func (cmd *ServeCmd) Run(cli *CLI) error {
 				URLs:          urls,
 				AllowedOrigin: e.AllowedOrigin,
 			})
-			sipICEServerURLs = append(sipICEServerURLs, urls...)
 		}
 	}
 	muxHandlerDyn.Handle("GET /api/iceServers", pkgapiiceservers.NewIceServersHandler(iceServerEntries))
@@ -225,7 +223,9 @@ func (cmd *ServeCmd) Run(cli *CLI) error {
 	// Both halves are constructed before the HTTP server accepts requests. The
 	// service owns user SIP calls/messages; the hub only provides bounded event
 	// delivery and never waits for SIP network operations on its own goroutine.
-	sipService := sipregistration.NewService(sipRegistrations, logger, sipregistration.WithICEServers(sipICEServerURLs))
+	// Frontend ICE entries are origin-scoped browser configuration, not a SIP
+	// fallback: SIP uses its default empty ICE list until it gains its own setting.
+	sipService := sipregistration.NewService(sipRegistrations, logger)
 	sipService.SetBridge(ssHandler)
 	ssHandler.SetSIPHandler(sipService)
 
