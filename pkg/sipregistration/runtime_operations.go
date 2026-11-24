@@ -105,9 +105,12 @@ func ownedFrom(credential Credential) *sip.FromHeader {
 	return from
 }
 
+const maxSIPInviteRedirects = 5
+
 // Invite creates an outbound dialog and sends only its INVITE. The caller owns
 // SDP/browser negotiation and must subsequently Ack, Hangup, and Close as
-// appropriate. On an INVITE failure the dialog and injected media are closed.
+// appropriate. Redirects reuse the same offer and media socket; only the old
+// SIP transaction is closed between attempts. Other failures close both.
 func (r *diagoRuntime) Invite(ctx context.Context, credential Credential, target sip.Uri, sess *media.MediaSession, onProgress func(code int)) (*diago.DialogClientSession, error) {
 	failBeforeDialog := func(err error) (*diago.DialogClientSession, error) {
 		if sess == nil {
@@ -127,26 +130,88 @@ func (r *diagoRuntime) Invite(ctx context.Context, credential Credential, target
 	if r.dg == nil {
 		return failBeforeDialog(ErrOffline)
 	}
-	dialog, err := r.dg.NewDialog(target, diago.NewDialogOptions{Transport: string(credential.Transport)})
-	if err != nil {
-		return failBeforeDialog(err)
-	}
-	dialog.InitMediaSession(sess, nil, nil)
-	dialog.InviteRequest.SetDestination(destination)
-	if err := dialog.Invite(operationCtx, diago.InviteClientOptions{
-		Username: credential.Username,
-		Password: credential.Password,
-		Headers:  []sip.Header{ownedFrom(credential)},
-		OnResponse: func(response *sip.Response) error {
-			if onProgress != nil && response.StatusCode >= 100 && response.StatusCode < 200 {
-				onProgress(response.StatusCode)
+
+	currentTarget := *target.Clone()
+	visited := map[string]bool{currentTarget.String(): true}
+	for redirects := 0; ; redirects++ {
+		dialog, err := r.dg.NewDialog(currentTarget, diago.NewDialogOptions{Transport: string(credential.Transport)})
+		if err != nil {
+			return failBeforeDialog(err)
+		}
+		dialog.InitMediaSession(sess, nil, nil)
+		dialog.InviteRequest.SetDestination(destination)
+		err = dialog.Invite(operationCtx, diago.InviteClientOptions{
+			Username: credential.Username,
+			Password: credential.Password,
+			Headers:  []sip.Header{ownedFrom(credential)},
+			OnResponse: func(response *sip.Response) error {
+				if onProgress != nil && response.StatusCode >= 100 && response.StatusCode < 200 {
+					onProgress(response.StatusCode)
+				}
+				return nil
+			},
+		})
+		if err == nil {
+			return dialog, nil
+		}
+
+		var response *sip.Response
+		var responseErr *sipgo.ErrDialogResponse
+		if errors.As(err, &responseErr) && responseErr != nil {
+			response = responseErr.Res
+		} else {
+			var valueErr sipgo.ErrDialogResponse
+			if errors.As(err, &valueErr) {
+				response = valueErr.Res
 			}
-			return nil
-		},
-	}); err != nil {
-		return nil, errors.Join(err, dialog.Close())
+		}
+		if response == nil || (response.StatusCode != 300 && response.StatusCode != sip.StatusMovedPermanently && response.StatusCode != sip.StatusMovedTemporarily) {
+			return nil, errors.Join(err, dialog.Close())
+		}
+		redirectTarget, redirectDestination, redirectErr := sipInviteRedirect(credential, response)
+		if redirectErr != nil {
+			return nil, errors.Join(err, redirectErr, dialog.Close())
+		}
+		if redirects >= maxSIPInviteRedirects {
+			return nil, errors.Join(err, fmt.Errorf("SIP INVITE exceeded %d redirects", maxSIPInviteRedirects), dialog.Close())
+		}
+		key := redirectTarget.String()
+		if visited[key] {
+			return nil, errors.Join(err, fmt.Errorf("SIP INVITE redirect loop at %s", key), dialog.Close())
+		}
+		visited[key] = true
+
+		// Dialog.Close would also close sess. The redirected INVITE needs the
+		// identical offer and socket, so dispose only of the failed SIP leg.
+		if closeErr := dialog.DialogClientSession.Close(); closeErr != nil {
+			var mediaCloseErr error
+			if sess != nil {
+				mediaCloseErr = sess.Close()
+			}
+			return nil, errors.Join(err, closeErr, mediaCloseErr)
+		}
+		currentTarget = redirectTarget
+		destination = redirectDestination
 	}
-	return dialog, nil
+}
+
+func sipInviteRedirect(credential Credential, response *sip.Response) (sip.Uri, string, error) {
+	if response == nil || (response.StatusCode != 300 && response.StatusCode != sip.StatusMovedPermanently && response.StatusCode != sip.StatusMovedTemporarily) {
+		return sip.Uri{}, "", errors.New("SIP INVITE response is not a supported redirect")
+	}
+	contact := response.Contact()
+	if contact == nil {
+		return sip.Uri{}, "", fmt.Errorf("SIP INVITE %d redirect has no Contact", response.StatusCode)
+	}
+	target, _, err := parseSIPTarget(credential, contact.Address.String())
+	if err != nil {
+		return sip.Uri{}, "", fmt.Errorf("invalid SIP INVITE redirect Contact: %w", err)
+	}
+	port := target.Port
+	if port == 0 {
+		port = defaultRegistrarPort(credential.Transport)
+	}
+	return target, net.JoinHostPort(strings.Trim(target.Host, "[]"), strconv.Itoa(port)), nil
 }
 
 // SendMessage sends one pager-mode MESSAGE through the account's pinned

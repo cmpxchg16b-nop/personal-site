@@ -1363,4 +1363,7 @@ func TestServiceMessageOverRealUDPUsesOwnedDigestAndInboundFanout(t *testing.T) 
 	if status := registrar.sendMessage(t, registration, "1001"); status != statusTemporarilyUnavailable {
 		t.Fatalf("inbound MESSAGE without browser status = %d, want 480", status)
 	}
+	if status := registrar.sendMessageToHost(t, registration, "1001", "192.168.10.201"); status != statusTemporarilyUnavailable {
+		t.Fatalf("inbound MESSAGE with PBX-rewritten To host status = %d, want 480 rather than 404", status)
+	}
 }

@@ -19,7 +19,9 @@ func inboundWireRequest(method sip.RequestMethod, recipient, via, callID string,
 		"Via: SIP/2.0/UDP %s\r\n"+
 		"Max-Forwards: 70\r\n"+
 		"From: <sip:caller@pbx.example>;tag=caller-tag\r\n"+
-		"To: <sip:1001@127.0.0.1>\r\n"+
+		// The PBX may rewrite To to the registered Contact host instead of the
+		// configured registrar host. Runtime + username must still route it.
+		"To: <sip:1001@192.168.10.201>\r\n"+
 		"Call-ID: %s\r\n"+
 		"CSeq: %d %s\r\n"+
 		"%s"+

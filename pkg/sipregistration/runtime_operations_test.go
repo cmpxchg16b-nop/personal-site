@@ -355,6 +355,107 @@ func TestDiagoRuntimeInviteDialogFailureClosesMediaOnce(t *testing.T) {
 	}
 }
 
+func TestDiagoRuntimeInviteFollowsRedirectAndReusesMedia(t *testing.T) {
+	serverCtx, stopServer := context.WithCancel(context.Background())
+	defer stopServer()
+
+	targetUA, err := sipgo.NewUA(sipgo.WithUserAgent("target"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer targetUA.Close()
+	target := diago.NewDiago(targetUA, diago.WithTransport(diago.Transport{Transport: "udp", BindHost: "127.0.0.1", BindPort: 0}))
+	answerErr := make(chan error, 1)
+	targetOffer := make(chan []byte, 1)
+	if err := target.ServeBackground(serverCtx, func(dialog *diago.DialogServerSession) {
+		targetOffer <- append([]byte(nil), dialog.InviteRequest.Body()...)
+		answerErr <- dialog.Answer()
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var targetPorts []int
+	waitFor(t, "target UDP listener", func() bool {
+		targetPorts = targetUA.TransportLayer().ListenPorts("udp")
+		return len(targetPorts) == 1
+	})
+
+	redirectUA, err := sipgo.NewUA(sipgo.WithUserAgent("redirect"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer redirectUA.Close()
+	redirect := diago.NewDiago(redirectUA, diago.WithTransport(diago.Transport{Transport: "udp", BindHost: "127.0.0.1", BindPort: 0}))
+	redirectErr := make(chan error, 1)
+	if err := redirect.ServeBackground(serverCtx, func(dialog *diago.DialogServerSession) {
+		contact := &sip.ContactHeader{Address: sip.Uri{Scheme: "sip", User: "2002", Host: "127.0.0.1", Port: targetPorts[0]}}
+		redirectErr <- dialog.Respond(sip.StatusMovedTemporarily, "Moved Temporarily", nil, contact)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var redirectPorts []int
+	waitFor(t, "redirect UDP listener", func() bool {
+		redirectPorts = redirectUA.TransportLayer().ListenPorts("udp")
+		return len(redirectPorts) == 1
+	})
+
+	manager := NewManager(slog.New(slog.DiscardHandler))
+	credential, err := normalizeInput(testInput(net.JoinHostPort("127.0.0.1", strconv.Itoa(redirectPorts[0])), "1001", true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtimeValue, err := newDiagoRuntime(credential, manager)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rt := runtimeValue.(*diagoRuntime)
+	t.Cleanup(func() { _ = rt.Close() })
+	targetURI, _, err := parseSIPTarget(credential, "2002")
+	if err != nil {
+		t.Fatal(err)
+	}
+	browserModel, err := parseBrowserSDP([]byte(serviceTestBrowserOffer))
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := newOutboundSIPMedia(net.ParseIP("127.0.0.1"), browserModel, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalOffer := append([]byte(nil), session.LocalSDP()...)
+	expectedMedia := "m=audio " + strconv.Itoa(session.Laddr.Port) + " RTP/AVP "
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	dialog, err := rt.Invite(ctx, credential, targetURI, session, nil)
+	if err != nil {
+		t.Fatalf("redirected INVITE: %v", err)
+	}
+	if dialog.InviteRequest.Recipient.Port != targetPorts[0] {
+		t.Fatalf("redirected Request-URI = %s, want target port %d", dialog.InviteRequest.Recipient.String(), targetPorts[0])
+	}
+	offer := <-targetOffer
+	if !strings.Contains(string(offer), expectedMedia) || !strings.Contains(string(offer), "c=IN IP4 127.0.0.1") {
+		t.Fatalf("redirected INVITE did not reuse media:\noriginal:\n%s\nredirected:\n%s", originalOffer, offer)
+	}
+	if _, err := negotiateInboundSelection([]byte(serviceTestBrowserOffer), offer); err != nil {
+		t.Fatalf("redirected offer cannot be negotiated by the browser callee: %v\nSDP:\n%s", err, offer)
+	}
+	if err := dialog.Ack(ctx); err != nil {
+		t.Fatalf("ACK redirected INVITE: %v", err)
+	}
+	if err := <-answerErr; err != nil {
+		t.Fatalf("target answer: %v", err)
+	}
+	if err := <-redirectErr; err != nil {
+		t.Fatalf("redirect response: %v", err)
+	}
+	if err := dialog.Close(); err != nil {
+		t.Fatalf("close redirected dialog: %v", err)
+	}
+	if err := session.StopRTP(1, 0); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("media socket was not owned by the successful redirected dialog: %v", err)
+	}
+}
+
 func TestStopOperationsCancelsOutboundMessage(t *testing.T) {
 	blackhole := newBlackholeUDP(t)
 	manager := NewManager(slog.New(slog.DiscardHandler))

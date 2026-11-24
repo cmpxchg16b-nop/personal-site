@@ -157,6 +157,10 @@ func (r *loopbackRegistrar) waitObservation(t *testing.T, kind string, after int
 }
 
 func (r *loopbackRegistrar) sendMessage(t *testing.T, registration registrarObservation, username string) int {
+	return r.sendMessageToHost(t, registration, username, "127.0.0.1")
+}
+
+func (r *loopbackRegistrar) sendMessageToHost(t *testing.T, registration registrarObservation, username, toHost string) int {
 	t.Helper()
 	contact, err := sipUriForLookup(registration.contact)
 	if err != nil {
@@ -168,7 +172,7 @@ func (r *loopbackRegistrar) sendMessage(t *testing.T, registration registrarObse
 	from := &sip.FromHeader{Address: sip.Uri{Scheme: "sip", User: "caller", Host: "pbx.example"}, Params: sip.NewParams()}
 	from.Params.Add("tag", sip.GenerateTagN(16))
 	request.AppendHeader(from)
-	request.AppendHeader(&sip.ToHeader{Address: sip.Uri{Scheme: "sip", User: username, Host: "127.0.0.1"}})
+	request.AppendHeader(&sip.ToHeader{Address: sip.Uri{Scheme: "sip", User: username, Host: toHost}})
 	contentType := sip.ContentTypeHeader("text/plain")
 	request.AppendHeader(&contentType)
 	request.SetBody([]byte("hello"))

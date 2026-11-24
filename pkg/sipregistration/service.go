@@ -584,6 +584,13 @@ func validOffer(description *webrtc.SessionDescription) bool {
 	return description != nil && description.Type == webrtc.SDPTypeOffer && description.SDP != "" && len(description.SDP) <= maxSIPSessionDescription && utf8.ValidString(description.SDP)
 }
 
+func audioCodecsForLog(model sdpModel) []rtpCodec {
+	if model.Audio == nil {
+		return nil
+	}
+	return model.Audio.Codecs
+}
+
 func (s *Service) newCall(ownerID ss.UserId, deliveryID string, credential Credential, runtime operationRuntime, revision uint64, id, direction, kind, remoteURI string) *serviceCall {
 	ctx, cancel := context.WithCancel(s.ctx)
 	call := &serviceCall{
@@ -1401,11 +1408,15 @@ func (s *Service) processAccept(call *serviceCall, deliveryID string, event *ss.
 		return
 	}
 	if !validOffer(event.SessionDesc) {
+		s.logger.Warn("reject inbound SIP accept", "call_id", call.id, "err", "invalid browser SDP offer")
 		s.rejectInboundAccept(call, deliveryID, "invalid browser SDP offer", 488)
 		return
 	}
 	selection, err := negotiateInboundSelection([]byte(event.SessionDesc.SDP), offer)
 	if err != nil {
+		browserModel, browserParseErr := parseBrowserSDP([]byte(event.SessionDesc.SDP))
+		sipModel, sipParseErr := parseSDP(offer)
+		s.logger.Warn("inbound SIP/browser media intersection failed", "call_id", call.id, "err", err, "browser_parse_err", browserParseErr, "sip_parse_err", sipParseErr, "browser_audio", audioCodecsForLog(browserModel), "sip_audio", audioCodecsForLog(sipModel))
 		s.rejectInboundAccept(call, deliveryID, "no common browser/SIP media", 488)
 		return
 	}
@@ -1488,6 +1499,7 @@ func (s *Service) runInboundAccept(call *serviceCall, deliveryID string, offer w
 	}
 	_, rtpSession, err := s.newInboundMedia(call.inDialog, call.runtime.MediaBindIP(), selection)
 	if err != nil {
+		s.logger.Warn("create inbound SIP media failed", "call_id", call.id, "err", err)
 		call.mu.Lock()
 		call.answerErr = err
 		close(call.answerDone)
@@ -1503,6 +1515,7 @@ func (s *Service) runInboundAccept(call *serviceCall, deliveryID string, offer w
 		s.addBrowserTrack(call, track)
 	})
 	if err != nil {
+		s.logger.Warn("create inbound browser media failed", "call_id", call.id, "err", err)
 		call.mu.Lock()
 		call.answerErr = err
 		close(call.answerDone)

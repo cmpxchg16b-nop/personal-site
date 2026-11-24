@@ -18,7 +18,7 @@ func (m *Manager) handleInboundInvite(dialog *diago.DialogServerSession) {
 // listener cannot ring browsers through a replacement credential generation.
 func (m *Manager) handleRuntimeInboundInvite(runtime *diagoRuntime, dialog *diago.DialogServerSession) {
 	request := dialog.InviteRequest
-	credential, matched := m.resolveInbound("INVITE", request)
+	credential, matched := m.resolveInboundForRuntime(runtime, "INVITE", request)
 	status := sip.StatusNotImplemented
 	phrase := "Not Implemented"
 	var service *Service
@@ -42,7 +42,7 @@ func (m *Manager) handleRuntimeInboundInvite(runtime *diagoRuntime, dialog *diag
 			phrase = "Not Implemented"
 		} else {
 			leased, operations, revision, live = m.leaseForRuntime(runtime)
-			if !live || leased.ID != credential.ID || leased.OwnerID != credential.OwnerID || leased.SIPURI != credential.SIPURI || leased.SIPURI != inboundAOR(request) {
+			if !live || leased.ID != credential.ID || leased.OwnerID != credential.OwnerID || leased.SIPURI != credential.SIPURI || leased.Username != inboundUsername(request) {
 				status = statusTemporarilyUnavailable
 				phrase = "Temporarily Unavailable"
 			} else {
@@ -63,7 +63,7 @@ func (m *Manager) handleInboundMessage(request *sip.Request, transaction sip.Ser
 }
 
 func (m *Manager) handleRuntimeInboundMessage(runtime *diagoRuntime, request *sip.Request, transaction sip.ServerTransaction) error {
-	credential, matched := m.resolveInbound("MESSAGE", request)
+	credential, matched := m.resolveInboundForRuntime(runtime, "MESSAGE", request)
 	status := sip.StatusNotImplemented
 	phrase := "Not Implemented"
 	var headers []sip.Header
@@ -82,7 +82,7 @@ func (m *Manager) handleRuntimeInboundMessage(runtime *diagoRuntime, request *si
 			phrase = "Not Implemented"
 		} else {
 			leased, _, _, live := m.leaseForRuntime(runtime)
-			if !live || leased.ID != credential.ID || leased.OwnerID != credential.OwnerID || leased.SIPURI != credential.SIPURI || leased.SIPURI != inboundAOR(request) {
+			if !live || leased.ID != credential.ID || leased.OwnerID != credential.OwnerID || leased.SIPURI != credential.SIPURI || leased.Username != inboundUsername(request) {
 				status = statusTemporarilyUnavailable
 				phrase = "Temporarily Unavailable"
 			} else {
@@ -112,8 +112,42 @@ func (m *Manager) resolveInbound(method string, request *sip.Request) (Credentia
 	return credential, true
 }
 
+// resolveInboundForRuntime binds an inbound request to the account that owns
+// the receiving listener. PBXs commonly rewrite the To host to the registered
+// Contact host, so only the SIP user is compared here; the exact runtime pointer
+// still prevents a stale listener or another registrar account from matching.
+func (m *Manager) resolveInboundForRuntime(runtime *diagoRuntime, method string, request *sip.Request) (Credential, bool) {
+	if runtime == nil {
+		return m.resolveInbound(method, request)
+	}
+	m.mu.RLock()
+	var credential Credential
+	matchedRuntime := false
+	for _, current := range m.entries {
+		if current.runtime == runtime {
+			credential = cloneCredential(current.credential)
+			matchedRuntime = true
+			break
+		}
+	}
+	m.mu.RUnlock()
+	if !matchedRuntime || credential.Username != inboundUsername(request) {
+		m.logger.Warn("unmatched inbound SIP signaling for runtime", "method", method, "aor", inboundAOR(request), "configured_aor", credential.SIPURI, "request_uri", request.Recipient.String(), "source", request.Source())
+		return Credential{}, false
+	}
+	m.logger.Info("inbound SIP signaling resolved to user", "method", method, "aor", inboundAOR(request), "configured_aor", credential.SIPURI, "user_id", credential.OwnerID, "credential_id", credential.ID, "enabled", credential.Enabled, "registration_state", credential.Registration.State, "source", request.Source())
+	return credential, true
+}
+
+func inboundUsername(request *sip.Request) string {
+	if request == nil || request.To() == nil {
+		return ""
+	}
+	return request.To().Address.User
+}
+
 func inboundAOR(request *sip.Request) string {
-	if request == nil || request.To() == nil || request.To().Address.User == "" || request.To().Address.Host == "" {
+	if inboundUsername(request) == "" || request.To().Address.Host == "" {
 		return ""
 	}
 	return canonicalAOR(request.To().Address.User, request.To().Address.Host)
