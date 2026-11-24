@@ -126,7 +126,7 @@ export default function PhonePanel({
   const [query, setQuery] = useState("");
   const [credentialChoice, setCredentialChoice] = useState("");
   const [dialTarget, setDialTarget] = useState("");
-  const [dialKind, setDialKind] = useState<"voice" | "video">("voice");
+  const [dialKind, setDialKind] = useState<"voice" | "video" | "text">("voice");
 
   const eligible = useMemo(
     () => eligibleSipCredentials(credentialsQuery.data),
@@ -195,8 +195,10 @@ export default function PhonePanel({
       return;
     }
     const target = dialTarget.trim();
-    void sip.dial({ credentialId, target, kind: dialKind });
-    // Dial confirmation opens chat immediately, before the peer answers.
+    if (dialKind !== "text") {
+      void sip.dial({ credentialId, target, kind: dialKind });
+    }
+    // Call confirmation opens chat immediately. Text has no INVITE to answer.
     onOpenExternalConversation({ credentialId, target });
     closeDialog();
   };
@@ -484,13 +486,14 @@ export default function PhonePanel({
               label={t("chat.externalSip.callKind")}
               value={dialKind}
               onChange={(event) =>
-                setDialKind(event.target.value as "voice" | "video")
+                setDialKind(event.target.value as "voice" | "video" | "text")
               }
             >
               <MenuItem value="voice">{t("chat.externalSip.voice")}</MenuItem>
               <MenuItem value="video">
                 {t("chat.externalSip.audioVideo")}
               </MenuItem>
+              <MenuItem value="text">{t("chat.externalSip.text")}</MenuItem>
             </TextField>
           </DialogContent>
           <DialogActions sx={{ px: 3, pb: 2 }}>

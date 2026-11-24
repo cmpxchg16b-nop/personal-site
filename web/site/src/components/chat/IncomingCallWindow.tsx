@@ -6,7 +6,7 @@
 // sidebar and the conversation only display call state). Drag it by its
 // header strip; the buttons are never drag starts.
 
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { PointerEvent as ReactPointerEvent } from "react";
 import { Avatar, Box, IconButton, Paper, Typography } from "@mui/material";
 import CallIcon from "@mui/icons-material/Call";
@@ -17,6 +17,7 @@ import { useTranslation } from "react-i18next";
 import type { ChatUser } from "@/api/ss/types";
 import type { ExternalSIPCall } from "@/api/ss/sip";
 import UserAvatar from "./UserAvatar";
+import { showBrowserNotification } from "./browserNotification";
 import type { ActivePhoneCall } from "./types";
 
 type IncomingCall = ActivePhoneCall | ExternalSIPCall;
@@ -63,11 +64,37 @@ export function IncomingCallWindow<T extends IncomingCall>({
     e.currentTarget.releasePointerCapture(e.pointerId);
   };
 
-  if (call === null) return null;
   const fallbackName =
-    "state" in call
-      ? (call.remoteUri ?? call.target ?? call.callId)
-      : call.ref.userId;
+    call === null
+      ? ""
+      : "state" in call
+        ? (call.remoteUri ?? call.target ?? call.callId)
+        : call.ref.userId;
+  const callerName = caller?.name ?? fallbackName;
+  const incomingText =
+    call === null
+      ? ""
+      : t(
+          call.kind === "video"
+            ? "chat.call.incomingVideo"
+            : "chat.call.incoming",
+        );
+  const callId = call?.callId ?? null;
+  const notificationTag =
+    call === null
+      ? ""
+      : `chat:incoming-call:${"state" in call ? "sip" : "webrtc"}:${call.callId}`;
+
+  useEffect(() => {
+    if (callId === null) return;
+    return showBrowserNotification(callerName, {
+      body: incomingText,
+      tag: notificationTag,
+      requireInteraction: true,
+    });
+  }, [callId, callerName, incomingText, notificationTag]);
+
+  if (call === null) return null;
 
   return (
     <Paper
@@ -117,14 +144,10 @@ export function IncomingCallWindow<T extends IncomingCall>({
           <Avatar sx={{ width: 48, height: 48 }} />
         )}
         <Typography variant="subtitle2" noWrap>
-          {caller?.name ?? fallbackName}
+          {callerName}
         </Typography>
         <Typography variant="caption" color="text.secondary">
-          {t(
-            call.kind === "video"
-              ? "chat.call.incomingVideo"
-              : "chat.call.incoming",
-          )}
+          {incomingText}
         </Typography>
         <Box sx={{ display: "flex", gap: 3, mt: 0.5 }}>
           <IconButton
