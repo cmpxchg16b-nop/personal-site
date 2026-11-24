@@ -21,6 +21,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { AudioGraph } from "@/api/audio/audiograph";
+import { dialerForSender, type DialerHandle } from "@/api/dtmf";
 import type { PeerSessions } from "@/api/ss/peersessions";
 import type { ChannelId, SubscriberId } from "@/api/ss/types";
 import type { ActivePhoneCall } from "./types";
@@ -28,17 +29,6 @@ import type { ActivePhoneCall } from "./types";
 // callKey indexes one call's media attachments by its pair.
 function callKey(channelId: ChannelId, peer: SubscriberId): string {
   return `${channelId}:${peer}`;
-}
-
-// DialerHandle is one pair's DTMF sender as the dial pad sees it.
-export interface DialerHandle {
-  /**
-   * Queues one digit (0-9, *, #) as an RFC 4733 telephone-event on the
-   * call's audio sender. A no-op while the sender cannot insert tones
-   * (not connected yet, held): canInsertDTMF is the live gate, checked
-   * at press time, not render time.
-   */
-  insert: (digit: string) => void;
 }
 
 export interface UseCallMediaResult {
@@ -364,29 +354,12 @@ export function useCallMedia(
   const dtmfFor = useCallback(
     (channelId: ChannelId, peer: SubscriberId): DialerHandle | null => {
       const key = callKey(channelId, peer);
-      const retained = sendersRef.current.get(key);
-      const sender =
-        retained === undefined
+      return dialerForSender(() => {
+        const retained = sendersRef.current.get(key);
+        return retained === undefined
           ? null
           : sessions.resolveSender(channelId, peer, retained);
-      if (sender?.dtmf == null) return null;
-      const negotiated = sender
-        .getParameters()
-        .codecs.some(
-          (c) => c.mimeType.toLowerCase() === "audio/telephone-event",
-        );
-      if (!negotiated) return null;
-      return {
-        insert: (digit: string) => {
-          const retained = sendersRef.current.get(key);
-          const live =
-            retained === undefined
-              ? null
-              : sessions.resolveSender(channelId, peer, retained);
-          if (live?.dtmf?.canInsertDTMF !== true) return;
-          live.dtmf.insertDTMF(digit);
-        },
-      };
+      });
     },
     [sessions],
   );

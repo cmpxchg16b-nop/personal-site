@@ -91,6 +91,14 @@ class MockTransport {
 
 class MockSender {
   track: MediaStreamTrack | null = null;
+  dtmf: {
+    canInsertDTMF: boolean;
+    insertDTMF: ReturnType<typeof vi.fn>;
+  } | null = null;
+  codecs: RTCRtpCodecParameters[] = [];
+  readonly getParameters = vi.fn(
+    () => ({ codecs: this.codecs }) as RTCRtpParameters,
+  );
   readonly replaceTrack = vi.fn(async (track: MediaStreamTrack | null) => {
     this.track = track;
   });
@@ -800,6 +808,78 @@ describe("external SIP protocol and media", () => {
     expect(audio.acquireLocalInput).toHaveBeenCalledOnce();
     expect(pc.sender("audio").replaceTrack).toHaveBeenCalledWith(microphone);
     expect(pc.transceivers.map(({ kind }) => kind)).toEqual(["audio"]);
+  });
+
+  it("requires DTMF support and negotiated telephone-event for a dialer", async () => {
+    const { client } = setup();
+    await client.dial({
+      credentialId: "credential-1",
+      target: "1234",
+      kind: "voice",
+    });
+    const sender = MockPeerConnection.instances[0]?.sender("audio");
+    if (sender === undefined) throw new Error("missing peer connection");
+
+    await client.handleEvent(
+      serverCall({
+        callId: "uuid-1",
+        state: "accepted",
+        sessionDesc: { type: "answer", sdp: "answer" },
+      }),
+    );
+    await flushMicrotasks();
+
+    expect(client.dtmfFor("uuid-1")).toBeNull();
+    sender.dtmf = { canInsertDTMF: true, insertDTMF: vi.fn() };
+    expect(client.dtmfFor("uuid-1")).toBeNull();
+    sender.codecs = [{ mimeType: "audio/opus" } as RTCRtpCodecParameters];
+    expect(client.dtmfFor("uuid-1")).toBeNull();
+    sender.codecs = [
+      { mimeType: "audio/telephone-event" } as RTCRtpCodecParameters,
+    ];
+    expect(client.dtmfFor("uuid-1")).not.toBeNull();
+  });
+
+  it("checks canInsertDTMF at press time and invalidates dialers on cleanup", async () => {
+    const { client } = setup();
+    await client.dial({
+      credentialId: "credential-1",
+      target: "1234",
+      kind: "voice",
+    });
+    const pc = MockPeerConnection.instances[0];
+    const sender = pc.sender("audio");
+    const insertDTMF = vi.fn();
+    sender.dtmf = { canInsertDTMF: true, insertDTMF };
+    sender.codecs = [
+      { mimeType: "audio/telephone-event" } as RTCRtpCodecParameters,
+    ];
+    expect(client.dtmfFor("uuid-1")).toBeNull();
+
+    await client.handleEvent(
+      serverCall({
+        callId: "uuid-1",
+        state: "accepted",
+        sessionDesc: { type: "answer", sdp: "answer" },
+      }),
+    );
+    await flushMicrotasks();
+    const dialer = client.dtmfFor("uuid-1");
+    if (dialer === null) throw new Error("missing negotiated dialer");
+
+    sender.dtmf.canInsertDTMF = false;
+    dialer.insert("1");
+    expect(insertDTMF).not.toHaveBeenCalled();
+    sender.dtmf.canInsertDTMF = true;
+    dialer.insert("2");
+    expect(insertDTMF).toHaveBeenCalledOnce();
+    expect(insertDTMF).toHaveBeenCalledWith("2");
+
+    await client.handleEvent(serverCall({ callId: "uuid-1", state: "ended" }));
+    expect(client.dtmfFor("uuid-1")).toBeNull();
+    dialer.insert("3");
+    expect(insertDTMF).toHaveBeenCalledOnce();
+    expect(pc.close).toHaveBeenCalledOnce();
   });
 
   it("turns a pre-answer media transport failure into a cancel and retained failure", async () => {

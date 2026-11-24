@@ -32,11 +32,12 @@ type rtpCodec struct {
 }
 
 type mediaSection struct {
-	Kind         string
-	Port         int
-	Protocol     string
-	Codecs       []rtpCodec
-	ConnectionIP net.IP
+	Kind            string
+	Port            int
+	Protocol        string
+	Codecs          []rtpCodec
+	TelephoneEvents []rtpCodec
+	ConnectionIP    net.IP
 
 	// Formats preserves the m-line for an answer that must reject the section.
 	// Direction is the media direction after inheriting the session default.
@@ -62,6 +63,7 @@ type codecPair struct {
 type negotiatedSelection struct {
 	Audio              []codecPair
 	Video              []codecPair
+	DTMF               *codecPair
 	SIPAudio           *mediaSection
 	SIPVideo           *mediaSection
 	RejectVideoFormats []string
@@ -227,13 +229,23 @@ func parseMediaSectionWithProfile(description *pionsdp.MediaDescription, kind st
 		if !ok {
 			codec, ok = staticRTPCodec(kind, payloadType)
 		}
-		if !ok || nonPrimaryRTPCodec(codec.Name) {
+		if !ok {
 			continue
 		}
 		codec.PayloadType = payloadType
 		codec.Fmtp = strings.TrimSpace(fmtpLines[payloadType])
 		if codec.Channels == 0 && kind == "audio" {
 			codec.Channels = 1
+		}
+		if kind == "audio" && isTelephoneEvent(codec.Name) {
+			section.TelephoneEvents = append(section.TelephoneEvents, codec)
+			if len(section.TelephoneEvents) > maxSDPCodecsPerMedia {
+				return nil, fmt.Errorf("audio media has too many telephone-event codecs")
+			}
+			continue
+		}
+		if nonPrimaryRTPCodec(codec.Name) {
+			continue
 		}
 		section.Codecs = append(section.Codecs, codec)
 		if len(section.Codecs) > maxSDPCodecsPerMedia {
@@ -327,6 +339,10 @@ func staticRTPCodec(kind string, payloadType uint8) (rtpCodec, bool) {
 	}
 }
 
+func isTelephoneEvent(name string) bool {
+	return strings.EqualFold(strings.TrimSpace(name), "telephone-event")
+}
+
 func nonPrimaryRTPCodec(name string) bool {
 	switch strings.ToLower(strings.TrimSpace(name)) {
 	case "telephone-event", "cn", "comfort-noise",
@@ -388,6 +404,7 @@ func cloneMediaSection(section *mediaSection) *mediaSection {
 	}
 	cloned := *section
 	cloned.Codecs = append([]rtpCodec(nil), section.Codecs...)
+	cloned.TelephoneEvents = append([]rtpCodec(nil), section.TelephoneEvents...)
 	cloned.ConnectionIP = cloneIP(section.ConnectionIP)
 	cloned.Formats = append([]string(nil), section.Formats...)
 	return &cloned
@@ -419,6 +436,20 @@ func intersectCodecsForKind(kind string, browser, sip []rtpCodec) []codecPair {
 		}
 	}
 	return pairs
+}
+
+// intersectTelephoneEvents selects the browser-preferred RFC 4733 capability
+// shared by the two audio sections. It is separate from primary-codec matching:
+// telephone-event rides the audio RTP stream but is never decoded as audio.
+func intersectTelephoneEvents(browser, sip []rtpCodec) *codecPair {
+	for _, browserCodec := range browser {
+		for _, sipCodec := range sip {
+			if rtpCodecsCompatible("audio", browserCodec, sipCodec) {
+				return &codecPair{Browser: browserCodec, SIP: sipCodec}
+			}
+		}
+	}
+	return nil
 }
 
 func rtpCodecsCompatible(kind string, a, b rtpCodec) bool {
@@ -564,6 +595,12 @@ func pinNegotiatedSelection(selection negotiatedSelection) (negotiatedSelection,
 	if len(selection.Video) > 1 {
 		selection.Video = selection.Video[:1]
 	}
+	if selection.DTMF != nil && len(selection.Video) == 1 && selection.DTMF.SIP.PayloadType == selection.Video[0].SIP.PayloadType {
+		// DTMF must not make an otherwise usable video call fail shared-socket
+		// demux. Drop only the optional helper; primary codec collisions remain
+		// the relay setup errors they were before DTMF support.
+		selection.DTMF = nil
+	}
 	if selection.SIPAudio == nil || selection.SIPAudio.Port == 0 || selection.SIPAudio.ConnectionIP == nil {
 		return negotiatedSelection{}, errors.New("selected SIP audio has no remote RTP address")
 	}
@@ -582,6 +619,7 @@ func negotiateSDPModels(browser, sip sdpModel) (negotiatedSelection, error) {
 	if len(selection.Audio) == 0 {
 		return negotiatedSelection{}, errNoCommonAudio
 	}
+	selection.DTMF = intersectTelephoneEvents(browser.Audio.TelephoneEvents, sip.Audio.TelephoneEvents)
 
 	if activeMedia(browser.Video) && activeMedia(sip.Video) {
 		selection.Video = intersectCodecsForKind("video", browser.Video.Codecs, sip.Video.Codecs)
@@ -653,9 +691,9 @@ func (s negotiatedSelection) sipCodecs() (audio, video []rtpCodec) {
 }
 
 // generateSIPSDP emits a sendrecv plaintext RTP/AVP offer using exactly the
-// supplied primary codec descriptions. A non-nil rejectVideoFormats emits a
-// port-0 video m-line; nil omits video entirely. No comfort-noise,
-// telephone-event, repair, or preferred codec is inserted.
+// supplied codec descriptions. A non-nil rejectVideoFormats emits a port-0
+// video m-line; nil omits video entirely. Audio telephone-event is emitted only
+// when explicitly supplied; comfort-noise, repair, and preferred codecs are not.
 func generateSIPSDP(bindIP net.IP, rtpPort int, audio, video []rtpCodec, rejectVideoFormats []string) []byte {
 	return generateSIPSDPWithDirections(bindIP, rtpPort, audio, video, rejectVideoFormats, "sendrecv", "sendrecv")
 }
@@ -691,7 +729,8 @@ func generateSDPMediaSectionWithDirection(kind string, port int, codecs []rtpCod
 	attributes := make([]string, 0, len(codecs)*2+1)
 	for _, original := range codecs {
 		codec := normalizeRTPCodec(original, kind)
-		if nonPrimaryRTPCodec(codec.Name) || codec.Name == "" || codec.ClockRate == 0 {
+		isAudioDTMF := kind == "audio" && isTelephoneEvent(codec.Name)
+		if (nonPrimaryRTPCodec(codec.Name) && !isAudioDTMF) || codec.Name == "" || codec.ClockRate == 0 {
 			continue
 		}
 		payloadType := strconv.Itoa(int(codec.PayloadType))

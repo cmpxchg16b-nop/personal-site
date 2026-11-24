@@ -65,6 +65,10 @@ func TestSDPParseDynamicCodecsAndMediaOverrides(t *testing.T) {
 	if !reflect.DeepEqual(model.Audio.Codecs, wantAudio) {
 		t.Fatalf("audio codecs = %#v, want %#v", model.Audio.Codecs, wantAudio)
 	}
+	wantDTMF := []rtpCodec{{PayloadType: 101, Name: "telephone-event", ClockRate: 8000, Channels: 1, Fmtp: "0-16"}}
+	if !reflect.DeepEqual(model.Audio.TelephoneEvents, wantDTMF) {
+		t.Fatalf("audio telephone-events = %#v, want %#v", model.Audio.TelephoneEvents, wantDTMF)
+	}
 	if model.Video.Direction != "sendonly" || !model.Video.ConnectionIP.Equal(net.ParseIP("192.0.2.10")) {
 		t.Fatalf("video inheritance = %+v", model.Video)
 	}
@@ -314,7 +318,7 @@ func TestRTPCodecConversionsDoNotRestrictVocabulary(t *testing.T) {
 	}
 }
 
-func TestGenerateSIPSDPRoundTripWithoutHelperInjection(t *testing.T) {
+func TestGenerateSIPSDPRoundTripWithExplicitTelephoneEvent(t *testing.T) {
 	audio := []rtpCodec{
 		{PayloadType: 111, Name: "opus", ClockRate: 48000, Channels: 2, Fmtp: "useinbandfec=1;stereo=1"},
 		{PayloadType: 0, Name: "PCMU", ClockRate: 8000, Channels: 1},
@@ -328,7 +332,7 @@ func TestGenerateSIPSDPRoundTripWithoutHelperInjection(t *testing.T) {
 	}
 	raw := generateSIPSDP(net.ParseIP("198.51.100.30"), 4100, audio, video, nil)
 	text := string(raw)
-	for _, forbidden := range []string{"telephone-event", "rtx", "comfort-noise", "CN/"} {
+	for _, forbidden := range []string{"rtx", "comfort-noise", "CN/"} {
 		if strings.Contains(strings.ToLower(text), strings.ToLower(forbidden)) {
 			t.Fatalf("generated SDP contains helper %q:\n%s", forbidden, text)
 		}
@@ -346,6 +350,9 @@ func TestGenerateSIPSDPRoundTripWithoutHelperInjection(t *testing.T) {
 	}
 	if !reflect.DeepEqual(model.Audio.Codecs, audio[:3]) {
 		t.Fatalf("round-trip audio = %#v, want %#v", model.Audio.Codecs, audio[:3])
+	}
+	if !reflect.DeepEqual(model.Audio.TelephoneEvents, audio[3:]) || strings.Count(text, "telephone-event") != 1 {
+		t.Fatalf("round-trip telephone-event = %#v, want %#v\n%s", model.Audio.TelephoneEvents, audio[3:], text)
 	}
 	if !reflect.DeepEqual(model.Video.Codecs, video[:2]) {
 		t.Fatalf("round-trip video = %#v, want %#v", model.Video.Codecs, video[:2])
@@ -485,6 +492,10 @@ func TestParseBrowserSDPAcceptsWebRTCProfileAndIgnoresTransportAttributes(t *tes
 	if !reflect.DeepEqual(model.Audio.Codecs, wantAudio) {
 		t.Fatalf("browser audio codecs = %#v, want %#v", model.Audio.Codecs, wantAudio)
 	}
+	wantDTMF := []rtpCodec{{PayloadType: 101, Name: "telephone-event", ClockRate: 8000, Channels: 1, Fmtp: "0-16"}}
+	if !reflect.DeepEqual(model.Audio.TelephoneEvents, wantDTMF) {
+		t.Fatalf("browser telephone-events = %#v, want %#v", model.Audio.TelephoneEvents, wantDTMF)
+	}
 	wantVideo := []rtpCodec{
 		{PayloadType: 96, Name: "VP8", ClockRate: 90000},
 		{PayloadType: 102, Name: "H264", ClockRate: 90000, Fmtp: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f"},
@@ -531,6 +542,9 @@ func TestNegotiateRawSelectionsPinBrowserPreferenceAndSIPAddresses(t *testing.T)
 			if audio.Browser.PayloadType != 111 || audio.SIP.PayloadType != 96 {
 				t.Fatalf("audio pair = %+v", audio)
 			}
+			if selection.DTMF == nil || selection.DTMF.Browser.PayloadType != 101 || selection.DTMF.SIP.PayloadType != 101 {
+				t.Fatalf("DTMF pair = %+v", selection.DTMF)
+			}
 			video := selection.Video[0]
 			if video.Browser.PayloadType != 96 || video.Browser.Name != "VP8" || video.SIP.PayloadType != 98 {
 				t.Fatalf("video pair = %+v", video)
@@ -542,6 +556,35 @@ func TestNegotiateRawSelectionsPinBrowserPreferenceAndSIPAddresses(t *testing.T)
 				t.Fatalf("SIP video address = %+v", selection.SIPVideo)
 			}
 		})
+	}
+}
+
+func TestNegotiateTelephoneEventUsesSeparateDynamicPTAndAllowsAbsence(t *testing.T) {
+	browserAudio := rtpCodec{PayloadType: 111, Name: "opus", ClockRate: 48000, Channels: 2}
+	sipAudio := rtpCodec{PayloadType: 96, Name: "opus", ClockRate: 48000, Channels: 2}
+	browser := sdpModel{Audio: &mediaSection{
+		Kind: "audio", Port: 9, Codecs: []rtpCodec{browserAudio},
+		TelephoneEvents: []rtpCodec{{PayloadType: 126, Name: "telephone-event", ClockRate: 8000, Channels: 1, Fmtp: "0-16"}},
+	}}
+	sip := sdpModel{Audio: &mediaSection{
+		Kind: "audio", Port: 4000, Codecs: []rtpCodec{sipAudio},
+		TelephoneEvents: []rtpCodec{{PayloadType: 120, Name: "telephone-event", ClockRate: 8000, Channels: 1, Fmtp: "0-15"}},
+	}}
+	selection, err := negotiateSDPModels(browser, sip)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if selection.DTMF == nil || selection.DTMF.Browser.PayloadType != 126 || selection.DTMF.SIP.PayloadType != 120 {
+		t.Fatalf("dynamic DTMF pair = %+v", selection.DTMF)
+	}
+
+	sip.Audio.TelephoneEvents = nil
+	selection, err = negotiateSDPModels(browser, sip)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if selection.DTMF != nil {
+		t.Fatalf("DTMF negotiated without a SIP capability: %+v", selection.DTMF)
 	}
 }
 

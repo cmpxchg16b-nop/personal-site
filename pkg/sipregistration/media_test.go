@@ -17,6 +17,7 @@ import (
 	"github.com/emiago/diago/media"
 	"github.com/emiago/sipgo"
 	"github.com/emiago/sipgo/sip"
+	"github.com/pion/interceptor"
 	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v4"
 )
@@ -37,6 +38,7 @@ func TestNewOutboundSIPMediaUsesActualBrowserCodecs(t *testing.T) {
 		Audio: &mediaSection{Kind: "audio", Port: 9, Codecs: []rtpCodec{
 			{PayloadType: 111, Name: "opus", ClockRate: 48000, Channels: 2, Fmtp: "minptime=10;useinbandfec=1"},
 			{PayloadType: 0, Name: "PCMU", ClockRate: 8000, Channels: 1},
+		}, TelephoneEvents: []rtpCodec{
 			{PayloadType: 101, Name: "telephone-event", ClockRate: 8000, Channels: 1},
 		}},
 		Video: &mediaSection{Kind: "video", Port: 9, Codecs: []rtpCodec{
@@ -59,17 +61,42 @@ func TestNewOutboundSIPMediaUsesActualBrowserCodecs(t *testing.T) {
 	if model.Audio.Direction != "sendrecv" || model.Video.Direction != "sendrecv" {
 		t.Fatalf("outbound offer directions = %q, %q", model.Audio.Direction, model.Video.Direction)
 	}
-	if !reflect.DeepEqual(model.Audio.Codecs, browser.Audio.Codecs[:2]) || !reflect.DeepEqual(model.Video.Codecs, browser.Video.Codecs[:1]) {
+	if !reflect.DeepEqual(model.Audio.Codecs, browser.Audio.Codecs) || !reflect.DeepEqual(model.Video.Codecs, browser.Video.Codecs[:1]) {
 		t.Fatalf("outbound codecs = %#v, %#v", model.Audio.Codecs, model.Video.Codecs)
 	}
-	if strings.Contains(strings.ToLower(string(session.LocalSDP())), "telephone-event") || strings.Contains(strings.ToLower(string(session.LocalSDP())), "rtx") {
-		t.Fatalf("helper codec injected into outbound SDP:\n%s", session.LocalSDP())
+	if !reflect.DeepEqual(model.Audio.TelephoneEvents, browser.Audio.TelephoneEvents) || strings.Contains(strings.ToLower(string(session.LocalSDP())), "rtx") {
+		t.Fatalf("outbound DTMF/helper codecs are wrong:\n%s", session.LocalSDP())
 	}
-	if len(session.Codecs) != 3 || session.Codecs[0].Fmtp != browser.Audio.Codecs[0].Fmtp {
+	if len(session.Codecs) != 4 || session.Codecs[0].Fmtp != browser.Audio.Codecs[0].Fmtp {
 		t.Fatalf("diago codecs were not retained: %+v", session.Codecs)
 	}
 	if _, err := newOutboundSIPMedia(net.ParseIP("127.0.0.1"), sdpModel{}, false); !errors.Is(err, errNoCommonAudio) {
 		t.Fatalf("missing browser audio error = %v", err)
+	}
+}
+
+func TestNewOutboundSIPMediaOmitsDTMFOnVideoPayloadTypeCollision(t *testing.T) {
+	browser := sdpModel{
+		Audio: &mediaSection{
+			Kind: "audio", Port: 9,
+			Codecs:          []rtpCodec{{PayloadType: 0, Name: "PCMU", ClockRate: 8000, Channels: 1}},
+			TelephoneEvents: []rtpCodec{{PayloadType: 101, Name: "telephone-event", ClockRate: 8000, Channels: 1}},
+		},
+		Video: &mediaSection{Kind: "video", Port: 9, Codecs: []rtpCodec{
+			{PayloadType: 101, Name: "VP8", ClockRate: 90000},
+		}},
+	}
+	session, err := newOutboundSIPMedia(net.ParseIP("127.0.0.1"), browser, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = session.Close() })
+	offer, err := parseSDP(session.LocalSDP())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(offer.Audio.TelephoneEvents) != 0 || len(offer.Video.Codecs) != 1 || offer.Video.Codecs[0].PayloadType != 101 {
+		t.Fatalf("optional DTMF displaced video:\n%s", session.LocalSDP())
 	}
 }
 
@@ -165,11 +192,15 @@ func TestNewOutboundSIPMediaBoundsLargeChromeCapabilitiesForUDPMTU(t *testing.T)
 	if !reflect.DeepEqual(offer.Video.Codecs, wantVideo) {
 		t.Fatalf("bounded video = %#v, want %#v", offer.Video.Codecs, wantVideo)
 	}
-	if len(session.Codecs) != maxSIPOfferAudioCodecs+maxSIPOfferVideoCodecs {
-		t.Fatalf("diago codec table was not bounded: %+v", session.Codecs)
+	if len(session.Codecs) != maxSIPOfferAudioCodecs+maxSIPOfferVideoCodecs+1 {
+		t.Fatalf("diago codec table was not bounded with DTMF: %+v", session.Codecs)
+	}
+	wantDTMF := []rtpCodec{{PayloadType: 101, Name: "telephone-event", ClockRate: 8000, Channels: 1, Fmtp: "0-16"}}
+	if !reflect.DeepEqual(offer.Audio.TelephoneEvents, wantDTMF) {
+		t.Fatalf("bounded offer DTMF = %#v, want %#v", offer.Audio.TelephoneEvents, wantDTMF)
 	}
 	lowerSDP := strings.ToLower(string(localSDP))
-	for _, forbidden := range []string{"telephone-event", "cn/", "rtx", "red/", "ulpfec", "flexfec", "vp9", "av1", "h265", "g729"} {
+	for _, forbidden := range []string{"cn/", "rtx", "red/", "ulpfec", "flexfec", "vp9", "av1", "h265", "g729"} {
 		if strings.Contains(lowerSDP, forbidden) {
 			t.Fatalf("bounded offer contains excluded capability %q:\n%s", forbidden, localSDP)
 		}
@@ -179,7 +210,9 @@ func TestNewOutboundSIPMediaBoundsLargeChromeCapabilitiesForUDPMTU(t *testing.T)
 
 func TestNewInboundSIPMediaPinsSelectedAnswerAndCleansDialog(t *testing.T) {
 	browserOffer := testSDP(
-		"m=audio 9 UDP/TLS/RTP/SAVPF 0",
+		"m=audio 9 UDP/TLS/RTP/SAVPF 0 101",
+		"a=rtpmap:101 telephone-event/8000",
+		"a=fmtp:101 0-16",
 		"m=video 9 UDP/TLS/RTP/SAVPF 96",
 		"a=rtpmap:96 VP8/90000",
 	)
@@ -228,14 +261,63 @@ func TestNewInboundSIPMediaPinsSelectedAnswerAndCleansDialog(t *testing.T) {
 	if answer.Video == nil || answer.Video.Port != 0 || !reflect.DeepEqual(answer.Video.Formats, []string{"97"}) {
 		t.Fatalf("pinned video rejection = %+v\n%s", answer.Video, session.LocalSDP())
 	}
-	if strings.Contains(strings.ToLower(string(session.LocalSDP())), "telephone-event") {
-		t.Fatalf("telephone-event injected into answer:\n%s", session.LocalSDP())
+	wantDTMF := []rtpCodec{{PayloadType: 101, Name: "telephone-event", ClockRate: 8000, Channels: 1}}
+	if !reflect.DeepEqual(answer.Audio.TelephoneEvents, wantDTMF) {
+		t.Fatalf("selected inbound DTMF = %#v, want %#v\n%s", answer.Audio.TelephoneEvents, wantDTMF, session.LocalSDP())
 	}
 	if err := dialog.DialogMedia.Close(); err != nil {
 		t.Fatal(err)
 	}
 	if err := session.StopRTP(1, 0); !errors.Is(err, net.ErrClosed) {
 		t.Fatalf("media socket remains open after dialog close: %v", err)
+	}
+}
+
+func TestNewInboundSIPMediaOmitsConflictingDTMF(t *testing.T) {
+	browserOffer := testSDP(
+		"m=audio 9 UDP/TLS/RTP/SAVPF 0 101",
+		"a=rtpmap:101 telephone-event/8000",
+		"m=video 9 UDP/TLS/RTP/SAVPF 96",
+		"a=rtpmap:96 VP8/90000",
+	)
+	sipOffer := testSDP(
+		"m=audio 4000 RTP/AVP 0 101",
+		"c=IN IP4 127.0.0.1",
+		"a=rtpmap:101 telephone-event/8000",
+		"m=video 4002 RTP/AVP 101",
+		"a=rtpmap:101 VP8/90000",
+	)
+	selection, err := negotiateInboundSelection(browserOffer, sipOffer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if selection.DTMF != nil || len(selection.Video) != 1 || selection.Video[0].SIP.PayloadType != 101 {
+		t.Fatalf("conflicting DTMF selection = %+v", selection)
+	}
+	outbound, err := negotiateOutboundSelection(browserOffer, sipOffer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if outbound.DTMF != nil {
+		t.Fatalf("outbound answer retained conflicting DTMF: %+v", outbound.DTMF)
+	}
+
+	request := sip.NewRequest(sip.INVITE, sip.Uri{User: "user", Host: "127.0.0.1"})
+	request.SetBody(sipOffer)
+	server := &sipgo.DialogServerSession{}
+	server.InviteRequest = request
+	dialog := &diago.DialogServerSession{DialogServerSession: server}
+	session, _, err := newInboundSIPMedia(dialog, net.ParseIP("127.0.0.1"), selection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = dialog.DialogMedia.Close() })
+	answer, err := parseSDP(session.LocalSDP())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(answer.Audio.TelephoneEvents) != 0 || len(answer.Video.Codecs) != 1 || answer.Video.Codecs[0].PayloadType != 101 {
+		t.Fatalf("conflicting DTMF was not omitted from answer:\n%s", session.LocalSDP())
 	}
 }
 
@@ -416,10 +498,58 @@ func waitCandidateForwarding(t *testing.T, done <-chan struct{}, candidateErrors
 	}
 }
 
-func connectPionBrowser(t *testing.T, selection negotiatedSelection, onTrack func(*webrtc.TrackRemote)) (*pionBrowserFixture, *browserMedia) {
+// relayDTMFInjector rewrites crafted audio payloads below Pion's track API.
+// TrackLocalStaticRTP otherwise forces every packet to the primary audio PT.
+type relayDTMFInjector struct {
+	interceptor.NoOp
+	pt atomic.Int32
+}
+
+func (i *relayDTMFInjector) BindLocalStream(_ *interceptor.StreamInfo, writer interceptor.RTPWriter) interceptor.RTPWriter {
+	return interceptor.RTPWriterFunc(func(header *rtp.Header, payload []byte, attributes interceptor.Attributes) (int, error) {
+		if pt := i.pt.Load(); pt >= 0 && len(payload) == 5 && payload[0] == 0xee {
+			header.PayloadType = uint8(pt)
+			return writer.Write(header, payload[1:], attributes)
+		}
+		return writer.Write(header, payload, attributes)
+	})
+}
+
+type relayInterceptorFactory func(id string) (interceptor.Interceptor, error)
+
+func (f relayInterceptorFactory) NewInterceptor(id string) (interceptor.Interceptor, error) {
+	return f(id)
+}
+
+func connectPionBrowser(t *testing.T, selection negotiatedSelection, onTrack func(*webrtc.TrackRemote), extraInterceptors ...interceptor.Factory) (*pionBrowserFixture, *browserMedia) {
 	t.Helper()
 	fixture := &pionBrowserFixture{received: make(chan observedRTP, 32)}
-	pc, err := webrtc.NewPeerConnection(webrtc.Configuration{})
+	var pc *webrtc.PeerConnection
+	var err error
+	if len(extraInterceptors) == 0 && selection.DTMF == nil {
+		pc, err = webrtc.NewPeerConnection(webrtc.Configuration{})
+	} else {
+		engine := &webrtc.MediaEngine{}
+		if err := engine.RegisterDefaultCodecs(); err != nil {
+			t.Fatal(err)
+		}
+		if selection.DTMF != nil {
+			if err := registerBrowserCodec(engine, selection.DTMF.Browser, "audio", webrtc.RTPCodecTypeAudio); err != nil {
+				t.Fatal(err)
+			}
+		}
+		registry := &interceptor.Registry{}
+		if err := webrtc.RegisterDefaultInterceptors(engine, registry); err != nil {
+			t.Fatal(err)
+		}
+		for _, factory := range extraInterceptors {
+			registry.Add(factory)
+		}
+		pc, err = webrtc.NewAPI(
+			webrtc.WithMediaEngine(engine),
+			webrtc.WithInterceptorRegistry(registry),
+		).NewPeerConnection(webrtc.Configuration{})
+	}
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -497,6 +627,10 @@ func connectPionBrowser(t *testing.T, selection negotiatedSelection, onTrack fun
 
 func TestBrowserMediaOfferAnswerWithSelectedCodecsAndCandidates(t *testing.T) {
 	selection := testRelaySelection()
+	selection.DTMF = &codecPair{
+		Browser: rtpCodec{PayloadType: 101, Name: "telephone-event", ClockRate: 8000, Channels: 1, Fmtp: "0-16"},
+		SIP:     rtpCodec{PayloadType: 120, Name: "telephone-event", ClockRate: 8000, Channels: 1, Fmtp: "0-16"},
+	}
 	_, browser := connectPionBrowser(t, selection, nil)
 	answer, err := parseBrowserSDP([]byte(browser.Answer.SDP))
 	if err != nil {
@@ -505,6 +639,9 @@ func TestBrowserMediaOfferAnswerWithSelectedCodecsAndCandidates(t *testing.T) {
 	audio, video := selection.browserCodecs()
 	if !reflect.DeepEqual(answer.Audio.Codecs, audio) || !reflect.DeepEqual(answer.Video.Codecs, video) {
 		t.Fatalf("browser answer codecs = %#v, %#v; want %#v, %#v", answer.Audio.Codecs, answer.Video.Codecs, audio, video)
+	}
+	if !reflect.DeepEqual(answer.Audio.TelephoneEvents, []rtpCodec{selection.DTMF.Browser}) {
+		t.Fatalf("browser answer DTMF = %#v, want %#v\n%s", answer.Audio.TelephoneEvents, selection.DTMF.Browser, browser.Answer.SDP)
 	}
 	if !strings.Contains(browser.Answer.SDP, "a=setup:active") {
 		t.Fatalf("answer is not an active DTLS answerer:\n%s", browser.Answer.SDP)
@@ -556,10 +693,15 @@ func listenTestUDP(t *testing.T) *net.UDPConn {
 
 func writeTestPacket(t *testing.T, connection *webrtc.TrackLocalStaticRTP, payloadType uint8, timestamp uint32, marker bool, payload []byte) {
 	t.Helper()
+	writeTestPacketWithSequence(t, connection, payloadType, uint16(timestamp), timestamp, marker, payload)
+}
+
+func writeTestPacketWithSequence(t *testing.T, connection *webrtc.TrackLocalStaticRTP, payloadType uint8, sequence uint16, timestamp uint32, marker bool, payload []byte) {
+	t.Helper()
 	if err := connection.WriteRTP(&rtp.Packet{Header: rtp.Header{
 		Version:        2,
 		PayloadType:    payloadType,
-		SequenceNumber: uint16(timestamp),
+		SequenceNumber: sequence,
 		Timestamp:      timestamp,
 		Marker:         marker,
 		SSRC:           5000,
@@ -749,6 +891,98 @@ func TestMediaRelayBidirectionalPayloadPTTimestampAndDemuxCleanup(t *testing.T) 
 	}
 	if _, err := videoConn.Write([]byte{1}); !errors.Is(err, net.ErrClosed) {
 		t.Fatalf("dedicated video socket remains open: %v", err)
+	}
+}
+
+func TestMediaRelayForwardsBrowserDTMFWithNegotiatedPT(t *testing.T) {
+	selection := testRelaySelection()
+	selection.Video = nil
+	selection.DTMF = &codecPair{
+		Browser: rtpCodec{PayloadType: 101, Name: "telephone-event", ClockRate: 8000, Channels: 1, Fmtp: "0-16"},
+		SIP:     rtpCodec{PayloadType: 120, Name: "telephone-event", ClockRate: 8000, Channels: 1, Fmtp: "0-16"},
+	}
+	injector := &relayDTMFInjector{}
+	injector.pt.Store(int32(selection.DTMF.Browser.PayloadType))
+
+	var trackMu sync.Mutex
+	var connectedRelay *mediaRelay
+	var pendingTracks []*webrtc.TrackRemote
+	fixture, browser := connectPionBrowser(t, selection, func(track *webrtc.TrackRemote) {
+		trackMu.Lock()
+		defer trackMu.Unlock()
+		if connectedRelay == nil {
+			pendingTracks = append(pendingTracks, track)
+			return
+		}
+		connectedRelay.AddTrack(track)
+	}, relayInterceptorFactory(func(string) (interceptor.Interceptor, error) { return injector, nil }))
+
+	audioPeer := listenTestUDP(t)
+	sipAudio, _ := selection.sipCodecs()
+	sipAudio = append(sipAudio, selection.DTMF.SIP)
+	session, err := initializeSIPMediaSession(net.ParseIP("127.0.0.1"), sipAudio, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rtpSession := media.NewRTPSession(session)
+	t.Cleanup(func() {
+		_ = rtpSession.MonitorClose()
+		_ = session.Close()
+	})
+	audioAddress := audioPeer.LocalAddr().(*net.UDPAddr)
+	session.SetRemoteAddr(audioAddress)
+	selection.SIPAudio = &mediaSection{Kind: "audio", Port: audioAddress.Port, ConnectionIP: cloneIP(audioAddress.IP)}
+	dialog := &relayTestDialog{session: session, rtp: rtpSession, reader: media.NewRTPPacketReaderSession(rtpSession)}
+	relay, err := newMediaRelay(dialog, browser, selection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = relay.Close() })
+	if stats := rtpSession.WriteStats(); stats.SSRC != relay.audioWriter.writer.SSRC {
+		t.Fatalf("primary audio RTCP writer was not primed: %+v", stats)
+	}
+	trackMu.Lock()
+	connectedRelay = relay
+	for _, track := range pendingTracks {
+		relay.AddTrack(track)
+	}
+	pendingTracks = nil
+	trackMu.Unlock()
+
+	audioBefore := []byte{0x01, 0x80, 0x00, 0xff}
+	writeTestPacket(t, fixture.audio, 111, 1000, true, audioBefore)
+	waitRelayRemoteKinds(t, relay, webrtc.RTPCodecTypeAudio)
+	got := readTestUDPRTP(t, audioPeer)
+	if got.PayloadType != 96 || got.Timestamp != 1000 || !bytes.Equal(got.Payload, audioBefore) {
+		t.Fatalf("audio before DTMF = %+v payload %x", got.Header, got.Payload)
+	}
+
+	const eventTimestamp = uint32(4000)
+	events := []struct {
+		sequence uint16
+		marker   bool
+		payload  []byte
+	}{
+		{sequence: 1001, marker: true, payload: []byte{5, 10, 0, 160}},
+		{sequence: 1002, payload: []byte{5, 10, 1, 64}},
+		{sequence: 1003, payload: []byte{5, 0x8a, 3, 32}},
+		{sequence: 1004, payload: []byte{5, 0x8a, 3, 32}},
+		{sequence: 1005, payload: []byte{5, 0x8a, 3, 32}},
+	}
+	for _, event := range events {
+		crafted := append([]byte{0xee}, event.payload...)
+		writeTestPacketWithSequence(t, fixture.audio, 111, event.sequence, eventTimestamp, event.marker, crafted)
+		got = readTestUDPRTP(t, audioPeer)
+		if got.PayloadType != 120 || got.Timestamp != eventTimestamp || got.Marker != event.marker || !bytes.Equal(got.Payload, event.payload) {
+			t.Fatalf("SIP DTMF sequence %d = %+v payload %x, want PT 120 timestamp %d marker %v payload %x", event.sequence, got.Header, got.Payload, eventTimestamp, event.marker, event.payload)
+		}
+	}
+
+	audioAfter := []byte{0xde, 0xad, 0xbe, 0xef}
+	writeTestPacket(t, fixture.audio, 111, 5000, false, audioAfter)
+	got = readTestUDPRTP(t, audioPeer)
+	if got.PayloadType != 96 || got.Timestamp != 5000 || !bytes.Equal(got.Payload, audioAfter) {
+		t.Fatalf("audio after DTMF = %+v payload %x", got.Header, got.Payload)
 	}
 }
 

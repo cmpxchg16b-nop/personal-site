@@ -161,3 +161,22 @@ on PT 96/97/98/99 reproduced `index out of range [10] with length 10`.
   negotiates audio codecs without a panic.
 - `pkg/sipregistration/media_test.go`: the complete inbound selection, remote
   offer, and pinned-answer path covers Opus/96 audio plus VP8/99 video.
+
+## Patch 8: explicit primary-audio clock for relay sender reports
+
+`RTPSession.WriteRTP` learns its sender-report clock from the first packet on a
+new SSRC. The user SIP gateway intentionally shares one audio writer/SSRC for
+primary audio and RFC 4733 telephone-event. If DTMF precedes Opus, upstream
+would retain 8 kHz and extrapolate later Opus sender-report timestamps at the
+wrong rate.
+
+- `media/rtp_session.go`: `PrimeWriteStats(codec, ssrc)` lets a relay initialize
+  the SSRC and primary codec clock before its first packet. It is a no-op once
+  packet statistics exist, so ordinary diago writers and live streams keep their
+  original behavior. A private primed state suppresses reports only until the
+  first relay packet, so priming alone never emits a zero-timestamp report while
+  existing manually seeded statistics retain their previous RTCP behavior.
+- `pkg/sipregistration/media.go`: the audio relay writer primes this clock from
+  the selected primary SIP audio codec when writing through an `RTPSession`.
+- `media/rtp_session_test.go`: a DTMF-first/Opus-second sequence verifies that
+  the sender report advances at 48 kHz and retains the shared writer SSRC.

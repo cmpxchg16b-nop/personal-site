@@ -4,6 +4,7 @@
 package media
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"net"
@@ -187,6 +188,35 @@ func TestRTPSessionWriting(t *testing.T) {
 	// firstpkt + expected pkts = last seq numb
 	// assert.Equal(t, int(rtpSess.readStats.firstPktSequenceNumber)+expectedPkts, int(recReport.LastSequenceNumber))
 	// assert.Equal(t, int(float32(lostPackets)/float32(expectedPkts)*256), int(recReport.FractionLost))
+}
+
+func TestRTPSessionPrimeWriteStatsKeepsPrimaryClockForDTMF(t *testing.T) {
+	rtcpOutput := &bytes.Buffer{}
+	rtpSess := fakeSession(9876, 1234, nil, io.Discard, nil, rtcpOutput)
+	rtpSess.Sess.Codecs = []Codec{CodecAudioOpus, CodecTelephoneEvent8000}
+	t.Cleanup(rtpSess.rtcpTicker.Stop)
+	writer := NewRTPPacketWriter(rtpSess, CodecAudioOpus)
+	writer.ClockDisable()
+	rtpSess.PrimeWriteStats(CodecAudioOpus, writer.SSRC)
+	if err := rtpSess.writeRTCP(time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	assert.Zero(t, rtcpOutput.Len(), "priming must not emit a sender report before RTP")
+
+	// A telephone-event may be the relay's first packet. Sender reports must
+	// still extrapolate the following Opus timestamp at 48 kHz, not 8 kHz.
+	if _, err := writer.WriteSamples([]byte{5, 10, 0, 160}, 0, true, CodecTelephoneEvent8000.PayloadType); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writer.WriteSamples([]byte{1, 2, 3}, 960, false, CodecAudioOpus.PayloadType); err != nil {
+		t.Fatal(err)
+	}
+	now := rtpSess.writeStats.lastPacketTime.Add(time.Second)
+	senderReport := rtcp.SenderReport{}
+	rtpSess.parseSenderReport(&senderReport, now, writer.SSRC)
+	wantRTPTime := rtpSess.writeStats.lastPacketTimestamp + 48000
+	assert.Equal(t, wantRTPTime, senderReport.RTPTime)
+	assert.Equal(t, writer.SSRC, senderReport.SSRC)
 }
 
 func TestRTPSessionRTCPCallbacksConcurrentUpdate(t *testing.T) {

@@ -17,6 +17,10 @@ type ExternalSIPConversationViewProps = {
   sip: UseExternalSIPResult;
   localAnalyser: AnalyserNode | null;
   remoteAnalyser: AnalyserNode | null;
+  dialPad?: {
+    open: boolean;
+    onToggle: () => void;
+  };
   onBack: () => void;
   sx?: SxProps<Theme>;
 };
@@ -29,6 +33,7 @@ export default function ExternalSIPConversationView({
   sip,
   localAnalyser,
   remoteAnalyser,
+  dialPad,
   onBack,
   sx,
 }: ExternalSIPConversationViewProps) {
@@ -92,6 +97,7 @@ export default function ExternalSIPConversationView({
       }}
       localAnalyser={localAnalyser}
       remoteAnalyser={remoteAnalyser}
+      dialPad={dialPad}
       onBack={onBack}
       sx={sx}
     />

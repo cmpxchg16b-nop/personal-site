@@ -85,7 +85,8 @@ func initializeSIPMediaSession(bindIP net.IP, audio, video []rtpCodec) (*media.M
 }
 
 // newOutboundSIPMedia creates the plaintext offer for the SIP leg from the
-// browser's actual primary capabilities. No default or helper codec is added.
+// browser's actual capabilities. The primary codecs stay bounded for UDP MTU;
+// one offered telephone-event capability is retained for RFC 4733 DTMF.
 func newOutboundSIPMedia(bindIP net.IP, browser sdpModel, wantVideo bool) (*media.MediaSession, error) {
 	if !activeMedia(browser.Audio) {
 		return nil, errNoCommonAudio
@@ -94,16 +95,32 @@ func newOutboundSIPMedia(bindIP net.IP, browser sdpModel, wantVideo bool) (*medi
 	if len(audio) == 0 {
 		return nil, errNoCommonAudio
 	}
+	offerAudio := append([]rtpCodec(nil), audio...)
 	var video []rtpCodec
 	if wantVideo && activeMedia(browser.Video) {
 		video = sipOfferPrimaryCodecs(browser.Video.Codecs, maxSIPOfferVideoCodecs)
 	}
+	if len(browser.Audio.TelephoneEvents) > 0 {
+		dtmf := browser.Audio.TelephoneEvents[0]
+		conflicts := false
+		for _, videoCodec := range video {
+			if dtmf.PayloadType == videoCodec.PayloadType {
+				// DTMF is optional. The shared SIP socket cannot demux equal
+				// audio/video PTs, so preserve the otherwise valid video call.
+				conflicts = true
+				break
+			}
+		}
+		if !conflicts {
+			offerAudio = append(offerAudio, dtmf)
+		}
+	}
 
-	session, err := initializeSIPMediaSession(bindIP, audio, video)
+	session, err := initializeSIPMediaSession(bindIP, offerAudio, video)
 	if err != nil {
 		return nil, err
 	}
-	localSDP := generateSIPSDP(bindIP, session.Laddr.Port, audio, video, nil)
+	localSDP := generateSIPSDP(bindIP, session.Laddr.Port, offerAudio, video, nil)
 	if err := session.InitWithSDP(localSDP); err != nil {
 		_ = session.Close()
 		return nil, fmt.Errorf("pin outbound SIP SDP: %w", err)
@@ -111,7 +128,7 @@ func newOutboundSIPMedia(bindIP net.IP, browser sdpModel, wantVideo bool) (*medi
 	// InitWithSDP uses diago's generic codec parser, which does not retain
 	// fmtp. Restore the actual capabilities used in the pinned offer and keep
 	// video available to the shared RTP demux/statistics path.
-	session.Codecs = append(diagoCodecList("audio", audio), diagoCodecList("video", video)...)
+	session.Codecs = append(diagoCodecList("audio", offerAudio), diagoCodecList("video", video)...)
 	return session, nil
 }
 
@@ -134,6 +151,9 @@ func newInboundSIPMedia(dialog *diago.DialogServerSession, bindIP net.IP, select
 		return nil, nil, errors.New("inbound selection must contain one audio and at most one video pair")
 	}
 	audio, video := selection.sipCodecs()
+	if selection.DTMF != nil {
+		audio = append(audio, selection.DTMF.SIP)
+	}
 	session, err := initializeSIPMediaSession(bindIP, audio, video)
 	if err != nil {
 		return nil, nil, err
@@ -194,13 +214,17 @@ type browserMedia struct {
 	closeErr             error
 }
 
-func registerBrowserCodec(engine *webrtc.MediaEngine, codec rtpCodec, kind string, codecType webrtc.RTPCodecType) error {
-	capability := codec.webRTCCapability(kind)
-	if err := engine.RegisterCodec(webrtc.RTPCodecParameters{
-		RTPCodecCapability: capability,
+func browserCodecParameters(codec rtpCodec, kind string) webrtc.RTPCodecParameters {
+	return webrtc.RTPCodecParameters{
+		RTPCodecCapability: codec.webRTCCapability(kind),
 		PayloadType:        webrtc.PayloadType(codec.PayloadType),
-	}, codecType); err != nil {
-		return fmt.Errorf("register browser %s codec %s/%d: %w", kind, capability.MimeType, codec.PayloadType, err)
+	}
+}
+
+func registerBrowserCodec(engine *webrtc.MediaEngine, codec rtpCodec, kind string, codecType webrtc.RTPCodecType) error {
+	parameters := browserCodecParameters(codec, kind)
+	if err := engine.RegisterCodec(parameters, codecType); err != nil {
+		return fmt.Errorf("register browser %s codec %s/%d: %w", kind, parameters.MimeType, codec.PayloadType, err)
 	}
 	return nil
 }
@@ -222,6 +246,11 @@ func newBrowserMedia(
 	engine := &webrtc.MediaEngine{}
 	if err := registerBrowserCodec(engine, selection.Audio[0].Browser, "audio", webrtc.RTPCodecTypeAudio); err != nil {
 		return nil, err
+	}
+	if selection.DTMF != nil {
+		if err := registerBrowserCodec(engine, selection.DTMF.Browser, "audio", webrtc.RTPCodecTypeAudio); err != nil {
+			return nil, err
+		}
 	}
 	if len(selection.Video) == 1 {
 		if err := registerBrowserCodec(engine, selection.Video[0].Browser, "video", webrtc.RTPCodecTypeVideo); err != nil {
@@ -287,8 +316,32 @@ func newBrowserMedia(
 	if err != nil {
 		return nil, fmt.Errorf("create browser audio track: %w", err)
 	}
-	if _, err = pc.AddTrack(browser.audioTrack); err != nil {
+	audioSender, err := pc.AddTrack(browser.audioTrack)
+	if err != nil {
 		return nil, fmt.Errorf("add browser audio track: %w", err)
+	}
+	if selection.DTMF != nil {
+		// AddTrack otherwise narrows the answer to the track's primary codec.
+		// Pin the same primary + telephone-event preferences used by sip-bot so
+		// the browser keeps its RTCDTMFSender and emits RFC 4733 on this track.
+		preferences := []webrtc.RTPCodecParameters{
+			browserCodecParameters(selection.Audio[0].Browser, "audio"),
+			browserCodecParameters(selection.DTMF.Browser, "audio"),
+		}
+		pinned := false
+		for _, transceiver := range pc.GetTransceivers() {
+			if transceiver.Sender() != audioSender {
+				continue
+			}
+			if err := transceiver.SetCodecPreferences(preferences); err != nil {
+				return nil, fmt.Errorf("pin browser audio DTMF codec: %w", err)
+			}
+			pinned = true
+			break
+		}
+		if !pinned {
+			return nil, errors.New("browser audio transceiver is missing after AddTrack")
+		}
 	}
 	if len(selection.Video) == 1 {
 		browser.videoTrack, err = webrtc.NewTrackLocalStaticRTP(
@@ -416,6 +469,13 @@ func newRelayRTPWriter(target media.RTPWriter, codec rtpCodec, kind string, mu *
 	}
 	writer := media.NewRTPPacketWriter(target, converted)
 	writer.ClockDisable()
+	if kind == "audio" {
+		if rtpSession, ok := target.(*media.RTPSession); ok {
+			// Keep sender reports on the primary audio clock even if the user
+			// presses a DTMF key before the first audio packet arrives.
+			rtpSession.PrimeWriteStats(converted, writer.SSRC)
+		}
+	}
 	return &relayRTPWriter{mu: mu, writer: writer}
 }
 
@@ -537,6 +597,11 @@ func newMediaRelay(dialog sipDialog, browser *browserMedia, selection negotiated
 	}
 	if err := ensureSessionCodec(session, selection.Audio[0].SIP, "audio"); err != nil {
 		return nil, err
+	}
+	if selection.DTMF != nil {
+		if err := ensureSessionCodec(session, selection.DTMF.SIP, "audio"); err != nil {
+			return nil, err
+		}
 	}
 	if len(selection.Video) == 1 {
 		if err := ensureSessionCodec(session, selection.Video[0].SIP, "video"); err != nil {
@@ -661,10 +726,12 @@ func (r *mediaRelay) AddTrack(track *webrtc.TrackRemote) {
 	}
 	var writer *relayRTPWriter
 	var pair codecPair
+	var dtmf *codecPair
 	switch kind {
 	case webrtc.RTPCodecTypeAudio:
 		writer = r.audioWriter
 		pair = r.selection.Audio[0]
+		dtmf = r.selection.DTMF
 	case webrtc.RTPCodecTypeVideo:
 		if len(r.selection.Video) != 1 {
 			r.mu.Unlock()
@@ -685,10 +752,10 @@ func (r *mediaRelay) AddTrack(track *webrtc.TrackRemote) {
 	}
 	r.wg.Add(1)
 	r.mu.Unlock()
-	go r.browserToSIP(track, writer, pair)
+	go r.browserToSIP(track, writer, pair, dtmf)
 }
 
-func (r *mediaRelay) browserToSIP(track *webrtc.TrackRemote, writer *relayRTPWriter, pair codecPair) {
+func (r *mediaRelay) browserToSIP(track *webrtc.TrackRemote, writer *relayRTPWriter, pair codecPair, dtmf *codecPair) {
 	defer r.wg.Done()
 	for {
 		select {
@@ -699,6 +766,16 @@ func (r *mediaRelay) browserToSIP(track *webrtc.TrackRemote, writer *relayRTPWri
 		packet, _, err := track.ReadRTP()
 		if err != nil {
 			return
+		}
+		if dtmf != nil && packet.PayloadType == dtmf.Browser.PayloadType {
+			// Preserve the browser's complete RFC 4733 series, including its
+			// redundant END packets. Re-encoding fresh digits here (as sip-bot
+			// does) would be redundant in this packet-payload gateway; only the
+			// negotiated payload type changes between the two RTP legs.
+			if err := writer.Write(packet, dtmf.SIP.PayloadType); err != nil {
+				return
+			}
+			continue
 		}
 		if packet.PayloadType != pair.Browser.PayloadType {
 			continue

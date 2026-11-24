@@ -4,6 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import type { AudioGraph } from "@/api/audio/audiograph";
 import { useICEServers } from "@/hooks/useICEServers";
+import { dialerForSender, type DialerHandle } from "../dtmf";
 import { useSSProxy } from "./react";
 import type { SSProxy } from "./proxy";
 import {
@@ -617,6 +618,16 @@ export class ExternalSIPClient {
     }
   }
 
+  /** The accepted call's DTMF dialer, while telephone-event is negotiated. */
+  dtmfFor(callId: string): DialerHandle | null {
+    return dialerForSender(() => {
+      const runtime = this.runtimes.get(callId);
+      return runtime !== undefined && this.runtimeIsLive(runtime)
+        ? runtime.audioSender
+        : null;
+    });
+  }
+
   private async control(callId: string, action: SIPCallAction): Promise<void> {
     const call = this.state.calls[callId];
     if (
@@ -731,6 +742,8 @@ export class ExternalSIPClient {
       try {
         if (event.sessionDesc !== undefined) {
           await this.applyRemoteDescription(runtime, event.sessionDesc);
+          // Negotiated sender parameters now include the answered codecs.
+          this.publish();
         }
         if (event.rtcICECandidate !== undefined) {
           await this.applyRemoteCandidate(runtime, event.rtcICECandidate);
@@ -982,6 +995,7 @@ export interface UseExternalSIPResult extends ExternalSIPSnapshot {
   accept: (callId: string) => Promise<void>;
   decline: (callId: string) => Promise<void>;
   end: (callId: string) => Promise<void>;
+  dtmfFor: (callId: string) => DialerHandle | null;
   sendMessage: (input: ExternalSIPMessageInput) => Promise<string | null>;
 }
 
@@ -1047,6 +1061,10 @@ export function useExternalSIP(
     (callId: string) => clientRef.current?.end(callId) ?? Promise.resolve(),
     [],
   );
+  const dtmfFor = useCallback(
+    (callId: string) => clientRef.current?.dtmfFor(callId) ?? null,
+    [],
+  );
   const sendMessage = useCallback(
     (input: ExternalSIPMessageInput) =>
       clientRef.current?.sendMessage(input) ?? Promise.resolve(null),
@@ -1057,5 +1075,5 @@ export function useExternalSIP(
     snapshotState.proxy === proxy
       ? snapshotState.value
       : EMPTY_EXTERNAL_SIP_SNAPSHOT;
-  return { ...snapshot, dial, accept, decline, end, sendMessage };
+  return { ...snapshot, dial, accept, decline, end, dtmfFor, sendMessage };
 }

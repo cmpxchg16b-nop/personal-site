@@ -330,8 +330,17 @@ Rules and implemented behavior:
   in browser preference order after helper payloads are removed. This retains
   the usual Opus/G722/PCMU/PCMA audio fallbacks and Chrome's VP8/H264 path;
   answer-time relay selection still narrows to one pair per media kind.
-- No codec, fmtp feature, channel count, telephone-event, comfort-noise, RTX,
-  RED, or FEC capability is injected. Those helper payloads are not relayed.
+- No primary codec, fmtp feature, channel count, comfort-noise, RTX, RED, or FEC
+  capability is injected. Telephone-event is the one supported helper
+  capability: an actual browser offer is retained in outbound SIP SDP, and an
+  inbound SIP capability is answered only when both legs negotiate it. Each
+  leg's dynamic PT is retained and translated by the relay.
+- Browser-to-SIP DTMF uses RFC 4733. The complete telephone-event series,
+  including its redundant END packets, crosses the existing audio RTP writer
+  byte for byte with the negotiated SIP PT; events are neither mixed into the
+  primary audio codec nor re-encoded into duplicate key presses. As in sip-bot,
+  the reverse SIP-to-browser DTMF direction is deliberately dropped. SIP INFO,
+  KPML, and separate in-band DTMF generation/detection are not implemented.
 - No decode, transcode, mix, resample, comfort-media generation, or free-running
   packet pacer is used. RTP payload bytes, media timestamps, and marker bits are
   preserved. SSRCs and sequence numbers are leg-local.
@@ -352,8 +361,9 @@ Rules and implemented behavior:
   terminal failure with ACK/BYE); it never triggers transcoding.
 
 Current exclusions: SIP-side SRTP/SDES/DTLS-SRTP, late-offer inbound calls,
-early-media forwarding, DTMF, re-INVITE/hold updates, multiple audio/video
-m-lines, and non-RTP media profiles. Tagged re-INVITE is explicitly answered
+early-media forwarding, SIP-to-browser DTMF forwarding, non-RFC-4733 DTMF
+translation, re-INVITE/hold updates, multiple audio/video m-lines, and non-RTP
+media profiles. Tagged re-INVITE is explicitly answered
 488 so diago cannot silently apply an unsupported media update. The configured
 WebRTC STUN/TURN URLs are used by Pion, but SIP media currently advertises the
 runtime's route-selected local address; a deployment behind NAT still needs a
@@ -415,7 +425,8 @@ Backend:
 - `pkg/sipregistration/sdp.go`: browser/SIP profile parsing, actual capability
   matching, dynamic PT/fmtp handling, direction mapping, and SDP generation.
 - `pkg/sipregistration/media.go`: diago media sessions, dedicated Pion
-  answerers, ICE, bidirectional audio/video RTP relay, and demuxed video output.
+  answerers, ICE, bidirectional audio/video RTP relay, browser-to-SIP RFC 4733
+  DTMF forwarding with dynamic PT translation, and demuxed video output.
 - `pkg/sipregistration/inbound.go`: exact runtime + AOR + lease routing and SIP
   status mapping.
 - `cmd/server/main.go`: one manager/service/hub wiring shared by all users.
@@ -428,12 +439,17 @@ Browser:
 - `web/site/src/api/ss/types.ts`: TypeScript mirror of the SIP service contract.
 - `web/site/src/api/ss/sip.ts`: call/message reducers and history, ordered SS
   commands, one RTCPeerConnection per call, offer/answer/ICE queues, media
-  capture/playback, and best-effort server abort on local failures.
+  capture/playback, negotiated DTMF dialers, and best-effort server abort on
+  local failures. `web/site/src/api/dtmf.ts` shares the legacy two-phase sender
+  capability check and live press-time gate between internal and external calls.
 - `web/site/src/components/chat/PhonePanel.tsx`: voice/video dial dialog,
   unexpired caller-identity selection, SIP MESSAGE composer/history/reply.
 - `web/site/src/components/chat/ExternalSIPCallOverlay.tsx`: incoming answer /
   decline, outbound/active status, hangup, and local/remote video.
 - `web/site/src/components/chat/sipForm.ts`: caller eligibility and selection.
+  `ChatApp.tsx` and `ExternalSIPConversationView.tsx` connect accepted external
+  calls to the existing `DialPad.tsx` and `ConversationView` composer toggle;
+  there is no second phone-specific keypad implementation.
 
 The main test files are `pkg/sipregistration/{service,runtime_operations,sdp,media,inbound_wire}_test.go`,
 `pkg/api/websocket_ss/sip_test.go`, `pkg/models/ss/sip_test.go`, and
@@ -442,8 +458,10 @@ They cover registration and ownership, real UDP digest INVITE/MESSAGE,
 provisional/final responses, ACK/BYE and CANCEL behavior, parallel answer races,
 per-tab/all-tab decline, timeout/disconnect/replacement, SDP capabilities and
 directions, Pion-to-Pion negotiation, bidirectional arbitrary-payload RTP,
-MESSAGE status and spoof resistance, browser offer/ICE ordering, local failure
-notification, and reconnect configuration.
+real WebRTC-track-to-SIP-UDP RFC 4733 forwarding (including END retransmissions
+and dynamic PTs), MESSAGE status and spoof resistance, browser offer/ICE
+ordering, DTMF sender capability/live-gate behavior, local failure notification,
+and reconnect configuration.
 
 Validation commands and live-browser results for this milestone are recorded in
 the 2026-11-24 progress entry below and in `.ai/memory/sessions/61.md`; the
@@ -528,3 +546,28 @@ Live validation used isolated Chrome tabs and a temporary loopback UDP PBX:
   PBX interoperability, TCP/TLS/WS, SRTP, and full two-way browser video remain
   validation blind spots. The temporary `scratch_sip_e2e/` directory remains
   for inspection because its deletion was not permitted; it is not product code.
+
+### 2026-11-24 — DTMF / IVR follow-up
+
+- Restored sip-bot's browser-to-SIP DTMF direction without copying its fixed-PT
+  re-encoder. The user SIP gateway negotiates actual telephone-event
+  capabilities on both legs, pins Pion's audio transceiver to primary audio +
+  DTMF, and forwards the browser's complete RFC 4733 series with per-leg dynamic
+  PT translation. SIP-to-browser DTMF remains intentionally dropped.
+- Reused the existing chat `DialPad`, composer toggle, and two-phase live-sender
+  capability check for accepted external SIP calls in the phone tab. No parallel
+  keypad or alternate press-time policy was introduced.
+- Optional DTMF never makes an otherwise valid audio/video call fail shared-RTP
+  demux: a conflicting DTMF PT is omitted while the primary call remains. The
+  relay primes diago's sender-report clock from primary audio; a private
+  pre-media state prevents that priming from emitting a zero-packet RTCP report.
+- Automated validation on the final change: full `go test -count=1 ./...`;
+  `go test -race -count=1 ./pkg/sipregistration`; nested diago `go test -race
+-count=1 ./media`; `go build ./cmd/server`; frontend 15 files / 149 tests,
+  TypeScript, full ESLint, and `npm run build` all passed. Focused RTP tests
+  verify browser PT 101 to SIP PT 120, exact payloads/markers/timestamps,
+  standard END retransmissions, and audio before/after DTMF. DTMF-first sender
+  reports retain Opus's 48 kHz clock, and priming without RTP emits no RTCP.
+- No live external `5000` IVR call was placed in this follow-up. Actual browser
+  `RTCDTMFSender` interoperability with the deployment's PBX therefore remains
+  a live-validation step, not a claim inferred from the Pion/UDP tests.

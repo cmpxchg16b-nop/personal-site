@@ -142,6 +142,9 @@ func (stats *RTPReadStats) calcJitter(now time.Time, readPktTimestamp uint32) {
 type RTPWriteStats struct {
 	SSRC uint32
 
+	// primed distinguishes a relay's pre-media clock initialization from the
+	// existing manually seeded statistics, which may legitimately emit RTCP.
+	primed              bool
 	lastPacketTime      time.Time
 	lastPacketTimestamp uint32
 	sampleRate          uint32
@@ -426,6 +429,7 @@ func (s *RTPSession) WriteRTP(pkt *rtp.Packet) error {
 		}
 	}
 
+	writeStats.primed = false
 	writeStats.PacketsCount++
 	writeStats.OctetCount += uint64(len(pkt.Payload))
 	writeStats.lastPacketTime = time.Now()
@@ -445,6 +449,21 @@ func (s *RTPSession) WriteStats() RTPWriteStats {
 	s.rtcpMU.Lock()
 	defer s.rtcpMU.Unlock()
 	return s.writeStats
+}
+
+// PrimeWriteStats pins the sender-report SSRC and clock before a relay's first
+// packet. It is needed when telephone-event may precede primary audio on the
+// same SSRC: WriteRTP otherwise learns the clock from that helper payload.
+// Calling after media has started leaves the live statistics untouched.
+func (s *RTPSession) PrimeWriteStats(codec Codec, ssrc uint32) {
+	s.rtcpMU.Lock()
+	defer s.rtcpMU.Unlock()
+	if s.writeStats.PacketsCount != 0 {
+		return
+	}
+	s.writeStats.SSRC = ssrc
+	s.writeStats.sampleRate = codec.SampleRate
+	s.writeStats.primed = true
 }
 
 // Monitor starts reading RTCP and monitoring media quality
@@ -647,7 +666,7 @@ func (s *RTPSession) writeRTCP(now time.Time) error {
 
 		pkt = &rr
 	} else {
-		if s.writeStats.SSRC == 0 {
+		if s.writeStats.SSRC == 0 || s.writeStats.primed {
 			s.rtcpMU.Unlock()
 			return nil
 		}

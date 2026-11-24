@@ -10,6 +10,7 @@ import type {
   SubscriberId,
 } from "@/api/ss/types";
 import type { PeerConnectionStates } from "@/api/ss/peersessions";
+import type { DialerHandle } from "@/api/dtmf";
 import {
   isExternalSIPCallActive,
   type UseExternalSIPResult,
@@ -28,7 +29,6 @@ import { IncomingCallWindow } from "./IncomingCallWindow";
 import { VideoWindow } from "./VideoWindow";
 import { DialPad } from "./DialPad";
 import { ExternalSIPCallOverlay } from "./ExternalSIPCallOverlay";
-import type { DialerHandle } from "./useCallMedia";
 import {
   conversationKey,
   type ActivePhoneCall,
@@ -174,6 +174,10 @@ export default function ChatApp({
 
   const phoneContactUser =
     phoneContact === null ? undefined : users[phoneContact.ref.userId];
+  const externalConversationVisible =
+    activeTab === "phone" &&
+    phoneContactUser === undefined &&
+    externalConversation !== null;
 
   const activeKey = selected === null ? null : conversationKey(selected);
   const activeMessages = activeKey === null ? [] : (messages[activeKey] ?? []);
@@ -238,13 +242,24 @@ export default function ChatApp({
     (call) => call.status === "accepted" && call.kind === "video",
   );
 
-  // The open conversation's DTMF dialer: the call must be accepted (the
-  // mic's sender only exists then) and telephone-event negotiated. Null
-  // hides both the composer's toggle and the pad itself.
-  const activeDialer =
-    selected === null || activeCall?.status !== "accepted"
+  // The visible conversation's DTMF dialer: its call must be accepted and
+  // telephone-event negotiated. Null hides both the composer's toggle and
+  // the pad itself. An external selection left behind by a tab/contact switch
+  // never lends its dialer to the currently visible view.
+  const activeDialer = externalConversationVisible
+    ? activeExternalCall?.state === "accepted"
+      ? externalSIP.dtmfFor(activeExternalCall.callId)
+      : null
+    : selected === null || activeCall?.status !== "accepted"
       ? null
       : dtmfFor(selected.channelId, selected.userId);
+  const dialPad =
+    activeDialer === null
+      ? undefined
+      : {
+          open: dialPadOpen,
+          onToggle: () => setDialPadOpen((open) => !open),
+        };
 
   const handleSelect = (ref: ConversationRef) => {
     onSelect(ref);
@@ -380,6 +395,7 @@ export default function ChatApp({
                 ? null
                 : externalRemoteAnalyserFor(activeExternalCall.callId)
             }
+            dialPad={dialPad}
             onBack={() => setMobileListOpen(true)}
             sx={{
               display: { xs: mobileListOpen ? "none" : "flex", sm: "flex" },
@@ -410,14 +426,7 @@ export default function ChatApp({
                 ? null
                 : remoteAnalyserFor(selected.channelId, selected.userId)
             }
-            dialPad={
-              activeDialer === null
-                ? undefined
-                : {
-                    open: dialPadOpen,
-                    onToggle: () => setDialPadOpen((open) => !open),
-                  }
-            }
+            dialPad={dialPad}
             onBack={() => setMobileListOpen(true)}
             sx={{
               display: { xs: mobileListOpen ? "none" : "flex", sm: "flex" },
