@@ -15,24 +15,27 @@ import DragIndicatorIcon from "@mui/icons-material/DragIndicator";
 import VideocamIcon from "@mui/icons-material/Videocam";
 import { useTranslation } from "react-i18next";
 import type { ChatUser } from "@/api/ss/types";
+import type { ExternalSIPCall } from "@/api/ss/sip";
 import UserAvatar from "./UserAvatar";
 import type { ActivePhoneCall } from "./types";
 
-type IncomingCallWindowProps = {
+type IncomingCall = ActivePhoneCall | ExternalSIPCall;
+
+type IncomingCallWindowProps<T extends IncomingCall> = {
   // The ringing call to answer, or null when none is (the window hides).
-  call: ActivePhoneCall | null;
+  call: T | null;
   // The caller, when known — for the avatar and the name.
   caller: ChatUser | undefined;
-  onAccept: (call: ActivePhoneCall) => void;
-  onReject: (call: ActivePhoneCall) => void;
+  onAccept: (call: T) => void;
+  onReject: (call: T) => void;
 };
 
-export function IncomingCallWindow({
+export function IncomingCallWindow<T extends IncomingCall>({
   call,
   caller,
   onAccept,
   onReject,
-}: IncomingCallWindowProps) {
+}: IncomingCallWindowProps<T>) {
   const { t } = useTranslation();
   // The drag offset from the window's home position (top-right, below
   // the top bar), in pixels.
@@ -61,6 +64,10 @@ export function IncomingCallWindow({
   };
 
   if (call === null) return null;
+  const fallbackName =
+    "state" in call
+      ? (call.remoteUri ?? call.target ?? call.callId)
+      : call.ref.userId;
 
   return (
     <Paper
@@ -110,7 +117,7 @@ export function IncomingCallWindow({
           <Avatar sx={{ width: 48, height: 48 }} />
         )}
         <Typography variant="subtitle2" noWrap>
-          {caller?.name ?? call.ref.userId}
+          {caller?.name ?? fallbackName}
         </Typography>
         <Typography variant="caption" color="text.secondary">
           {t(

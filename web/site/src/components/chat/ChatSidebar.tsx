@@ -20,6 +20,7 @@ import type { ChatChannel, ChatUser } from "@/api/ss/types";
 import type { UseExternalSIPResult } from "@/api/ss/sip";
 import ConversationTree from "./ConversationTree";
 import PhonePanel from "./PhonePanel";
+import type { ExternalSIPConversationRef } from "./externalSipConversation";
 import SettingsPanel from "./SettingsPanel";
 import {
   conversationKey,
@@ -46,6 +47,8 @@ type ChatSidebarProps = {
   currentUserId: string;
   selectedCallId: string | null;
   onSelectContact: (ref: ConversationRef, messageId: string) => void;
+  onOpenExternalConversation: (ref: ExternalSIPConversationRef) => void;
+  selectedExternalConversation: ExternalSIPConversationRef | null;
   sipSelected: boolean;
   onOpenSip: () => void;
   sip: UseExternalSIPResult;
@@ -69,6 +72,8 @@ export default function ChatSidebar({
   currentUserId,
   selectedCallId,
   onSelectContact,
+  onOpenExternalConversation,
+  selectedExternalConversation,
   sipSelected,
   onOpenSip,
   sip,
@@ -266,6 +271,8 @@ export default function ChatSidebar({
               currentUserId={currentUserId}
               selectedMessageId={selectedCallId}
               onSelectContact={onSelectContact}
+              onOpenExternalConversation={onOpenExternalConversation}
+              selectedExternalConversation={selectedExternalConversation}
               sip={sip}
             />
           </Box>

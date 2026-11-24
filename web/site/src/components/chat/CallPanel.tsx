@@ -13,10 +13,11 @@ import CallEndIcon from "@mui/icons-material/CallEnd";
 import RingVolumeIcon from "@mui/icons-material/RingVolume";
 import { useTranslation } from "react-i18next";
 import { AudioSpectrum } from "./AudioSpectrum";
+import type { ExternalSIPCall } from "@/api/ss/sip";
 import type { ActivePhoneCall } from "./types";
 
 type CallPanelProps = {
-  call: ActivePhoneCall;
+  call: ActivePhoneCall | ExternalSIPCall;
   // The peer's display name (the spectrum labels and the ringing text).
   peerName: string;
   // FFT taps of the two voices (see useCallMedia); null until wired.
@@ -48,7 +49,11 @@ export function CallPanel({
   // display. elapsed ticks once a second while accepted.
   const acceptedAtRef = useRef<number | null>(null);
   const [elapsed, setElapsed] = useState(0);
-  const accepted = call.status === "accepted";
+  const external = "state" in call;
+  const accepted = external
+    ? call.state === "accepted"
+    : call.status === "accepted";
+  const incoming = external ? call.direction === "incoming" : call.incoming;
   useEffect(() => {
     if (!accepted) return;
     acceptedAtRef.current ??= Date.now() / 1000;
@@ -96,7 +101,7 @@ export function CallPanel({
               }}
             />
             <Typography variant="body2" sx={{ fontWeight: 600 }}>
-              {call.incoming
+              {incoming
                 ? t(
                     call.kind === "video"
                       ? "chat.call.incomingVideo"
@@ -104,7 +109,7 @@ export function CallPanel({
                   )
                 : t("chat.call.calling", { name: peerName })}
             </Typography>
-            {call.incoming && (
+            {incoming && (
               <Typography variant="caption" color="text.secondary">
                 {t("chat.call.ringingHint")}
               </Typography>
@@ -114,7 +119,7 @@ export function CallPanel({
         {/* The end button belongs to the call's owner actions: the
             caller can cancel a ringing or hang up; an incoming ringing
             call is answered from the global popup, not here. */}
-        {!(call.incoming && !accepted) && (
+        {!(incoming && !accepted) && (
           <Button
             size="small"
             color="error"

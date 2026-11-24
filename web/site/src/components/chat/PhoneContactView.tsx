@@ -1,11 +1,8 @@
 "use client";
 
-import { useState } from "react";
 import {
-  Alert,
   Box,
   IconButton,
-  Snackbar,
   Typography,
   type SxProps,
   type Theme,
@@ -21,22 +18,27 @@ import UserAvatar from "./UserAvatar";
 type PhoneContactViewProps = {
   user: ChatUser;
   onBack: () => void;
+  onVoiceCall: () => void;
+  onVideoCall: () => void;
+  onMessage: () => void;
   sx?: SxProps<Theme>;
 };
 
-// PhoneContactView is the Linphone-style contact action pane. The actions are
-// visual scaffolding only until their SIP/SMS implementations are available.
+// PhoneContactView is the contact's action pane. Every action enters the
+// existing conversation; voice/video also start their call immediately.
 export default function PhoneContactView({
   user,
   onBack,
+  onVoiceCall,
+  onVideoCall,
+  onMessage,
   sx,
 }: PhoneContactViewProps) {
   const { t } = useTranslation();
-  const [noticeOpen, setNoticeOpen] = useState(false);
   const actions = [
-    { key: "videoCall", Icon: VideocamIcon },
-    { key: "voiceCall", Icon: CallIcon },
-    { key: "sms", Icon: SmsIcon },
+    { key: "videoCall", Icon: VideocamIcon, onClick: onVideoCall },
+    { key: "voiceCall", Icon: CallIcon, onClick: onVoiceCall },
+    { key: "sms", Icon: SmsIcon, onClick: onMessage },
   ] as const;
 
   return (
@@ -88,13 +90,13 @@ export default function PhoneContactView({
           {user.name}
         </Typography>
         <Box sx={{ display: "flex", gap: 2.5, mt: 4 }}>
-          {actions.map(({ key, Icon }) => (
+          {actions.map(({ key, Icon, onClick }) => (
             <IconButton
               key={key}
               size="large"
               aria-label={t(`chat.phone.${key}`)}
               title={t(`chat.phone.${key}`)}
-              onClick={() => setNoticeOpen(true)}
+              onClick={onClick}
               sx={{
                 width: 56,
                 height: 56,
@@ -108,22 +110,6 @@ export default function PhoneContactView({
           ))}
         </Box>
       </Box>
-      <Snackbar
-        open={noticeOpen}
-        autoHideDuration={3500}
-        onClose={(_, reason) => {
-          if (reason !== "clickaway") setNoticeOpen(false);
-        }}
-        anchorOrigin={{ vertical: "bottom", horizontal: "center" }}
-      >
-        <Alert
-          severity="info"
-          variant="filled"
-          onClose={() => setNoticeOpen(false)}
-        >
-          {t("chat.phone.unavailable")}
-        </Alert>
-      </Snackbar>
     </Box>
   );
 }

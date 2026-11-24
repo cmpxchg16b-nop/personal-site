@@ -258,6 +258,9 @@ export default function ChatPage() {
         remoteVideoFor={remoteVideoFor}
         dtmfFor={dtmfFor}
         externalSIP={externalSIP}
+        externalRemoteAnalyserFor={(callId) =>
+          audio?.remoteAnalyser(`external-sip:${callId}`) ?? null
+        }
       />
     </>
   );

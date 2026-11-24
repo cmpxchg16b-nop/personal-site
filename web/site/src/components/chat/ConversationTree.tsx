@@ -8,16 +8,14 @@ import {
   ListItem,
   ListItemButton,
   ListItemText,
-  Typography,
 } from "@mui/material";
 import TagIcon from "@mui/icons-material/Tag";
 import ExpandMoreIcon from "@mui/icons-material/ExpandMore";
 import ChevronRightIcon from "@mui/icons-material/ChevronRight";
-import PhoneInTalkIcon from "@mui/icons-material/PhoneInTalk";
-import RingVolumeIcon from "@mui/icons-material/RingVolume";
-import { useTranslation } from "react-i18next";
+
 import type { ChatChannel } from "@/api/ss/types";
 import UserAvatar from "./UserAvatar";
+import { CallStatusPill } from "./CallStatusPill";
 import {
   conversationKey,
   type ActivePhoneCall,
@@ -65,50 +63,6 @@ function UnreadBadge({ count }: { count: number }) {
       }}
     >
       {count}
-    </Box>
-  );
-}
-
-// CallStatusPill is the member row's voice-call state: a ringing pill
-// (pulsing) while the call is inviting either way, an in-call pill once
-// accepted.
-function CallStatusPill({ call }: { call: ActivePhoneCall }) {
-  const { t } = useTranslation();
-  const ringing = call.status === "inviting";
-  const Icon = ringing ? RingVolumeIcon : PhoneInTalkIcon;
-  const label = ringing
-    ? call.incoming
-      ? t("chat.call.incomingShort")
-      : t("chat.call.callingShort")
-    : t("chat.call.inCallShort");
-  return (
-    <Box
-      component="span"
-      sx={{
-        ml: 1,
-        px: 0.75,
-        height: 18,
-        borderRadius: "9999px",
-        display: "inline-flex",
-        alignItems: "center",
-        gap: 0.5,
-        flexShrink: 0,
-        color: ringing ? "primary.main" : "success.main",
-        border: 1,
-        borderColor: ringing ? "primary.main" : "success.main",
-        ...(ringing && {
-          "@keyframes callPulse": {
-            "0%, 100%": { opacity: 1 },
-            "50%": { opacity: 0.4 },
-          },
-          animation: "callPulse 1.2s ease-in-out infinite",
-        }),
-      }}
-    >
-      <Icon sx={{ fontSize: 12 }} />
-      <Typography variant="caption" component="span" sx={{ lineHeight: 1 }}>
-        {label}
-      </Typography>
     </Box>
   );
 }
@@ -195,7 +149,12 @@ export default function ConversationTree({
                             primary: { variant: "body2", noWrap: true },
                           }}
                         />
-                        {call !== undefined && <CallStatusPill call={call} />}
+                        {call !== undefined && (
+                          <CallStatusPill
+                            status={call.status}
+                            incoming={call.incoming}
+                          />
+                        )}
                         {dmUnread > 0 && <UnreadBadge count={dmUnread} />}
                       </ListItemButton>
                     </ListItem>

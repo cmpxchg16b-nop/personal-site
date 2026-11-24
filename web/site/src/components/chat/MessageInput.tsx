@@ -28,7 +28,7 @@ type MessageInputProps = {
   // the picker's kind: how the transfer is announced and rendered (see
   // TransferKind). The kind is the user's explicit choice here — it is
   // never derived from the file's MIME type.
-  onAttachFile: (files: File[], kind: TransferKind) => void;
+  onAttachFile?: (files: File[], kind: TransferKind) => void;
   // The dial pad's toggle: present while the conversation's call
   // negotiated DTMF (the pad exists then); open is its visibility,
   // onToggle flips it.
@@ -77,7 +77,7 @@ export default function MessageInput({
   const pickFiles =
     (kind: TransferKind) => (e: ChangeEvent<HTMLInputElement>) => {
       const files = Array.from(e.target.files ?? []);
-      if (files.length > 0) onAttachFile(files, kind);
+      if (files.length > 0) onAttachFile?.(files, kind);
       e.target.value = "";
     };
   const openPicker = (ref: RefObject<HTMLInputElement | null>) => {
@@ -101,14 +101,16 @@ export default function MessageInput({
         borderColor: "divider",
       }}
     >
-      <IconButton
-        onClick={(e) => setAttachAnchor(e.currentTarget)}
-        aria-label={t("chat.attach")}
-        aria-haspopup="true"
-        aria-expanded={attachAnchor !== null ? "true" : undefined}
-      >
-        <AttachFileIcon fontSize="small" />
-      </IconButton>
+      {onAttachFile !== undefined && (
+        <IconButton
+          onClick={(e) => setAttachAnchor(e.currentTarget)}
+          aria-label={t("chat.attach")}
+          aria-haspopup="true"
+          aria-expanded={attachAnchor !== null ? "true" : undefined}
+        >
+          <AttachFileIcon fontSize="small" />
+        </IconButton>
+      )}
       <Menu
         anchorOrigin={{
           vertical: "top",

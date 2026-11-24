@@ -14,6 +14,7 @@ import ForumOutlinedIcon from "@mui/icons-material/ForumOutlined";
 import VideocamIcon from "@mui/icons-material/Videocam";
 import { useTranslation } from "react-i18next";
 import type { ChatUser } from "@/api/ss/types";
+import type { ExternalSIPCall } from "@/api/ss/sip";
 import { CallPanel } from "./CallPanel";
 import MessageInput from "./MessageInput";
 import MessageList from "./MessageList";
@@ -36,7 +37,7 @@ type ConversationViewProps = {
   onSend: (content: string) => void;
   // onAttachFile reports the files picked in the composer's attach menu,
   // with the picker's kind.
-  onAttachFile: (files: File[], kind: TransferKind) => void;
+  onAttachFile?: (files: File[], kind: TransferKind) => void;
   // onRequestFile asks for a completed transfer's bytes by fileId.
   onRequestFile: (fileId: string) => void;
   // getFileByFileId resolves a completed transfer's bytes locally; the
@@ -44,11 +45,14 @@ type ConversationViewProps = {
   getFileByFileId: (fileId: string) => Blob | undefined;
   // The live voice call with this conversation's peer, or null (see
   // usePhoneCalls).
-  call: ActivePhoneCall | null;
+  call: ActivePhoneCall | ExternalSIPCall | null;
   // The live state of the peer connection to the conversation's user
   // (see usePeerSessions' connectionStates), or null when no session
   // exists (yet); the header's presence line renders it.
   connectionState: RTCPeerConnectionState | null;
+  // External SIP peers have no SS presence; their adapter hides only this
+  // status line/dot while retaining the same conversation component.
+  showPresence?: boolean;
   // Rings the peer (the header's voice call button).
   onStartCall: () => void;
   // Rings the peer with video (the header's video call button).
@@ -114,6 +118,7 @@ export default function ConversationView({
   getFileByFileId,
   call,
   connectionState,
+  showPresence = true,
   onStartCall,
   onStartVideoCall,
   onEndCall,
@@ -188,6 +193,12 @@ export default function ConversationView({
     userId: conversation.user.id,
   };
   const target = `@${conversation.user.name}`;
+  const incoming =
+    call !== null &&
+    ("state" in call ? call.direction === "incoming" : call.incoming);
+  const inviting =
+    call !== null &&
+    ("state" in call ? call.state === "ringing" : call.status === "inviting");
 
   return (
     <Box
@@ -226,21 +237,23 @@ export default function ConversationView({
         <UserAvatar
           user={conversation.user}
           size={36}
-          showPresence
+          showPresence={showPresence}
           connectionState={connectionState}
         />
         <Box sx={{ minWidth: 0 }}>
           <Typography variant="subtitle1" noWrap sx={{ fontWeight: 600 }}>
             {conversation.user.name}
           </Typography>
-          <Typography
-            variant="caption"
-            color="text.secondary"
-            noWrap
-            sx={{ display: "flex", alignItems: "center", gap: 0.5 }}
-          >
-            {t(presenceKey(conversation.user.online, connectionState))}
-          </Typography>
+          {showPresence && (
+            <Typography
+              variant="caption"
+              color="text.secondary"
+              noWrap
+              sx={{ display: "flex", alignItems: "center", gap: 0.5 }}
+            >
+              {t(presenceKey(conversation.user.online, connectionState))}
+            </Typography>
+          )}
         </Box>
         {/* The call buttons, at the header's right end: they ring the
             peer — voice and video. While a call is live, its kind's
@@ -266,7 +279,7 @@ export default function ConversationView({
               </IconButton>
             );
           }
-          if (call.incoming && call.status === "inviting") {
+          if (incoming && inviting) {
             return (
               <IconButton
                 key={kind}
@@ -292,6 +305,7 @@ export default function ConversationView({
       </Box>
       {call !== null && (
         <CallPanel
+          key={call.callId}
           call={call}
           peerName={conversation.user.name}
           localAnalyser={localAnalyser}
@@ -308,6 +322,7 @@ export default function ConversationView({
         getFileByFileId={getFileByFileId}
       />
       <MessageInput
+        key={conversationKey(ref)}
         target={target}
         onSend={onSend}
         onAttachFile={onAttachFile}

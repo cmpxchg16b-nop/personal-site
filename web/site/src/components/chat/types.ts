@@ -2,6 +2,7 @@
 // signalling types in @/api/ss/types.
 
 import type { ChatUser } from "@/api/ss/types";
+import type { ExternalSIPMessageState } from "@/api/ss/sip";
 import type {
   DCCallKind,
   DCCallStatus,
@@ -20,6 +21,10 @@ export type TextChatMessage = {
   id: string;
   authorId: string;
   content: string;
+  // External SIP MESSAGE delivery is shown below outgoing text. Ordinary
+  // data-channel chats leave both fields absent.
+  delivery?: ExternalSIPMessageState;
+  deliveryReason?: string;
   // Unix seconds, matching Comment.creation_time elsewhere in the app.
   timestamp: number;
 };
@@ -74,7 +79,7 @@ export type MediaChatMessage = ImageChatMessage | VideoChatMessage;
 
 // PhoneSessionStatus is the lifecycle state of a voice call — the wire
 // type, re-exported so UI components stay free of api imports.
-export type PhoneSessionStatus = DCCallStatus;
+export type PhoneSessionStatus = DCCallStatus | "failed";
 
 // PhoneCallKind is what a call carries — voice only, or voice and
 // video — the wire type, re-exported so UI components stay free of api

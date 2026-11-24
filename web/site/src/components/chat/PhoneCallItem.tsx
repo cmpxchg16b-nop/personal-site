@@ -39,6 +39,7 @@ const STATUS_ICON = {
   ended: CallEndIcon,
   rejected: PhoneDisabledIcon,
   cancelled: PhoneMissedIcon,
+  failed: PhoneDisabledIcon,
 } as const;
 
 // STATUS_ICON_VIDEO is the video call's status-icon set.
@@ -48,6 +49,7 @@ const STATUS_ICON_VIDEO = {
   ended: VideocamOffIcon,
   rejected: VideocamOffIcon,
   cancelled: MissedVideoCallIcon,
+  failed: VideocamOffIcon,
 } as const;
 
 export function PhoneCallItem({ message, author, isOwn }: PhoneCallItemProps) {
@@ -72,6 +74,8 @@ export function PhoneCallItem({ message, author, isOwn }: PhoneCallItemProps) {
         return t("chat.call.declined");
       case "cancelled":
         return isOwn ? t("chat.call.cancelled") : t("chat.call.missed");
+      case "failed":
+        return t("chat.externalSip.states.failed");
     }
   };
   const StatusIcon = (

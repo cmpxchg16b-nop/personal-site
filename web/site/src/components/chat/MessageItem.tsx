@@ -19,7 +19,7 @@ type MessageItemProps = {
 // Content keeps the author's line breaks (pre-wrap); long unbroken text
 // wraps instead of overflowing.
 export function MessageItem({ group, isOwn }: MessageItemProps) {
-  const { i18n } = useTranslation();
+  const { t, i18n } = useTranslation();
   const startedAt = new Date(group.startedAt * 1000);
   const relative = formatDistanceToNow(startedAt, {
     addSuffix: true,
@@ -58,13 +58,33 @@ export function MessageItem({ group, isOwn }: MessageItemProps) {
           </Typography>
         </Box>
         {group.messages.map((message) => (
-          <Typography
-            key={message.id}
-            variant="body2"
-            sx={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere", mt: 0.25 }}
-          >
-            {message.content}
-          </Typography>
+          <Box key={message.id}>
+            <Typography
+              variant="body2"
+              sx={{
+                whiteSpace: "pre-wrap",
+                overflowWrap: "anywhere",
+                mt: 0.25,
+              }}
+            >
+              {message.content}
+            </Typography>
+            {message.delivery !== undefined && (
+              <Typography
+                variant="caption"
+                color={
+                  message.delivery === "failed" ? "error" : "text.secondary"
+                }
+                sx={{ display: "block", mt: 0.25 }}
+              >
+                {t(`chat.externalSip.messageStates.${message.delivery}`)}
+                {message.deliveryReason !== undefined &&
+                message.deliveryReason !== ""
+                  ? ` · ${message.deliveryReason}`
+                  : ""}
+              </Typography>
+            )}
+          </Box>
         ))}
       </Box>
     </Box>

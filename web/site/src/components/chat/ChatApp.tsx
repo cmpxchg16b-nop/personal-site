@@ -10,9 +10,18 @@ import type {
   SubscriberId,
 } from "@/api/ss/types";
 import type { PeerConnectionStates } from "@/api/ss/peersessions";
-import type { UseExternalSIPResult } from "@/api/ss/sip";
+import {
+  isExternalSIPCallActive,
+  type UseExternalSIPResult,
+} from "@/api/ss/sip";
 import ChatSidebar, { type ChatSidebarTab } from "./ChatSidebar";
 import ConversationView from "./ConversationView";
+import ExternalSIPConversationView from "./ExternalSIPConversationView";
+import {
+  externalSIPConversationForCall,
+  sameExternalSIPConversation,
+  type ExternalSIPConversationRef,
+} from "./externalSipConversation";
 import PhoneContactView from "./PhoneContactView";
 import SipRegistrationSettings from "./SipRegistrationSettings";
 import { IncomingCallWindow } from "./IncomingCallWindow";
@@ -110,6 +119,7 @@ type ChatAppProps = {
   dtmfFor: (channelId: ChannelId, peer: SubscriberId) => DialerHandle | null;
   // External SIP is intentionally separate from channel conversations/calls.
   externalSIP: UseExternalSIPResult;
+  externalRemoteAnalyserFor: (callId: string) => AnalyserNode | null;
 };
 
 export default function ChatApp({
@@ -136,6 +146,7 @@ export default function ChatApp({
   remoteVideoFor,
   dtmfFor,
   externalSIP,
+  externalRemoteAnalyserFor,
 }: ChatAppProps) {
   const { t } = useTranslation();
   const [mobileListOpen, setMobileListOpen] = useState(false);
@@ -145,6 +156,8 @@ export default function ChatApp({
     messageId: string;
   } | null>(null);
   const [sipSettingsOpen, setSipSettingsOpen] = useState(false);
+  const [externalConversation, setExternalConversation] =
+    useState<ExternalSIPConversationRef | null>(null);
   // The dial pad's visibility — viewport chrome like mobileListOpen:
   // the pad EXISTS while the open conversation's call negotiated DTMF
   // (activeDialer below), and SHOWS on the user's toggle.
@@ -168,10 +181,48 @@ export default function ChatApp({
   // The open conversation's live call, and the ringing incoming call the
   // global window answers (the latest, in the unlikely case of several).
   const activeCall = activeKey === null ? null : (calls[activeKey] ?? null);
+  const activeExternalCall =
+    externalConversation === null
+      ? null
+      : (Object.values(externalSIP.calls)
+          .filter((call) => {
+            if (!isExternalSIPCallActive(call)) return false;
+            const ref = externalSIPConversationForCall(call);
+            return (
+              ref !== null &&
+              sameExternalSIPConversation(
+                ref,
+                externalConversation,
+                call.localUri,
+              )
+            );
+          })
+          .sort((a, b) => b.updatedAt - a.updatedAt)[0] ?? null);
   const incomingCall =
     Object.values(calls)
       .filter((call) => call.status === "inviting" && call.incoming)
       .sort((a, b) => b.since - a.since)[0] ?? null;
+  const incomingExternalCall =
+    Object.values(externalSIP.calls)
+      .filter(
+        (call) => call.direction === "incoming" && call.state === "ringing",
+      )
+      .sort((a, b) => b.updatedAt - a.updatedAt)[0] ?? null;
+  const incomingExternalName =
+    incomingExternalCall === null
+      ? ""
+      : (incomingExternalCall.remoteUri ??
+        incomingExternalCall.target ??
+        incomingExternalCall.callId);
+  const incomingExternalUser: ChatUser | undefined =
+    incomingExternalCall === null
+      ? undefined
+      : {
+          id: `external:incoming:${incomingExternalCall.callId}`,
+          name: incomingExternalName,
+          online: true,
+          visible: true,
+        };
 
   // The open conversation's peer connection state, for the header's
   // presence line; null when no session exists (yet).
@@ -197,6 +248,22 @@ export default function ChatApp({
 
   const handleSelect = (ref: ConversationRef) => {
     onSelect(ref);
+    setExternalConversation(null);
+    setPhoneContact(null);
+    setSipSettingsOpen(false);
+    setMobileListOpen(false);
+  };
+
+  const openInternalConversation = (ref: ConversationRef) => {
+    // Sidebar selection toggles; call/contact actions instead ensure that the
+    // intended conversation is open, including when it already is selected.
+    if (
+      selected === null ||
+      conversationKey(selected) !== conversationKey(ref)
+    ) {
+      onSelect(ref);
+    }
+    setExternalConversation(null);
     setPhoneContact(null);
     setSipSettingsOpen(false);
     setMobileListOpen(false);
@@ -209,9 +276,36 @@ export default function ChatApp({
   };
 
   const handleSelectContact = (ref: ConversationRef, messageId: string) => {
+    setExternalConversation(null);
     setPhoneContact({ ref, messageId });
     setSipSettingsOpen(false);
     setMobileListOpen(false);
+  };
+
+  const openExternalConversation = (ref: ExternalSIPConversationRef) => {
+    setExternalConversation(ref);
+    setActiveTab("phone");
+    setPhoneContact(null);
+    setSipSettingsOpen(false);
+    setMobileListOpen(false);
+  };
+
+  const acceptExternalCall = (call: (typeof externalSIP.calls)[string]) => {
+    const ref = externalSIPConversationForCall(call);
+    if (ref !== null) openExternalConversation(ref);
+    void externalSIP.accept(call.callId);
+  };
+
+  const acceptInternalCall = (call: ActivePhoneCall) => {
+    openInternalConversation(call.ref);
+    onAcceptCall(call);
+  };
+
+  const startContactCall = (kind: PhoneCallKind) => {
+    if (phoneContact === null) return;
+    const ref = phoneContact.ref;
+    openInternalConversation(ref);
+    onStartCall(ref, kind);
   };
 
   return (
@@ -244,6 +338,8 @@ export default function ChatApp({
           currentUserId={currentUserId}
           selectedCallId={phoneContact?.messageId ?? null}
           onSelectContact={handleSelectContact}
+          onOpenExternalConversation={openExternalConversation}
+          selectedExternalConversation={externalConversation}
           sipSelected={activeTab === "settings" && sipSettingsOpen}
           onOpenSip={() => {
             setSipSettingsOpen(true);
@@ -262,6 +358,28 @@ export default function ChatApp({
         ) : activeTab === "phone" && phoneContactUser !== undefined ? (
           <PhoneContactView
             user={phoneContactUser}
+            onBack={() => setMobileListOpen(true)}
+            onVoiceCall={() => startContactCall("voice")}
+            onVideoCall={() => startContactCall("video")}
+            onMessage={() =>
+              phoneContact !== null &&
+              openInternalConversation(phoneContact.ref)
+            }
+            sx={{
+              display: { xs: mobileListOpen ? "none" : "flex", sm: "flex" },
+            }}
+          />
+        ) : activeTab === "phone" && externalConversation !== null ? (
+          <ExternalSIPConversationView
+            conversation={externalConversation}
+            call={activeExternalCall}
+            sip={externalSIP}
+            localAnalyser={localAnalyser}
+            remoteAnalyser={
+              activeExternalCall === null
+                ? null
+                : externalRemoteAnalyserFor(activeExternalCall.callId)
+            }
             onBack={() => setMobileListOpen(true)}
             sx={{
               display: { xs: mobileListOpen ? "none" : "flex", sm: "flex" },
@@ -309,14 +427,23 @@ export default function ChatApp({
       </Paper>
       {/* The global incoming-call popup — the one place calls are
           answered. */}
-      <IncomingCallWindow
-        call={incomingCall}
-        caller={
-          incomingCall === null ? undefined : users[incomingCall.ref.userId]
-        }
-        onAccept={onAcceptCall}
-        onReject={onRejectCall}
-      />
+      {incomingCall !== null &&
+      (incomingExternalCall === null ||
+        incomingCall.since * 1000 >= incomingExternalCall.since) ? (
+        <IncomingCallWindow
+          call={incomingCall}
+          caller={users[incomingCall.ref.userId]}
+          onAccept={acceptInternalCall}
+          onReject={onRejectCall}
+        />
+      ) : (
+        <IncomingCallWindow
+          call={incomingExternalCall}
+          caller={incomingExternalUser}
+          onAccept={acceptExternalCall}
+          onReject={(call) => void externalSIP.decline(call.callId)}
+        />
+      )}
       <ExternalSIPCallOverlay sip={externalSIP} />
       {/* The video calls' floating views: our own camera while it
           sends, then the peers' cameras — rendered later at the same
