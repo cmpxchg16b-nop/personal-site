@@ -77,6 +77,39 @@ func TestRegisterResponseExpiry(t *testing.T) {
 	})
 }
 
+func TestRewriteRegisterContactFromViaTransport(t *testing.T) {
+	tests := []struct {
+		network  string
+		wantHost string
+		wantPort int
+	}{
+		{network: "UDP", wantHost: "198.51.100.20", wantPort: 24000},
+		{network: "TCP", wantHost: "192.0.2.10", wantPort: 15060},
+		{network: "TLS", wantHost: "192.0.2.10", wantPort: 15060},
+		{network: "WS", wantHost: "192.0.2.10", wantPort: 15060},
+		{network: "WSS", wantHost: "192.0.2.10", wantPort: 15060},
+	}
+	for _, test := range tests {
+		t.Run(test.network, func(t *testing.T) {
+			request := sip.NewRequest(sip.REGISTER, sip.Uri{Scheme: "sip", User: "alice", Host: "pbx.example"})
+			request.SetTransport(test.network)
+			contact := &sip.ContactHeader{Address: sip.Uri{Scheme: "sip", User: "alice", Host: "192.0.2.10", Port: 15060}}
+			request.AppendHeader(contact)
+			params := sip.NewParams()
+			params.Add("rport", "24000")
+			params.Add("received", "198.51.100.20")
+			via := &sip.ViaHeader{Transport: test.network, Host: "192.0.2.10", Port: 15060, Params: params}
+
+			rewriteRegisterContactFromVia(request, via, contact.Clone())
+
+			got := request.Contact()
+			if got.Address.Host != test.wantHost || got.Address.Port != test.wantPort {
+				t.Fatalf("%s Contact = %s:%d, want %s:%d", test.network, got.Address.Host, got.Address.Port, test.wantHost, test.wantPort)
+			}
+		})
+	}
+}
+
 func TestBuildUnregisterRequestExpiresOnlyOurContact(t *testing.T) {
 	params := sip.NewParams()
 	params.Add("Expires", "300")

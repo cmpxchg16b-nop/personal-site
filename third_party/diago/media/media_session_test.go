@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"testing"
+	"time"
 
 	"github.com/emiago/diago/media/sdp"
 	"github.com/emiago/sipgo/fakes"
@@ -403,7 +404,7 @@ s=Sip Go Media
 c=IN IP4 192.168.178.54
 t=0 0
 m=audio 34391 RTP/SAVP 0 8
-a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:8Dlz/SyzlAKCZwH49w5DX8S4pDa7Lw0n3LTI4t6Z
+a=crypto:1  AES_CM_128_HMAC_SHA1_80 inline:8Dlz/SyzlAKCZwH49w5DX8S4pDa7Lw0n3LTI4t6Z
 a=sendrecv`
 
 		m := MediaSession{
@@ -417,6 +418,28 @@ a=sendrecv`
 		}
 		err := m.RemoteSDP([]byte(sd))
 		require.NoError(t, err)
+	})
+
+	t.Run("MalformedCryptoErrorDoesNotExposeKey", func(t *testing.T) {
+		sd := `v=0
+o=- 3948988145 3948988145 IN IP4 192.168.178.54
+s=Sip Go Media
+c=IN IP4 192.168.178.54
+t=0 0
+m=audio 34391 RTP/SAVP 0 8
+a=crypto:invalid AES_CM_128_HMAC_SHA1_80 inline:secret-key-material
+a=sendrecv`
+
+		m := MediaSession{
+			Codecs:    []Codec{CodecAudioAlaw, CodecAudioUlaw},
+			Laddr:     net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)},
+			Mode:      "sendrecv",
+			SecureRTP: 1,
+			SRTPAlg:   SRTPProfileAes128CmHmacSha1_80,
+		}
+		err := m.RemoteSDP([]byte(sd))
+		require.Error(t, err)
+		require.NotContains(t, err.Error(), "secret-key-material")
 	})
 
 }
@@ -545,6 +568,57 @@ func TestMediaSRTP(t *testing.T) {
 
 		assert.Equal(t, pkt.Payload, rPkt.Payload)
 	}
+}
+
+func TestRTPSessionDropsInvalidSRTPPacket(t *testing.T) {
+	oldPortStart, oldPortEnd := RTPPortStart, RTPPortEnd
+	RTPPortStart, RTPPortEnd = 0, 0
+	t.Cleanup(func() { RTPPortStart, RTPPortEnd = oldPortStart, oldPortEnd })
+
+	m1 := MediaSession{
+		Laddr:     net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)},
+		Codecs:    []Codec{CodecAudioAlaw},
+		SecureRTP: 1,
+		SRTPAlg:   SRTPProfileAes128CmHmacSha1_80,
+		Mode:      sdp.ModeSendrecv,
+	}
+	require.NoError(t, m1.Init())
+	t.Cleanup(func() { require.NoError(t, m1.Close()) })
+	m2 := MediaSession{
+		Laddr:     net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)},
+		Codecs:    []Codec{CodecAudioAlaw},
+		SecureRTP: 1,
+		SRTPAlg:   SRTPProfileAes128CmHmacSha1_80,
+		Mode:      sdp.ModeSendrecv,
+	}
+	require.NoError(t, m2.Init())
+	t.Cleanup(func() { require.NoError(t, m2.Close()) })
+	require.NoError(t, m1.RemoteSDP(m2.LocalSDP()))
+	require.NoError(t, m2.RemoteSDP(m1.LocalSDP()))
+
+	// Queue the forged datagram and valid media on the same source socket so the
+	// reader encounters the authentication failure first.
+	_, err := m1.rtpConn.WriteTo([]byte{0x80, 0x00, 0x07, 0xd0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 2, 3, 4}, &m2.Laddr)
+	require.NoError(t, err)
+	pkt := &rtp.Packet{
+		Header: rtp.Header{
+			Version:        2,
+			PayloadType:    CodecAudioAlaw.PayloadType,
+			SequenceNumber: 2000,
+			Timestamp:      16000,
+			SSRC:           0xdeadbeef,
+		},
+		Payload: []byte("valid after forged SRTP"),
+	}
+	require.NoError(t, m1.WriteRTP(pkt))
+	require.NoError(t, m2.StopRTP(1, time.Second))
+
+	session := NewRTPSession(&m2)
+	var received rtp.Packet
+	_, err = session.ReadRTP(make([]byte, RTPBufSize), &received)
+	require.NoError(t, err)
+	require.Equal(t, pkt.Payload, received.Payload)
+	require.Equal(t, pkt.SequenceNumber, received.SequenceNumber)
 }
 
 func TestMediaSessionRTPSymetric(t *testing.T) {

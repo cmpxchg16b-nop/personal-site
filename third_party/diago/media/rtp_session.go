@@ -267,6 +267,11 @@ func (s *RTPSession) ReadRTP(b []byte, readPkt *rtp.Packet) (n int, err error) {
 	sess := s.Sess
 	for {
 		n, err = sess.ReadRTP(b, readPkt)
+		if errors.Is(err, ErrSRTPDecrypt) {
+			// Authentication/replay failures invalidate only this datagram. Keep
+			// the media stream alive for subsequent valid SRTP packets.
+			continue
+		}
 		if err != nil {
 			return n, err
 		}

@@ -171,20 +171,7 @@ func (t *RegisterTransaction) register(ctx context.Context) error {
 		return fmt.Errorf("no Via header in response")
 	}
 
-	// https://datatracker.ietf.org/doc/html/rfc3581#section-9
-	if rport, _ := via.Params.Get("rport"); rport != "" {
-		if p, err := strconv.Atoi(rport); err == nil {
-			contact.Address.Port = p
-		}
-
-		if received, _ := via.Params.Get("received"); received != "" {
-			// TODO: consider parsing IP
-			contact.Address.Host = received
-		}
-
-		// Update contact address of NAT
-		req.ReplaceHeader(contact)
-	}
+	rewriteRegisterContactFromVia(req, via, contact)
 
 	if res.StatusCode == sip.StatusUnauthorized || res.StatusCode == sip.StatusProxyAuthRequired {
 		res, err = client.DoDigestAuth(ctx, req, res, sipgo.DigestAuth{
@@ -219,6 +206,28 @@ func (t *RegisterTransaction) register(ctx context.Context) error {
 // Expiry returns the lease granted by the latest successful REGISTER response.
 // Like the transaction itself, it is not synchronized; callers must serialize
 // it with Register, Qualify, and Unregister.
+// rewriteRegisterContactFromVia applies the RFC 3581 source address learned
+// from a REGISTER response to this UA's Contact. A reliable transport's rport
+// is the outbound connection's source port, not the UA's listening Contact.
+func rewriteRegisterContactFromVia(req *sip.Request, via *sip.ViaHeader, contact *sip.ContactHeader) {
+	if sip.IsReliable(req.Transport()) {
+		return
+	}
+	if rport, _ := via.Params.Get("rport"); rport != "" {
+		if p, err := strconv.Atoi(rport); err == nil {
+			contact.Address.Port = p
+		}
+
+		if received, _ := via.Params.Get("received"); received != "" {
+			// TODO: consider parsing IP
+			contact.Address.Host = received
+		}
+
+		// Update contact address of NAT
+		req.ReplaceHeader(contact)
+	}
+}
+
 func (t *RegisterTransaction) Expiry() time.Duration {
 	return t.expiry
 }

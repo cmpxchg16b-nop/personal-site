@@ -86,10 +86,11 @@ counting; as written it is dead code for multi-media SDPs. The sip
 bot's /video-call and inbound video calls bridge exactly those, so the
 guard now counts only m-lines OF THE REQUESTED TYPE:
 
-- `media/sdp/sdp.go` `MediaDescription`: a second m-line of the same
-  media type still errors; m-lines of other types are skipped. A
-  single-m-line SDP (everything upstream ever parses) behaves
-  byte-identically.
+- `media/sdp/sdp.go` `MediaDescription`: a second ACTIVE m-line of the same
+  media type still errors; port-zero rejected m-lines are skipped so an answer
+  can retain rejected profile alternatives without creating another session.
+  M-lines of other types are skipped. A single-active-m-line SDP (everything
+  upstream ever parses) behaves byte-identically.
 
 No other behavior changes; SDP generation is untouched.
 
@@ -198,3 +199,53 @@ source-lock check runs.
 - `media/media_session_test.go`: a video PT is ignored before an allowed audio
   PT teaches the mapped source. The user-subsystem demux test additionally sends
   browser audio after inbound video and proves it still reaches the audio peer.
+
+## Patch 10: preserve listener Contact on reliable REGISTER transports
+
+Upstream rewrites REGISTER Contact from the response Via `rport`/`received`
+before digest authentication. That is valid for the shared UDP socket, but on
+TCP/TLS/WS/WSS the rport is the outbound connection's ephemeral source port, not
+the UA listener. Advertising it prevents the registrar from delivering inbound
+calls to the registered Contact.
+
+- `register_transaction.go`: apply the RFC 3581 Contact rewrite only to
+  connectionless transports. Reliable transports retain the listener Contact
+  derived from diago's transport configuration; explicit external listener
+  configuration remains responsible for reachable TCP NAT mappings.
+- `register_transaction_expiry_test.go`: cover UDP learning alongside TCP, TLS,
+  WS, and WSS listener preservation. Before the guard, all four reliable cases
+  reproduced the incorrect rport/received replacement.
+
+## Patch 11: whitespace-tolerant, key-redacting SDES errors
+
+The user SIP gateway accepts `RTP/SAVP` offers dynamically and must not expose
+inline master keys through negotiation errors. Upstream split crypto attributes
+on literal single spaces and included the complete attribute in malformed-tag
+errors, so valid repeated whitespace could fail and key material could reach
+application logs.
+
+- `media/media_session.go`: parse crypto fields with `strings.Fields` and remove
+  the raw attribute from malformed-attribute/tag errors. Supported key parsing,
+  SRTP contexts, and generated SDP are otherwise unchanged.
+- `media/media_session_test.go`: cover repeated whitespace in a valid SDES offer
+  and verify that a malformed tag error does not contain its inline key.
+- `pkg/sipregistration`: performs stricter supported-suite/session-parameter
+  validation before calling diago and likewise returns key-redacted errors.
+
+## Patch 12: drop invalid SRTP datagrams without ending the RTP session
+
+An unauthenticated or replayed SRTP packet is a per-datagram failure, not a
+socket/stream EOF. Returning its decryption error through `RTPSession` made the
+user gateway's relay goroutine exit permanently, so one forged UDP datagram
+could stop all subsequent valid SIP-to-browser audio.
+
+- `media/media_session.go`: exported `ErrSRTPDecrypt` classifies authentication,
+  replay, and decryption failures while retaining the underlying error.
+- `media/rtp_session.go`: `ReadRTP` skips only this classified per-packet error
+  and continues reading; socket closure, deadlines, and other errors retain
+  their existing behavior.
+- `media/media_session_test.go`: queues a forged datagram and a valid encrypted
+  packet on one source socket and proves the session returns the valid media.
+- `pkg/sipregistration/sdp.go` additionally filters secure inbound offers to
+  their audio m-line before diago parses them, preventing flattened video
+  attributes from selecting the wrong SDES key/tag.

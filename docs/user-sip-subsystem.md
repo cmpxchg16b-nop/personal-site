@@ -309,7 +309,7 @@ The implemented media path is:
 Browser WebRTC UA
   ↔ ICE + DTLS-SRTP (mandatory WebRTC side)
 Dedicated Pion answerer + Go RTP relay
-  ↔ plaintext RTP/AVP + endpoint-local RTCP (current SIP side)
+  ↔ plaintext RTP/AVP or SDES-SRTP RTP/SAVP (SIP SDP dependent)
 SIP UA / PBX
 ```
 
@@ -325,6 +325,12 @@ Rules and implemented behavior:
 - One browser-preferred audio pair and at most one video pair are selected for
   the relay. Audio is mandatory; video is optional. A SIP video offer with no
   usable match receives a port-0 video m-line rather than being silently omitted.
+- SignalWire-style audio profile alternatives are supported only when the
+  additional AVP/SAVP m-lines have the same nonzero port, formats, codecs,
+  direction, and connection address as the first audio section. They represent
+  one media stream: the offerer's first section is selected and each alternative
+  receives an ordered port-0 answer. Arbitrary independent audio streams remain
+  unsupported.
 - To keep a UDP INVITE below sipgo's MTU, the initial outbound offer is bounded
   to at most four actual primary audio and two actual primary video capabilities
   in browser preference order after helper payloads are removed. This retains
@@ -359,6 +365,24 @@ Rules and implemented behavior:
 - Pion and diago each handle their own RTCP. RTCP is **not forwarded or
   translated between legs**; SSRC/sequence mappings are therefore local to each
   leg rather than an end-to-end RTCP gateway.
+- An inbound audio `RTP/SAVP` offer dynamically enables SDES-SRTP for the
+  default `AES_CM_128_HMAC_SHA1_80` suite with one plain inline key. The answer
+  mirrors SAVP, echoes the selected tag/suite, and carries a fresh local sending
+  key; diago protects both RTP and RTCP. Missing/malformed crypto, unsupported
+  suites, lifetime/MKI, and session parameters fail negotiation rather than
+  silently falling back to plaintext. An inbound `RTP/AVP` offer remains
+  plaintext even if it carries a crypto attribute.
+- The initial SRTP scope is inbound audio only. Active SRTP video is rejected
+  because one diago media session cannot represent independent per-m-line SDES
+  contexts; a rejected video m-line is still answered normally. Outbound initial
+  offers remain RTP/AVP: an AVP offer cannot be upgraded to SAVP by the answer,
+  so secure outbound offering needs a separate local policy or standards-based
+  capability negotiation rather than answer-time guessing.
+- SDES carries master keys in SDP. Its confidentiality and authentication are
+  only as strong as the SIP signaling path; TLS/SIPS or an equivalent protected
+  signaling design is required to protect those keys from network observers.
+  Enabling SRTP over plaintext UDP/TCP signaling does not provide that
+  end-to-end key secrecy.
 - SIP media enables diago's symmetric RTP mode. The negotiated SDP `c=`/remote
   address may be a private or otherwise unreachable address (for example a
   Docker container), so audio and DTMF are sent to the actual learned RTP source
@@ -372,10 +396,10 @@ Rules and implemented behavior:
 - No common real audio codec fails negotiation (inbound SIP 488 or outbound
   terminal failure with ACK/BYE); it never triggers transcoding.
 
-Current exclusions: SIP-side SRTP/SDES/DTLS-SRTP, late-offer inbound calls,
-early-media forwarding, SIP-to-browser DTMF forwarding, non-RFC-4733 DTMF
-translation, re-INVITE/hold updates, multiple audio/video m-lines, and non-RTP
-media profiles. Tagged re-INVITE is explicitly answered
+Current exclusions: outbound SRTP offers, active SRTP video, SIP-side
+DTLS-SRTP/SAVPF, late-offer inbound calls, early-media forwarding,
+SIP-to-browser DTMF forwarding, non-RFC-4733 DTMF translation, re-INVITE/hold
+updates, multiple independent audio/video m-lines, and non-RTP media profiles. Tagged re-INVITE is explicitly answered
 488 so diago cannot silently apply an unsupported media update. The configured
 WebRTC STUN/TURN URLs are used by Pion, and SIP media advertises the runtime's
 route-selected local address while symmetric RTP learns the reachable remote
@@ -389,7 +413,8 @@ tests alone.
 - Credentials and observed states disappear on process restart. Passwords are
   plaintext in process memory, as required to answer digest challenges; they
   are excluded from API responses and application log fields. MESSAGE bodies,
-  Authorization headers, and SDP credentials/fingerprints are not logged.
+  Authorization headers, SDP credentials/fingerprints, and SDES inline keys are
+  not logged.
 - Creation is capped at eight credentials per user and 64 process-wide,
   including disabled entries. Registrar and negotiated media targets may use
   public, private, loopback, or other locally reachable addresses for every
@@ -436,11 +461,13 @@ Backend:
   inbound call state machines, parallel ringing, answer/decline/cancel/BYE,
   MESSAGE results/delivery, media-egress checks, and cleanup.
 - `pkg/sipregistration/sdp.go`: browser/SIP profile parsing, actual capability
-  matching, dynamic PT/fmtp handling, direction mapping, and SDP generation.
+  matching, dynamic PT/fmtp handling, direction mapping, SDES validation, and
+  SDP generation.
 - `pkg/sipregistration/media.go`: diago media sessions with symmetric RTP
-  learning, dedicated Pion answerers, ICE, bidirectional audio/video RTP relay,
-  sip-bot-style browser DTMF parsing/deduplication/re-origination, and demuxed
-  video output. `dtmf.go` contains the RFC 4733 event vocabulary.
+  learning, inbound SDP-selected SDES-SRTP contexts, dedicated Pion answerers,
+  ICE, bidirectional audio/video RTP relay, sip-bot-style browser DTMF
+  parsing/deduplication/re-origination, and demuxed video output. `dtmf.go`
+  contains the RFC 4733 event vocabulary.
 - `pkg/sipregistration/inbound.go`: exact runtime + AOR + lease routing and SIP
   status mapping.
 - `cmd/server/main.go`: one manager/service/hub wiring shared by all users.
@@ -471,8 +498,10 @@ The main test files are `pkg/sipregistration/{service,runtime_operations,sdp,med
 They cover registration and ownership, real UDP digest INVITE/MESSAGE,
 provisional/final responses, ACK/BYE and CANCEL behavior, parallel answer races,
 per-tab/all-tab decline, timeout/disconnect/replacement, SDP capabilities and
-directions, Pion-to-Pion negotiation, bidirectional arbitrary-payload RTP,
-real WebRTC-track-to-SIP-UDP DTMF parsing/deduplication and seven-packet
+directions, inbound SDP-selected SDES negotiation with key-redacted errors,
+Pion-to-Pion negotiation, bidirectional arbitrary-payload RTP, encrypted
+SRTP-to-relay-to-browser media in both directions, real
+WebRTC-track-to-SIP-UDP DTMF parsing/deduplication and seven-packet
 re-origination with dynamic PTs and primary-audio timestamps, MESSAGE status and
 spoof resistance, browser offer/ICE
 ordering, DTMF sender capability/live-gate behavior, local failure notification,
@@ -589,3 +618,30 @@ Live validation used isolated Chrome tabs and a temporary loopback UDP PBX:
   and checks primary-audio timestamps around DTMF. Final full-suite results are
   recorded in `.ai/memory/sessions/70.md`; earlier green commands are not used
   as a substitute for that live evidence.
+
+### 2026-11-25 — inbound SDP-selected SDES-SRTP
+
+- Added dynamic inbound `RTP/SAVP` negotiation using diago's SDES contexts while
+  retaining plaintext `RTP/AVP` behavior and outbound AVP offers. The supported
+  SDES subset is AES_CM_128_HMAC_SHA1_80 with a bare inline key; invalid or
+  unsupported negotiation fails without logging inline keys.
+- Added the SignalWire offer shape found by fragmented live capture: an active
+  SAVP audio m-line followed by an equivalent same-port AVP alternative. The
+  gateway selects the offerer's first section, answers SAVP with its fresh key,
+  and rejects the AVP alternative with an ordered port-0 m-line. AVP-first
+  alternatives and genuinely independent multi-audio offers are distinguished.
+- Invalid SRTP authentication/replay datagrams are dropped without terminating
+  the relay. Audio-only filtering prevents video attributes from becoming the
+  audio SDES context. Active SRTP video, DTLS-SRTP/SAVPF, lifetime/MKI, and
+  non-default suites remain explicit exclusions.
+- Final automated checks passed: `go test -race -count=1
+./pkg/sipregistration`, focused SRTP/media race tests, `go test -count=1
+./...`, nested diago `go test -count=1 ./media`, both package `go vet`
+  commands, `go build ./cmd/server`, and `git --no-pager diff --check`.
+- Live SignalWire verification kept both credential encryption settings at
+  their default. Capture showed caller AVP 200, callee SAVP 200 selecting tag 7,
+  the AVP alternative rejected at port 0, and ACK on both legs. Two browser PCs
+  were connected; each increased inbound and outbound audio by 100 RTP packets
+  in a two-second sample. The user additionally confirmed audible audio. A
+  final call on the exact deployed binary reached In call on both pages and
+  ended normally. Captures containing SDES keys were deleted after analysis.

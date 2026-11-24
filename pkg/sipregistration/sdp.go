@@ -1,9 +1,11 @@
 package sipregistration
 
 import (
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"net"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -16,6 +18,7 @@ import (
 const (
 	maxSDPFormatsPerMedia = 128
 	maxSDPCodecsPerMedia  = 32
+	sipSDESCryptoSuite    = "AES_CM_128_HMAC_SHA1_80"
 )
 
 var errNoCommonAudio = errors.New("no common audio codec")
@@ -46,8 +49,9 @@ type mediaSection struct {
 }
 
 type sdpModel struct {
-	Audio *mediaSection
-	Video *mediaSection
+	Audio             *mediaSection
+	AudioAlternatives []*mediaSection
+	Video             *mediaSection
 }
 
 type codecPair struct {
@@ -66,6 +70,7 @@ type negotiatedSelection struct {
 	DTMF               *codecPair
 	SIPAudio           *mediaSection
 	SIPVideo           *mediaSection
+	RejectAudio        []*mediaSection
 	RejectVideoFormats []string
 }
 
@@ -121,9 +126,9 @@ func rtpCodecFromWebRTC(params webrtc.RTPCodecParameters) rtpCodec {
 	}
 }
 
-// parseSDP parses the one-audio/one-video plaintext RTP profile supported by
-// the SIP leg. A missing video m-line leaves Video nil; a rejected video m-line
-// leaves a non-nil section with Port zero and its original Formats.
+// parseSDP parses the one-audio/one-video RTP or SDES-SRTP profiles supported
+// by the SIP leg. A missing video m-line leaves Video nil; a rejected video
+// m-line leaves a non-nil section with Port zero and its original Formats.
 func parseSDP(raw []byte) (sdpModel, error) {
 	return parseSDPWithProfiles(raw, false)
 }
@@ -153,21 +158,44 @@ func parseSDPWithProfiles(raw []byte, browser bool) (sdpModel, error) {
 		if kind != "audio" && kind != "video" {
 			continue
 		}
-		if (kind == "audio" && model.Audio != nil) || (kind == "video" && model.Video != nil) {
-			return sdpModel{}, fmt.Errorf("multiple %s media sections are unsupported", kind)
-		}
-
 		section, err := parseMediaSectionWithProfile(description, kind, sessionIP, sessionDirection, browser)
 		if err != nil {
 			return sdpModel{}, err
 		}
 		if kind == "audio" {
+			if model.Audio != nil {
+				// SignalWire offers an active SAVP m-line followed by an otherwise
+				// identical AVP alternative. Keep the offerer's first section and
+				// retain later alternatives so the answer can reject them in order.
+				// A port-zero section is already rejected and needs no equivalence.
+				if section.Port == 0 || rtpProfileAlternative(model.Audio, section) {
+					model.AudioAlternatives = append(model.AudioAlternatives, section)
+					continue
+				}
+				return sdpModel{}, errors.New("multiple independent audio media sections are unsupported")
+			}
 			model.Audio = section
 		} else {
+			if model.Video != nil {
+				return sdpModel{}, errors.New("multiple video media sections are unsupported")
+			}
 			model.Video = section
 		}
 	}
 	return model, nil
+}
+
+func rtpProfileAlternative(first, alternative *mediaSection) bool {
+	if first == nil || alternative == nil || first.Kind != "audio" || alternative.Kind != "audio" ||
+		first.Port == 0 || first.Port != alternative.Port || first.Direction != alternative.Direction ||
+		!first.ConnectionIP.Equal(alternative.ConnectionIP) ||
+		!((first.Protocol == "RTP/SAVP" && alternative.Protocol == "RTP/AVP") ||
+			(first.Protocol == "RTP/AVP" && alternative.Protocol == "RTP/SAVP")) {
+		return false
+	}
+	return slices.Equal(first.Formats, alternative.Formats) &&
+		slices.Equal(first.Codecs, alternative.Codecs) &&
+		slices.Equal(first.TelephoneEvents, alternative.TelephoneEvents)
 }
 
 func parseMediaSection(description *pionsdp.MediaDescription, kind string, sessionIP net.IP, sessionDirection string) (*mediaSection, error) {
@@ -180,8 +208,8 @@ func parseMediaSectionWithProfile(description *pionsdp.MediaDescription, kind st
 		if !browserRTPProfile(protocol) {
 			return nil, fmt.Errorf("%s media uses unsupported WebRTC profile %q", kind, protocol)
 		}
-	} else if protocol != "RTP/AVP" {
-		return nil, fmt.Errorf("%s media uses unsupported profile %q: only RTP/AVP is supported", kind, protocol)
+	} else if protocol != "RTP/AVP" && protocol != "RTP/SAVP" {
+		return nil, fmt.Errorf("%s media uses unsupported profile %q: only RTP/AVP and RTP/SAVP are supported", kind, protocol)
 	}
 	port := description.MediaName.Port.Value
 	if port < 0 || port > 65535 {
@@ -554,8 +582,8 @@ func negotiateInboundOffer(browser, sipOffer sdpModel) (negotiatedSelection, err
 	return negotiateSDPModels(browser, sipOffer)
 }
 
-// negotiateOutboundSelection parses an actual WebRTC offer and plaintext SIP
-// answer, then pins the single codec pair used by each relay direction.
+// negotiateOutboundSelection parses an actual WebRTC offer and SIP answer,
+// then pins the single codec pair used by each relay direction.
 func negotiateOutboundSelection(browserOffer, sipAnswer []byte) (negotiatedSelection, error) {
 	browser, err := parseBrowserSDP(browserOffer)
 	if err != nil {
@@ -632,6 +660,9 @@ func negotiateSDPModels(browser, sip sdpModel) (negotiatedSelection, error) {
 	}
 	selection.SIPAudio = cloneMediaSection(sip.Audio)
 	selection.SIPVideo = cloneMediaSection(sip.Video)
+	for _, alternative := range sip.AudioAlternatives {
+		selection.RejectAudio = append(selection.RejectAudio, cloneMediaSection(alternative))
+	}
 	return selection, nil
 }
 
@@ -693,6 +724,139 @@ func (s negotiatedSelection) sipCodecs() (audio, video []rtpCodec) {
 	return pairCodecs(s.Audio, false), pairCodecs(s.Video, false)
 }
 
+// validateSIPSDESOffer accepts the subset diago can implement without
+// changing its semantics: one AES_CM_128_HMAC_SHA1_80 inline key, with no
+// lifetime, MKI, or session parameters. Other valid suites may be present as
+// alternatives. Errors deliberately never include the offered key material.
+func validateSIPSDESOffer(raw []byte) error {
+	var description pionsdp.SessionDescription
+	if err := description.Unmarshal(raw); err != nil {
+		return fmt.Errorf("parse SDES offer: %w", err)
+	}
+	for _, mediaDescription := range description.MediaDescriptions {
+		if !strings.EqualFold(mediaDescription.MediaName.Media, "audio") ||
+			strings.ToUpper(strings.Join(mediaDescription.MediaName.Protos, "/")) != "RTP/SAVP" {
+			continue
+		}
+		supported := false
+		tags := make(map[uint64]bool)
+		for _, attribute := range mediaDescription.Attributes {
+			if attribute.Key != "crypto" {
+				continue
+			}
+			fields := strings.Fields(attribute.Value)
+			if len(fields) < 3 {
+				return errors.New("invalid SDES crypto attribute")
+			}
+			tagText := fields[0]
+			if len(tagText) > 9 || (len(tagText) > 1 && tagText[0] == '0') {
+				return errors.New("invalid SDES crypto tag")
+			}
+			tag, err := strconv.ParseUint(tagText, 10, 31)
+			if err != nil || tag == 0 || tags[tag] {
+				return errors.New("invalid or duplicate SDES crypto tag")
+			}
+			tags[tag] = true
+			if fields[1] != sipSDESCryptoSuite {
+				continue
+			}
+			if len(fields) != 3 {
+				return errors.New("unsupported SDES session parameters")
+			}
+			if !strings.HasPrefix(fields[2], "inline:") {
+				return errors.New("unsupported SDES key method")
+			}
+			encoded := strings.TrimPrefix(fields[2], "inline:")
+			if strings.Contains(encoded, "|") {
+				return errors.New("unsupported SDES lifetime or MKI")
+			}
+			key, err := base64.StdEncoding.DecodeString(encoded)
+			if err != nil || len(key) != 30 {
+				return errors.New("invalid AES_CM_128_HMAC_SHA1_80 inline key")
+			}
+			supported = true
+		}
+		if !supported {
+			return errors.New("SRTP offer has no supported SDES crypto attribute")
+		}
+		return nil
+	}
+	return nil
+}
+
+// sipAudioOnlySDP removes non-selected audio alternatives and non-audio media
+// before diago parses an offer. Diago's SDP representation flattens media-level
+// attributes and supports one active audio session, so it must see only the
+// section selected by parseSDP.
+func sipAudioOnlySDP(raw []byte, protocol string) ([]byte, error) {
+	var description pionsdp.SessionDescription
+	if err := description.Unmarshal(raw); err != nil {
+		return nil, fmt.Errorf("parse audio-only SIP offer: %w", err)
+	}
+	audio := make([]*pionsdp.MediaDescription, 0, 1)
+	for _, mediaDescription := range description.MediaDescriptions {
+		if strings.EqualFold(mediaDescription.MediaName.Media, "audio") &&
+			strings.ToUpper(strings.Join(mediaDescription.MediaName.Protos, "/")) == protocol {
+			audio = append(audio, mediaDescription)
+			break
+		}
+	}
+	if len(audio) != 1 {
+		return nil, fmt.Errorf("SIP offer has no %s audio media section", protocol)
+	}
+	description.MediaDescriptions = audio
+	filtered, err := description.Marshal()
+	if err != nil {
+		return nil, fmt.Errorf("marshal audio-only SIP offer: %w", err)
+	}
+	return filtered, nil
+}
+
+// sipSDPSecurity is the transport security applied to the active audio m-line.
+// crypto contains the value after "a=crypto:", including the selected tag and
+// suite. It is generated locally by diago and must never be logged.
+type sipSDPSecurity struct {
+	protocol      string
+	videoProtocol string
+	crypto        string
+}
+
+func plaintextSIPSDPSecurity() sipSDPSecurity {
+	return sipSDPSecurity{protocol: "RTP/AVP", videoProtocol: "RTP/AVP"}
+}
+
+// parseLocalSIPSDESAnswer extracts the secure transport and generated sending
+// key from diago's temporary audio answer. The caller replaces that SDP with
+// the gateway's pinned codec/direction answer while retaining the initialized
+// SRTP contexts on the same MediaSession.
+func parseLocalSIPSDESAnswer(raw []byte) (sipSDPSecurity, error) {
+	var description pionsdp.SessionDescription
+	if err := description.Unmarshal(raw); err != nil {
+		return sipSDPSecurity{}, fmt.Errorf("parse local SDES answer: %w", err)
+	}
+	for _, mediaDescription := range description.MediaDescriptions {
+		if !strings.EqualFold(mediaDescription.MediaName.Media, "audio") {
+			continue
+		}
+		protocol := strings.ToUpper(strings.Join(mediaDescription.MediaName.Protos, "/"))
+		security := sipSDPSecurity{protocol: protocol}
+		for _, attribute := range mediaDescription.Attributes {
+			if attribute.Key != "crypto" {
+				continue
+			}
+			if security.crypto != "" {
+				return sipSDPSecurity{}, errors.New("local SDES answer contains multiple crypto attributes")
+			}
+			security.crypto = singleSDPLine(attribute.Value)
+		}
+		if protocol != "RTP/SAVP" || security.crypto == "" {
+			return sipSDPSecurity{}, errors.New("local SDES answer has no usable SRTP crypto attribute")
+		}
+		return security, nil
+	}
+	return sipSDPSecurity{}, errors.New("local SDES answer has no audio media")
+}
+
 // generateSIPSDP emits a sendrecv plaintext RTP/AVP offer using exactly the
 // supplied codec descriptions. A non-nil rejectVideoFormats emits a port-0
 // video m-line; nil omits video entirely. Audio telephone-event is emitted only
@@ -702,8 +866,20 @@ func generateSIPSDP(bindIP net.IP, rtpPort int, audio, video []rtpCodec, rejectV
 }
 
 func generateSIPSDPWithDirections(bindIP net.IP, rtpPort int, audio, video []rtpCodec, rejectVideoFormats []string, audioDirection, videoDirection string) []byte {
+	return generateSIPSDPWithDirectionsAndSecurity(bindIP, rtpPort, audio, video, rejectVideoFormats, audioDirection, videoDirection, nil, plaintextSIPSDPSecurity())
+}
+
+func generateSIPSDPWithDirectionsAndSecurity(bindIP net.IP, rtpPort int, audio, video []rtpCodec, rejectVideoFormats []string, audioDirection, videoDirection string, rejectAudio []*mediaSection, security sipSDPSecurity) []byte {
 	ip, addressType := sdpBindAddress(bindIP)
 	sessionID := uint64(time.Now().Unix())
+	protocol := security.protocol
+	if protocol == "" {
+		protocol = "RTP/AVP"
+	}
+	videoProtocol := security.videoProtocol
+	if videoProtocol == "" {
+		videoProtocol = protocol
+	}
 	lines := []string{
 		"v=0",
 		fmt.Sprintf("o=- %d %d IN %s %s", sessionID, sessionID, addressType, ip),
@@ -711,11 +887,19 @@ func generateSIPSDPWithDirections(bindIP net.IP, rtpPort int, audio, video []rtp
 		fmt.Sprintf("c=IN %s %s", addressType, ip),
 		"t=0 0",
 	}
-	lines = append(lines, generateSDPMediaSectionWithDirection("audio", rtpPort, audio, audioDirection)...)
+	lines = append(lines, generateSDPMediaSectionWithDirectionAndSecurity("audio", rtpPort, audio, audioDirection, protocol, security.crypto)...)
+	for _, rejected := range rejectAudio {
+		if rejected == nil {
+			continue
+		}
+		lines = append(lines, "m=audio 0 "+rejected.Protocol+sdpFormatsSuffix(rejected.Formats), "a=inactive")
+	}
 	if len(video) > 0 {
-		lines = append(lines, generateSDPMediaSectionWithDirection("video", rtpPort, video, videoDirection)...)
+		// Active SRTP video is rejected before generation: one diago MediaSession
+		// cannot carry independent per-m-line SDES contexts.
+		lines = append(lines, generateSDPMediaSectionWithDirectionAndSecurity("video", rtpPort, video, videoDirection, videoProtocol, "")...)
 	} else if rejectVideoFormats != nil {
-		lines = append(lines, "m=video 0 RTP/AVP"+sdpFormatsSuffix(rejectVideoFormats), "a=inactive")
+		lines = append(lines, "m=video 0 "+videoProtocol+sdpFormatsSuffix(rejectVideoFormats), "a=inactive")
 	}
 	return []byte(strings.Join(lines, "\r\n") + "\r\n")
 }
@@ -725,6 +909,10 @@ func generateSDPMediaSection(kind string, port int, codecs []rtpCodec) []string 
 }
 
 func generateSDPMediaSectionWithDirection(kind string, port int, codecs []rtpCodec, direction string) []string {
+	return generateSDPMediaSectionWithDirectionAndSecurity(kind, port, codecs, direction, "RTP/AVP", "")
+}
+
+func generateSDPMediaSectionWithDirectionAndSecurity(kind string, port int, codecs []rtpCodec, direction, protocol, crypto string) []string {
 	if len(codecs) == 0 {
 		port = 0
 	}
@@ -750,12 +938,15 @@ func generateSDPMediaSectionWithDirection(kind string, port int, codecs []rtpCod
 	if len(formats) == 0 {
 		port = 0
 	}
-	lines := []string{"m=" + kind + " " + strconv.Itoa(port) + " RTP/AVP" + sdpFormatsSuffix(formats)}
+	lines := []string{"m=" + kind + " " + strconv.Itoa(port) + " " + protocol + sdpFormatsSuffix(formats)}
 	lines = append(lines, attributes...)
 	if port == 0 {
 		lines = append(lines, "a=inactive")
 	} else {
 		lines = append(lines, "a="+normalizeSDPDirection(direction))
+		if crypto != "" {
+			lines = append(lines, "a=crypto:"+singleSDPLine(crypto))
+		}
 	}
 	return lines
 }

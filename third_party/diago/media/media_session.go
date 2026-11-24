@@ -55,6 +55,10 @@ var (
 	RTPNATDisabled = 0
 	RTPNATSymetric = 1
 
+	// ErrSRTPDecrypt identifies a per-packet SRTP authentication, replay, or
+	// decryption failure. RTPSession drops that packet and keeps reading.
+	ErrSRTPDecrypt = errors.New("SRTP packet decryption failed")
+
 	// SDP codec exchanges
 	// 0 (Default) - answerer prefers offerer order recomended by rfc
 	// 1 - answerer prefers local order
@@ -554,14 +558,14 @@ func (s *MediaSession) RemoteSDP(sdpReceived []byte) error {
 	// Check for SDES
 	for _, v := range attrs {
 		if strings.HasPrefix(v, "crypto:") {
-			vals := strings.Split(v, " ")
+			vals := strings.Fields(v)
 			if len(vals) < 3 {
-				return fmt.Errorf("sdp: bad crypto attribute attr=%q", v)
+				return fmt.Errorf("sdp: malformed crypto attribute")
 			}
 			// Parse crypto tag
 			tagString := strings.TrimPrefix(vals[0], "crypto:")
 			if s.srtpRemoteTag, err = strconv.Atoi(tagString); err != nil {
-				return fmt.Errorf("bad crypto tag in %q", v)
+				return fmt.Errorf("invalid SDES crypto tag")
 			}
 
 			// Parse algorithm
@@ -891,7 +895,7 @@ func (m *MediaSession) ReadRTP(buf []byte, pkt *rtp.Packet) (int, error) {
 	if m.remoteCtxSRTP != nil {
 		decrypted, err := m.remoteCtxSRTP.DecryptRTP(buf, buf[:n], &pkt.Header)
 		if err != nil {
-			return n, fmt.Errorf("Read SRTP Decrypt error: %w", err)
+			return n, fmt.Errorf("%w: %w", ErrSRTPDecrypt, err)
 		}
 		if len(decrypted) > len(buf) {
 			DefaultLogger().Warn("Growing Decrypted RTP buffer", "diff", len(decrypted)-len(buf))

@@ -116,8 +116,57 @@ func TestSDPParseStaticPayloadsAndRejectedVersusAbsentVideo(t *testing.T) {
 	}
 }
 
+func TestSDPParseAcceptsSDESSRTP(t *testing.T) {
+	model, err := parseSDP(testSDP(
+		"m=audio 4000 RTP/SAVP 0 101",
+		"a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:8Dlz/SyzlAKCZwH49w5DX8S4pDa7Lw0n3LTI4t6Z",
+		"a=rtpmap:101 telephone-event/8000",
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if model.Audio == nil || model.Audio.Protocol != "RTP/SAVP" {
+		t.Fatalf("parsed SRTP audio = %+v", model.Audio)
+	}
+}
+
+func TestSDPParseSignalWireAudioProfileAlternatives(t *testing.T) {
+	media := []string{
+		"m=audio 15348 RTP/SAVP 102 9 0 8 18 103 101",
+		"a=rtpmap:102 opus/48000/2",
+		"a=fmtp:102 useinbandfec=1; maxaveragebitrate=30000; maxplaybackrate=48000; ptime=20; minptime=10; maxptime=40",
+		"a=rtpmap:9 G722/8000",
+		"a=rtpmap:0 PCMU/8000",
+		"a=rtpmap:8 PCMA/8000",
+		"a=rtpmap:18 G729/8000",
+		"a=fmtp:18 annexb=no",
+		"a=rtpmap:103 telephone-event/48000",
+		"a=fmtp:103 0-15",
+		"a=rtpmap:101 telephone-event/8000",
+		"a=fmtp:101 0-15",
+		"a=crypto:7 AES_CM_128_HMAC_SHA1_80 inline:8Dlz/SyzlAKCZwH49w5DX8S4pDa7Lw0n3LTI4t6Z",
+		"a=ptime:20",
+	}
+	alternative := append([]string(nil), media...)
+	alternative[0] = "m=audio 15348 RTP/AVP 102 9 0 8 18 103 101"
+	alternative = append(alternative[:len(alternative)-2], alternative[len(alternative)-1])
+	model, err := parseSDP(testSDP(append(media, alternative...)...))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if model.Audio == nil || model.Audio.Protocol != "RTP/SAVP" || len(model.AudioAlternatives) != 1 ||
+		model.AudioAlternatives[0].Protocol != "RTP/AVP" {
+		t.Fatalf("SignalWire alternatives = %+v, %+v", model.Audio, model.AudioAlternatives)
+	}
+
+	independent := append(append([]string(nil), media...), "m=audio 15350 RTP/AVP 0")
+	if _, err := parseSDP(testSDP(independent...)); err == nil {
+		t.Fatal("independent second audio stream was accepted as a profile alternative")
+	}
+}
+
 func TestSDPParseRejectsNonPlainRTPProfiles(t *testing.T) {
-	for _, protocol := range []string{"RTP/SAVP", "RTP/SAVPF", "UDP/TLS/RTP/SAVPF", "TCP/RTP/AVP", "raw"} {
+	for _, protocol := range []string{"RTP/SAVPF", "UDP/TLS/RTP/SAVPF", "TCP/RTP/AVP", "raw"} {
 		t.Run(protocol, func(t *testing.T) {
 			if _, err := parseSDP(testSDP("m=audio 4000 " + protocol + " 0")); err == nil {
 				t.Fatalf("parse protocol %q succeeded, want rejection", protocol)

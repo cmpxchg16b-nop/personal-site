@@ -15,6 +15,7 @@ import (
 
 	"github.com/emiago/diago"
 	"github.com/emiago/diago/media"
+	diagosdp "github.com/emiago/diago/media/sdp"
 	"github.com/emiago/sipgo"
 	"github.com/emiago/sipgo/sip"
 	"github.com/pion/interceptor"
@@ -210,6 +211,434 @@ func TestNewOutboundSIPMediaBoundsLargeChromeCapabilitiesForUDPMTU(t *testing.T)
 		}
 	}
 	t.Logf("bounded Chrome offer size: %d bytes", len(localSDP))
+}
+
+func testSDPCrypto(t *testing.T, raw []byte) (tag, suite, inline string) {
+	t.Helper()
+	found := false
+	for _, line := range strings.Split(string(raw), "\r\n") {
+		if !strings.HasPrefix(line, "a=crypto:") {
+			continue
+		}
+		if found {
+			t.Fatal("SDP contains multiple audio crypto attributes")
+		}
+		found = true
+		fields := strings.Fields(strings.TrimPrefix(line, "a=crypto:"))
+		if len(fields) != 3 {
+			t.Fatalf("crypto attribute has %d fields, want 3", len(fields))
+		}
+		tag, suite, inline = fields[0], fields[1], fields[2]
+	}
+	if !found {
+		t.Fatal("SDP has no crypto attribute")
+	}
+	return tag, suite, inline
+}
+
+func TestNewInboundSIPMediaSDESSRTPBidirectionalRTP(t *testing.T) {
+	remote := &media.MediaSession{
+		Codecs:    []media.Codec{media.CodecAudioUlaw},
+		Mode:      diagosdp.ModeSendrecv,
+		Laddr:     net.UDPAddr{IP: net.ParseIP("127.0.0.1")},
+		SecureRTP: 1,
+		SRTPAlg:   media.SRTPProfileAes128CmHmacSha1_80,
+	}
+	if err := remote.Init(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = remote.Close() })
+	offer := remote.LocalSDP()
+	offerTag, offerSuite, offerInline := testSDPCrypto(t, offer)
+
+	browserOffer := testSDP("m=audio 9 UDP/TLS/RTP/SAVPF 0")
+	selection, err := negotiateInboundSelection(browserOffer, offer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := sip.NewRequest(sip.INVITE, sip.Uri{User: "user", Host: "127.0.0.1"})
+	request.SetBody(offer)
+	server := &sipgo.DialogServerSession{}
+	server.InviteRequest = request
+	dialog := &diago.DialogServerSession{DialogServerSession: server}
+	session, _, err := newInboundSIPMedia(dialog, net.ParseIP("127.0.0.1"), selection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = dialog.DialogMedia.Close() })
+
+	answer := session.LocalSDP()
+	answerModel, err := parseSDP(answer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if answerModel.Audio == nil || answerModel.Audio.Protocol != "RTP/SAVP" {
+		t.Fatalf("SRTP answer audio = %+v", answerModel.Audio)
+	}
+	answerTag, answerSuite, answerInline := testSDPCrypto(t, answer)
+	if answerTag != offerTag || answerSuite != offerSuite {
+		t.Fatal("SDES answer did not echo the selected offer tag and suite")
+	}
+	if answerInline == offerInline {
+		t.Fatal("SDES answer reused the offerer's sending key")
+	}
+	if err := remote.RemoteSDP(answer); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, test := range []struct {
+		name   string
+		writer *media.MediaSession
+		reader *media.MediaSession
+		ssrc   uint32
+	}{
+		{name: "SIP peer to gateway", writer: remote, reader: session, ssrc: 0x11223344},
+		{name: "gateway to SIP peer", writer: session, reader: remote, ssrc: 0x55667788},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if err := test.reader.StopRTP(1, 2*time.Second); err != nil {
+				t.Fatal(err)
+			}
+			payload := []byte("arbitrary SRTP payload")
+			packet := rtp.Packet{
+				Header:  rtp.Header{Version: 2, PayloadType: 0, SequenceNumber: 100, Timestamp: 8000, SSRC: test.ssrc},
+				Payload: payload,
+			}
+			if err := test.writer.WriteRTP(&packet); err != nil {
+				t.Fatal(err)
+			}
+			wire := make([]byte, media.RTPBufSize)
+			n, err := test.reader.ReadRTPRaw(wire)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if bytes.Contains(wire[:n], payload) {
+				t.Fatal("RTP payload was sent in plaintext")
+			}
+
+			packet.SequenceNumber++
+			packet.Timestamp += 160
+			if err := test.writer.WriteRTP(&packet); err != nil {
+				t.Fatal(err)
+			}
+			var decoded rtp.Packet
+			if _, err := test.reader.ReadRTP(make([]byte, media.RTPBufSize), &decoded); err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(decoded.Payload, payload) || decoded.SSRC != test.ssrc {
+				t.Fatalf("decrypted RTP = %+v", decoded)
+			}
+		})
+	}
+}
+
+func TestMediaRelaySDESSRTPBidirectional(t *testing.T) {
+	remote := &media.MediaSession{
+		Codecs:    []media.Codec{media.CodecAudioUlaw},
+		Mode:      diagosdp.ModeSendrecv,
+		Laddr:     net.UDPAddr{IP: net.ParseIP("127.0.0.1")},
+		SecureRTP: 1,
+		SRTPAlg:   media.SRTPProfileAes128CmHmacSha1_80,
+	}
+	if err := remote.Init(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = remote.Close() })
+	offer := remote.LocalSDP()
+	selection, err := negotiateInboundSelection(testSDP("m=audio 9 UDP/TLS/RTP/SAVPF 0"), offer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := sip.NewRequest(sip.INVITE, sip.Uri{User: "user", Host: "127.0.0.1"})
+	request.SetBody(offer)
+	server := &sipgo.DialogServerSession{}
+	server.InviteRequest = request
+	dialog := &diago.DialogServerSession{DialogServerSession: server}
+	if _, _, err := newInboundSIPMedia(dialog, net.ParseIP("127.0.0.1"), selection); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = dialog.DialogMedia.Close() })
+	if err := remote.RemoteSDP(dialog.MediaSession().LocalSDP()); err != nil {
+		t.Fatal(err)
+	}
+
+	var trackMu sync.Mutex
+	var connectedRelay *mediaRelay
+	var pendingTracks []*webrtc.TrackRemote
+	fixture, browser := connectPionBrowser(t, selection, func(track *webrtc.TrackRemote) {
+		trackMu.Lock()
+		defer trackMu.Unlock()
+		if connectedRelay == nil {
+			pendingTracks = append(pendingTracks, track)
+			return
+		}
+		connectedRelay.AddTrack(track)
+	})
+	relay, err := newMediaRelay(dialog, browser, selection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = relay.Close() })
+	trackMu.Lock()
+	connectedRelay = relay
+	for _, track := range pendingTracks {
+		relay.AddTrack(track)
+	}
+	pendingTracks = nil
+	trackMu.Unlock()
+	// Pion may surface the remote track only with its first incoming RTP packet.
+	writeTestPacket(t, fixture.audio, 0, 800, false, []byte{0})
+	waitRelayRemoteKinds(t, relay, webrtc.RTPCodecTypeAudio)
+
+	browserPayload := []byte{0x01, 0x80, 0x00, 0xff}
+	writeTestPacket(t, fixture.audio, 0, 1600, true, browserPayload)
+	if err := remote.StopRTP(1, 2*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	var fromBrowser rtp.Packet
+	for {
+		if _, err := remote.ReadRTP(make([]byte, media.RTPBufSize), &fromBrowser); err != nil {
+			t.Fatal(err)
+		}
+		if fromBrowser.Timestamp == 1600 {
+			break
+		}
+	}
+	if fromBrowser.PayloadType != 0 || fromBrowser.Timestamp != 1600 || !fromBrowser.Marker || !bytes.Equal(fromBrowser.Payload, browserPayload) {
+		t.Fatalf("browser-to-SRTP relay packet = %+v", fromBrowser)
+	}
+
+	sipPayload := []byte{0xde, 0xad, 0xbe, 0xef}
+	if err := remote.WriteRTP(&rtp.Packet{
+		Header:  rtp.Header{Version: 2, PayloadType: 0, SequenceNumber: 50, Timestamp: 3200, Marker: true, SSRC: 0x12345678},
+		Payload: sipPayload,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	fromSIP := waitObservedRTP(t, fixture.received, webrtc.RTPCodecTypeAudio)
+	if fromSIP.PayloadType != 0 || fromSIP.Timestamp != 3200 || !fromSIP.Marker || !bytes.Equal(fromSIP.Payload, sipPayload) {
+		t.Fatalf("SRTP-to-browser relay packet = %+v", fromSIP)
+	}
+}
+
+func TestNewInboundSIPMediaRejectsInvalidSDES(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		crypto string
+	}{
+		{name: "missing crypto"},
+		{name: "unsupported suite", crypto: "a=crypto:1 AES_CM_256_HMAC_SHA1_80 inline:8Dlz/SyzlAKCZwH49w5DX8S4pDa7Lw0n3LTI4t6Z"},
+		{name: "invalid inline key", crypto: "a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:not-base64"},
+		{name: "unsupported session parameters", crypto: "a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:8Dlz/SyzlAKCZwH49w5DX8S4pDa7Lw0n3LTI4t6Z UNENCRYPTED_SRTP"},
+		{name: "unsupported lifetime", crypto: "a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:8Dlz/SyzlAKCZwH49w5DX8S4pDa7Lw0n3LTI4t6Z|2^20"},
+		{name: "invalid tag", crypto: "a=crypto:invalid AES_CM_128_HMAC_SHA1_80 inline:8Dlz/SyzlAKCZwH49w5DX8S4pDa7Lw0n3LTI4t6Z"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			lines := []string{"m=audio 4000 RTP/SAVP 0", "c=IN IP4 127.0.0.1"}
+			if test.crypto != "" {
+				lines = append(lines, test.crypto)
+			}
+			offer := testSDP(lines...)
+			selection, err := negotiateInboundSelection(testSDP("m=audio 9 UDP/TLS/RTP/SAVPF 0"), offer)
+			if err != nil {
+				t.Fatal(err)
+			}
+			request := sip.NewRequest(sip.INVITE, sip.Uri{User: "user", Host: "127.0.0.1"})
+			request.SetBody(offer)
+			server := &sipgo.DialogServerSession{}
+			server.InviteRequest = request
+			dialog := &diago.DialogServerSession{DialogServerSession: server}
+			session, _, err := newInboundSIPMedia(dialog, net.ParseIP("127.0.0.1"), selection)
+			if err == nil {
+				_ = session.Close()
+				t.Fatal("invalid SDES offer succeeded")
+			}
+			if strings.Contains(err.Error(), "inline:") {
+				t.Fatalf("SDES error exposed key material: %v", err)
+			}
+		})
+	}
+}
+
+func TestNewInboundSIPMediaAVPFirstProfileAlternative(t *testing.T) {
+	offer := testSDP(
+		"m=audio 4000 RTP/AVP 0",
+		"m=audio 4000 RTP/SAVP 0",
+		"a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:8Dlz/SyzlAKCZwH49w5DX8S4pDa7Lw0n3LTI4t6Z",
+	)
+	selection, err := negotiateInboundSelection(testSDP("m=audio 9 UDP/TLS/RTP/SAVPF 0"), offer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := sip.NewRequest(sip.INVITE, sip.Uri{User: "user", Host: "127.0.0.1"})
+	request.SetBody(offer)
+	server := &sipgo.DialogServerSession{}
+	server.InviteRequest = request
+	dialog := &diago.DialogServerSession{DialogServerSession: server}
+	session, _, err := newInboundSIPMedia(dialog, net.ParseIP("127.0.0.1"), selection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = dialog.DialogMedia.Close() })
+	answer := session.LocalSDP()
+	if session.SecureRTP != 0 || strings.Contains(string(answer), "a=crypto:") ||
+		!strings.Contains(string(answer), "m=audio 0 RTP/SAVP 0\r\n") {
+		t.Fatal("AVP-first alternative did not retain plaintext audio and reject SAVP")
+	}
+}
+
+func TestNewInboundSIPMediaSignalWireSAVPAlternative(t *testing.T) {
+	sipOffer := testSDP(
+		"m=audio 15348 RTP/SAVP 102 9 0 8 18 103 101",
+		"c=IN IP4 127.0.0.1",
+		"a=rtpmap:102 opus/48000/2",
+		"a=fmtp:102 useinbandfec=1; maxaveragebitrate=30000; maxplaybackrate=48000; ptime=20; minptime=10; maxptime=40",
+		"a=rtpmap:9 G722/8000",
+		"a=rtpmap:0 PCMU/8000",
+		"a=rtpmap:8 PCMA/8000",
+		"a=rtpmap:18 G729/8000",
+		"a=fmtp:18 annexb=no",
+		"a=rtpmap:103 telephone-event/48000",
+		"a=fmtp:103 0-15",
+		"a=rtpmap:101 telephone-event/8000",
+		"a=fmtp:101 0-15",
+		"a=crypto:1 AEAD_AES_256_GCM_8 inline:PS1uQCVeeCFCanVmcjkpPywjNWhcYD0mXXtxaVBR",
+		"a=crypto:5 AES_256_CM_HMAC_SHA1_80 inline:PS1uQCVeeCFCanVmcjkpPywjNWhcYD0mXXtxaVBR",
+		"a=crypto:7 AES_CM_128_HMAC_SHA1_80 inline:8Dlz/SyzlAKCZwH49w5DX8S4pDa7Lw0n3LTI4t6Z",
+		"a=crypto:8 AES_256_CM_HMAC_SHA1_32 inline:PS1uQCVeeCFCanVmcjkpPywjNWhcYD0mXXtxaVBR",
+		"a=crypto:10 AES_CM_128_HMAC_SHA1_32 inline:PS1uQCVeeCFCanVmcjkpPywjNWhcYD0mXXtxaVBR",
+		"a=ptime:20",
+		"m=audio 15348 RTP/AVP 102 9 0 8 18 103 101",
+		"c=IN IP4 127.0.0.1",
+		"a=rtpmap:102 opus/48000/2",
+		"a=fmtp:102 useinbandfec=1; maxaveragebitrate=30000; maxplaybackrate=48000; ptime=20; minptime=10; maxptime=40",
+		"a=rtpmap:9 G722/8000",
+		"a=rtpmap:0 PCMU/8000",
+		"a=rtpmap:8 PCMA/8000",
+		"a=rtpmap:18 G729/8000",
+		"a=fmtp:18 annexb=no",
+		"a=rtpmap:103 telephone-event/48000",
+		"a=fmtp:103 0-15",
+		"a=rtpmap:101 telephone-event/8000",
+		"a=fmtp:101 0-15",
+		"a=ptime:20",
+	)
+	browserOffer := testSDP(
+		"m=audio 9 UDP/TLS/RTP/SAVPF 111 9 0 8 101",
+		"a=rtpmap:111 opus/48000/2",
+		"a=fmtp:111 minptime=10;useinbandfec=1",
+		"a=rtpmap:9 G722/8000",
+		"a=rtpmap:0 PCMU/8000",
+		"a=rtpmap:8 PCMA/8000",
+		"a=rtpmap:101 telephone-event/8000",
+		"a=fmtp:101 0-16",
+	)
+	selection, err := negotiateInboundSelection(browserOffer, sipOffer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(selection.Audio) != 1 || selection.Audio[0].SIP.PayloadType != 102 || len(selection.RejectAudio) != 1 {
+		t.Fatalf("SignalWire selection = %+v", selection)
+	}
+	request := sip.NewRequest(sip.INVITE, sip.Uri{User: "user", Host: "127.0.0.1"})
+	request.SetBody(sipOffer)
+	server := &sipgo.DialogServerSession{}
+	server.InviteRequest = request
+	dialog := &diago.DialogServerSession{DialogServerSession: server}
+	session, _, err := newInboundSIPMedia(dialog, net.ParseIP("127.0.0.1"), selection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = dialog.DialogMedia.Close() })
+	answer := session.LocalSDP()
+	tag, suite, _ := testSDPCrypto(t, answer)
+	if tag != "7" || suite != sipSDESCryptoSuite {
+		t.Fatalf("SignalWire selected crypto tag/suite = %s/%s", tag, suite)
+	}
+	if strings.Count(string(answer), "m=audio ") != 2 || !strings.Contains(string(answer), "m=audio 0 RTP/AVP 102 9 0 8 18 103 101\r\n") {
+		t.Fatal("SignalWire AVP alternative was not rejected in order")
+	}
+	model, err := parseSDP(answer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if model.Audio.Protocol != "RTP/SAVP" || len(model.AudioAlternatives) != 1 || model.AudioAlternatives[0].Port != 0 {
+		t.Fatalf("SignalWire answer profiles = %+v, %+v", model.Audio, model.AudioAlternatives)
+	}
+}
+
+func TestNewInboundSIPMediaSDESUsesAudioCryptoWithVideoFirstOffer(t *testing.T) {
+	offer := testSDP(
+		"m=video 4002 RTP/SAVP 96",
+		"a=rtpmap:96 VP8/90000",
+		"a=crypto:7 AES_CM_128_HMAC_SHA1_80 inline:PS1uQCVeeCFCanVmcjkpPywjNWhcYD0mXXtxaVBR",
+		"m=audio 4000 RTP/SAVP 0",
+		"c=IN IP4 127.0.0.1",
+		"a=crypto:3 AES_CM_128_HMAC_SHA1_80 inline:8Dlz/SyzlAKCZwH49w5DX8S4pDa7Lw0n3LTI4t6Z",
+	)
+	selection, err := negotiateInboundSelection(testSDP("m=audio 9 UDP/TLS/RTP/SAVPF 0"), offer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(selection.Video) != 0 || len(selection.RejectVideoFormats) != 1 {
+		t.Fatalf("video-first selection = %+v", selection)
+	}
+	request := sip.NewRequest(sip.INVITE, sip.Uri{User: "user", Host: "127.0.0.1"})
+	request.SetBody(offer)
+	server := &sipgo.DialogServerSession{}
+	server.InviteRequest = request
+	dialog := &diago.DialogServerSession{DialogServerSession: server}
+	session, _, err := newInboundSIPMedia(dialog, net.ParseIP("127.0.0.1"), selection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = dialog.DialogMedia.Close() })
+	answer := session.LocalSDP()
+	tag, _, _ := testSDPCrypto(t, answer)
+	if tag != "3" {
+		t.Fatalf("audio answer selected crypto tag %s, want audio tag 3", tag)
+	}
+	model, err := parseSDP(answer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if model.Video == nil || model.Video.Port != 0 || model.Video.Protocol != "RTP/SAVP" {
+		t.Fatalf("video-first rejection = %+v", model.Video)
+	}
+}
+
+func TestNewInboundSIPMediaRejectsActiveSRTPVideo(t *testing.T) {
+	for _, audioProtocol := range []string{"RTP/AVP", "RTP/SAVP"} {
+		t.Run(audioProtocol, func(t *testing.T) {
+			lines := []string{"m=audio 4000 " + audioProtocol + " 0", "c=IN IP4 127.0.0.1"}
+			if audioProtocol == "RTP/SAVP" {
+				lines = append(lines, "a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:8Dlz/SyzlAKCZwH49w5DX8S4pDa7Lw0n3LTI4t6Z")
+			}
+			lines = append(lines,
+				"m=video 4002 RTP/SAVP 96",
+				"a=rtpmap:96 VP8/90000",
+				"a=crypto:2 AES_CM_128_HMAC_SHA1_80 inline:8Dlz/SyzlAKCZwH49w5DX8S4pDa7Lw0n3LTI4t6Z",
+			)
+			offer := testSDP(lines...)
+			browser := testSDP(
+				"m=audio 9 UDP/TLS/RTP/SAVPF 0",
+				"m=video 9 UDP/TLS/RTP/SAVPF 96",
+				"a=rtpmap:96 VP8/90000",
+			)
+			selection, err := negotiateInboundSelection(browser, offer)
+			if err != nil {
+				t.Fatal(err)
+			}
+			request := sip.NewRequest(sip.INVITE, sip.Uri{User: "user", Host: "127.0.0.1"})
+			request.SetBody(offer)
+			server := &sipgo.DialogServerSession{}
+			server.InviteRequest = request
+			dialog := &diago.DialogServerSession{DialogServerSession: server}
+			if _, _, err := newInboundSIPMedia(dialog, net.ParseIP("127.0.0.1"), selection); err == nil || !strings.Contains(err.Error(), "active video") {
+				t.Fatalf("active SRTP video error = %v", err)
+			}
+		})
+	}
 }
 
 func TestNewInboundSIPMediaPinsSelectedAnswerAndCleansDialog(t *testing.T) {

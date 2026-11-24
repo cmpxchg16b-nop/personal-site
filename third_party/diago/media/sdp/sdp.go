@@ -86,7 +86,17 @@ func (sd SessionDescription) MediaDescription(mediaType string) (MediaDescriptio
 			continue
 		}
 		if v != "" {
-			return md, fmt.Errorf("more than 1 media line for type %q", mediaType)
+			// A single RTP session may pin an answer containing its one active
+			// m-line plus port-zero alternatives rejected to preserve offer/answer
+			// alignment. Rejected sections do not create another media session.
+			currentPort := mediaLinePort(val)
+			previousPort := mediaLinePort(v)
+			if currentPort == 0 {
+				continue
+			}
+			if previousPort != 0 {
+				return md, fmt.Errorf("more than 1 media line for type %q", mediaType)
+			}
 		}
 		v = val
 	}
@@ -113,6 +123,15 @@ func (sd SessionDescription) MediaDescription(mediaType string) (MediaDescriptio
 
 	md.Formats = fields[3:]
 	return md, nil
+}
+
+func mediaLinePort(value string) int {
+	fields := strings.Fields(value)
+	if len(fields) < 2 {
+		return 0
+	}
+	port, _ := strconv.Atoi(strings.Split(fields[1], "/")[0])
+	return port
 }
 
 // c=<nettype> <addrtype> <connection-address>

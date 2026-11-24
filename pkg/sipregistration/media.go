@@ -55,6 +55,10 @@ func diagoCodecList(kind string, codecs []rtpCodec) []media.Codec {
 }
 
 func initializeSIPMediaSession(bindIP net.IP, audio, video []rtpCodec) (*media.MediaSession, error) {
+	return initializeSIPMediaSessionWithSecurity(bindIP, audio, video, false)
+}
+
+func initializeSIPMediaSessionWithSecurity(bindIP net.IP, audio, video []rtpCodec, secure bool) (*media.MediaSession, error) {
 	if bindIP == nil {
 		return nil, errors.New("SIP media bind IP is required")
 	}
@@ -87,6 +91,10 @@ func initializeSIPMediaSession(bindIP net.IP, audio, video []rtpCodec) (*media.M
 		// mapped source instead of disappearing into that private route.
 		RTPNAT:             media.RTPNATSymetric,
 		RTPNATPayloadTypes: allowedNATSources,
+	}
+	if secure {
+		session.SecureRTP = 1 // SDES; diago creates the RTP/RTCP contexts.
+		session.SRTPAlg = media.SRTPProfileAes128CmHmacSha1_80
 	}
 	if err := session.Init(); err != nil {
 		return nil, fmt.Errorf("initialize SIP media: %w", err)
@@ -145,10 +153,11 @@ func newOutboundSIPMedia(bindIP net.IP, browser sdpModel, wantVideo bool) (*medi
 	return session, nil
 }
 
-// newInboundSIPMedia applies the original plaintext offer, pins the selected
-// answer (including a port-zero video rejection), and injects packet-level
-// reader/writers into the dialog. Dialog close stops RTCP monitoring and then
-// closes the media session through diago's normal DialogMedia cleanup.
+// newInboundSIPMedia applies the original offer, pins the selected answer
+// (including a port-zero video rejection), and injects packet-level
+// reader/writers into the dialog. RTP/SAVP dynamically enables diago's SDES
+// contexts; RTP/AVP retains plaintext media. Dialog close stops RTCP monitoring
+// and then closes the media session through diago's normal DialogMedia cleanup.
 func newInboundSIPMedia(dialog *diago.DialogServerSession, bindIP net.IP, selection negotiatedSelection) (*media.MediaSession, *media.RTPSession, error) {
 	if dialog == nil || dialog.DialogServerSession == nil || dialog.InviteRequest == nil {
 		return nil, nil, errors.New("inbound SIP dialog and INVITE are required")
@@ -157,17 +166,27 @@ func newInboundSIPMedia(dialog *diago.DialogServerSession, bindIP net.IP, select
 	if len(rawOffer) == 0 {
 		return nil, nil, errors.New("inbound SIP INVITE has no SDP offer")
 	}
-	if _, err := parseSDP(rawOffer); err != nil {
-		return nil, nil, fmt.Errorf("validate inbound plaintext SIP offer: %w", err)
+	offer, err := parseSDP(rawOffer)
+	if err != nil {
+		return nil, nil, fmt.Errorf("validate inbound SIP offer: %w", err)
 	}
+	secure := offer.Audio != nil && offer.Audio.Protocol == "RTP/SAVP"
 	if len(selection.Audio) != 1 || len(selection.Video) > 1 {
 		return nil, nil, errors.New("inbound selection must contain one audio and at most one video pair")
+	}
+	if len(selection.Video) != 0 && (secure || selection.SIPVideo == nil || selection.SIPVideo.Protocol == "RTP/SAVP") {
+		return nil, nil, errors.New("inbound SRTP with active video is unsupported")
+	}
+	if secure {
+		if err := validateSIPSDESOffer(rawOffer); err != nil {
+			return nil, nil, fmt.Errorf("validate inbound SIP SDES offer: %w", err)
+		}
 	}
 	audio, video := selection.sipCodecs()
 	if selection.DTMF != nil {
 		audio = append(audio, selection.DTMF.SIP)
 	}
-	session, err := initializeSIPMediaSession(bindIP, audio, video)
+	session, err := initializeSIPMediaSessionWithSecurity(bindIP, audio, video, secure)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -175,11 +194,33 @@ func newInboundSIPMedia(dialog *diago.DialogServerSession, bindIP net.IP, select
 		_ = session.Close()
 	}
 
-	if err := session.RemoteSDP(rawOffer); err != nil {
+	remoteOffer := rawOffer
+	if secure || len(offer.AudioAlternatives) != 0 {
+		remoteOffer, err = sipAudioOnlySDP(rawOffer, offer.Audio.Protocol)
+		if err != nil {
+			cleanupSession()
+			return nil, nil, fmt.Errorf("isolate inbound SIP audio offer: %w", err)
+		}
+	}
+	if err := session.RemoteSDP(remoteOffer); err != nil {
 		cleanupSession()
 		return nil, nil, fmt.Errorf("apply inbound SIP offer: %w", err)
 	}
-	answer := generateSIPSDPWithDirections(
+	security := plaintextSIPSDPSecurity()
+	if secure {
+		// LocalSDP initializes a fresh sending key/context and echoes the selected
+		// remote tag. Only its transport fields are copied into the custom answer;
+		// the generated key material is never logged.
+		security, err = parseLocalSIPSDESAnswer(session.LocalSDP())
+		if err != nil {
+			cleanupSession()
+			return nil, nil, fmt.Errorf("create inbound SIP SDES answer: %w", err)
+		}
+	}
+	if selection.SIPVideo != nil {
+		security.videoProtocol = selection.SIPVideo.Protocol
+	}
+	answer := generateSIPSDPWithDirectionsAndSecurity(
 		bindIP,
 		session.Laddr.Port,
 		audio,
@@ -187,6 +228,8 @@ func newInboundSIPMedia(dialog *diago.DialogServerSession, bindIP net.IP, select
 		selection.RejectVideoFormats,
 		sipAnswerDirection(mediaDirection(selection.SIPAudio)),
 		sipAnswerDirection(mediaDirection(selection.SIPVideo)),
+		selection.RejectAudio,
+		security,
 	)
 	if err := session.InitWithSDP(answer); err != nil {
 		cleanupSession()
