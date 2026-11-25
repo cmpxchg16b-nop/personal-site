@@ -29,6 +29,7 @@ import VolumeUpIcon from "@mui/icons-material/VolumeUp";
 import { useTranslation } from "react-i18next";
 import { useAudioGraph } from "@/api/audio/audiograph";
 import { useCameraController } from "@/api/media/camera";
+import { enumerateDevicesWithMicrophoneLabels } from "@/api/media/devices";
 import { useCallVolumes } from "./useCallVolumes";
 
 function errorMessage(error: unknown, fallback: string): string {
@@ -254,13 +255,27 @@ export default function DeviceSettings({
   const microphoneStarting = useRef(false);
   const cameraHeld = useRef(false);
   const microphoneHeld = useRef(false);
+  const deviceEnumeration = useRef<Promise<MediaDeviceInfo[]> | null>(null);
 
   const refreshDevices = useCallback(async () => {
     try {
       if (navigator.mediaDevices?.enumerateDevices === undefined) {
         throw new Error(t("chat.devices.unsupported"));
       }
-      setDevices(await navigator.mediaDevices.enumerateDevices());
+      let enumeration = deviceEnumeration.current;
+      if (enumeration === null) {
+        enumeration = enumerateDevicesWithMicrophoneLabels(
+          navigator.mediaDevices,
+        );
+        deviceEnumeration.current = enumeration;
+      }
+      try {
+        setDevices(await enumeration);
+      } finally {
+        if (deviceEnumeration.current === enumeration) {
+          deviceEnumeration.current = null;
+        }
+      }
     } catch (reason) {
       setError(errorMessage(reason, t("chat.devices.enumerateFailed")));
     }
