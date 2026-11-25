@@ -370,6 +370,7 @@ export interface SIPCallEvent {
   state?: SIPCallState;
   localUri?: string;
   remoteUri?: string;
+  remoteName?: string;
   reason?: string;
   sessionDesc?: RTCSessionDescriptionInit;
   rtcICECandidate?: RTCIceCandidateInit;

@@ -22,6 +22,7 @@ func TestSIPWireJSONShape(t *testing.T) {
 		State:           "dialing",
 		LocalUri:        "sip:alice@example.com",
 		RemoteUri:       "sip:bob@example.com",
+		RemoteName:      "Bob",
 		Reason:          "testing",
 		SessionDesc:     &webrtc.SessionDescription{Type: webrtc.SDPTypeOffer, SDP: "v=0\r\n"},
 		RTCICECandidate: &webrtc.ICECandidateInit{Candidate: "candidate:1"},
@@ -53,7 +54,7 @@ func TestSIPWireJSONShape(t *testing.T) {
 			want: map[string]any{
 				"callId": "call-1", "credentialId": "credential-1", "target": "sip:bob@example.com",
 				"kind": "video", "action": "dial", "direction": "outgoing", "state": "dialing",
-				"localUri": "sip:alice@example.com", "remoteUri": "sip:bob@example.com", "reason": "testing",
+				"localUri": "sip:alice@example.com", "remoteUri": "sip:bob@example.com", "remoteName": "Bob", "reason": "testing",
 				"sessionDesc": map[string]any{"type": "offer", "sdp": "v=0\r\n"},
 				"rtcICECandidate": map[string]any{
 					"candidate": "candidate:1", "sdpMid": nil, "sdpMLineIndex": nil, "usernameFragment": nil,

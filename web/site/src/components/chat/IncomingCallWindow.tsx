@@ -18,6 +18,10 @@ import type { ChatUser } from "@/api/ss/types";
 import type { ExternalSIPCall } from "@/api/ss/sip";
 import UserAvatar from "./UserAvatar";
 import { showBrowserNotification } from "./browserNotification";
+import {
+  externalSIPCallerIdentity,
+  type IncomingCallerIdentity,
+} from "./incomingCallIdentity";
 import type { ActivePhoneCall } from "./types";
 
 type IncomingCall = ActivePhoneCall | ExternalSIPCall;
@@ -64,13 +68,13 @@ export function IncomingCallWindow<T extends IncomingCall>({
     e.currentTarget.releasePointerCapture(e.pointerId);
   };
 
-  const fallbackName =
+  const identity: IncomingCallerIdentity =
     call === null
-      ? ""
+      ? { name: "" }
       : "state" in call
-        ? (call.remoteUri ?? call.target ?? call.callId)
-        : call.ref.userId;
-  const callerName = caller?.name ?? fallbackName;
+        ? externalSIPCallerIdentity(call)
+        : { name: call.ref.userId };
+  const callerName = caller?.name ?? identity.name;
   const incomingText =
     call === null
       ? ""
@@ -104,7 +108,8 @@ export function IncomingCallWindow<T extends IncomingCall>({
         top: 72,
         right: 24,
         zIndex: (theme) => theme.zIndex.modal,
-        width: 264,
+        width: 320,
+        maxWidth: "calc(100vw - 32px)",
         borderRadius: 2,
         overflow: "hidden",
         transform: `translate(${offset.x}px, ${offset.y}px)`,
@@ -143,9 +148,20 @@ export function IncomingCallWindow<T extends IncomingCall>({
         ) : (
           <Avatar sx={{ width: 48, height: 48 }} />
         )}
-        <Typography variant="subtitle2" noWrap>
-          {callerName}
-        </Typography>
+        <Box sx={{ width: "100%", minWidth: 0, textAlign: "center" }}>
+          <Typography variant="subtitle1" sx={{ overflowWrap: "anywhere" }}>
+            {callerName}
+          </Typography>
+          {identity.aor !== undefined && (
+            <Typography
+              variant="caption"
+              color="text.secondary"
+              sx={{ display: "block", overflowWrap: "anywhere", mt: 0.25 }}
+            >
+              {identity.aor}
+            </Typography>
+          )}
+        </Box>
         <Typography variant="caption" color="text.secondary">
           {incomingText}
         </Typography>

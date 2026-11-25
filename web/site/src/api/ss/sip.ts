@@ -58,6 +58,7 @@ export interface ExternalSIPCall {
   state: SIPCallState;
   localUri?: string;
   remoteUri?: string;
+  remoteName?: string;
   reason?: string;
   /** Local wall-clock milliseconds, used only for display ordering. */
   since: number;
@@ -152,6 +153,7 @@ export function reduceSIPCallEvent(
     state: progressedCallState(previous?.state, requestedState),
     localUri: event.localUri ?? previous?.localUri,
     remoteUri: event.remoteUri ?? previous?.remoteUri,
+    remoteName: event.remoteName ?? previous?.remoteName,
     reason:
       event.reason !== undefined
         ? conciseSIPReason(event.reason, "")

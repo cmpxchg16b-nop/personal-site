@@ -27,6 +27,7 @@ import PhoneContactView from "./PhoneContactView";
 import DeviceSettings from "./DeviceSettings";
 import SipRegistrationSettings from "./SipRegistrationSettings";
 import { IncomingCallWindow } from "./IncomingCallWindow";
+import { externalSIPCallerIdentity } from "./incomingCallIdentity";
 import { VideoWindow } from "./VideoWindow";
 import { DialPad } from "./DialPad";
 import { ExternalSIPCallOverlay } from "./ExternalSIPCallOverlay";
@@ -218,9 +219,7 @@ export default function ChatApp({
   const incomingExternalName =
     incomingExternalCall === null
       ? ""
-      : (incomingExternalCall.remoteUri ??
-        incomingExternalCall.target ??
-        incomingExternalCall.callId);
+      : externalSIPCallerIdentity(incomingExternalCall).name;
   const incomingExternalUser: ChatUser | undefined =
     incomingExternalCall === null
       ? undefined

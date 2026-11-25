@@ -219,6 +219,7 @@ type serviceCall struct {
 	kind          string
 	localURI      string
 	remoteURI     string
+	remoteName    string
 	createdAt     time.Time
 	ctx           context.Context
 	cancel        context.CancelFunc
@@ -556,6 +557,7 @@ func (s *Service) eventFor(call *serviceCall, state, reason string) *ss.SIPCallE
 		State:        state,
 		LocalUri:     call.localURI,
 		RemoteUri:    call.remoteURI,
+		RemoteName:   call.remoteName,
 		Reason:       conciseSIPReason(reason),
 	}
 }
@@ -1207,8 +1209,12 @@ func (s *Service) serveInboundInvite(credential Credential, runtime operationRun
 	if activeMedia(model.Video) {
 		kind = "video"
 	}
-	remoteURI := sipHeaderURI(request.From())
+	from := request.From()
+	remoteURI := sipHeaderURI(from)
 	call := s.newCall(ss.UserId(credential.OwnerID), "", credential, runtime, revision, s.newUUID(), "incoming", kind, remoteURI)
+	if from != nil {
+		call.remoteName = from.DisplayName
+	}
 	call.inDialog = dialog
 	call.sipOffer = offer
 	call.legs = make(map[string]*inboundLeg)

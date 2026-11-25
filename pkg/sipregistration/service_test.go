@@ -755,6 +755,27 @@ func waitServiceRoutine(t *testing.T, done <-chan struct{}, description string) 
 	}
 }
 
+func TestServiceInboundCallerIdentity(t *testing.T) {
+	bridge := newServiceFakeBridge("tab-one")
+	service, _, current, runtime, _, _ := newServiceForTest(t, bridge)
+	dialog := newServiceFakeServerDialog()
+	dialog.request.From().DisplayName = "Alice Caller"
+	callID, done := startServiceInbound(t, service, current, runtime, dialog)
+	ringing := bridge.waitEvent(t, "incoming caller identity", func(event serviceRecordedEvent) bool {
+		return event.fanout && event.call != nil && event.call.CallId == callID && event.call.State == "ringing"
+	})
+	if ringing.call.RemoteName != "Alice Caller" || ringing.call.RemoteUri != "sip:caller@remote.example" {
+		t.Fatalf("incoming caller identity = %+v", ringing.call)
+	}
+
+	dialog.cancel()
+	cancelled := bridge.waitEvent(t, "cancelled caller identity", callStateEvent(callID, "tab-one", "cancelled"))
+	if cancelled.call.RemoteName != "Alice Caller" || cancelled.call.RemoteUri != "sip:caller@remote.example" {
+		t.Fatalf("cancelled caller identity = %+v", cancelled.call)
+	}
+	waitServiceRoutine(t, done, "caller-identity serve return")
+}
+
 func TestServiceInboundFirstAcceptCancelsLosers(t *testing.T) {
 	bridge := newServiceFakeBridge("tab-one", "tab-two")
 	service, _, current, runtime, _, _ := newServiceForTest(t, bridge)

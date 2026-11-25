@@ -158,6 +158,7 @@ type SIPCallEvent struct {
 	State           string                     `json:"state,omitempty"`
 	LocalUri        string                     `json:"localUri,omitempty"`
 	RemoteUri       string                     `json:"remoteUri,omitempty"`
+	RemoteName      string                     `json:"remoteName,omitempty"`
 	Reason          string                     `json:"reason,omitempty"`
 	SessionDesc     *webrtc.SessionDescription `json:"sessionDesc,omitempty"`
 	RTCICECandidate *webrtc.ICECandidateInit   `json:"rtcICECandidate,omitempty"`

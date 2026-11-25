@@ -1265,6 +1265,31 @@ describe("external SIP reducers", () => {
     expect(terminal.calls["call"]?.reason).toBe("normal");
   });
 
+  it("preserves the inbound display name and canonical AOR across sparse progress", () => {
+    let state = reduceSIPCallEvent(
+      empty,
+      {
+        callId: "incoming",
+        direction: "incoming",
+        state: "ringing",
+        remoteName: "Alice Caller",
+        remoteUri: "sip:alice@example.com",
+      },
+      100,
+    );
+    state = reduceSIPCallEvent(
+      state,
+      { callId: "incoming", state: "accepted" },
+      200,
+    );
+
+    expect(state.calls["incoming"]).toMatchObject({
+      state: "accepted",
+      remoteName: "Alice Caller",
+      remoteUri: "sip:alice@example.com",
+    });
+  });
+
   it("updates an existing message ID without losing the original text", () => {
     let state = reduceSIPMessageEvent(empty, {
       messageId: "message",
