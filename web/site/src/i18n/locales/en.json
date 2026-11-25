@@ -189,6 +189,35 @@
       }
     },
 
+    "devices": {
+      "title": "Devices",
+      "back": "Back to settings",
+      "description": "WebRTC and SIP calls share these devices and application volumes. Changes are saved on this browser.",
+      "unsupported": "This browser does not support media device selection.",
+      "enumerateFailed": "Unable to list media devices.",
+      "refresh": "Refresh device list",
+      "systemDefault": "System default",
+      "unavailable": "Saved device (currently unavailable)",
+      "unnamed": "{{kind}} {{index}}",
+      "camera": "Camera",
+      "microphone": "Microphone",
+      "speaker": "Speaker",
+      "cameraPreview": "Camera preview",
+      "test": "Test",
+      "stop": "Stop",
+      "testing": "Testing…",
+      "opening": "Opening…",
+      "cameraFailed": "Unable to open the selected camera.",
+      "microphoneFailed": "Unable to open the selected microphone.",
+      "inputLevel": "Input level",
+      "outputLevel": "Output level",
+      "microphoneHint": "The meter shows processed microphone samples. Preview is not played back locally, avoiding feedback.",
+      "microphoneVolume": "Microphone volume",
+      "speakerVolume": "Speaker volume",
+
+      "volumeHint": "These gains apply only inside this site; they do not change system volume."
+    },
+
     "sip": {
       "title": "SIP Registration",
       "back": "Back to settings",

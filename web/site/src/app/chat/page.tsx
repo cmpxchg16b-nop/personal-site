@@ -1,6 +1,7 @@
 "use client";
 
 import { useAudioGraph } from "@/api/audio/audiograph";
+import { useCameraController } from "@/api/media/camera";
 import {
   newChatControlDCMsg,
   newDCMsg,
@@ -85,7 +86,8 @@ export default function ChatPage() {
   // audio graph (useCallMedia); the two volumes are the graph's gain
   // nodes (useCallVolumes).
   const audio = useAudioGraph();
-  const externalSIP = useExternalSIP(audio);
+  const camera = useCameraController();
+  const externalSIP = useExternalSIP(audio, camera);
   const { calls, startCall, acceptCall, rejectCall, hangupCall } =
     usePhoneCalls(me, dcMsgs, sessions, sendTo, audio);
   const {
@@ -94,7 +96,7 @@ export default function ChatPage() {
     localCamera,
     remoteVideoFor,
     dtmfFor,
-  } = useCallMedia(sessions, audio, calls);
+  } = useCallMedia(sessions, audio, camera, calls);
   const { localVolume, remoteVolume, setLocalVolume, setRemoteVolume } =
     useCallVolumes(audio);
   const { echoCancellation, setEchoCancellation } = useEchoCancellation(audio);

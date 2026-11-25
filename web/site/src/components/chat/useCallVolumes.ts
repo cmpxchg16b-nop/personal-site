@@ -1,11 +1,10 @@
 "use client";
 
-// useCallVolumes exposes the audio graph's two user-facing volumes as
-// React state: the mic send volume (what peers hear) and the speaker
-// volume of the incoming voices. The graph keeps the values, so an
-// adjustment made before any call still applies once one starts.
+// useCallVolumes exposes the audio graph's two user-facing volumes through a
+// shared subscription: the top bar and Devices page always render the same
+// gains, and the graph persists every change for later calls and page loads.
 
-import { useCallback, useState } from "react";
+import { useCallback, useSyncExternalStore } from "react";
 import type { AudioGraph } from "@/api/audio/audiograph";
 
 export interface UseCallVolumesResult {
@@ -18,24 +17,30 @@ export interface UseCallVolumesResult {
 }
 
 export function useCallVolumes(audio: AudioGraph | null): UseCallVolumesResult {
-  const [localVolume, setLocalVolumeState] = useState(() =>
-    audio === null ? 1 : audio.getLocalVolume(),
+  const subscribe = useCallback(
+    (listener: () => void) => audio?.subscribeVolumes(listener) ?? (() => {}),
+    [audio],
   );
-  const [remoteVolume, setRemoteVolumeState] = useState(() =>
-    audio === null ? 1 : audio.getRemoteVolume(),
+  const getLocalVolume = useCallback(
+    () => audio?.getLocalVolume() ?? 1,
+    [audio],
+  );
+  const getRemoteVolume = useCallback(
+    () => audio?.getRemoteVolume() ?? 1,
+    [audio],
+  );
+  const localVolume = useSyncExternalStore(subscribe, getLocalVolume, () => 1);
+  const remoteVolume = useSyncExternalStore(
+    subscribe,
+    getRemoteVolume,
+    () => 1,
   );
   const setLocalVolume = useCallback(
-    (volume: number) => {
-      setLocalVolumeState(volume);
-      audio?.setLocalVolume(volume);
-    },
+    (volume: number) => audio?.setLocalVolume(volume),
     [audio],
   );
   const setRemoteVolume = useCallback(
-    (volume: number) => {
-      setRemoteVolumeState(volume);
-      audio?.setRemoteVolume(volume);
-    },
+    (volume: number) => audio?.setRemoteVolume(volume),
     [audio],
   );
   return { localVolume, remoteVolume, setLocalVolume, setRemoteVolume };

@@ -25,6 +25,7 @@ vi.mock("@/hooks/useICEServers", () => ({
 }));
 
 import type { AudioGraph } from "@/api/audio/audiograph";
+import type { CameraController } from "@/api/media/camera";
 import {
   ExternalSIPClient,
   reduceSIPCallEvent,
@@ -227,6 +228,14 @@ interface Setup {
     removeRemote: ReturnType<typeof vi.fn>;
   };
   microphone: MediaStreamTrack;
+  camera: {
+    acquire: ReturnType<typeof vi.fn>;
+    release: ReturnType<typeof vi.fn>;
+    subscribe: ReturnType<typeof vi.fn>;
+  };
+  cameraTrack: MediaStreamTrack;
+  cameraStream: MediaStream;
+  emitCamera: (stream: MediaStream | null) => void;
 }
 
 interface SetupOptions {
@@ -249,9 +258,28 @@ function setup(options: SetupOptions = {}): Setup {
     removeRemote: vi.fn(),
   };
   let sequence = 0;
+  const cameraTrack = mediaTrack("video");
+  const cameraStream = mediaStream(cameraTrack);
+  let cameraListener: ((stream: MediaStream | null) => void) | null = null;
+  const camera = {
+    localStream: null as MediaStream | null,
+    acquire: vi.fn(async () => {
+      camera.localStream = cameraStream;
+      return cameraStream;
+    }),
+    release: vi.fn(),
+    subscribe: vi.fn((listener: (stream: MediaStream | null) => void) => {
+      cameraListener = listener;
+      listener(null);
+      return () => {
+        if (cameraListener === listener) cameraListener = null;
+      };
+    }),
+  };
   const client = new ExternalSIPClient({
     transport,
     audio: audio as unknown as AudioGraph,
+    camera: camera as unknown as CameraController,
     createPeerConnection: () => {
       const peer = new MockPeerConnection();
       options.configurePeer?.(peer);
@@ -261,7 +289,19 @@ function setup(options: SetupOptions = {}): Setup {
     now: () => 10_000,
   });
   clients.push(client);
-  return { client, transport, audio, microphone };
+  return {
+    client,
+    transport,
+    audio,
+    microphone,
+    camera,
+    cameraTrack,
+    cameraStream,
+    emitCamera: (stream) => {
+      camera.localStream = stream;
+      cameraListener?.(stream);
+    },
+  };
 }
 
 function sentCall(transport: MockTransport, index: number): SIPCallEvent {
@@ -934,11 +974,15 @@ describe("external SIP protocol and media", () => {
   });
 
   it("accepts an inbound call with a browser offer and attaches mic/camera on accepted", async () => {
-    const { client, transport, microphone } = setup();
-    const camera = mediaTrack("video");
-    const cameraStream = mediaStream(camera);
-    const getUserMedia = vi.fn(async () => cameraStream);
-    vi.stubGlobal("navigator", { mediaDevices: { getUserMedia } });
+    const {
+      client,
+      transport,
+      microphone,
+      camera,
+      cameraTrack,
+      cameraStream,
+      emitCamera,
+    } = setup();
 
     await client.handleEvent(
       serverCall({
@@ -982,15 +1026,26 @@ describe("external SIP protocol and media", () => {
     await flushMicrotasks();
 
     const pc = MockPeerConnection.instances[0];
-    expect(getUserMedia).toHaveBeenCalledWith({ video: true });
+    expect(camera.acquire).toHaveBeenCalledOnce();
     expect(pc.sender("audio").replaceTrack).toHaveBeenCalledWith(microphone);
-    expect(pc.sender("video").replaceTrack).toHaveBeenCalledWith(camera);
+    expect(pc.sender("video").replaceTrack).toHaveBeenCalledWith(cameraTrack);
     expect(client.getSnapshot().media["incoming-call"]?.localStream).toBe(
       cameraStream,
     );
 
+    const replacementTrack = mediaTrack("video");
+    const replacementStream = mediaStream(replacementTrack);
+    emitCamera(replacementStream);
+    await flushMicrotasks();
+    expect(pc.sender("video").replaceTrack).toHaveBeenLastCalledWith(
+      replacementTrack,
+    );
+    expect(client.getSnapshot().media["incoming-call"]?.localStream).toBe(
+      replacementStream,
+    );
+
     client.dispose();
-    expect(camera.stop).toHaveBeenCalledOnce();
+    expect(camera.release).toHaveBeenCalledOnce();
     expect(pc.close).toHaveBeenCalledOnce();
   });
 

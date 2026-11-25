@@ -189,6 +189,35 @@
       }
     },
 
+    "devices": {
+      "title": "设备",
+      "back": "返回设置",
+      "description": "WebRTC 和 SIP 通话共用这里的设备与应用音量，修改会保存在当前浏览器中。",
+      "unsupported": "当前浏览器不支持媒体设备选择。",
+      "enumerateFailed": "无法列出媒体设备。",
+      "refresh": "刷新设备列表",
+      "systemDefault": "系统默认",
+      "unavailable": "已保存的设备（当前不可用）",
+      "unnamed": "{{kind}} {{index}}",
+      "camera": "摄像头",
+      "microphone": "麦克风",
+      "speaker": "扬声器",
+      "cameraPreview": "摄像头预览",
+      "test": "测试",
+      "stop": "停止",
+      "testing": "正在测试…",
+      "opening": "正在打开…",
+      "cameraFailed": "无法打开所选摄像头。",
+      "microphoneFailed": "无法打开所选麦克风。",
+      "inputLevel": "输入电平",
+      "outputLevel": "输出电平",
+      "microphoneHint": "电平表显示处理后的麦克风采样。预览不会在本地回放，以免产生啸叫。",
+      "microphoneVolume": "麦克风音量",
+      "speakerVolume": "扬声器音量",
+
+      "volumeHint": "这些增益只作用于本站内部，不会改变系统音量。"
+    },
+
     "sip": {
       "title": "SIP 注册",
       "back": "返回设置",

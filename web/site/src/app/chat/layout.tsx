@@ -3,6 +3,7 @@
 import type { ReactNode } from "react";
 
 import { AudioGraphProvider } from "@/api/audio/audiograph";
+import { CameraProvider } from "@/api/media/camera";
 import { SSProxyProvider } from "@/api/ss/react";
 
 // The /chat segment owns the signalling server connection: mounting it
@@ -18,7 +19,9 @@ import { SSProxyProvider } from "@/api/ss/react";
 export default function ChatLayout({ children }: { children: ReactNode }) {
   return (
     <SSProxyProvider>
-      <AudioGraphProvider>{children}</AudioGraphProvider>
+      <CameraProvider>
+        <AudioGraphProvider>{children}</AudioGraphProvider>
+      </CameraProvider>
     </SSProxyProvider>
   );
 }

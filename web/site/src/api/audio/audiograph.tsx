@@ -42,6 +42,7 @@
 
 import { createContext, useContext, useEffect, useMemo } from "react";
 import type { ReactNode } from "react";
+import { loadMediaSettings, saveMediaSettings } from "../media/settings";
 
 // The analyser configuration of both FFT taps: 2048-sample FFT (1024
 // frequency bins) with moderate temporal smoothing — enough to avoid
@@ -83,17 +84,26 @@ export class AudioGraph {
   private localInputHolds = 0;
 
   // The remote chain: per-remote sources muxed into one gain node feeding
-  // the speaker.
+  // the speaker. The output analyser taps samples AFTER application volume.
   private remoteGainNode: GainNode | null = null;
+  private remoteOutputAnalyserNode: AnalyserNode | null = null;
+  private speakerTest: {
+    oscillator: OscillatorNode;
+    envelope: GainNode;
+  } | null = null;
   private remotes = new Map<string, RemoteEntry>();
 
   // The user-facing settings, kept as plain fields so nodes (and
   // captures) built later pick them up; the setters also adjust the
   // live ones. echoCancellation gates the capture-side voice processing
   // (echo cancellation, noise suppression, auto gain) — off by default.
-  private localVolume = 1;
-  private remoteVolume = 1;
+  private localVolume = loadMediaSettings().microphoneVolume;
+  private remoteVolume = loadMediaSettings().speakerVolume;
+  private microphoneId = loadMediaSettings().microphoneId;
   private echoCancellation = false;
+  private microphoneVersion = 0;
+  private microphoneSwitchTail: Promise<void> = Promise.resolve();
+  private readonly volumeListeners = new Set<() => void>();
 
   // The autoplay-unlock listener, while armed (see armGestureUnlock).
   private unlockListener: (() => void) | null = null;
@@ -103,6 +113,9 @@ export class AudioGraph {
   // constraints are merely omitted, so "off" must say false.
   private captureConstraints(): MediaTrackConstraints {
     return {
+      ...(this.microphoneId === ""
+        ? {}
+        : { deviceId: { exact: this.microphoneId } }),
       echoCancellation: this.echoCancellation,
       noiseSuppression: this.echoCancellation,
       autoGainControl: this.echoCancellation,
@@ -135,7 +148,12 @@ export class AudioGraph {
           "retrying plain { audio: true }",
       );
       try {
-        return await navigator.mediaDevices.getUserMedia({ audio: true });
+        return await navigator.mediaDevices.getUserMedia({
+          audio:
+            this.microphoneId === ""
+              ? true
+              : { deviceId: { exact: this.microphoneId } },
+        });
       } catch (fallbackErr) {
         await this.logNoMicrophone(fallbackErr);
         throw fallbackErr;
@@ -173,6 +191,23 @@ export class AudioGraph {
     );
   }
 
+  private async openSelectedMicrophone(
+    ctx: AudioContext,
+  ): Promise<MediaStream> {
+    for (;;) {
+      const selection = this.microphoneVersion;
+      const stream = await this.openMicrophone();
+      if (this.ctx !== ctx) {
+        for (const track of stream.getTracks()) track.stop();
+        throw new Error("audiograph: released while opening the mic");
+      }
+      if (selection === this.microphoneVersion) return stream;
+      // A selection made during the permission prompt wins; never build the
+      // audio path from the obsolete capture.
+      for (const track of stream.getTracks()) track.stop();
+    }
+  }
+
   /**
    * Creates the AudioContext on first use and resumes it when suspended.
    * Browsers only let a context start inside a user gesture — the call
@@ -198,7 +233,10 @@ export class AudioGraph {
       });
       this.remoteGainNode = ctx.createGain();
       this.remoteGainNode.gain.value = this.remoteVolume;
-      this.remoteGainNode.connect(ctx.destination);
+      this.remoteOutputAnalyserNode = ctx.createAnalyser();
+      this.remoteOutputAnalyserNode.fftSize = FFT_SIZE;
+      this.remoteGainNode.connect(this.remoteOutputAnalyserNode);
+      this.remoteOutputAnalyserNode.connect(ctx.destination);
     }
     if (this.ctx.state === "suspended") {
       void this.ctx.resume();
@@ -263,12 +301,7 @@ export class AudioGraph {
         throw new Error("audiograph: no audio context");
       }
       promise = (async () => {
-        const stream = await this.openMicrophone();
-        if (this.ctx !== ctx) {
-          // The graph was released while the permission prompt sat open.
-          for (const track of stream.getTracks()) track.stop();
-          throw new Error("audiograph: released while opening the mic");
-        }
+        const stream = await this.openSelectedMicrophone(ctx);
         console.info(
           `[audiograph] mic captured: ctx=${ctx.sampleRate}Hz, ` +
             `settings=${JSON.stringify(stream.getAudioTracks()[0]?.getSettings() ?? {})}`,
@@ -343,24 +376,87 @@ export class AudioGraph {
     return this.localVolume;
   }
 
-  /** Sets the mic send volume (0..1) heard by every peer. */
+  subscribeVolumes(listener: () => void): () => void {
+    this.volumeListeners.add(listener);
+    return () => this.volumeListeners.delete(listener);
+  }
+
+  private volumesChanged(): void {
+    for (const listener of this.volumeListeners) listener();
+  }
+
+  /** Sets the mic send volume (0..1) heard by every peer and its preview. */
   setLocalVolume(volume: number): void {
-    this.localVolume = volume;
+    this.localVolume = Number.isFinite(volume)
+      ? Math.max(0, Math.min(1, volume))
+      : 1;
+    saveMediaSettings({ microphoneVolume: this.localVolume });
     if (this.localGainNode !== null) {
-      this.localGainNode.gain.value = volume;
+      this.localGainNode.gain.value = this.localVolume;
     }
+    this.volumesChanged();
   }
 
   getRemoteVolume(): number {
     return this.remoteVolume;
   }
 
-  /** Sets the speaker volume (0..1) of all remote voices together. */
+  /** Sets the application speaker volume (0..1) of all remote voices/tests. */
   setRemoteVolume(volume: number): void {
-    this.remoteVolume = volume;
+    this.remoteVolume = Number.isFinite(volume)
+      ? Math.max(0, Math.min(1, volume))
+      : 1;
+    saveMediaSettings({ speakerVolume: this.remoteVolume });
     if (this.remoteGainNode !== null) {
-      this.remoteGainNode.gain.value = volume;
+      this.remoteGainNode.gain.value = this.remoteVolume;
     }
+    this.volumesChanged();
+  }
+
+  getMicrophoneDeviceId(): string {
+    return this.microphoneId;
+  }
+
+  /** Switches the raw mic under the stable processed track used by senders. */
+  setMicrophoneDevice(deviceId: string): Promise<void> {
+    this.microphoneId = deviceId;
+    saveMediaSettings({ microphoneId: deviceId });
+    const selection = ++this.microphoneVersion;
+    this.microphoneSwitchTail = this.microphoneSwitchTail
+      .catch(() => {})
+      .then(async () => {
+        const previous = this.localStream;
+        const previousSource = this.localSourceNode;
+        const gain = this.localGainNode;
+        const ctx = this.ctx;
+        if (
+          selection !== this.microphoneVersion ||
+          this.localInputHolds === 0 ||
+          previous === null ||
+          previousSource === null ||
+          gain === null ||
+          ctx === null
+        ) {
+          return;
+        }
+        const stream = await this.openMicrophone();
+        if (
+          selection !== this.microphoneVersion ||
+          this.ctx !== ctx ||
+          this.localStream !== previous ||
+          this.localInputHolds === 0
+        ) {
+          for (const track of stream.getTracks()) track.stop();
+          return;
+        }
+        const source = ctx.createMediaStreamSource(stream);
+        source.connect(gain);
+        this.localStream = stream;
+        this.localSourceNode = source;
+        previousSource.disconnect();
+        for (const track of previous.getTracks()) track.stop();
+      });
+    return this.microphoneSwitchTail;
   }
 
   getEchoCancellation(): boolean {
@@ -384,6 +480,38 @@ export class AudioGraph {
           console.error("audiograph: cannot apply echo cancellation", err),
         );
     }
+  }
+
+  /** Post-gain output samples, including the speaker test tone. */
+  get speakerAnalyser(): AnalyserNode | null {
+    return this.remoteOutputAnalyserNode;
+  }
+
+  /** Starts a continuous sine tone through the call's application gain. */
+  startSpeakerTest(): void {
+    if (this.speakerTest !== null) return;
+    this.resume();
+    const ctx = this.ctx;
+    if (ctx === null || this.remoteGainNode === null) return;
+    const oscillator = ctx.createOscillator();
+    const envelope = ctx.createGain();
+    oscillator.frequency.value = 660;
+    envelope.gain.value = 0.2;
+    oscillator.connect(envelope);
+    envelope.connect(this.remoteGainNode);
+    oscillator.onended = () => {
+      oscillator.disconnect();
+      envelope.disconnect();
+    };
+    oscillator.start();
+    this.speakerTest = { oscillator, envelope };
+  }
+
+  stopSpeakerTest(): void {
+    const test = this.speakerTest;
+    if (test === null) return;
+    this.speakerTest = null;
+    test.oscillator.stop();
   }
 
   /**
@@ -483,6 +611,7 @@ export class AudioGraph {
    * resume() builds a fresh context.
    */
   release(): void {
+    this.stopSpeakerTest();
     this.disarmGestureUnlock();
     for (const id of [...this.remotes.keys()]) {
       this.removeRemote(id);
@@ -501,6 +630,7 @@ export class AudioGraph {
       void this.ctx.close();
       this.ctx = null;
       this.remoteGainNode = null;
+      this.remoteOutputAnalyserNode = null;
     }
   }
 }

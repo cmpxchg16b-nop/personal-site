@@ -12,6 +12,7 @@ import {
 } from "@mui/material";
 import ChevronRightIcon from "@mui/icons-material/ChevronRight";
 import PersonOutlineIcon from "@mui/icons-material/AccountCircleOutlined";
+import DevicesOutlinedIcon from "@mui/icons-material/DevicesOutlined";
 import SettingsPhoneIcon from "@mui/icons-material/SettingsPhone";
 import { useTranslation } from "react-i18next";
 import type { ChatUser } from "@/api/ss/types";
@@ -20,7 +21,9 @@ import UserAvatar from "./UserAvatar";
 type SettingsPanelProps = {
   user: ChatUser | undefined;
   sipSelected: boolean;
+  deviceSelected: boolean;
   onOpenSip: () => void;
+  onOpenDevices: () => void;
 };
 
 // SettingsPanel intentionally has no profile editing controls: identity still
@@ -28,7 +31,9 @@ type SettingsPanelProps = {
 export default function SettingsPanel({
   user,
   sipSelected,
+  deviceSelected,
   onOpenSip,
+  onOpenDevices,
 }: SettingsPanelProps) {
   const { t } = useTranslation();
 
@@ -58,6 +63,26 @@ export default function SettingsPanel({
         </Typography>
       </Box>
       <List disablePadding sx={{ py: 1 }}>
+        <ListItem disablePadding>
+          <ListItemButton
+            selected={deviceSelected}
+            onClick={onOpenDevices}
+            aria-label={t("chat.devices.title")}
+            aria-controls="device-settings"
+            sx={{ px: 2, py: 1.5 }}
+          >
+            <ListItemIcon sx={{ minWidth: 40 }}>
+              <DevicesOutlinedIcon color="action" />
+            </ListItemIcon>
+            <ListItemText
+              primary={t("chat.devices.title")}
+              slotProps={{
+                primary: { variant: "body2", sx: { fontWeight: 500 } },
+              }}
+            />
+            <ChevronRightIcon color="action" sx={{ ml: 1 }} />
+          </ListItemButton>
+        </ListItem>
         <ListItem disablePadding>
           <ListItemButton
             selected={sipSelected}

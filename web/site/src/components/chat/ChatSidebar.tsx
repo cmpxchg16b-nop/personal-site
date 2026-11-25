@@ -51,6 +51,8 @@ type ChatSidebarProps = {
   selectedExternalConversation: ExternalSIPConversationRef | null;
   sipSelected: boolean;
   onOpenSip: () => void;
+  deviceSelected: boolean;
+  onOpenDevices: () => void;
   sip: UseExternalSIPResult;
   // Responsive visibility is controlled by the parent (ChatApp) through sx.
   sx?: SxProps<Theme>;
@@ -76,6 +78,8 @@ export default function ChatSidebar({
   selectedExternalConversation,
   sipSelected,
   onOpenSip,
+  deviceSelected,
+  onOpenDevices,
   sip,
   sx,
 }: ChatSidebarProps) {
@@ -287,6 +291,8 @@ export default function ChatSidebar({
               user={users[currentUserId]}
               sipSelected={sipSelected}
               onOpenSip={onOpenSip}
+              deviceSelected={deviceSelected}
+              onOpenDevices={onOpenDevices}
             />
           </Box>
         )}

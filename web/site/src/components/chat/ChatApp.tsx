@@ -24,6 +24,7 @@ import {
   type ExternalSIPConversationRef,
 } from "./externalSipConversation";
 import PhoneContactView from "./PhoneContactView";
+import DeviceSettings from "./DeviceSettings";
 import SipRegistrationSettings from "./SipRegistrationSettings";
 import { IncomingCallWindow } from "./IncomingCallWindow";
 import { VideoWindow } from "./VideoWindow";
@@ -155,7 +156,9 @@ export default function ChatApp({
     ref: ConversationRef;
     messageId: string;
   } | null>(null);
-  const [sipSettingsOpen, setSipSettingsOpen] = useState(false);
+  const [settingsPage, setSettingsPage] = useState<"sip" | "devices" | null>(
+    null,
+  );
   const [externalConversation, setExternalConversation] =
     useState<ExternalSIPConversationRef | null>(null);
   // The dial pad's visibility — viewport chrome like mobileListOpen:
@@ -265,7 +268,7 @@ export default function ChatApp({
     onSelect(ref);
     setExternalConversation(null);
     setPhoneContact(null);
-    setSipSettingsOpen(false);
+    setSettingsPage(null);
     setMobileListOpen(false);
   };
 
@@ -280,20 +283,20 @@ export default function ChatApp({
     }
     setExternalConversation(null);
     setPhoneContact(null);
-    setSipSettingsOpen(false);
+    setSettingsPage(null);
     setMobileListOpen(false);
   };
 
   const handleTabChange = (tab: ChatSidebarTab) => {
     setActiveTab(tab);
     setPhoneContact(null);
-    setSipSettingsOpen(false);
+    setSettingsPage(null);
   };
 
   const handleSelectContact = (ref: ConversationRef, messageId: string) => {
     setExternalConversation(null);
     setPhoneContact({ ref, messageId });
-    setSipSettingsOpen(false);
+    setSettingsPage(null);
     setMobileListOpen(false);
   };
 
@@ -301,7 +304,7 @@ export default function ChatApp({
     setExternalConversation(ref);
     setActiveTab("phone");
     setPhoneContact(null);
-    setSipSettingsOpen(false);
+    setSettingsPage(null);
     setMobileListOpen(false);
   };
 
@@ -355,17 +358,34 @@ export default function ChatApp({
           onSelectContact={handleSelectContact}
           onOpenExternalConversation={openExternalConversation}
           selectedExternalConversation={externalConversation}
-          sipSelected={activeTab === "settings" && sipSettingsOpen}
+          sipSelected={activeTab === "settings" && settingsPage === "sip"}
           onOpenSip={() => {
-            setSipSettingsOpen(true);
+            setSettingsPage("sip");
+            setMobileListOpen(false);
+          }}
+          deviceSelected={
+            activeTab === "settings" && settingsPage === "devices"
+          }
+          onOpenDevices={() => {
+            setSettingsPage("devices");
             setMobileListOpen(false);
           }}
           sip={externalSIP}
           sx={{ display: { xs: mobileListOpen ? "flex" : "none", sm: "flex" } }}
         />
-        {activeTab === "settings" && sipSettingsOpen ? (
+        {activeTab === "settings" && settingsPage === "sip" ? (
           <SipRegistrationSettings
             onBack={() => setMobileListOpen(true)}
+            sx={{
+              display: { xs: mobileListOpen ? "none" : "flex", sm: "flex" },
+            }}
+          />
+        ) : activeTab === "settings" && settingsPage === "devices" ? (
+          <DeviceSettings
+            onBack={() => {
+              setSettingsPage(null);
+              setMobileListOpen(true);
+            }}
             sx={{
               display: { xs: mobileListOpen ? "none" : "flex", sm: "flex" },
             }}

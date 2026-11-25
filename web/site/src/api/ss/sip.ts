@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import type { AudioGraph } from "@/api/audio/audiograph";
+import type { CameraController } from "@/api/media/camera";
 import { useICEServers } from "@/hooks/useICEServers";
 import { dialerForSender, type DialerHandle } from "../dtmf";
 import { useSSProxy } from "./react";
@@ -221,6 +222,7 @@ export interface ExternalSIPTransport {
 export interface ExternalSIPClientOptions {
   transport: ExternalSIPTransport;
   audio?: AudioGraph | null;
+  camera?: CameraController | null;
   iceServers?: RTCIceServer[];
   createPeerConnection?: (configuration: RTCConfiguration) => RTCPeerConnection;
   randomUUID?: () => string;
@@ -241,10 +243,9 @@ interface CallRuntime {
   closed: boolean;
   mediaPromise: Promise<void> | null;
   audioInputHeld: boolean;
-  readonly ownedLocalTracks: MediaStreamTrack[];
+  cameraInputHeld: boolean;
   localStream: MediaStream | null;
   remoteStream: MediaStream | null;
-  remoteAudio: HTMLAudioElement | null;
 }
 
 function messageForSendFailure(error: unknown): string {
@@ -268,6 +269,8 @@ function failureAbortAction(call: ExternalSIPCall): SIPCallAction {
 export class ExternalSIPClient {
   private readonly transport: ExternalSIPTransport;
   private readonly audio: AudioGraph | null;
+  private readonly camera: CameraController | null;
+  private readonly unsubscribeCamera: (() => void) | null;
   private readonly createPeerConnection: (
     configuration: RTCConfiguration,
   ) => RTCPeerConnection;
@@ -288,12 +291,41 @@ export class ExternalSIPClient {
   constructor(options: ExternalSIPClientOptions) {
     this.transport = options.transport;
     this.audio = options.audio ?? null;
+    this.camera = options.camera ?? null;
     this.iceServers = [...(options.iceServers ?? [])];
     this.createPeerConnection =
       options.createPeerConnection ??
       ((configuration) => new RTCPeerConnection(configuration));
     this.randomUUID = options.randomUUID ?? (() => crypto.randomUUID());
     this.now = options.now ?? (() => Date.now());
+    this.unsubscribeCamera =
+      this.camera?.subscribe((stream) => this.cameraChanged(stream)) ?? null;
+  }
+
+  private cameraChanged(stream: MediaStream | null): void {
+    const track = stream?.getVideoTracks()[0];
+    if (track === undefined) return;
+    let changed = false;
+    for (const runtime of this.runtimes.values()) {
+      if (
+        runtime.videoSender === null ||
+        !runtime.cameraInputHeld ||
+        !this.runtimeIsLive(runtime)
+      ) {
+        continue;
+      }
+      runtime.localStream = stream;
+      changed = true;
+      void runtime.videoSender.replaceTrack(track).catch((error: unknown) => {
+        if (this.runtimeIsLive(runtime)) {
+          void this.failCall(
+            runtime.callId,
+            conciseSIPReason(error, "Unable to switch camera"),
+          ).catch(() => {});
+        }
+      });
+    }
+    if (changed) this.publish();
   }
 
   setICEServers(iceServers: RTCIceServer[]): void {
@@ -434,10 +466,9 @@ export class ExternalSIPClient {
       closed: false,
       mediaPromise: null,
       audioInputHeld: false,
-      ownedLocalTracks: [],
+      cameraInputHeld: false,
       localStream: null,
       remoteStream: null,
-      remoteAudio: null,
     };
     this.runtimes.set(call.callId, runtime);
 
@@ -817,37 +848,30 @@ export class ExternalSIPClient {
   }
 
   private async captureAndAttachMedia(runtime: CallRuntime): Promise<void> {
-    if (this.audio !== null) {
-      const input = await this.audio.acquireLocalInput();
-      runtime.audioInputHeld = true;
-      if (!this.runtimeIsLive(runtime)) {
-        this.releaseAudioInput(runtime);
-        return;
-      }
-      await runtime.audioSender.replaceTrack(input.track);
-    } else {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      runtime.ownedLocalTracks.push(...stream.getTracks());
-      if (!this.runtimeIsLive(runtime)) {
-        this.stopOwnedTracks(runtime);
-        return;
-      }
-      const track = stream.getAudioTracks()[0];
-      if (track === undefined) throw new Error("No microphone track available");
-      await runtime.audioSender.replaceTrack(track);
+    if (this.audio === null) throw new Error("Audio graph unavailable");
+    const input = await this.audio.acquireLocalInput();
+    runtime.audioInputHeld = true;
+    if (!this.runtimeIsLive(runtime)) {
+      this.releaseAudioInput(runtime);
+      return;
     }
+    await runtime.audioSender.replaceTrack(input.track);
 
     if (runtime.videoSender !== null) {
-      const stream = await navigator.mediaDevices.getUserMedia({ video: true });
-      runtime.ownedLocalTracks.push(...stream.getTracks());
+      if (this.camera === null)
+        throw new Error("Camera controller unavailable");
+      const stream = await this.camera.acquire();
+      runtime.cameraInputHeld = true;
       if (!this.runtimeIsLive(runtime)) {
-        this.stopOwnedTracks(runtime);
+        this.releaseCameraInput(runtime);
         return;
       }
       const track = stream.getVideoTracks()[0];
       if (track === undefined) throw new Error("No camera track available");
       await runtime.videoSender.replaceTrack(track);
-      runtime.localStream = stream;
+      // A switch may have completed while replaceTrack was pending; never
+      // restore the now-stopped stream captured before that await.
+      runtime.localStream = this.camera.localStream;
     }
     if (!this.runtimeIsLive(runtime)) return;
     this.connectRemoteAudio(runtime);
@@ -863,16 +887,7 @@ export class ExternalSIPClient {
     ) {
       return;
     }
-    if (this.audio !== null) {
-      this.audio.addRemote(`external-sip:${runtime.callId}`, stream);
-      return;
-    }
-    if (runtime.remoteAudio !== null || typeof document === "undefined") return;
-    const element = document.createElement("audio");
-    element.srcObject = stream;
-    element.autoplay = true;
-    runtime.remoteAudio = element;
-    void element.play().catch(() => {});
+    this.audio?.addRemote(`external-sip:${runtime.callId}`, stream);
   }
 
   private releaseAudioInput(runtime: CallRuntime): void {
@@ -881,9 +896,11 @@ export class ExternalSIPClient {
     this.audio?.releaseLocalInput();
   }
 
-  private stopOwnedTracks(runtime: CallRuntime): void {
-    for (const track of runtime.ownedLocalTracks.splice(0)) track.stop();
+  private releaseCameraInput(runtime: CallRuntime): void {
+    if (!runtime.cameraInputHeld) return;
+    runtime.cameraInputHeld = false;
     runtime.localStream = null;
+    this.camera?.release();
   }
 
   private cleanupRuntime(runtime: CallRuntime): void {
@@ -891,13 +908,8 @@ export class ExternalSIPClient {
     runtime.closed = true;
     this.runtimes.delete(runtime.callId);
     this.audio?.removeRemote(`external-sip:${runtime.callId}`);
-    if (runtime.remoteAudio !== null) {
-      runtime.remoteAudio.pause();
-      runtime.remoteAudio.srcObject = null;
-      runtime.remoteAudio = null;
-    }
     this.releaseAudioInput(runtime);
-    this.stopOwnedTracks(runtime);
+    this.releaseCameraInput(runtime);
     runtime.pendingLocalCandidates.length = 0;
     runtime.pendingRemoteCandidates.length = 0;
     runtime.pc.onicecandidate = null;
@@ -978,6 +990,7 @@ export class ExternalSIPClient {
 
   /** Stop every media path and peer connection without emitting more events. */
   dispose(): void {
+    this.unsubscribeCamera?.();
     if (this.closed) return;
     this.closed = true;
     if (this.reader !== null) void this.reader.cancel().catch(() => {});
@@ -1002,6 +1015,7 @@ export interface UseExternalSIPResult extends ExternalSIPSnapshot {
 /** React binding: one client per proxy incarnation, torn down on unmount. */
 export function useExternalSIP(
   audio: AudioGraph | null = null,
+  camera: CameraController | null = null,
 ): UseExternalSIPResult {
   const proxy: SSProxy | null = useSSProxy();
   const iceQuery = useICEServers();
@@ -1030,6 +1044,7 @@ export function useExternalSIP(
     const client = new ExternalSIPClient({
       transport: proxy,
       audio,
+      camera,
       iceServers: iceServersRef.current,
     });
     clientRef.current = client;
@@ -1042,7 +1057,7 @@ export function useExternalSIP(
       if (clientRef.current === client) clientRef.current = null;
       client.dispose();
     };
-  }, [proxy, audio]);
+  }, [proxy, audio, camera]);
 
   const dial = useCallback(
     (input: ExternalSIPDialInput) =>

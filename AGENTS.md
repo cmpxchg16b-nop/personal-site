@@ -45,6 +45,12 @@ them factual and concise enough to remain useful to the next session.
 4. Use at most seven review rounds. If issues remain after the seventh round,
    the reviewer should fix them directly instead of requesting another rework.
 
+## Web UI design
+
+- Follow Material Design principles and use the project's MUI components, spacing, typography, states, and responsive behavior consistently.
+- Keep button labels concise. Use one word when it conveys the action; do not repeat surrounding section context or use two or three words unnecessarily.
+- Show media previews directly when their settings surface opens when browser/platform permissions allow it. Test controls use concise Test/Stop actions with an adjacent visible status while testing.
+
 ## Formatting and efficiency
 
 - Avoid formatting busywork; do not burn tokens on stylistic tweaks or spend time cleaning up noisy diffs left by auto-formatters.

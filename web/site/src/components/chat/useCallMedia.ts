@@ -21,6 +21,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { AudioGraph } from "@/api/audio/audiograph";
+import type { CameraController } from "@/api/media/camera";
 import { dialerForSender, type DialerHandle } from "@/api/dtmf";
 import type { PeerSessions } from "@/api/ss/peersessions";
 import type { ChannelId, SubscriberId } from "@/api/ss/types";
@@ -72,21 +73,18 @@ export interface UseCallMediaResult {
 export function useCallMedia(
   sessions: PeerSessions,
   audio: AudioGraph | null,
+  camera: CameraController | null,
   calls: Record<string, ActivePhoneCall>,
 ): UseCallMediaResult {
   // The RTCRtpSenders of our tracks per attached pair: the mic's, and
   // the camera's for video calls.
   const sendersRef = useRef(new Map<string, RTCRtpSender>());
   const cameraSendersRef = useRef(new Map<string, RTCRtpSender>());
-  // The one shared camera capture: cameraPromise makes the acquisition
-  // idempotent (concurrent video calls share it), cameraHolds counts the
-  // acquisitions — the capture stops when the last hold is released.
-  // localCamera is the render-facing half (the "me" view); reading the
-  // lifecycle ref during render is off-limits.
-  const cameraPromiseRef = useRef<Promise<MediaStream> | null>(null);
-  const cameraStreamRef = useRef<MediaStream | null>(null);
-  const cameraHoldsRef = useRef(0);
-  const [localCamera, setLocalCamera] = useState<MediaStream | null>(null);
+  // CameraController owns the shared capture and reference counts. Its
+  // subscription updates this render-facing stream and live video senders.
+  const [localCamera, setLocalCamera] = useState<MediaStream | null>(
+    () => camera?.localStream ?? null,
+  );
   // The peers' camera streams per pair (video tracks off the wire).
   const remoteVideosRef = useRef(new Map<string, MediaStream>());
   // The pairs whose mic senders' first negotiation is being watched:
@@ -98,71 +96,31 @@ export function useCallMedia(
   // them the moment they exist.
   const [, setMediaVersion] = useState(0);
 
-  // acquireCamera opens the camera, shared between concurrent video
-  // calls — reference-counted like the audio graph's mic capture: every
-  // acquisition takes a hold, balanced by releaseCamera, and the capture
-  // stops with the last hold, so the camera indicator lights exactly
-  // while a video call is sending. A rejected acquisition (permission
-  // denied) takes no hold and may be retried.
-  const acquireCamera = useCallback(async (): Promise<MediaStream> => {
-    let promise = cameraPromiseRef.current;
-    if (promise === null) {
-      promise = navigator.mediaDevices.getUserMedia({ video: true });
-      cameraPromiseRef.current = promise;
-    }
-    // The hold is taken before the await: acquisitions sharing one
-    // pending getUserMedia are then all counted before any releaseCamera
-    // can run.
-    cameraHoldsRef.current += 1;
-    try {
-      const stream = await promise;
-      if (cameraPromiseRef.current !== promise) {
-        // The hook was released while the permission prompt sat open.
-        for (const track of stream.getTracks()) track.stop();
-        throw new Error("callmedia: released while opening the camera");
-      }
-      cameraStreamRef.current = stream;
-      setLocalCamera(stream);
-      return stream;
-    } catch (err) {
-      // Allow a retry (e.g. the user grants the permission later) —
-      // unless a newer acquisition already replaced the promise — and
-      // drop this acquisition's hold with the failure.
-      if (cameraPromiseRef.current === promise) cameraPromiseRef.current = null;
-      cameraHoldsRef.current -= 1;
-      throw err;
-    }
-  }, []);
-
-  // releaseCamera balances one acquireCamera hold; the last release
-  // stops the capture. Acquisitions settle before their releases run
-  // (the caller awaits before attaching), so the capture is never
-  // pending here.
-  const releaseCamera = useCallback(() => {
-    if (cameraHoldsRef.current > 0) cameraHoldsRef.current -= 1;
-    if (cameraHoldsRef.current > 0) return;
-    const stream = cameraStreamRef.current;
-    if (stream !== null) {
-      for (const track of stream.getTracks()) track.stop();
-    }
-    cameraStreamRef.current = null;
-    cameraPromiseRef.current = null;
-    setLocalCamera(null);
-  }, []);
-
-  // Leaving the chat page drops the camera even mid-call (the mic goes
-  // with the audio graph's own release).
   useEffect(() => {
-    return () => {
-      const stream = cameraStreamRef.current;
-      if (stream !== null) {
-        for (const track of stream.getTracks()) track.stop();
+    if (camera === null) return;
+    return camera.subscribe((stream) => {
+      setLocalCamera(stream);
+      const track = stream?.getVideoTracks()[0];
+      if (track === undefined) return;
+      for (const [key, sender] of [...cameraSendersRef.current]) {
+        void sender.replaceTrack(track).catch((error: unknown) => {
+          console.error("callmedia: cannot switch the camera", error);
+          if (cameraSendersRef.current.get(key) !== sender) return;
+          // Do not leave an accepted sender on the old, stopped track. Drop
+          // this attachment and its hold; a later call-state change may retry.
+          const separator = key.indexOf(":");
+          sessions.removeTrack(
+            key.slice(0, separator),
+            key.slice(separator + 1),
+            sender,
+          );
+          cameraSendersRef.current.delete(key);
+          camera.release();
+          setMediaVersion((version) => version + 1);
+        });
       }
-      cameraStreamRef.current = null;
-      cameraPromiseRef.current = null;
-      cameraHoldsRef.current = 0;
-    };
-  }, []);
+    });
+  }, [camera, sessions]);
 
   // Remote streams: every inbound track of any session is routed by
   // kind — audio connects into the audio graph (the volume menu and the
@@ -279,12 +237,15 @@ export function useCallMedia(
       if (cameraSendersRef.current.has(key)) continue;
       void (async () => {
         try {
-          const stream = await acquireCamera();
+          const stream = await camera?.acquire();
+          if (stream === undefined) {
+            throw new Error("callmedia: camera controller unavailable");
+          }
           // The effect re-ran (or the call ended) while the camera
           // opened: this hold has no attachment to back, so it goes
           // back.
           if (!live || cameraSendersRef.current.has(key)) {
-            releaseCamera();
+            camera?.release();
             return;
           }
           const sender = sessions.addTrack(
@@ -294,7 +255,7 @@ export function useCallMedia(
             stream,
           );
           if (sender === null) {
-            releaseCamera();
+            camera?.release();
             return;
           }
           cameraSendersRef.current.set(key, sender);
@@ -321,7 +282,7 @@ export function useCallMedia(
       const sep = key.indexOf(":");
       sessions.removeTrack(key.slice(0, sep), key.slice(sep + 1), sender);
       cameraSendersRef.current.delete(key);
-      releaseCamera();
+      camera?.release();
       setMediaVersion((v) => v + 1);
     }
     // A peer view whose call left "accepted" closes; a live video track
@@ -334,7 +295,7 @@ export function useCallMedia(
     return () => {
       live = false;
     };
-  }, [sessions, audio, calls, acquireCamera, releaseCamera]);
+  }, [sessions, audio, camera, calls]);
 
   const remoteAnalyserFor = useCallback(
     (channelId: ChannelId, peer: SubscriberId) =>
