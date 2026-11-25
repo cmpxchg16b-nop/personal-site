@@ -62,7 +62,10 @@ function DeviceSelect({
       label={label}
       value={value}
       onChange={(event) => void onChange(event.target.value)}
-      slotProps={{ select: { displayEmpty: true } }}
+      slotProps={{
+        inputLabel: { shrink: true },
+        select: { displayEmpty: true },
+      }}
     >
       <MenuItem value="">{defaultLabel}</MenuItem>
       {value !== "" && !available && (
